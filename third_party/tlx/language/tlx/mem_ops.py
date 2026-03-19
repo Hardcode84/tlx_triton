@@ -156,6 +156,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     unwrapped_num = tl._unwrap_if_constexpr(num)
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
+    layout = tl._unwrap_if_constexpr(layout)
     elem_type = dtype.to_ir(_semantic.builder)
     if layout is None:
         if storage == tlx.storage_kind.smem:
@@ -197,7 +198,9 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                 layout = tlx.tensor_memory_layout_encoding.make_default(shape)
             layout_handle = layout.to_ir(_semantic.builder)
     else:
-        raise NotImplementedError("User-specified layout encoding not yet implemented.")
+        if not isinstance(layout, tlx.shared_layout_encoding):
+            raise TypeError(f"layout must be a shared_layout_encoding, got {type(layout)}")
+        layout_handle = layout.to_ir(_semantic.builder)
 
     alias_handle = None
     shared_buffer_handle = None
