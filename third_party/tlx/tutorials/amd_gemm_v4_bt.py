@@ -23,6 +23,14 @@ from triton._internal_testing import is_cuda, is_hip
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
+B_K_CONTIGUOUS_LAYOUT = tlx.swizzled_shared_layout_encoding(
+    vectorSize=1, perPhase=1, maxPhase=1,
+    order=[0, 1],
+    numCTAs=[1, 1], numCTAsPerCGA=[1, 1],
+    numCTASplit=[1, 1], numCTAOrder=[1, 0],
+)
+
+
 @triton.jit
 def matmul_kernel_v4_bt(
     a_ptr, bt_ptr, c_ptr,
@@ -33,6 +41,7 @@ def matmul_kernel_v4_bt(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    B_LAYOUT: tl.constexpr = B_K_CONTIGUOUS_LAYOUT,
 ):
     pid = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -51,11 +60,10 @@ def matmul_kernel_v4_bt(
 
     # A is M*K, loaded as (BLOCK_M, BLOCK_K) tiles.
     buffers_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 2)
-    # B^T is N*K in memory. We allocate (BLOCK_K, BLOCK_N) and load with
-    # swapped indexing: rows = K offsets, cols = N offsets. Each "row" reads
-    # BLOCK_N elements strided by stride_btn (= K for contiguous B^T) from
-    # the same K-offset across all N columns. Data lands K-contiguous in LDS.
-    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(bt_ptr), 2)
+    # B^T is N*K in memory. We allocate (BLOCK_K, BLOCK_N) with order=[0,1]
+    # (K-contiguous) so that data lands with K as the fast dimension in LDS.
+    # This tells the AMD lowering to use regular ds_read instead of ds_read_tr.
+    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(bt_ptr), 2, layout=B_LAYOUT)
 
     offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)

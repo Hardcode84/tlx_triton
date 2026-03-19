@@ -47,19 +47,37 @@ LogicalResult insertRequireLayout(ModuleOp m) {
           llvm::dbgs() << "LocalLoadOp\n";
           localLoadOp.dump();
         });
-        // Get the shared encoding for this local load op based on the dot op
+        // Get the shared encoding for this local load op based on the dot op.
         bool incompatible = false;
         auto encoding = mlir::getSharedEncIfAllUsersAreDotEnc(
                             localLoadOp->getResult(0), incompatible)
                             .value_or(nullptr);
         if (encoding) {
+          // If the source memdesc has a user-specified order that differs
+          // from the derived one, rebuild the encoding with that order.
+          // This lets the user signal K-contiguous data (order=[0,1]) for
+          // pre-transposed B, which avoids ds_read_tr in the LLVM lowering.
+          auto loadMemDescTy = op->getOperands()[0];
+          if (auto srcType =
+                  dyn_cast<ttg::MemDescType>(loadMemDescTy.getType())) {
+            if (auto srcEnc = dyn_cast<ttg::SwizzledSharedEncodingAttr>(
+                    srcType.getEncoding())) {
+              if (srcEnc.getOrder() != encoding.getOrder()) {
+                LDBG("Respecting user-specified order "
+                     << srcEnc << " instead of derived " << encoding);
+                encoding = ttg::SwizzledSharedEncodingAttr::get(
+                    encoding.getContext(), encoding.getVec(),
+                    encoding.getPerPhase(), encoding.getMaxPhase(),
+                    srcEnc.getOrder(), encoding.getCTALayout());
+              }
+            }
+          }
           LLVM_DEBUG({
             llvm::dbgs() << "SwizzledSharedEncodingAttr\n";
             encoding.dump();
           });
           builder.setInsertionPoint(localLoadOp);
           auto encodingAttr = mlir::cast<Attribute>(encoding);
-          auto loadMemDescTy = op->getOperands()[0];
           if (auto type = dyn_cast<ttg::MemDescType>(loadMemDescTy.getType())) {
             auto newType = ttg::MemDescType::get(
                 type.getShape(), type.getElementType(), encodingAttr,
