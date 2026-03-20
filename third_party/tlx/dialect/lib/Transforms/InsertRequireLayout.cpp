@@ -87,9 +87,12 @@ LogicalResult insertRequireLayout(ModuleOp m) {
             localLoadOp->setOperand(0, converLayoutOp.getResult());
           }
         } else {
-          localLoadOp->emitError(
-              "Cannot find appropriate shared encoding for local load op");
-          return WalkResult::interrupt();
+          // Cannot determine shared encoding for this local_load. This
+          // happens when the load result feeds loop iter_args rather
+          // than a dot operand directly. Skip it -- the layout will be
+          // resolved by propagation from other local_loads that do feed
+          // dots.
+          LDBG("Skipping local_load without determinable dot encoding");
         }
       }
     }
