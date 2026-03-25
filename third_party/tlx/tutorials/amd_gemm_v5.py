@@ -24,22 +24,18 @@ def matmul_kernel_v5_local_prefetch(
     V5 Local prefetch pipeline - TLX conversion from Gluon.
 
     3-stage overlapped pipeline:
-    - Stage 1: Async copy global → shared (iteration k+2)
-    - Stage 2: Local load shared → registers (iteration k+1)
-    - Stage 3: Compute/DOT (iteration k)
-
-    Gluon pattern:
         Prologue:
             AC A0, B0 --> buffer 0
             AC A1, B1 --> buffer 1
-            async_wait buffer 0
+            wait_group(1)               -- buffer 0 guaranteed ready
             local_load A0, B0 <-- buffer 0
 
         Main Loop (k in [0, iterMax-2]):
-            DOT(A, B)                           # iteration k
-            async_wait all
-            AC A_{k+2}, B_{k+2} --> buffer g_idx    # iteration k+2
-            local_load A_{k+1}, B_{k+1} <-- buffer l_idx  # iteration k+1
+            DOT(A, B)                              -- compute tile k
+            AC A_{k+2}, B_{k+2} --> buffer g_idx   -- prefetch k+2
+            commit_group
+            wait_group(1)                           -- buffer l_idx ready
+            local_load A, B <-- buffer l_idx        -- load tile k+1
 
         Epilogue:
             DOT(final)
@@ -88,21 +84,19 @@ def matmul_kernel_v5_local_prefetch(
     tlx.async_load_wait_group(1)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    a = tlx.local_load(a_smem_1)
-    b = tlx.local_load(b_smem_1)
+    a = tlx.local_load(a_smem_0)
+    b = tlx.local_load(b_smem_0)
 
-    ## Main Loop: True 3-stage pipeline matching Gluon v5
-    ## At iteration k:
-    ##   - Local load iteration k from shared to registers (iteration k was prefetched earlier)
-    ##   - DOT computes iteration k
-    ##   - Async copy prefetches iteration k+2
-    # Disable auto-pipelining with num_stages=0
-    for k in tl.range(0, iterMax, num_stages=0):
-        g_idx = k % 2       # Buffer for async copy (iteration k+2)
-        l_idx = 1 - g_idx   # Buffer for local load (iteration k+1)
+    ## Main Loop: 3-stage pipeline (matches Gluon v5)
+    ##   DOT(a, b)           — compute tile k (already in registers)
+    ##   async_copy k+2      — issue prefetch into buffer g_idx
+    ##   wait_group(1)        — k+1 data is now ready
+    ##   local_load k+1      — load from buffer l_idx
+    for k in tl.range(0, iterMax - 1, num_stages=0):
+        g_idx = k % 2
+        l_idx = 1 - g_idx
 
         acc = tl.dot(a, b, acc)
-        tlx.async_load_wait_group(0)
 
         a_next_smem = tlx.local_view(buffers_A, g_idx)
         b_next_smem = tlx.local_view(buffers_B, g_idx)
@@ -110,13 +104,12 @@ def matmul_kernel_v5_local_prefetch(
         token_b = tlx.async_load(b_ptrs, b_next_smem, mask=offs_k[:, None] < K - (k + 2) * BLOCK_K)
         tlx.async_load_commit_group([token_a, token_b])
 
+        tlx.async_load_wait_group(1)
+
         a_load_shmem = tlx.local_view(buffers_A, l_idx)
         b_load_shmem = tlx.local_view(buffers_B, l_idx)
-        a_next = tlx.local_load(a_load_shmem)
-        b_next = tlx.local_load(b_load_shmem)
-
-        a = a_next
-        b = b_next
+        a = tlx.local_load(a_load_shmem)
+        b = tlx.local_load(b_load_shmem)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
