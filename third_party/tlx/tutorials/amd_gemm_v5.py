@@ -84,8 +84,8 @@ def matmul_kernel_v5_local_prefetch(
     tlx.async_load_wait_group(1)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    a = tlx.local_load(a_smem_0)
-    b = tlx.local_load(b_smem_0)
+    a = tlx.local_load(a_smem_0, relaxed=True)
+    b = tlx.local_load(b_smem_0, relaxed=True)
 
     ## Main Loop: 3-stage pipeline (matches Gluon v5)
     ##   DOT(a, b)           — compute tile k (already in registers)
@@ -108,8 +108,8 @@ def matmul_kernel_v5_local_prefetch(
 
         a_load_shmem = tlx.local_view(buffers_A, l_idx)
         b_load_shmem = tlx.local_view(buffers_B, l_idx)
-        a = tlx.local_load(a_load_shmem)
-        b = tlx.local_load(b_load_shmem)
+        a = tlx.local_load(a_load_shmem, relaxed=True)
+        b = tlx.local_load(b_load_shmem, relaxed=True)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
