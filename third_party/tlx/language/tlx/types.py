@@ -1048,12 +1048,12 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
     """
 
     def __init__(self, num: int, size: int = 128):
-        # Initialize with a block type of size int8 elements to get size-byte stride
+        # Initialize with a block type of size int8 elements to get size-byte stride.
         element_type = tl.block_type(tl.int8, [size])
         super().__init__(element_type, address_space=1)
-        # Number of descriptors this pointer can access (1 means single descriptor)
+        # Number of descriptors this pointer can access (1 means single descriptor).
         self.num = num
-        # Size of each descriptor in bytes
+        # Size of each descriptor in bytes.
         self.size = size
 
     def __eq__(self, other):
