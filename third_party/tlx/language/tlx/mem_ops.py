@@ -603,8 +603,15 @@ def async_load(
         # unsupported for now
         raise NotImplementedError("async_load by block pointer is not supported yet")
     else:
-        # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-        _, src, mask, other, _ = _semantic._prepare_legacy_load(src, mask, other, None, None)
+        # Load by a tensor of pointers or a pointer of scalar
+        if src.type.is_block():
+            if mask is not None:
+                src, mask = _semantic.broadcast_impl_value(src, mask)
+            if other is not None:
+                src, other = _semantic.broadcast_impl_value(src, other)
+        elt_ty = src.type.scalar.element_ty
+        if other is not None:
+            other = _semantic.cast(other, elt_ty)
 
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
