@@ -324,6 +324,24 @@ class mbarrier_type(buffered_tensor_type):
         )
 
 
+class async_token_type(tl.base_type):
+
+    def __eq__(self, other):
+        return isinstance(other, async_token_type)
+
+    def __hash__(self):
+        return hash("async_token_type")
+
+    def mangle(self) -> str:
+        return "async_token"
+
+    def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
+        raise NotImplementedError("async_token cannot be used as a loop-carried variable")
+
+    def _unflatten_ir(self, handles: List[ir.value], cursor: int):
+        return async_token(handles[cursor]), cursor + 1
+
+
 class async_token(tl.base_value):
     """
     Defines a type of value used to track and synchronize asynchronous operations.
@@ -331,7 +349,7 @@ class async_token(tl.base_value):
 
     def __init__(self, handle):
         self.handle = handle
+        self.type = async_token_type()
 
-    @property
-    def type(self):
-        return None  # Python expects this to exist even if unused
+    def _flatten_ir(self, handles) -> None:
+        handles.append(self.handle)
