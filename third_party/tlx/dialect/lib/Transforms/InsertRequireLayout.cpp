@@ -127,6 +127,9 @@ public:
 
   void visitBranchOperand(OpOperand &operand) override {}
   void visitCallOperand(OpOperand &operand) override {}
+  void visitNonControlFlowArguments(RegionSuccessor &successor,
+                                    ArrayRef<BlockArgument> arguments) override {
+  }
   void setToExitState(DotEncodingLattice *lattice) override {}
 };
 
@@ -139,7 +142,7 @@ computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                            ttg::LocalLoadOp localLoadOp) {
   auto resultType = cast<RankedTensorType>(localLoadOp.getType());
   auto order = ttg::getOrderForMemory(resultType);
-  auto ctaLayout = ttg::getCTALayout(resultType.getEncoding());
+  auto ctaLayout = ttg::getCGALayout(resultType.getEncoding());
   unsigned bitWidth = resultType.getElementType().getIntOrFloatBitWidth();
   return ttg::SwizzledSharedEncodingAttr::get(localLoadOp->getContext(), dotEnc,
                                               resultType.getShape(), order,
@@ -164,7 +167,7 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
              << srcEnc << " instead of derived " << encoding);
         encoding = ttg::SwizzledSharedEncodingAttr::get(
             encoding.getContext(), encoding.getVec(), encoding.getPerPhase(),
-            encoding.getMaxPhase(), srcEnc.getOrder(), encoding.getCTALayout());
+            encoding.getMaxPhase(), srcEnc.getOrder(), encoding.getCGALayout());
       }
     }
   }
@@ -174,8 +177,8 @@ static void applyRequireLayout(ttg::SwizzledSharedEncodingAttr encoding,
     auto newType = ttg::MemDescType::get(
         type.getShape(), type.getElementType(), mlir::cast<Attribute>(encoding),
         type.getMemorySpace(), type.getMutableMemory());
-    auto requireOp = builder.create<tlx::RequireLayoutOp>(localLoadOp->getLoc(),
-                                                          newType, loadMemDesc);
+    auto requireOp = tlx::RequireLayoutOp::create(builder, localLoadOp->getLoc(),
+                                                     newType, loadMemDesc);
     localLoadOp->setOperand(0, requireOp.getResult());
   }
 }
