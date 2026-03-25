@@ -144,7 +144,7 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
         srcEncoding = ttg::SwizzledSharedEncodingAttr::get(
             swizzledEncoding.getContext(), swizzledEncoding.getVec(),
             swizzledEncoding.getPerPhase(), swizzledEncoding.getMaxPhase(),
-            permutedOrder, swizzledEncoding.getCTALayout());
+            permutedOrder, swizzledEncoding.getCGALayout());
       }
       if (srcEncoding) {
         const auto updatedResultLayoutEncoding = LayoutEncoding(srcEncoding);
