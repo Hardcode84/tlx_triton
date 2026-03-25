@@ -265,10 +265,16 @@ def async_load_wait_group(
 def local_load(
     src: tlx.buffered_tensor,
     token: tlx.async_token = None,
+    relaxed: bool = False,
     _semantic=None,
 ) -> tl.tensor:
     """
     Loads buffer from local or tensor memory into a distributed tensor.
+
+    When relaxed=True, the load is annotated as synchronized via async_wait,
+    telling the AMD backend that no additional vmcnt wait is needed before
+    this LDS read. Use this when the load is preceded by an async_wait +
+    barrier that guarantees the data is ready.
     """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
@@ -281,7 +287,11 @@ def local_load(
         return tl.tensor(output, block_type)
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
-        return tl.tensor(output, block_type)
+        result = tl.tensor(output, block_type)
+        if relaxed:
+            result.handle.set_attr("ttg.amdg.syncedViaAsyncWait",
+                                   _semantic.builder.get_bool_attr(True))
+        return result
 
 
 @tl.builtin
