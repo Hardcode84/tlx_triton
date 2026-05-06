@@ -2,7 +2,6 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -382,6 +381,25 @@ static bool isAllowedTensorLayoutUser(Operation *op, unsigned operandIndex) {
   return isTransparentLayoutCarrierOp(op);
 }
 
+static bool isDotLocalAllocFallback(Operation *op, unsigned operandIndex) {
+  auto allocOp = dyn_cast<ttg::LocalAllocOp>(op);
+  if (!allocOp || operandIndex != 0 || !allocOp.getSrc())
+    return false;
+  if (allocOp->use_empty())
+    return false;
+
+  for (Operation *user : allocOp->getUsers()) {
+    auto localLoadOp = dyn_cast<ttg::LocalLoadOp>(user);
+    if (!localLoadOp)
+      return false;
+    auto resultType = dyn_cast<RankedTensorType>(localLoadOp.getType());
+    if (!resultType ||
+        !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+      return false;
+  }
+  return true;
+}
+
 static bool canRewriteTensorResult(Operation *op) {
   return isa<ttg::LocalLoadOp, RegionBranchOpInterface>(op);
 }
@@ -416,6 +434,27 @@ LogicalResult TensorBackwardPropagation::visitOperation(
 
   if (isa<ReleaseLayoutOp>(op))
     return success();
+
+  if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
+    if (!allocOp.getSrc() || !isTrackedTensorValue(allocOp.getSrc()) ||
+        !isDotLocalAllocFallback(op, /*operandIndex=*/0))
+      return success();
+
+    TensorLayout state;
+    for (Operation *user : allocOp->getUsers()) {
+      auto localLoadOp = cast<ttg::LocalLoadOp>(user);
+      auto resultType = cast<RankedTensorType>(localLoadOp.getType());
+      state = TensorLayout::meet(state, TensorLayout(resultType.getEncoding()));
+      state = TensorLayout::meet(
+          state, getLatticeElement(localLoadOp.getResult())->getValue());
+    }
+
+    if (!state.isUninitialized()) {
+      ChangeResult changed = operands[0]->meet(state);
+      propagateIfChanged(operands[0], changed);
+    }
+    return success();
+  }
 
   // If a tracked tensor value is used by an unsupported operation, rewriting
   // the producer chain is no longer legal for that entire component.
