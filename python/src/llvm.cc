@@ -22,6 +22,7 @@
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
@@ -55,6 +56,53 @@ using namespace llvm;
 // necessary because some LLVM passes (like schedulers) check whether the option
 // was explicitly set on the command line.
 template <typename T> T setLLVMOption(const std::string &name, T value);
+
+static std::pair<std::string, std::string>
+parseLLVMOptionAssignment(llvm::StringRef rawFlag) {
+  rawFlag = rawFlag.trim();
+  rawFlag.consume_front("--");
+  rawFlag.consume_front("-");
+
+  llvm::StringRef name;
+  llvm::StringRef value;
+  std::tie(name, value) = rawFlag.split('=');
+  if (name.empty())
+    throw std::runtime_error("empty LLVM option in TRITON_AMD_LLVM_FLAGS");
+  if (value.empty())
+    value = "true";
+  return {name.str(), value.str()};
+}
+
+static void applyLLVMOptionString(const std::string &rawFlag) {
+  auto [name, value] = parseLLVMOptionAssignment(rawFlag);
+  auto options = llvm::cl::getRegisteredOptions();
+  auto it = options.find(name);
+  if (it == options.end())
+    throw std::runtime_error("unknown LLVM option in TRITON_AMD_LLVM_FLAGS: " +
+                             name);
+  if (it->second->addOccurrence(1, name, value))
+    throw std::runtime_error("invalid value for LLVM option '" + name +
+                             "' in TRITON_AMD_LLVM_FLAGS: " + value);
+}
+
+static void applyLLVMOptionList(const std::vector<std::string> &flags) {
+  for (const std::string &flag : flags)
+    applyLLVMOptionString(flag);
+}
+
+static void applyLLVMEnvOptions(const char *envName) {
+  auto flagList = mlir::triton::tools::getStrEnv(envName);
+  if (flagList.empty())
+    return;
+
+  llvm::SmallVector<llvm::StringRef, 8> split;
+  llvm::StringRef(flagList).split(split, ',');
+  for (llvm::StringRef flag : split) {
+    flag = flag.trim();
+    if (!flag.empty())
+      applyLLVMOptionString(flag.str());
+  }
+}
 
 template <> bool setLLVMOption<bool>(const std::string &name, bool value) {
   auto options = llvm::cl::getRegisteredOptions();
@@ -158,10 +206,9 @@ void dumpSchedulingDAG(llvm::Module &module, const std::string &triple,
     return;
   }
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  // Apply command-line style LLVM flags before building the codegen pipeline.
+  applyLLVMOptionList(flags);
+  applyLLVMEnvOptions("TRITON_AMD_LLVM_FLAGS");
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -250,10 +297,9 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
 
   llvm::StripDebugInfo(module);
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  // Apply command-line style LLVM flags before building the codegen pipeline.
+  applyLLVMOptionList(flags);
+  applyLLVMEnvOptions("TRITON_AMD_LLVM_FLAGS");
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -331,10 +377,9 @@ std::string translateLLVMIRToASM(llvm::Module &module,
                                  bool enable_fp_fusion, bool isObject) {
   using namespace mlir;
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  // Apply command-line style LLVM flags before building the codegen pipeline.
+  applyLLVMOptionList(flags);
+  applyLLVMEnvOptions("TRITON_AMD_LLVM_FLAGS");
 
   if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
     setLLVMOption<bool>("print-after-all", true);
@@ -427,10 +472,9 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
     setLLVMOption<bool>("print-after-all", true);
   }
 
-  // Apply other flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  // Apply command-line style LLVM flags before building the codegen pipeline.
+  applyLLVMOptionList(flags);
+  applyLLVMEnvOptions("TRITON_AMD_LLVM_FLAGS");
 
   // Parse MIR into LLVM Module
   llvm::LLVMContext context;
