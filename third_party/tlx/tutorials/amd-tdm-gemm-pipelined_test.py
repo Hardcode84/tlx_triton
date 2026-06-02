@@ -319,10 +319,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     SUBTILE_LEN: tl.constexpr = BLOCK_K // NUM_SUBTILES
     tl.static_assert(SUBTILE_LEN == 32, "Subtile length must match the kdim of the WMMA instruction")
 
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
     off_m = pid_m * BLOCK_M
     off_n = pid_n * BLOCK_N
 
@@ -557,7 +555,7 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule(
     BLOCK_K = 128
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel[grid](
         a,
         b,
