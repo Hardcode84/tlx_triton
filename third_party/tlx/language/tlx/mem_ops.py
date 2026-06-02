@@ -1130,6 +1130,44 @@ def async_amd_descriptor_load(
 
 
 @tl.builtin
+def update_tensor_descriptor(
+    desc: tl.tensor_descriptor_base,
+    add_offsets: list[tl.tensor] = None,
+    set_bounds: list[tl.tensor] = None,
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """Update selected AMD TDM descriptor fields and return a new descriptor.
+
+    ``add_offsets`` advances the descriptor's global base address in element
+    units. It does not update bounds, so pass ``set_bounds`` when preserving
+    OOB handling for a shifted descriptor.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"update_tensor_descriptor is only available on AMD TDM-capable targets, got arch={arch}")
+    rank = len(desc.block_shape)
+    assert rank == 2, "update_tensor_descriptor currently supports 2D descriptors only"
+    if add_offsets is None and set_bounds is None:
+        raise ValueError("update_tensor_descriptor requires add_offsets or set_bounds")
+
+    add_offset_handles = []
+    if add_offsets is not None:
+        assert len(add_offsets) == rank, f"expected {rank} add_offsets, but got {len(add_offsets)}"
+        add_offset_handles = _semantic._convert_to_ir_values(add_offsets, require_i64=False)
+
+    set_bounds_handles = []
+    if set_bounds is not None:
+        assert len(set_bounds) == rank, f"expected {rank} set_bounds, but got {len(set_bounds)}"
+        set_bounds_handles = _semantic._convert_to_ir_values(set_bounds, require_i64=False)
+
+    handle = _semantic.builder.create_update_tensor_descriptor(desc.handle, add_offset_handles, set_bounds_handles)
+    if isinstance(desc, tl.tensor_descriptor):
+        return tl.tensor_descriptor(handle, list(desc.shape.values), list(desc.strides.values), desc.block_type)
+    return tl.tensor_descriptor_base(handle, desc.block_type)
+
+
+@tl.builtin
 def async_amd_descriptor_load_group(
     descs: list[tl.tensor_descriptor_base],
     results: list[tlx.buffered_tensor],

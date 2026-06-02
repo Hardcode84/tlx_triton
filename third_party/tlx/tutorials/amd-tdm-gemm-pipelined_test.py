@@ -35,7 +35,10 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+try:
+    DEVICE = triton.runtime.driver.active.get_active_torch_device()
+except RuntimeError:
+    DEVICE = None
 
 
 def is_gfx1250_available():
@@ -244,8 +247,19 @@ def matmul_tdm_pipelined_kernel(
     for k in tl.range(0, K_ITERS - 1):
         next_k = k + 1
         next_slot = next_k % NUM_BUFFERS
-        tlx.async_amd_descriptor_load(a_desc, tlx.local_view(a_buf, next_slot), [off_m, next_k * BLOCK_K])
-        tlx.async_amd_descriptor_load(b_desc, tlx.local_view(b_buf, next_slot), [next_k * BLOCK_K, off_n])
+        remain_k = K - next_k * BLOCK_K
+        a_next_desc = tlx.update_tensor_descriptor(
+            a_desc,
+            add_offsets=[0, next_k * BLOCK_K],
+            set_bounds=[M, remain_k],
+        )
+        b_next_desc = tlx.update_tensor_descriptor(
+            b_desc,
+            add_offsets=[next_k * BLOCK_K, 0],
+            set_bounds=[remain_k, N],
+        )
+        tlx.async_amd_descriptor_load(a_next_desc, tlx.local_view(a_buf, next_slot), [off_m, 0])
+        tlx.async_amd_descriptor_load(b_next_desc, tlx.local_view(b_buf, next_slot), [0, off_n])
 
         # Look-ahead prefetch for tile k+2 (in bounds when k+2 < K_ITERS).
         prefetch_k = next_k + 1
@@ -591,6 +605,7 @@ def test_matmul_tdm_pipelined_compiles_gfx1250():
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.update_tensor_descriptor" in ttgir
     assert "amdg.async_tdm_copy_local_to_global" in ttgir, ("expected TDM store of C in TTGIR, got:\n" + ttgir)
     assert "amdg.tdm_prefetch" in ttgir, ("expected TDM prefetch in TTGIR, got:\n" + ttgir)
     assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)

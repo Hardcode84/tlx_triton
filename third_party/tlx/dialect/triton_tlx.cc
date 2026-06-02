@@ -573,6 +573,14 @@ void init_triton_tlx_ir(py::module &&m) {
               unsigned pendings) -> mlir::Value {
              return self.create<amdgpu::AsyncTDMWait>(asyncTokens, pendings);
            })
+      .def("create_update_tensor_descriptor",
+           [](TritonOpBuilder &self, Value desc,
+              std::vector<Value> addOffsets,
+              std::vector<Value> setBounds) -> Value {
+             return self.create<amdgpu::UpdateTensorDescriptorOp>(
+                 desc.getType(), desc, ValueRange(addOffsets),
+                 ValueRange(setBounds), Value(), Value(), Value());
+           })
       // AMD-only: emit amdgpu.async_tdm_copy_local_to_global directly from
       // the user's local buffer. The op has no `pred` operand (unlike the
       // load) and returns no SSA value, so `AsyncTDMWait` synchronizes via
