@@ -2,6 +2,7 @@
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -140,6 +141,7 @@ static void computeDesiredEncodingAttr(mlir::ModuleOp &m) {
 // over the other; TLX kernels currently never hit this).
 static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
   llvm::DenseMap<Value, Attribute> descToEncoding;
+  SmallVector<std::pair<Value, Operation *>> worklist;
 
   auto record = [&](Operation *op, Value desc,
                     Attribute encoding) -> WalkResult {
@@ -149,6 +151,8 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
                          "conflicting memdesc layouts";
       return WalkResult::interrupt();
     }
+    if (inserted)
+      worklist.emplace_back(desc, op);
     return WalkResult::advance();
   };
 
@@ -177,6 +181,81 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
   });
   if (result.wasInterrupted())
     return failure();
+
+  auto recordValue = [&](Operation *op, Value desc,
+                         Attribute encoding) -> LogicalResult {
+    return failure(record(op, desc, encoding).wasInterrupted());
+  };
+
+  auto recordForLoopSlot = [&](Operation *op, scf::ForOp forOp, unsigned idx,
+                               Attribute encoding) -> LogicalResult {
+    if (idx >= forOp.getNumResults())
+      return success();
+
+    if (failed(recordValue(op, forOp.getInitArgs()[idx], encoding)))
+      return failure();
+    if (failed(recordValue(op, forOp.getRegionIterArgs()[idx], encoding)))
+      return failure();
+    if (failed(recordValue(op, forOp.getResult(idx), encoding)))
+      return failure();
+
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (idx < yieldOp.getNumOperands())
+      if (failed(recordValue(op, yieldOp.getOperand(idx), encoding)))
+        return failure();
+    return success();
+  };
+
+  while (!worklist.empty()) {
+    auto [desc, op] = worklist.pop_back_val();
+    Attribute encoding = descToEncoding.lookup(desc);
+
+    if (auto updateOp =
+            desc.getDefiningOp<tt::amdgpu::UpdateTensorDescriptorOp>())
+      if (failed(recordValue(op, updateOp.getDesc(), encoding)))
+        return failure();
+
+    if (auto forOp = desc.getDefiningOp<scf::ForOp>()) {
+      auto result = cast<OpResult>(desc);
+      if (failed(recordForLoopSlot(op, forOp, result.getResultNumber(),
+                                   encoding)))
+        return failure();
+    }
+
+    if (auto blockArg = dyn_cast<BlockArgument>(desc)) {
+      if (auto forOp =
+              dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+        unsigned argNumber = blockArg.getArgNumber();
+        if (argNumber > 0)
+          if (failed(recordForLoopSlot(op, forOp, argNumber - 1, encoding)))
+            return failure();
+      }
+    }
+
+    for (Operation *user : desc.getUsers()) {
+      if (auto updateOp = dyn_cast<tt::amdgpu::UpdateTensorDescriptorOp>(user))
+        if (updateOp.getDesc() == desc)
+          if (failed(recordValue(op, updateOp.getResult(), encoding)))
+            return failure();
+
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        for (auto [idx, initArg] : llvm::enumerate(forOp.getInitArgs()))
+          if (initArg == desc)
+            if (failed(recordForLoopSlot(op, forOp, idx, encoding)))
+              return failure();
+      }
+
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
+        auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
+        if (!forOp)
+          continue;
+        for (auto [idx, operand] : llvm::enumerate(yieldOp.getOperands()))
+          if (operand == desc)
+            if (failed(recordForLoopSlot(op, forOp, idx, encoding)))
+              return failure();
+      }
+    }
+  }
 
   for (auto [desc, encoding] : descToEncoding) {
     auto descTy = cast<tt::TensorDescType>(desc.getType());

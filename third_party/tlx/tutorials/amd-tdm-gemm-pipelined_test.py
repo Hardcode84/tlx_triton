@@ -96,7 +96,7 @@ def _single_warp_per_simd_issue_loads(
         tlx.async_amd_descriptor_load_group(
             [a_desc, b_desc],
             [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-            [[off_m, producer * BLOCK_K], [producer * BLOCK_K, off_n]],
+            [[off_m, 0], [0, off_n]],
             [0b0011, 0b1100],
             preds=[pred, pred],
         )
@@ -104,7 +104,7 @@ def _single_warp_per_simd_issue_loads(
         tlx.async_amd_descriptor_load_group(
             [a_desc, b_desc],
             [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-            [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
+            [[off_m, 0], [off_n, 0]],
             [0b0011, 0b1100],
             preds=[pred, pred],
         )
@@ -129,14 +129,14 @@ def _single_warp_per_simd_issue_loads_unpredicated(
         tlx.async_amd_descriptor_load_group(
             [a_desc, b_desc],
             [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-            [[off_m, producer * BLOCK_K], [producer * BLOCK_K, off_n]],
+            [[off_m, 0], [0, off_n]],
             [0b0011, 0b1100],
         )
     else:
         tlx.async_amd_descriptor_load_group(
             [a_desc, b_desc],
             [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-            [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
+            [[off_m, 0], [off_n, 0]],
             [0b0011, 0b1100],
         )
     return producer + 1
@@ -241,6 +241,8 @@ def matmul_tdm_pipelined_kernel(
     tlx.amd_descriptor_prefetch_tensor(b_desc, [BLOCK_K, off_n], pred=prefetch_pred)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    a_next_desc = a_desc
+    b_next_desc = b_desc
 
     # Steady state: at iter k, issue loads for tile k+1, prefetch tile
     # k+2 into L2, wait for tile k, consume it.
@@ -249,13 +251,13 @@ def matmul_tdm_pipelined_kernel(
         next_slot = next_k % NUM_BUFFERS
         remain_k = K - next_k * BLOCK_K
         a_next_desc = tlx.update_tensor_descriptor(
-            a_desc,
-            add_offsets=[0, next_k * BLOCK_K],
+            a_next_desc,
+            add_offsets=[0, BLOCK_K],
             set_bounds=[M, remain_k],
         )
         b_next_desc = tlx.update_tensor_descriptor(
-            b_desc,
-            add_offsets=[next_k * BLOCK_K, 0],
+            b_next_desc,
+            add_offsets=[BLOCK_K, 0],
             set_bounds=[remain_k, N],
         )
         tlx.async_amd_descriptor_load(a_next_desc, tlx.local_view(a_buf, next_slot), [off_m, 0])
@@ -361,6 +363,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     tl.assume(K_ITERS >= NUM_BUFFERS)
     producer = 0
     consumer = 0
+    a_producer_desc = a_desc
+    b_producer_desc = b_desc
 
     if L2_PREFETCH_DISTANCE > NUM_BUFFERS:
         for prefetch_offset in tl.static_range(NUM_BUFFERS, L2_PREFETCH_DISTANCE):
@@ -378,8 +382,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
 
     for _ in tl.static_range(NUM_BUFFERS - 1):
         producer = _single_warp_per_simd_issue_loads_unpredicated(
-            a_desc,
-            b_desc,
+            a_producer_desc,
+            b_producer_desc,
             a_buf,
             b_buf,
             producer,
@@ -389,6 +393,11 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             NUM_BUFFERS,
             TRANSPOSE_B,
         )
+        a_producer_desc = tlx.update_tensor_descriptor(a_producer_desc, add_offsets=[0, BLOCK_K])
+        if not TRANSPOSE_B:
+            b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[BLOCK_K, 0])
+        else:
+            b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[0, BLOCK_K])
 
     tlx.async_amd_descriptor_wait(NUM_BUFFERS - 2)
     a0, b0 = _single_warp_per_simd_load_subtile(
@@ -404,8 +413,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
     )
 
     producer = _single_warp_per_simd_issue_loads_unpredicated(
-        a_desc,
-        b_desc,
+        a_producer_desc,
+        b_producer_desc,
         a_buf,
         b_buf,
         producer,
@@ -415,6 +424,11 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         NUM_BUFFERS,
         TRANSPOSE_B,
     )
+    a_producer_desc = tlx.update_tensor_descriptor(a_producer_desc, add_offsets=[0, BLOCK_K])
+    if not TRANSPOSE_B:
+        b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[BLOCK_K, 0])
+    else:
+        b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[0, BLOCK_K])
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
@@ -477,8 +491,8 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
         pred = (i + 1) - epilogue_lb
         pred = (pred >> 31) & 1
         producer = _single_warp_per_simd_issue_loads(
-            a_desc,
-            b_desc,
+            a_producer_desc,
+            b_producer_desc,
             a_buf,
             b_buf,
             producer,
@@ -489,6 +503,11 @@ def matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel(
             NUM_BUFFERS,
             TRANSPOSE_B,
         )
+        a_producer_desc = tlx.update_tensor_descriptor(a_producer_desc, add_offsets=[0, BLOCK_K])
+        if not TRANSPOSE_B:
+            b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[BLOCK_K, 0])
+        else:
+            b_producer_desc = tlx.update_tensor_descriptor(b_producer_desc, add_offsets=[0, BLOCK_K])
         a0, b0 = _single_warp_per_simd_load_subtile(
             a_buf,
             b_buf,

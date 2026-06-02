@@ -292,3 +292,39 @@ tt.func public @tdm_local_descriptor_aligns_to_alloc(%ptr: !tt.ptr<f16>, %sz0: i
   tt.return
 }
 }
+
+// -----
+// =============================================================================
+// alignTDMDescriptorEncodings: when a TDM load consumes an updated descriptor
+// that is also carried through an scf.for iter_arg, all linked descriptor values
+// must receive the same encoding. Otherwise UpdateTensorDescriptorOp fails its
+// same-type verifier after the TDM consumer's descriptor result is rewritten.
+// =============================================================================
+
+#shared = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PADDED_TDM:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-LABEL: @tdm_update_descriptor_loop_carried
+// CHECK-SAME: %[[DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+tt.func public @tdm_update_descriptor_loop_carried(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %p: i32) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c0_i32 = arith.constant 0 : i32
+  %c32_i32 = arith.constant 32 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
+  // CHECK: scf.for {{.*}} iter_args(%[[ITER:.*]] = %[[DESC]]) -> (!tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>)
+  %result = scf.for %iv = %c0 to %c2 step %c1 iter_args(%iter_desc = %desc) -> (!tt.tensordesc<128x32xf16>) {
+    // CHECK: amdg.update_tensor_descriptor %[[ITER]]
+    // CHECK-SAME: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+    %next = amdg.update_tensor_descriptor %iter_desc add_offsets = [%c0_i32, %c32_i32] : !tt.tensordesc<128x32xf16>
+    %slot = arith.index_cast %iv : index to i32
+    %buf = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    // CHECK: amdg.async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+    %tok = amdg.async_tdm_copy_global_to_local %next[%m, %c0_i32] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    scf.yield %next : !tt.tensordesc<128x32xf16>
+  }
+  tt.return
+}
+}
