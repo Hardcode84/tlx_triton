@@ -78,7 +78,7 @@ class BackendInstaller:
             if is_git_repo():
                 try:
                     subprocess.run(["git", "submodule", "update", "--init", f"{backend_name}"], check=True,
-                                   stdout=subprocess.DEVNULL, cwd=root_dir)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root_dir)
                 except subprocess.CalledProcessError:
                     pass
                 except FileNotFoundError:
@@ -124,6 +124,18 @@ class BackendInstaller:
             BackendInstaller.prepare(backend_name, backend_src_dir=backend_src_dir, is_external=True)
             for backend_name, backend_src_dir in zip(backend_names, backend_dirs)
         ]
+
+
+def prepare_third_party_submodule(name: str):
+    if not is_git_repo():
+        return
+    try:
+        subprocess.run(["git", "submodule", "update", "--init", name], check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, cwd="third_party")
+    except subprocess.CalledProcessError:
+        pass
+    except FileNotFoundError:
+        pass
 
 
 def get_build_type():
@@ -375,7 +387,8 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+prepare_third_party_submodule("wave")
+backends = [*BackendInstaller.copy(["nvidia", "amd", "tlx_wave"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
