@@ -15,6 +15,10 @@ def stop_before_wave_lowering(mod, metadata, options):
     """
     metadata["name"] = _entry_name(mod)
     metadata["shared"] = 0
+    metadata["global_scratch_size"] = 0
+    metadata["global_scratch_align"] = 1
+    metadata["profile_scratch_size"] = 0
+    metadata["profile_scratch_align"] = 1
     metadata["tlx_wave_status"] = "stopped_before_wave_lowering"
     metadata["tlx_wave_arch"] = options.arch
     return str(mod)

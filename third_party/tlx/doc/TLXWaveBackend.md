@@ -253,6 +253,151 @@ Map:
 This should be a later milestone after global memory, LDS, and token mappings
 work.
 
+## Async GEMM Bridge Requirements
+
+The stage-1 async GEMM probe reaches the `wave` handoff with the structure the
+bridge should consume directly:
+
+- `ttg.local_alloc` for A and B LDS ring buffers;
+- `ttg.memdesc_index` / `ttg.memdesc_subview`-style views from `tlx.local_view`;
+- `ttg.async_copy_global_to_local` for global-to-LDS movement;
+- `ttg.async_commit_group` grouping A/B copy tokens;
+- `ttg.async_wait {num = ...}` before consuming LDS tiles;
+- `ttg.local_load` from LDS into dot operand encodings;
+- `tt.dot` over `#ttg.dot_op` operands;
+- ordinary `tt.store` for the C tile;
+- no `amdg.*` operations yet.
+
+The first Python bridge for async GEMM needs the following pieces.
+
+### 1. Module And Function Skeleton
+
+- Parse the cutoff TTGIR textual module and identify the single public
+  `tt.func` kernel.
+- Preserve kernel arguments, scalar index arithmetic, block attributes,
+  `num_warps`, and target metadata.
+- Emit a Wave/WaveAMD function with equivalent kernel argument ABI metadata,
+  leaving final HSACO lowering to the Wave toolchain.
+
+### 2. Address And Index Planning
+
+- Translate `tt.get_program_id`, `tt.make_range`, splats, scalar arithmetic,
+  and tensor pointer arithmetic into Wave scalar values plus `wave.index_expr`.
+- Classify each expression as uniform, lane-varying, or tile-varying.
+- Preserve masks from pointer bounds checks and carry them into `wave.where`,
+  predicated `wave.load`, or predicated DMA operations.
+- For GEMM, recover the affine forms for:
+  - A global addresses: `pid_m`, `offs_m`, `offs_k`, `stride_am`, `stride_ak`;
+  - B global addresses: `pid_n`, `offs_k`, `offs_n`, `stride_bk`, `stride_bn`;
+  - C global addresses: `offs_m`, `offs_n`, `stride_cm`, `stride_cn`.
+
+### 3. LDS Allocation And Memdesc Views
+
+- Build an LDS allocation plan from each `ttg.local_alloc`.
+- Support the first async GEMM shape:
+  - SMEM only;
+  - static rank-2 tile shape plus leading ring-buffer dimension;
+  - static element type;
+  - no storage alias overlap initially.
+- Map `tlx.local_view` / memdesc index operations to `(allocation, slot,
+  logical_offset)` records instead of emitting Wave ops immediately.
+- Emit final LDS bases and offsets when a local load/store/DMA use needs a
+  concrete shared-memory pointer.
+
+### 4. Async Copy And Tokens
+
+- Convert `ttg.async_copy_global_to_local` to either:
+  - `waveamd.dma_load_lds` when the shape, alignment, and address expression fit
+    WaveAMD DMA; or
+  - a conservative `wave.load` from global plus `wave.store` to shared as the
+    fallback.
+- Produce a `!wave.mem.token` for every side-effecting copy/store.
+- Convert `ttg.async_commit_group` into a bridge token group, likely emitted as
+  `wave.join` over the copy tokens.
+- Convert `ttg.async_wait {num = N}` conservatively at first:
+  - `num = 0` waits on all outstanding committed groups;
+  - `num > 0` may wait on all groups until the bridge has a precise outstanding
+    group model.
+- Thread tokens through later LDS consumers so `ttg.local_load` cannot move
+  before the relevant copy wait.
+
+### 5. Local Loads And Dot Operands
+
+- Translate `ttg.local_load` from an A/B memdesc view into Wave shared loads.
+- Interpret the result encoding, especially `#ttg.dot_op<{opIdx = 0|1,
+  parent = ...}>`, as an MMA operand layout requirement.
+- Pack loaded values into the fragment representation expected by WaveAMD, for
+  example through `waveamd.fragment_pack` or an equivalent bridge-side helper.
+- Reject unsupported local-load layouts with a diagnostic that includes the
+  original TTGIR encoding.
+
+### 6. MMA Lowering
+
+- Lower each supported `tt.dot` to the corresponding WaveAMD MMA op.
+- Start with one shape family:
+  - `f16 x f16 -> f32`;
+  - wave64;
+  - static `BLOCK_M`, `BLOCK_N`, and `BLOCK_K`;
+  - one CTA;
+  - no split-K or multi-CTA accumulation.
+- Preserve accumulator SSA flow across the async pipeline loop.
+- Keep `tt.dot_scaled` and custom `tiles_per_warp` support out of the first
+  async GEMM bridge unless needed by the chosen test kernel.
+
+### 7. Loop And Pipeline State
+
+- Support the simple double-buffered pattern first:
+  - static ring-buffer slot selection via `%k % NUM_BUFFERS`;
+  - prefetch copy into the next slot;
+  - wait;
+  - load next A/B operands;
+  - dot into the carried accumulator.
+- Represent loop-carried values explicitly in bridge state:
+  - accumulator fragment;
+  - current A/B operand fragments;
+  - outstanding async token groups;
+  - current ring-buffer slot.
+- Do not rely on AMD pipeline passes. The bridge owns the token and slot model
+  once it branches before AMD lowering.
+
+### 8. Output Store
+
+- Convert the final accumulator cast and `tt.store` to Wave global stores.
+- Preserve the C tile mask.
+- Keep stores ordered after the final MMA token dependencies, even if the Wave
+  arithmetic ops themselves are not token-producing.
+
+### Initial Unsupported Cases
+
+The first async GEMM bridge should reject these explicitly:
+
+- TDM descriptor loads and stores;
+- dynamic tile shapes or dynamic LDS allocation sizes;
+- storage alias overlap;
+- TMEM or NVIDIA-only TLX storage;
+- `tt.dot_scaled`;
+- multiple CTAs per program;
+- non-`f16` MMA operands;
+- atomics, reductions, or epilogue fusion beyond cast plus store;
+- layouts that cannot be mapped from TTGIR encodings to Wave fragment layout.
+
+### Suggested First Acceptance Test
+
+Use the async double-buffer GEMM probe as the first bridge test. It should lower
+from cutoff TTGIR containing:
+
+- two `ttg.local_alloc` ops;
+- four `ttg.async_copy_global_to_local` ops;
+- two `ttg.async_commit_group` ops;
+- two `ttg.async_wait` ops;
+- four `ttg.local_load` ops;
+- two `tt.dot` ops;
+- zero `amdg.*` ops.
+
+The first passing criterion should be `wave-opt` acceptance of the emitted
+Wave/WaveAMD textual MLIR. Runtime correctness can follow once Wave lowering and
+HSACO loading are wired into the Triton backend.
+
 ## Data Model In The Bridge
 
 The bridge needs an explicit internal representation instead of a pure op-to-op
