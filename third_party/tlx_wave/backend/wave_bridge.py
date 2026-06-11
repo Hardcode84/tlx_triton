@@ -39,6 +39,7 @@ class _TypePlan:
     kind: str
     shape: tuple[int, ...]
     element_type: str | None
+    element_byte_width: int | None
     pointee_type: str | None
     encoding: str | None
     memory_space: str | None
@@ -57,6 +58,7 @@ class _ValuePlan:
     type_kind: str
     shape: tuple[int, ...]
     element_type: str | None
+    element_byte_width: int | None
     pointee_type: str | None
     encoding: str | None
     memory_space: str | None
@@ -82,6 +84,7 @@ class _LayoutPlan:
     source: str
     shape: tuple[int, ...]
     element_type: str | None
+    element_byte_width: int | None
     encoding: str | None
     memory_space: str | None
 
@@ -95,6 +98,7 @@ class _MemDescPlan:
     shape: tuple[int, ...]
     alloc_shape: tuple[int, ...]
     element_type: str | None
+    element_byte_width: int | None
     encoding: str | None
     memory_space: str | None
     mutable: bool | None
@@ -112,6 +116,7 @@ class _AddressExprPlan:
     value_value_id: int | None
     result_value_id: int | None
     element_type: str | None
+    element_byte_width: int | None
     shape: tuple[int, ...]
     base_arg_index: int | None
     base_arg_name: str | None
@@ -145,6 +150,24 @@ class _BridgePlan:
     tokens: tuple[_TokenPlan, ...]
 
 
+@dataclass(frozen=True)
+class _LdsLayout:
+    size_bytes: int
+    offsets: dict[int, int]
+
+
+@dataclass
+class _WaveAsyncStats:
+    lds_size_bytes: int = 0
+    async_copies: int = 0
+    dma_load_lds: int = 0
+    load_store_fallbacks: int = 0
+    commit_groups: int = 0
+    waits: int = 0
+    joins: int = 0
+    barriers: int = 0
+
+
 def _value_id(value):
     return int(value.id())
 
@@ -159,12 +182,39 @@ def _tuple_or_empty(values):
     return tuple(int(value) for value in values)
 
 
+def _product(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _align_to(value, alignment):
+    if value == 0:
+        return 0
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def _attr_str(attr):
     return None if attr is None else str(attr)
 
 
 def _type_str(type_obj):
     return str(type_obj)
+
+
+def _scalar_byte_width(type_obj):
+    if type_obj is None:
+        return None
+    if type_obj.is_integer(1) or type_obj.is_integer(8):
+        return 1
+    if type_obj.is_integer(16) or type_obj.is_fp16() or type_obj.is_bf16():
+        return 2
+    if type_obj.is_integer(32) or type_obj.is_fp32():
+        return 4
+    if type_obj.is_integer(64) or type_obj.is_fp64() or type_obj.is_index():
+        return 8
+    return None
 
 
 def _type_kind(type_obj):
@@ -186,11 +236,17 @@ def _type_plan(type_obj):
     pointee_type = type_obj.get_pointee_type()
     if pointee_type is None and element_type is not None:
         pointee_type = element_type.get_pointee_type()
+    element_byte_width = _scalar_byte_width(element_type)
+    if element_byte_width is None:
+        element_byte_width = _scalar_byte_width(pointee_type)
+    if element_byte_width is None and _is_scalar_type(type_obj):
+        element_byte_width = _scalar_byte_width(type_obj)
     return _TypePlan(
         _type_str(type_obj),
         _type_kind(type_obj),
         _tuple_or_empty(type_obj.get_shape()),
         _type_str(element_type) if element_type is not None else None,
+        element_byte_width,
         _type_str(pointee_type) if pointee_type is not None else None,
         _attr_str(type_obj.get_encoding()),
         _attr_str(type_obj.get_memory_space()),
@@ -209,6 +265,19 @@ def _address_element_type(type_obj):
         return _type_str(type_obj)
     pointee_type = element_type.get_pointee_type()
     return _type_str(pointee_type if pointee_type is not None else element_type)
+
+
+def _address_element_byte_width(type_obj):
+    pointee_type = type_obj.get_pointee_type()
+    if pointee_type is not None:
+        return _scalar_byte_width(pointee_type)
+    element_type = type_obj.get_element_type()
+    if element_type is None:
+        return _scalar_byte_width(type_obj)
+    pointee_type = element_type.get_pointee_type()
+    return _scalar_byte_width(
+        pointee_type if pointee_type is not None else element_type
+    )
 
 
 def _is_scalar_type(type_obj):
@@ -365,6 +434,7 @@ def _argument_value_plan(value, index):
         type_plan.kind,
         type_plan.shape,
         type_plan.element_type,
+        type_plan.element_byte_width,
         type_plan.pointee_type,
         type_plan.encoding,
         type_plan.memory_space,
@@ -438,6 +508,7 @@ def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
         type_plan.kind,
         type_plan.shape,
         type_plan.element_type,
+        type_plan.element_byte_width,
         type_plan.pointee_type,
         type_plan.encoding,
         type_plan.memory_space,
@@ -494,6 +565,7 @@ def _layout_plan(value, source):
         source,
         type_plan.shape,
         type_plan.element_type,
+        type_plan.element_byte_width,
         type_plan.encoding,
         type_plan.memory_space,
     )
@@ -541,6 +613,7 @@ def _memdesc_plan_from_value(
         type_plan.shape,
         type_plan.alloc_shape,
         type_plan.element_type,
+        type_plan.element_byte_width,
         type_plan.encoding,
         type_plan.memory_space,
         type_plan.mutable,
@@ -652,6 +725,11 @@ def _address_plan(op, values, owners):
             if address_value is not None
             else (source_plan.element_type if source_plan is not None else None)
         ),
+        (
+            _address_element_byte_width(_value_type(address_value))
+            if address_value is not None
+            else (source_plan.element_byte_width if source_plan is not None else None)
+        ),
         source_plan.shape if source_plan is not None else (),
         source_plan.base_arg_index if source_plan is not None else None,
         source_plan.base_arg_name if source_plan is not None else None,
@@ -761,6 +839,202 @@ def _bridge_plan_metadata(plan):
         "memdescs": _public_dicts(plan.memdescs),
         "tokens": _public_dicts(plan.tokens),
     }
+
+
+def _memdesc_size_bytes(memdesc):
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot size LDS memdesc {memdesc.name or memdesc.source} "
+            f"with element type {memdesc.element_type}"
+        )
+    shape = memdesc.alloc_shape or memdesc.shape
+    return _product(shape) * memdesc.element_byte_width
+
+
+def _compute_lds_layout(plan):
+    offsets = {}
+    memdescs = {memdesc.value_id: memdesc for memdesc in plan.memdescs}
+    cursor = 0
+
+    for memdesc in plan.memdescs:
+        if memdesc.kind != "allocation":
+            continue
+        cursor = _align_to(cursor, 16)
+        offsets[memdesc.value_id] = cursor
+        cursor += _memdesc_size_bytes(memdesc)
+
+    def assign_view(memdesc):
+        if memdesc.value_id in offsets:
+            return offsets[memdesc.value_id]
+        if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
+            raise ValueError(
+                f"tlx_wave bridge cannot place LDS view {memdesc.name or memdesc.source} "
+                "without a known base memdesc"
+            )
+        base = memdescs[memdesc.base_value_id]
+        offset = assign_view(base)
+        if memdesc.view_op == "ttg.memdesc_index" and memdesc.static_index is not None:
+            offset += memdesc.static_index * _memdesc_size_bytes(memdesc)
+        offsets[memdesc.value_id] = offset
+        return offset
+
+    high_watermark = cursor
+    for memdesc in plan.memdescs:
+        if memdesc.kind == "view":
+            offset = assign_view(memdesc)
+            high_watermark = max(high_watermark, offset + _memdesc_size_bytes(memdesc))
+
+    return _LdsLayout(_align_to(high_watermark, 16), offsets)
+
+
+def _async_address_by_token(plan):
+    return {
+        address.token_value_id: address
+        for address in plan.addresses
+        if address.op == "ttg.async_copy_global_to_local"
+        and address.token_value_id is not None
+    }
+
+
+def _has_local_loads_after_wait(plan):
+    seen_wait = False
+    for token in plan.tokens:
+        if token.op == "ttg.async_wait":
+            seen_wait = True
+            break
+    if not seen_wait:
+        return False
+    return any(address.op == "ttg.local_load" for address in plan.addresses)
+
+
+def _source_pointee_type(kernel, address):
+    if address.base_arg_index is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower async copy without a source pointer base"
+        )
+    if address.base_arg_index >= len(kernel.args):
+        raise ValueError(
+            f"tlx_wave bridge async copy references missing kernel arg {address.base_arg_index}"
+        )
+    pointee_type = kernel.args[address.base_arg_index].ttgir_type_obj.get_pointee_type()
+    if pointee_type is None:
+        raise ValueError(
+            f"tlx_wave bridge async copy source %{address.base_arg_name} is not a pointer"
+        )
+    return pointee_type
+
+
+def _dma_packet_bytes(address, lds_offset):
+    if address.element_byte_width is None:
+        return None
+    if lds_offset % 4 != 0:
+        return None
+    if address.element_byte_width in (2, 4):
+        return 4
+    if address.element_byte_width == 16:
+        return 16
+    return None
+
+
+def _emit_async_source_ptr(builder, kernel, address, w, width):
+    pointee_type = _source_pointee_type(kernel, address)
+    element_type = _binding_type(pointee_type, w)
+    lane = builder.lane_id(width=width)
+    source_base = builder.args[address.base_arg_index]
+    return (
+        builder.ptr_add(source_base, lane, w.simd_ptr_type(element_type, width=width)),
+        lane,
+        element_type,
+    )
+
+
+def _emit_async_copy(
+    builder, kernel, address, lds_layout, after_token, w, width, stats
+):
+    if address.memdesc_value_id is None:
+        raise ValueError("tlx_wave bridge cannot lower async copy without LDS memdesc")
+    if address.memdesc_value_id not in lds_layout.offsets:
+        raise ValueError(
+            f"tlx_wave bridge has no LDS placement for memdesc {address.memdesc_value_id}"
+        )
+
+    lds_offset = lds_layout.offsets[address.memdesc_value_id]
+    source, lane, element_type = _emit_async_source_ptr(
+        builder, kernel, address, w, width
+    )
+    dma_bytes = _dma_packet_bytes(address, lds_offset)
+    stats.async_copies += 1
+    if dma_bytes is not None:
+        destination = builder.lds_base(w.i32(), offset=lds_offset)
+        stats.dma_load_lds += 1
+        return builder.dma_load_lds(
+            source, destination, after=after_token, bytes=dma_bytes
+        )
+
+    destination_base = builder.lds_base(element_type, offset=lds_offset)
+    destination = builder.ptr_add(
+        destination_base,
+        lane,
+        w.simd_ptr_type(element_type, w.shared_address_space(), width),
+    )
+    values, load_token = builder.load(
+        source, w.simd_type(element_type, width), after=after_token
+    )
+    stats.load_store_fallbacks += 1
+    return builder.store(values, destination, after=load_token)
+
+
+def _join_tokens(builder, tokens, stats):
+    if not tokens:
+        return builder.token()
+    stats.joins += 1
+    return builder.join(*tokens)
+
+
+def _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats):
+    address_by_token = _async_address_by_token(plan)
+    needs_shared_ready_token = _has_local_loads_after_wait(plan)
+    pending_copy_tokens = []
+    committed_groups = []
+    last_order_token = None
+
+    for token in plan.tokens:
+        if token.op == "ttg.async_copy_global_to_local":
+            address = address_by_token.get(token.value_id)
+            if address is None:
+                raise ValueError("tlx_wave bridge could not match async copy token")
+            if last_order_token is None:
+                last_order_token = builder.token()
+            last_order_token = _emit_async_copy(
+                builder,
+                kernel,
+                address,
+                lds_layout,
+                last_order_token,
+                w,
+                attrs.threads_per_warp,
+                stats,
+            )
+            pending_copy_tokens.append(last_order_token)
+        elif token.op == "ttg.async_commit_group":
+            group = _join_tokens(builder, tuple(pending_copy_tokens), stats)
+            pending_copy_tokens.clear()
+            committed_groups.append(group)
+            last_order_token = group
+            stats.commit_groups += 1
+        elif token.op == "ttg.async_wait":
+            keep_groups = token.wait_group or 0
+            wait_count = max(0, len(committed_groups) - keep_groups)
+            if wait_count:
+                waited_groups = tuple(committed_groups[:wait_count])
+                wait_token = _join_tokens(builder, waited_groups, stats)
+                builder.wait(wait_token)
+                stats.waits += 1
+                committed_groups = committed_groups[wait_count:]
+                last_order_token = wait_token
+                if needs_shared_ready_token:
+                    last_order_token = builder.barrier(wait_token)
+                    stats.barriers += 1
 
 
 def _entry_name(mod):
@@ -988,12 +1262,14 @@ def _binding_bool_attr(w, value):
 
 def _binding_attrs(w, attrs):
     return {
-        "tlx_wave.bridge.stage": w.StringAttr.get("module-function-skeleton"),
+        "tlx_wave.bridge.stage": w.StringAttr.get("async-copy-tokens"),
         "tlx_wave.source_op": w.StringAttr.get("tt.func"),
         "tlx_wave.num_pointer_args": _binding_i32_attr(w, attrs["pointer_count"]),
         "tlx_wave.num_scalar_args": _binding_i32_attr(w, attrs["scalar_count"]),
         "tlx_wave.wave_size": _binding_i32_attr(w, attrs["wave_size"]),
         "tlx_wave.num_warps": _binding_i32_attr(w, attrs["num_warps"]),
+        "tlx_wave.async.num_copies": _binding_i32_attr(w, attrs["async_copy_count"]),
+        "tlx_wave.async.num_waits": _binding_i32_attr(w, attrs["async_wait_count"]),
     }
 
 
@@ -1002,6 +1278,8 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
     target_triple = _target_triple(attrs)
     pointer_count = sum(arg.kind == "pointer" for arg in kernel.args)
     scalar_count = sum(arg.kind == "scalar" for arg in kernel.args)
+    lds_layout = _compute_lds_layout(plan)
+    stats = _WaveAsyncStats(lds_size_bytes=lds_layout.size_bytes)
     with w.module() as module_builder:
         func_attrs = _binding_attrs(
             w,
@@ -1010,6 +1288,10 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
                 "scalar_count": scalar_count,
                 "wave_size": attrs.threads_per_warp,
                 "num_warps": attrs.num_warps,
+                "async_copy_count": plan.op_counts.get(
+                    "ttg.async_copy_global_to_local", 0
+                ),
+                "async_wait_count": plan.op_counts.get("ttg.async_wait", 0),
             },
         )
         if kernel.noinline is not None:
@@ -1051,21 +1333,51 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
         module_builder.module.operation.attributes["tlx_wave.plan.num_memdescs"] = (
             _binding_i32_attr(w, len(plan.memdescs))
         )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_layouts"] = (
+            _binding_i32_attr(w, len(plan.layouts))
+        )
         module_builder.module.operation.attributes["tlx_wave.plan.num_tokens"] = (
             _binding_i32_attr(w, len(plan.tokens))
         )
         with module_builder.function(
-            kernel.name, arg_types, kernel=True, attrs=func_attrs
-        ):
-            pass
-        return str(module_builder.module)
+            kernel.name,
+            arg_types,
+            kernel=True,
+            lds_size=lds_layout.size_bytes if lds_layout.size_bytes else None,
+            attrs=func_attrs,
+        ) as builder:
+            _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats)
+
+        module_builder.module.operation.attributes["tlx_wave.lds_size_bytes"] = (
+            _binding_i32_attr(w, lds_layout.size_bytes)
+        )
+        module_builder.module.operation.attributes["tlx_wave.emitted.async_copies"] = (
+            _binding_i32_attr(w, stats.async_copies)
+        )
+        module_builder.module.operation.attributes["tlx_wave.emitted.dma_load_lds"] = (
+            _binding_i32_attr(w, stats.dma_load_lds)
+        )
+        module_builder.module.operation.attributes[
+            "tlx_wave.emitted.load_store_fallbacks"
+        ] = _binding_i32_attr(w, stats.load_store_fallbacks)
+        module_builder.module.operation.attributes["tlx_wave.emitted.joins"] = (
+            _binding_i32_attr(w, stats.joins)
+        )
+        module_builder.module.operation.attributes["tlx_wave.emitted.waits"] = (
+            _binding_i32_attr(w, stats.waits)
+        )
+        module_builder.module.operation.attributes["tlx_wave.emitted.barriers"] = (
+            _binding_i32_attr(w, stats.barriers)
+        )
+        return str(module_builder.module), stats
 
 
 def _emit_wave_skeleton(kernel, attrs, plan):
-    return _emit_wave_skeleton_with_bindings(kernel, attrs, plan), "wave-dsl"
+    wave_text, stats = _emit_wave_skeleton_with_bindings(kernel, attrs, plan)
+    return wave_text, "wave-dsl", stats
 
 
-def _verify_wave_skeleton(wave_text, wave_opt):
+def _verify_wave_module(wave_text, wave_opt):
     result = subprocess.run(
         [wave_opt, "-", "--verify-diagnostics"],
         input=wave_text,
@@ -1077,16 +1389,17 @@ def _verify_wave_skeleton(wave_text, wave_opt):
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(
-            f"tlx_wave generated Wave skeleton failed wave-opt verification: {detail}"
+            f"tlx_wave generated Wave module failed wave-opt verification: {detail}"
         )
 
 
 def stop_before_wave_lowering(mod, metadata, options):
-    """Emit the first Wave/WaveAMD module/function skeleton from cutoff TTGIR.
+    """Emit the first Wave/WaveAMD module from cutoff TTGIR.
 
-    This stage still does not lower TTGIR operations. It parses the handoff
-    module enough to preserve the public kernel ABI and launch metadata, then
-    emits a Wave textual MLIR shell for later bridge stages to fill.
+    This stage preserves the public kernel ABI and lowers TTGIR async
+    global-to-LDS copy, commit, and wait tokens into Wave/WaveAMD memory-token
+    operations. Later bridge stages consume the recorded graph and ready
+    shared-memory tokens when they lower local loads and compute ops.
     """
     attrs = _module_attrs(mod)
     _validate_target(options, attrs)
@@ -1099,7 +1412,7 @@ def stop_before_wave_lowering(mod, metadata, options):
     metadata["global_scratch_align"] = 1
     metadata["profile_scratch_size"] = 0
     metadata["profile_scratch_align"] = 1
-    metadata["tlx_wave_status"] = "emitted_wave_skeleton"
+    metadata["tlx_wave_status"] = "emitted_wave_async_tokens"
     metadata["tlx_wave_arch"] = options.arch
     metadata["tlx_wave_ttgir_target"] = attrs.target
     metadata["tlx_wave_num_warps"] = attrs.num_warps
@@ -1121,9 +1434,18 @@ def stop_before_wave_lowering(mod, metadata, options):
     metadata["tlx_wave_plan_json"] = json.dumps(
         _bridge_plan_metadata(plan), sort_keys=True
     )
-    wave_text, builder = _emit_wave_skeleton(kernel, attrs, plan)
+    wave_text, builder, wave_stats = _emit_wave_skeleton(kernel, attrs, plan)
+    metadata["shared"] = wave_stats.lds_size_bytes
+    metadata["tlx_wave_lds_size_bytes"] = wave_stats.lds_size_bytes
+    metadata["tlx_wave_num_async_copies"] = wave_stats.async_copies
+    metadata["tlx_wave_num_dma_load_lds"] = wave_stats.dma_load_lds
+    metadata["tlx_wave_num_load_store_fallbacks"] = wave_stats.load_store_fallbacks
+    metadata["tlx_wave_num_async_commit_groups"] = wave_stats.commit_groups
+    metadata["tlx_wave_num_async_waits"] = wave_stats.waits
+    metadata["tlx_wave_num_wave_joins"] = wave_stats.joins
+    metadata["tlx_wave_num_wave_barriers"] = wave_stats.barriers
     wave_opt = _wave_opt()
-    _verify_wave_skeleton(wave_text, wave_opt)
+    _verify_wave_module(wave_text, wave_opt)
     metadata["tlx_wave_wave_builder"] = builder
     metadata["tlx_wave_wave_opt"] = wave_opt
     return wave_text

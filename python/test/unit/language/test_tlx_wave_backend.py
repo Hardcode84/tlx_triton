@@ -46,6 +46,20 @@ def _tlx_wave_local_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
 
 
 @triton.jit
+def _tlx_wave_i8_async_kernel(in_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
+    offs = tl.arange(0, BLOCK_SIZE)
+
+    buffers = tlx.local_alloc((BLOCK_SIZE,), tl.int8, 1)
+    tile = tlx.local_view(buffers, 0)
+    token = tlx.async_load(in_ptr + offs, tile)
+    tlx.async_load_commit_group([token])
+    tlx.async_load_wait_group(0)
+
+    out = tlx.local_load(tile)
+    tl.store(out_ptr + offs, out)
+
+
+@triton.jit
 def _tlx_wave_gemm_cutoff_kernel(
     a_ptr,
     b_ptr,
@@ -120,13 +134,18 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
 
     assert compiled.metadata.target.backend == "tlx_wave"
     assert compiled.metadata.arch == "gfx950"
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_skeleton"
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
     assert compiled.metadata.tlx_wave_num_kernel_args == 3
     assert compiled.metadata.tlx_wave_num_pointer_args == 2
     assert compiled.metadata.tlx_wave_num_scalar_args == 1
     assert compiled.metadata.tlx_wave_plan_kind == "ttgir_graph"
     assert compiled.metadata.tlx_wave_plan_num_ops > 0
     assert compiled.metadata.tlx_wave_plan_num_values > 0
+    assert compiled.metadata.shared == 256
+    assert compiled.metadata.tlx_wave_lds_size_bytes == 256
+    assert compiled.metadata.tlx_wave_num_async_copies == 0
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 0
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
@@ -150,10 +169,13 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
     assert "%arg1: !wave.ptr<#wave.global, f32>" in wave_artifact
     assert "%arg2: i32" in wave_artifact
     assert "wave.kernel" in wave_artifact
-    assert 'tlx_wave.bridge.stage = "module-function-skeleton"' in wave_artifact
+    assert 'tlx_wave.bridge.stage = "async-copy-tokens"' in wave_artifact
     assert 'tlx_wave.source_target = "hip:gfx950"' in wave_artifact
     assert "tlx_wave.num_warps = 4 : i32" in wave_artifact
     assert "tlx_wave.threads_per_warp = 64 : i32" in wave_artifact
+    assert "tlx_wave.lds_size_bytes = 256 : i32" in wave_artifact
+    assert "tlx_wave.emitted.async_copies = 0 : i32" in wave_artifact
+    assert "wave.lds_size = 256 : i64" in wave_artifact
     assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
     assert "return" in wave_artifact
     assert "tt.func public" not in wave_artifact
@@ -184,7 +206,7 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert compiled.metadata.target == GFX950_WAVE
     assert compiled.metadata.num_ctas == 1
     assert compiled.metadata.warp_size == 64
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_skeleton"
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
     assert compiled.metadata.tlx_wave_num_kernel_args == 5
     assert compiled.metadata.tlx_wave_num_pointer_args == 3
     assert compiled.metadata.tlx_wave_num_scalar_args == 2
@@ -192,6 +214,14 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert compiled.metadata.tlx_wave_plan_num_addresses >= 5
     assert compiled.metadata.tlx_wave_plan_num_memdescs >= 6
     assert compiled.metadata.tlx_wave_plan_num_tokens >= 8
+    assert compiled.metadata.shared == 8192
+    assert compiled.metadata.tlx_wave_lds_size_bytes == 8192
+    assert compiled.metadata.tlx_wave_num_async_copies == 4
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
+    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 0
+    assert compiled.metadata.tlx_wave_num_async_commit_groups == 2
+    assert compiled.metadata.tlx_wave_num_async_waits == 2
+    assert compiled.metadata.tlx_wave_num_wave_barriers == 2
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
@@ -217,16 +247,26 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert "%arg3: i32" in wave_artifact
     assert "%arg4: i32" in wave_artifact
     assert "wave.kernel" in wave_artifact
-    assert 'tlx_wave.bridge.stage = "module-function-skeleton"' in wave_artifact
+    assert 'tlx_wave.bridge.stage = "async-copy-tokens"' in wave_artifact
     assert "tlx_wave.num_pointer_args = 3 : i32" in wave_artifact
     assert "tlx_wave.num_scalar_args = 2 : i32" in wave_artifact
     assert "tlx_wave.wave_size = 64 : i32" in wave_artifact
     assert "tlx_wave.has_explicit_local_mem_access = true" in wave_artifact
+    assert "tlx_wave.lds_size_bytes = 8192 : i32" in wave_artifact
+    assert "tlx_wave.emitted.async_copies = 4 : i32" in wave_artifact
+    assert "tlx_wave.emitted.dma_load_lds = 4 : i32" in wave_artifact
+    assert "tlx_wave.emitted.load_store_fallbacks = 0 : i32" in wave_artifact
+    assert "wave.lds_size = 8192 : i64" in wave_artifact
     assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
     assert "tlx_wave.plan.num_addresses" in wave_artifact
     assert "tlx_wave.plan.num_memdescs" in wave_artifact
     assert "tlx_wave.plan.num_tokens" in wave_artifact
     assert "return" in wave_artifact
+    assert wave_artifact.count("waveamd.dma_load_lds") == 4
+    assert wave_artifact.count("wave.join") == 4
+    assert wave_artifact.count("wave.wait") == 2
+    assert wave_artifact.count("wave.barrier") == 2
+    assert "after %" in wave_artifact
     assert "tt.func public" not in wave_artifact
     assert "ttg.local_alloc" not in wave_artifact
     assert "amdg." not in wave_artifact
@@ -275,6 +315,40 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert token_ops.count("ttg.async_wait") == 2
 
 
+def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8():
+    src = ASTSource(
+        fn=_tlx_wave_i8_async_kernel,
+        signature={"in_ptr": "*i8", "out_ptr": "*i8"},
+        constexprs={"BLOCK_SIZE": 64},
+    )
+
+    compiled = triton_compile(src, target=GFX950_WAVE)
+
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
+    assert compiled.metadata.shared == 64
+    assert compiled.metadata.tlx_wave_lds_size_bytes == 64
+    assert compiled.metadata.tlx_wave_num_async_copies == 1
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 1
+    assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
+    assert compiled.metadata.tlx_wave_num_async_waits == 1
+    assert compiled.metadata.tlx_wave_num_wave_barriers == 1
+
+    wave_artifact = _asm_text(compiled, "wave")
+    assert 'tlx_wave.bridge.stage = "async-copy-tokens"' in wave_artifact
+    assert "tlx_wave.emitted.async_copies = 1 : i32" in wave_artifact
+    assert "tlx_wave.emitted.dma_load_lds = 0 : i32" in wave_artifact
+    assert "tlx_wave.emitted.load_store_fallbacks = 1 : i32" in wave_artifact
+    assert "wave.lds_size = 64 : i64" in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.join" in wave_artifact
+    assert "wave.wait" in wave_artifact
+    assert "wave.barrier" in wave_artifact
+    assert "after %" in wave_artifact
+
+
 def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     one_func = """
   tt.func public @one(%p: !tt.ptr<f32>, %n: i32) attributes {noinline = false} {
@@ -293,7 +367,7 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     assert "func.func @one" in wave
     assert "%arg0: !wave.ptr<#wave.global, f32>" in wave
     assert "%arg1: i32" in wave
-    assert metadata["tlx_wave_status"] == "emitted_wave_skeleton"
+    assert metadata["tlx_wave_status"] == "emitted_wave_async_tokens"
     assert metadata["tlx_wave_wave_builder"] == "wave-dsl"
     assert metadata["tlx_wave_wave_opt"].endswith("wave-opt")
     del ctx
