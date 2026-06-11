@@ -240,6 +240,53 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   return result;
 }
 
+std::vector<int64_t> toInt64Vector(ArrayRef<int64_t> values) {
+  return std::vector<int64_t>(values.begin(), values.end());
+}
+
+py::object printAttribute(Attribute attr) {
+  if (!attr)
+    return py::none();
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  attr.print(os);
+  return py::str(os.str());
+}
+
+py::object attributeToPython(Attribute attr) {
+  if (!attr)
+    return py::none();
+  if (auto boolAttr = dyn_cast<BoolAttr>(attr))
+    return py::bool_(boolAttr.getValue());
+  if (auto stringAttr = dyn_cast<StringAttr>(attr))
+    return py::str(stringAttr.getValue().str());
+  if (auto integerAttr = dyn_cast<IntegerAttr>(attr)) {
+    if (integerAttr.getType().isInteger(1))
+      return py::bool_(!integerAttr.getValue().isZero());
+    return py::int_(integerAttr.getInt());
+  }
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return py::float_(floatAttr.getValueAsDouble());
+  if (auto arrayAttr = dyn_cast<ArrayAttr>(attr)) {
+    py::list values;
+    for (Attribute value : arrayAttr)
+      values.append(attributeToPython(value));
+    return std::move(values);
+  }
+  if (isa<UnitAttr>(attr))
+    return py::str("unit");
+  return printAttribute(attr);
+}
+
+py::dict operationAttrsToPython(Operation &op) {
+  py::dict attrs;
+  for (NamedAttribute attr : op.getAttrs()) {
+    attrs[py::str(attr.getName().getValue().str())] =
+        attributeToPython(attr.getValue());
+  }
+  return attrs;
+}
+
 } // anonymous namespace
 
 /*****************************************************************************/
@@ -370,6 +417,76 @@ void init_triton_ir(py::module_ &m) {
       .def("is_integer",
            [](Type &self, unsigned width) { return self.isInteger(width); })
       .def("is_fp16", &Type::isF16)
+      .def("is_bf16", &Type::isBF16)
+      .def("is_fp32", &Type::isF32)
+      .def("is_fp64", &Type::isF64)
+      .def("is_index", &Type::isIndex)
+      .def("is_ptr", [](Type &self) { return isa<PointerType>(self); })
+      .def("is_ranked_tensor",
+           [](Type &self) { return isa<RankedTensorType>(self); })
+      .def("is_memdesc",
+           [](Type &self) { return isa<ttg::MemDescType>(self); })
+      .def("is_async_token",
+           [](Type &self) { return isa<ttg::AsyncTokenType>(self); })
+      .def("get_shape",
+           [](Type &self) -> py::object {
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               return py::cast(toInt64Vector(tensorType.getShape()));
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(toInt64Vector(memDescType.getShape()));
+             return py::none();
+           })
+      .def("get_element_type",
+           [](Type &self) -> py::object {
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               return py::cast(tensorType.getElementType());
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(memDescType.getElementType());
+             return py::none();
+           })
+      .def("get_pointee_type",
+           [](Type &self) -> py::object {
+             if (auto ptrType = dyn_cast<PointerType>(self))
+               return py::cast(ptrType.getPointeeType());
+             return py::none();
+           })
+      .def("get_encoding",
+           [](Type &self) -> py::object {
+             Attribute encoding;
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               encoding = tensorType.getEncoding();
+             else if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               encoding = memDescType.getEncoding();
+             if (!encoding)
+               return py::none();
+             return py::cast(encoding);
+           })
+      .def("get_memory_space",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self)) {
+               if (Attribute memorySpace = memDescType.getMemorySpace())
+                 return py::cast(memorySpace);
+             }
+             return py::none();
+           })
+      .def("get_mutable_memory",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::bool_(memDescType.getMutableMemory());
+             return py::none();
+           })
+      .def("get_alloc_shape",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(toInt64Vector(memDescType.getAllocShape()));
+             return py::none();
+           })
+      .def("get_address_space",
+           [](Type &self) -> py::object {
+             if (auto ptrType = dyn_cast<PointerType>(self))
+               return py::int_(ptrType.getAddressSpace());
+             return py::none();
+           })
       .def("__eq__",
            [](Type &self, py::object &other) {
              Type *other_ty = py::cast<Type *>(other);
@@ -542,7 +659,13 @@ void init_triton_ir(py::module_ &m) {
       .def("erase", [](Block &self) { self.erase(); })
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
-  py::class_<Attribute>(m, "attribute");
+  py::class_<Attribute>(m, "attribute")
+      .def("__str__", [](Attribute &self) {
+        std::string str;
+        llvm::raw_string_ostream os(str);
+        self.print(os);
+        return os.str();
+      });
   py::class_<IntegerAttr, Attribute>(m, "integer_attr");
   py::class_<BoolAttr, Attribute>(m, "bool_attr");
   py::class_<UnitAttr, Attribute>(m, "unit_attr");
@@ -560,6 +683,10 @@ void init_triton_ir(py::module_ &m) {
              if (idx >= self->getNumResults())
                throw py::index_error("Op result index out of range");
              return self->getResult(idx);
+           })
+      .def("get_attrs",
+           [](OpState &self) {
+             return operationAttrsToPython(*self);
            })
       .def(
           "get_region",
@@ -635,6 +762,10 @@ void init_triton_ir(py::module_ &m) {
       .def("get_num_regions", &Operation::getNumRegions)
       .def("get_region", &Operation::getRegion, ret::reference)
       .def("get_block", &Operation::getBlock, ret::reference)
+      .def("get_attrs",
+           [](Operation &self) {
+             return operationAttrsToPython(self);
+           })
       .def("get_str_attr",
            [](Operation &self, const std::string &name) -> py::object {
              auto ret = self.getAttrOfType<StringAttr>(name);

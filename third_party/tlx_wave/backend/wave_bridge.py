@@ -10,8 +10,9 @@ from pathlib import Path
 class _KernelArg:
     index: int
     name: str
-    signature_type: str
+    ttgir_type_obj: object
     ttgir_type: str
+    type_kind: str
     wave_type: str
     kind: str
 
@@ -33,81 +34,98 @@ class _ModuleAttrs:
 
 
 @dataclass(frozen=True)
-class _ShapedType:
+class _TypePlan:
     raw: str
+    kind: str
     shape: tuple[int, ...]
-    element_type: str
-    layout: str | None
-    storage: str | None
-    mutable: bool
+    element_type: str | None
+    pointee_type: str | None
+    encoding: str | None
+    memory_space: str | None
+    mutable: bool | None
+    alloc_shape: tuple[int, ...]
+    address_space: int | None
 
 
 @dataclass(frozen=True)
 class _ValuePlan:
     value_id: int
     kind: str
+    producer: str
+    result_index: int | None
     type: str
+    type_kind: str
     shape: tuple[int, ...]
     element_type: str | None
-    varying_dims: tuple[int, ...]
-    variability: str
+    pointee_type: str | None
+    encoding: str | None
+    memory_space: str | None
     const_value: int | float | bool | None
     base_arg_index: int | None
     base_arg_name: str | None
-    ops: tuple[str, ...]
+    varying_dims: tuple[int, ...]
+    variability: str
 
 
 @dataclass(frozen=True)
-class _AddressExprPlan:
-    role: str
-    value_id: int
-    element_type: str
-    shape: tuple[int, ...]
-    variability: str
-    varying_dims: tuple[int, ...]
-    base_arg_index: int | None
-    base_arg_name: str | None
-    offset_value_id: int | None
-    offset_variability: str | None
-    offset_varying_dims: tuple[int, ...]
-    mask_value_id: int | None
-    mask_variability: str | None
-    mask_varying_dims: tuple[int, ...]
-    memdesc_value_id: int | None
-    ring_slot: int | None
-    ops: tuple[str, ...]
+class _OpPlan:
+    index: int
+    name: str
+    operands: tuple[int, ...]
+    results: tuple[int, ...]
+    attrs: dict
 
 
 @dataclass(frozen=True)
 class _LayoutPlan:
     value_id: int
-    kind: str
+    source: str
     shape: tuple[int, ...]
-    element_type: str
+    element_type: str | None
     encoding: str | None
-    storage: str | None
+    memory_space: str | None
 
 
 @dataclass(frozen=True)
 class _MemDescPlan:
     value_id: int
     kind: str
+    source: str
     name: str | None
     shape: tuple[int, ...]
-    tile_shape: tuple[int, ...]
-    element_type: str
-    layout: str | None
-    storage: str | None
-    mutable: bool
+    alloc_shape: tuple[int, ...]
+    element_type: str | None
+    encoding: str | None
+    memory_space: str | None
+    mutable: bool | None
     base_value_id: int | None
-    ring_slots: int | None
-    slot: int | None
+    view_op: str | None
+    view_operands: tuple[int, ...]
+    static_index: int | None
+
+
+@dataclass(frozen=True)
+class _AddressExprPlan:
+    op: str
+    address_value_id: int | None
+    memdesc_value_id: int | None
+    value_value_id: int | None
+    result_value_id: int | None
+    element_type: str | None
+    shape: tuple[int, ...]
+    base_arg_index: int | None
+    base_arg_name: str | None
+    offset_value_id: int | None
+    mask_value_id: int | None
+    token_value_id: int | None
+    varying_dims: tuple[int, ...]
+    variability: str
 
 
 @dataclass(frozen=True)
 class _TokenPlan:
     value_id: int | None
-    kind: str
+    op: str
     source_address_value_id: int | None
     memdesc_value_id: int | None
     mask_value_id: int | None
@@ -118,141 +136,136 @@ class _TokenPlan:
 @dataclass(frozen=True)
 class _BridgePlan:
     kind: str
+    op_counts: dict[str, int]
+    ops: tuple[_OpPlan, ...]
     values: tuple[_ValuePlan, ...]
     addresses: tuple[_AddressExprPlan, ...]
     layouts: tuple[_LayoutPlan, ...]
     memdescs: tuple[_MemDescPlan, ...]
     tokens: tuple[_TokenPlan, ...]
-    block_m: int | None
-    block_n: int | None
-    block_k: int | None
-    ring_slots: int | None
-    dot_count: int
-    async_copy_count: int
-    store_count: int
 
 
 def _value_id(value):
     return int(value.id())
 
 
-def _type_str(value_or_type):
-    return str(value_or_type.get_type() if hasattr(value_or_type, "get_type") else value_or_type)
+def _value_type(value):
+    return value.get_type()
 
 
-def _shape_tuple(value):
-    shape = value.get_shape()
-    if shape is None:
+def _tuple_or_empty(values):
+    if values is None:
         return ()
-    return tuple(int(dim) for dim in shape)
+    return tuple(int(value) for value in values)
 
 
-def _variability(varying_dims):
-    if not varying_dims:
-        return "uniform"
-    if len(varying_dims) == 1:
-        return "lane-varying"
-    return "tile-varying"
+def _attr_str(attr):
+    return None if attr is None else str(attr)
 
 
-def _merge_varying_dims(*plans):
-    dims = set()
-    for plan in plans:
-        if plan is not None:
-            dims.update(plan.varying_dims)
-    return tuple(sorted(dims))
+def _type_str(type_obj):
+    return str(type_obj)
 
 
-def _split_top_level(text):
-    parts = []
-    start = 0
-    angle_depth = 0
-    brace_depth = 0
-    bracket_depth = 0
-    for index, char in enumerate(text):
-        if char == "<":
-            angle_depth += 1
-        elif char == ">":
-            angle_depth -= 1
-        elif char == "{":
-            brace_depth += 1
-        elif char == "}":
-            brace_depth -= 1
-        elif char == "[":
-            bracket_depth += 1
-        elif char == "]":
-            bracket_depth -= 1
-        elif char == "," and angle_depth == 0 and brace_depth == 0 and bracket_depth == 0:
-            parts.append(text[start:index].strip())
-            start = index + 1
-    parts.append(text[start:].strip())
-    return parts
+def _type_kind(type_obj):
+    if type_obj.is_memdesc():
+        return "memdesc"
+    if type_obj.is_ranked_tensor():
+        return "tensor"
+    if type_obj.is_ptr():
+        return "pointer"
+    if type_obj.is_async_token():
+        return "token"
+    if _is_scalar_type(type_obj):
+        return "scalar"
+    return "other"
 
 
-def _parse_shape_and_element(text):
-    pieces = text.split("x")
-    if len(pieces) == 1:
-        return (), pieces[0]
-
-    dims = []
-    for piece in pieces[:-1]:
-        if piece == "?":
-            dims.append(-1)
-        elif piece.isdigit():
-            dims.append(int(piece))
-        else:
-            return (), text
-    return tuple(dims), pieces[-1]
-
-
-def _parse_shaped_type(raw):
-    raw = str(raw)
-    if raw.startswith("tensor<") and raw.endswith(">"):
-        body = raw[len("tensor<"):-1]
-        parts = _split_top_level(body)
-        shape, element = _parse_shape_and_element(parts[0])
-        layout = parts[1] if len(parts) > 1 else None
-        return _ShapedType(raw, shape, element, layout, None, False)
-    if raw.startswith("!ttg.memdesc<") and raw.endswith(">"):
-        body = raw[len("!ttg.memdesc<"):-1]
-        parts = _split_top_level(body)
-        shape, element = _parse_shape_and_element(parts[0])
-        layout = parts[1] if len(parts) > 1 else None
-        storage = parts[2] if len(parts) > 2 else None
-        mutable = any(part == "mutable" for part in parts[3:])
-        return _ShapedType(raw, shape, element, layout, storage, mutable)
-    return None
-
-
-def _element_type(raw_type):
-    shaped = _parse_shaped_type(raw_type)
-    if shaped is not None:
-        return shaped.element_type
-    raw_type = str(raw_type)
-    if raw_type.startswith("!tt.ptr<") and raw_type.endswith(">"):
-        return raw_type[len("!tt.ptr<"):-1]
-    return raw_type
-
-
-def _pointer_element_type(raw_type):
-    element_type = _element_type(raw_type)
-    if element_type.startswith("!tt.ptr<") and element_type.endswith(">"):
-        return element_type[len("!tt.ptr<"):-1]
-    return element_type
-
-
-def _layout_plan(value, kind):
-    shaped = _parse_shaped_type(_type_str(value))
-    if shaped is None:
-        return None
-    return _LayoutPlan(
-        _value_id(value),
-        kind,
-        shaped.shape,
-        shaped.element_type,
-        shaped.layout,
-        shaped.storage,
+def _type_plan(type_obj):
+    element_type = type_obj.get_element_type()
+    pointee_type = type_obj.get_pointee_type()
+    if pointee_type is None and element_type is not None:
+        pointee_type = element_type.get_pointee_type()
+    return _TypePlan(
+        _type_str(type_obj),
+        _type_kind(type_obj),
+        _tuple_or_empty(type_obj.get_shape()),
+        _type_str(element_type) if element_type is not None else None,
+        _type_str(pointee_type) if pointee_type is not None else None,
+        _attr_str(type_obj.get_encoding()),
+        _attr_str(type_obj.get_memory_space()),
+        type_obj.get_mutable_memory(),
+        _tuple_or_empty(type_obj.get_alloc_shape()),
+        type_obj.get_address_space(),
     )
+
+
+def _address_element_type(type_obj):
+    pointee_type = type_obj.get_pointee_type()
+    if pointee_type is not None:
+        return _type_str(pointee_type)
+    element_type = type_obj.get_element_type()
+    if element_type is None:
+        return _type_str(type_obj)
+    pointee_type = element_type.get_pointee_type()
+    return _type_str(pointee_type if pointee_type is not None else element_type)
+
+
+def _is_scalar_type(type_obj):
+    return (
+        type_obj.is_index()
+        or type_obj.is_fp16()
+        or type_obj.is_bf16()
+        or type_obj.is_fp32()
+        or type_obj.is_fp64()
+        or any(type_obj.is_integer(width) for width in (1, 8, 16, 32, 64))
+    )
+
+
+def _wave_scalar_name(name, type_obj):
+    if type_obj.is_integer(1):
+        return "i1"
+    if type_obj.is_integer(8):
+        return "i8"
+    if type_obj.is_integer(16):
+        return "i16"
+    if type_obj.is_integer(32):
+        return "i32"
+    if type_obj.is_integer(64):
+        return "i64"
+    if type_obj.is_index():
+        return "index"
+    if type_obj.is_fp16():
+        return "f16"
+    if type_obj.is_bf16():
+        return "bf16"
+    if type_obj.is_fp32():
+        return "f32"
+    raise ValueError(
+        f"tlx_wave bridge does not yet support kernel argument %{name} with type {type_obj}"
+    )
+
+
+def _wave_arg_type(name, ttgir_type):
+    pointee_type = ttgir_type.get_pointee_type()
+    if pointee_type is not None:
+        return (
+            f"!wave.ptr<#wave.global, {_wave_scalar_name(name, pointee_type)}>",
+            "pointer",
+        )
+    return _wave_scalar_name(name, ttgir_type), "scalar"
+
+
+def _jsonify(value):
+    if isinstance(value, tuple):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonify(item) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _public_dicts(records):
@@ -260,12 +273,13 @@ def _public_dicts(records):
     for record in records:
         row = {}
         for key, value in record.__dict__.items():
-            if key == "value_id" or key.endswith("_value_id") or key == "input_token_ids":
+            if (
+                key == "value_id"
+                or key.endswith("_value_id")
+                or key in {"operands", "results", "input_token_ids"}
+            ):
                 continue
-            if isinstance(value, tuple):
-                row[key] = list(value)
-            else:
-                row[key] = value
+            row[key] = _jsonify(value)
         result.append(row)
     return result
 
@@ -297,19 +311,39 @@ def _result_owner_map(ops):
     return owners
 
 
-def _unique_ops(ops):
-    return tuple(dict.fromkeys(name for name in ops if name))
+def _variability(varying_dims):
+    if not varying_dims:
+        return "uniform"
+    if len(varying_dims) == 1:
+        return "lane-varying"
+    return "tile-varying"
+
+
+def _merge_varying_dims(*plans):
+    dims = set()
+    for plan in plans:
+        if plan is not None:
+            dims.update(plan.varying_dims)
+    return tuple(sorted(dims))
 
 
 def _base_from_plans(plans):
-    bases = {(plan.base_arg_index, plan.base_arg_name) for plan in plans if plan and plan.base_arg_index is not None}
+    bases = {
+        (plan.base_arg_index, plan.base_arg_name)
+        for plan in plans
+        if plan and plan.base_arg_index is not None
+    }
     if len(bases) != 1:
         return None, None
     return next(iter(bases))
 
 
 def _const_int(plan):
-    if plan is None or isinstance(plan.const_value, bool) or not isinstance(plan.const_value, int):
+    if (
+        plan is None
+        or isinstance(plan.const_value, bool)
+        or not isinstance(plan.const_value, int)
+    ):
         return None
     return plan.const_value
 
@@ -321,39 +355,37 @@ def _shift_dims_for_expand(plan, axis):
 
 
 def _argument_value_plan(value, index):
-    raw_type = _type_str(value)
-    shaped = _parse_shaped_type(raw_type)
-    shape = _shape_tuple(value) or (shaped.shape if shaped else ())
-    element_type = shaped.element_type if shaped else _pointer_element_type(raw_type)
+    type_plan = _type_plan(_value_type(value))
     return _ValuePlan(
         _value_id(value),
         "argument",
-        raw_type,
-        shape,
-        element_type,
-        (),
-        "uniform",
+        "argument",
+        None,
+        type_plan.raw,
+        type_plan.kind,
+        type_plan.shape,
+        type_plan.element_type,
+        type_plan.pointee_type,
+        type_plan.encoding,
+        type_plan.memory_space,
         None,
         index,
         f"arg{index}",
-        ("argument",),
+        (),
+        "uniform",
     )
 
 
-def _value_plan_from_result(op, result, operand_plans, arg_info):
-    op_name = op.get_name()
+def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
     value_id = _value_id(result)
-    raw_type = _type_str(result)
-    shaped = _parse_shaped_type(raw_type)
-    shape = _shape_tuple(result) or (shaped.shape if shaped else ())
-    element_type = shaped.element_type if shaped else _pointer_element_type(raw_type)
-    const_value = op.get_constant_value() if op_name == "arith.constant" else None
-    base_arg_index, base_arg_name = _base_from_plans(operand_plans)
-    ops = _unique_ops(tuple(name for plan in operand_plans if plan for name in plan.ops) + (op_name,))
-
     if value_id in arg_info:
         index, _name = arg_info[value_id]
         return _argument_value_plan(result, index)
+
+    op_name = op.get_name()
+    type_plan = _type_plan(_value_type(result))
+    const_value = op.get_constant_value() if op_name == "arith.constant" else None
+    base_arg_index, base_arg_name = _base_from_plans(operand_plans)
 
     if op_name == "arith.constant":
         varying_dims = ()
@@ -362,13 +394,17 @@ def _value_plan_from_result(op, result, operand_plans, arg_info):
         varying_dims = ()
         kind = "program_id"
     elif op_name == "tt.make_range":
-        varying_dims = tuple(range(len(shape)))
+        varying_dims = tuple(range(len(type_plan.shape)))
         kind = "make_range"
     elif op_name == "tt.expand_dims":
-        varying_dims = _shift_dims_for_expand(operand_plans[0] if operand_plans else None, op.get_int_attr("axis") or 0)
+        varying_dims = _shift_dims_for_expand(
+            operand_plans[0] if operand_plans else None, op.get_int_attr("axis") or 0
+        )
         kind = "expand_dims"
     elif op_name in {"tt.broadcast", "tt.splat", "ttg.convert_layout"}:
-        varying_dims = operand_plans[0].varying_dims if operand_plans and operand_plans[0] else ()
+        varying_dims = (
+            operand_plans[0].varying_dims if operand_plans and operand_plans[0] else ()
+        )
         kind = op_name.split(".")[-1]
     elif op_name in {"arith.addi", "arith.muli", "arith.andi", "arith.cmpi"}:
         varying_dims = _merge_varying_dims(*operand_plans)
@@ -380,15 +416,15 @@ def _value_plan_from_result(op, result, operand_plans, arg_info):
             base_arg_index = ptr_base.base_arg_index
             base_arg_name = ptr_base.base_arg_name
         kind = "addptr"
-    elif op_name == "ttg.local_load":
-        varying_dims = tuple(range(len(shape)))
-        kind = "local_load"
-    elif op_name == "tt.dot":
-        varying_dims = tuple(range(len(shape)))
-        kind = "dot"
-    elif raw_type == "!ttg.async.token":
+    elif type_plan.kind == "token":
         varying_dims = ()
         kind = "token"
+    elif type_plan.kind == "memdesc":
+        varying_dims = ()
+        kind = "memdesc"
+    elif op_name in {"ttg.local_load", "tt.dot"}:
+        varying_dims = tuple(range(len(type_plan.shape)))
+        kind = op_name.split(".")[-1]
     else:
         varying_dims = _merge_varying_dims(*operand_plans)
         kind = op_name
@@ -396,15 +432,20 @@ def _value_plan_from_result(op, result, operand_plans, arg_info):
     return _ValuePlan(
         value_id,
         kind,
-        raw_type,
-        shape,
-        element_type,
-        varying_dims,
-        _variability(varying_dims),
+        op_name,
+        result_index,
+        type_plan.raw,
+        type_plan.kind,
+        type_plan.shape,
+        type_plan.element_type,
+        type_plan.pointee_type,
+        type_plan.encoding,
+        type_plan.memory_space,
         const_value,
         base_arg_index,
         base_arg_name,
-        ops,
+        varying_dims,
+        _variability(varying_dims),
     )
 
 
@@ -415,47 +456,98 @@ def _build_value_plans(mod, kernel, ops):
     for index in range(fn.get_num_args()):
         arg_value = fn.args(index)
         arg_info[_value_id(arg_value)] = (index, f"arg{index}")
-
-    for index in range(fn.get_num_args()):
-        arg_value = fn.args(index)
         arg_plan = _argument_value_plan(arg_value, index)
         values[arg_plan.value_id] = arg_plan
 
     for op in ops:
         operands = _op_operands(op)
         operand_plans = tuple(values.get(_value_id(operand)) for operand in operands)
-        for result in _op_results(op):
-            plan = _value_plan_from_result(op, result, operand_plans, arg_info)
+        for result_index, result in enumerate(_op_results(op)):
+            plan = _value_plan_from_result(
+                op, result_index, result, operand_plans, arg_info
+            )
             values[plan.value_id] = plan
     return values
 
 
-def _memdesc_from_value(value, kind, name=None, base_value_id=None, ring_slots=None, slot=None):
-    shaped = _parse_shaped_type(_type_str(value))
-    if shaped is None:
-        raise ValueError(f"tlx_wave bridge expected {kind} to have a TTGIR memdesc type, got {_type_str(value)}")
-    if shaped.storage is None:
-        raise ValueError(f"tlx_wave bridge expected {kind} memdesc to declare storage")
-    shape = shaped.shape
-    if kind == "allocation" and len(shape) >= 3:
-        inferred_ring_slots = shape[0]
-        tile_shape = shape[1:]
-    else:
-        inferred_ring_slots = ring_slots
-        tile_shape = shape
+def _build_op_plans(ops):
+    plans = []
+    for index, op in enumerate(ops):
+        plans.append(
+            _OpPlan(
+                index,
+                op.get_name(),
+                tuple(_value_id(operand) for operand in _op_operands(op)),
+                tuple(_value_id(result) for result in _op_results(op)),
+                dict(op.get_attrs()),
+            )
+        )
+    return tuple(plans)
+
+
+def _layout_plan(value, source):
+    type_plan = _type_plan(_value_type(value))
+    if type_plan.encoding is None and type_plan.memory_space is None:
+        return None
+    return _LayoutPlan(
+        _value_id(value),
+        source,
+        type_plan.shape,
+        type_plan.element_type,
+        type_plan.encoding,
+        type_plan.memory_space,
+    )
+
+
+def _build_layout_plans(ops):
+    layouts = {}
+    for op in ops:
+        for result in _op_results(op):
+            plan = _layout_plan(result, op.get_name())
+            if plan is not None:
+                layouts[plan.value_id] = plan
+    return tuple(layouts.values())
+
+
+_MEMDESC_VIEW_OPS = {
+    "ttg.memdesc_index",
+    "ttg.memdesc_subslice",
+    "ttg.memdesc_reinterpret",
+    "ttg.memdesc_reshape",
+    "ttg.memdesc_trans",
+}
+
+
+def _memdesc_plan_from_value(
+    value,
+    source,
+    kind,
+    name=None,
+    base_value_id=None,
+    view_op=None,
+    view_operands=(),
+    static_index=None,
+):
+    type_plan = _type_plan(_value_type(value))
+    if type_plan.kind != "memdesc":
+        raise ValueError(
+            f"tlx_wave bridge expected {source} to produce a memdesc, got {type_plan.raw}"
+        )
     return _MemDescPlan(
         _value_id(value),
         kind,
+        source,
         name,
-        shape,
-        tile_shape,
-        shaped.element_type,
-        shaped.layout,
-        shaped.storage,
-        shaped.mutable,
+        type_plan.shape,
+        type_plan.alloc_shape,
+        type_plan.element_type,
+        type_plan.encoding,
+        type_plan.memory_space,
+        type_plan.mutable,
         base_value_id,
-        inferred_ring_slots,
-        slot,
+        view_op,
+        view_operands,
+        static_index,
     )
 
 
@@ -467,265 +559,203 @@ def _build_memdesc_plans(ops, values):
         name = op.get_name()
         if name == "ttg.local_alloc":
             result = op.get_result(0)
-            plan = _memdesc_from_value(result, "allocation", name=f"alloc{alloc_index}")
+            plan = _memdesc_plan_from_value(
+                result, name, "allocation", name=f"alloc{alloc_index}"
+            )
             alloc_index += 1
             memdescs[plan.value_id] = plan
-        elif name == "ttg.memdesc_index":
-            base = op.get_operand(0)
-            slot_value = op.get_operand(1)
-            base_plan = memdescs.get(_value_id(base))
-            slot = _const_int(values.get(_value_id(slot_value)))
+        elif name in _MEMDESC_VIEW_OPS:
             result = op.get_result(0)
-            plan = _memdesc_from_value(
+            operands = _op_operands(op)
+            static_index = (
+                _const_int(values.get(_value_id(operands[1])))
+                if name == "ttg.memdesc_index" and len(operands) > 1
+                else None
+            )
+            plan = _memdesc_plan_from_value(
                 result,
+                name,
                 "view",
                 name=f"view{view_index}",
-                base_value_id=_value_id(base),
-                ring_slots=base_plan.ring_slots if base_plan else None,
-                slot=slot,
+                base_value_id=_value_id(operands[0]) if operands else None,
+                view_op=name,
+                view_operands=tuple(_value_id(operand) for operand in operands),
+                static_index=static_index,
             )
             view_index += 1
             memdescs[plan.value_id] = plan
-        elif name in {"ttg.memdesc_subslice", "ttg.memdesc_reinterpret", "ttg.memdesc_reshape", "ttg.memdesc_trans"}:
-            raise ValueError(f"tlx_wave bridge does not yet support LDS view op {name}")
     return memdescs
 
 
-def _build_layout_plans(ops):
-    layouts = {}
-    for op in ops:
-        for result in _op_results(op):
-            plan = _layout_plan(result, op.get_name())
-            if plan is not None and plan.shape:
-                layouts[plan.value_id] = plan
-    return layouts
+def _token_id(value, values):
+    if value is None:
+        return None
+    plan = values.get(_value_id(value))
+    if plan is not None and plan.type_kind == "token":
+        return plan.value_id
+    return None
 
 
-def _role_by_memdesc_view(ops, owners):
-    roles = {}
-    for op in ops:
-        if op.get_name() != "tt.dot":
-            continue
-        for operand_index, role in ((0, "a"), (1, "b")):
-            load_owner = owners.get(_value_id(op.get_operand(operand_index)))
-            if load_owner is None or load_owner.get_name() != "ttg.local_load":
-                continue
-            roles[_value_id(load_owner.get_operand(0))] = role
-    return roles
+def _address_plan(op, values, owners):
+    name = op.get_name()
+    operands = _op_operands(op)
+    results = _op_results(op)
+    address_value = memdesc_value = value_value = mask_value = None
+    result_value_id = token_value_id = None
 
+    if name == "ttg.async_copy_global_to_local":
+        address_value = operands[0] if len(operands) > 0 else None
+        memdesc_value = operands[1] if len(operands) > 1 else None
+        mask_value = operands[2] if len(operands) > 2 else None
+        token_value_id = _value_id(results[0]) if results else None
+        result_value_id = token_value_id
+    elif name == "tt.store":
+        address_value = operands[0] if len(operands) > 0 else None
+        value_value = operands[1] if len(operands) > 1 else None
+        mask_value = operands[2] if len(operands) > 2 else None
+    elif name == "tt.load":
+        address_value = operands[0] if len(operands) > 0 else None
+        mask_value = operands[1] if len(operands) > 1 else None
+        result_value_id = _value_id(results[0]) if results else None
+    elif name == "ttg.local_load":
+        memdesc_value = operands[0] if len(operands) > 0 else None
+        token_value_id = _token_id(operands[1], values) if len(operands) > 1 else None
+        result_value_id = _value_id(results[0]) if results else None
+    elif name == "ttg.local_store":
+        value_value = operands[0] if len(operands) > 0 else None
+        memdesc_value = operands[1] if len(operands) > 1 else None
+    else:
+        return None
 
-def _address_plan(role, address_value, values, owners, mask_value=None, memdesc_value=None, ring_slot=None):
-    address = values.get(_value_id(address_value))
-    if address is None:
-        raise ValueError(f"tlx_wave bridge could not plan address value for role {role}")
-    mask = values.get(_value_id(mask_value)) if mask_value is not None else None
+    source_value = address_value or memdesc_value
+    source_plan = (
+        values.get(_value_id(source_value)) if source_value is not None else None
+    )
     offset_value_id = None
-    offset_variability = None
-    offset_varying_dims = ()
-    owner = owners.get(address.value_id)
-    if owner is not None and owner.get_name() == "tt.addptr":
-        offset = values.get(_value_id(owner.get_operand(1)))
-        if offset is not None:
-            offset_value_id = offset.value_id
-            offset_variability = offset.variability
-            offset_varying_dims = offset.varying_dims
+    if address_value is not None:
+        owner = owners.get(_value_id(address_value))
+        if (
+            owner is not None
+            and owner.get_name() == "tt.addptr"
+            and owner.get_num_operands() > 1
+        ):
+            offset_value_id = _value_id(owner.get_operand(1))
+
     return _AddressExprPlan(
-        role,
-        address.value_id,
-        _pointer_element_type(address.type),
-        address.shape,
-        address.variability,
-        address.varying_dims,
-        address.base_arg_index,
-        address.base_arg_name,
-        offset_value_id,
-        offset_variability,
-        offset_varying_dims,
-        mask.value_id if mask else None,
-        mask.variability if mask else None,
-        mask.varying_dims if mask else (),
+        name,
+        _value_id(address_value) if address_value is not None else None,
         _value_id(memdesc_value) if memdesc_value is not None else None,
-        ring_slot,
-        address.ops,
+        _value_id(value_value) if value_value is not None else None,
+        result_value_id,
+        (
+            _address_element_type(_value_type(address_value))
+            if address_value is not None
+            else (source_plan.element_type if source_plan is not None else None)
+        ),
+        source_plan.shape if source_plan is not None else (),
+        source_plan.base_arg_index if source_plan is not None else None,
+        source_plan.base_arg_name if source_plan is not None else None,
+        offset_value_id,
+        _value_id(mask_value) if mask_value is not None else None,
+        token_value_id,
+        source_plan.varying_dims if source_plan is not None else (),
+        source_plan.variability if source_plan is not None else "uniform",
     )
 
 
-def _build_address_plans(ops, values, memdescs, owners):
-    roles = _role_by_memdesc_view(ops, owners)
+def _build_address_plans(ops, values, owners):
     addresses = []
-    async_index = 0
     for op in ops:
-        if op.get_name() == "ttg.async_copy_global_to_local":
-            address_value = op.get_operand(0)
-            memdesc_value = op.get_operand(1)
-            mask_value = op.get_operand(2) if op.get_num_operands() > 2 else None
-            memdesc_id = _value_id(memdesc_value)
-            role = roles.get(memdesc_id)
-            if role is None:
-                role = "a" if async_index % 2 == 0 else "b"
-            memdesc = memdescs.get(memdesc_id)
-            addresses.append(_address_plan(role, address_value, values, owners, mask_value, memdesc_value,
-                                           memdesc.slot if memdesc else None))
-            async_index += 1
-        elif op.get_name() == "tt.store":
-            address_value = op.get_operand(0)
-            mask_value = op.get_operand(2) if op.get_num_operands() > 2 else None
-            addresses.append(_address_plan("c", address_value, values, owners, mask_value))
+        plan = _address_plan(op, values, owners)
+        if plan is not None:
+            addresses.append(plan)
     return tuple(addresses)
 
 
-def _build_token_plans(ops):
+def _build_token_plans(ops, values):
     tokens = []
     for op in ops:
         name = op.get_name()
-        if name == "ttg.async_copy_global_to_local":
-            result_id = _value_id(op.get_result(0))
+        operands = _op_operands(op)
+        results = _op_results(op)
+        result_token_id = (
+            _value_id(results[0])
+            if results and values.get(_value_id(results[0])).type_kind == "token"
+            else None
+        )
+        input_token_ids = tuple(
+            token_id
+            for token_id in (_token_id(operand, values) for operand in operands)
+            if token_id is not None
+        )
+        if (
+            result_token_id is not None
+            or input_token_ids
+            or name in {"ttg.async_wait", "ttg.async_commit_group"}
+        ):
             tokens.append(
                 _TokenPlan(
-                    result_id,
-                    "async_copy",
-                    _value_id(op.get_operand(0)),
-                    _value_id(op.get_operand(1)),
-                    _value_id(op.get_operand(2)) if op.get_num_operands() > 2 else None,
-                    (),
-                    None,
+                    result_token_id,
+                    name,
+                    (
+                        _value_id(operands[0])
+                        if name == "ttg.async_copy_global_to_local"
+                        and len(operands) > 0
+                        else None
+                    ),
+                    (
+                        _value_id(operands[1])
+                        if name == "ttg.async_copy_global_to_local"
+                        and len(operands) > 1
+                        else None
+                    ),
+                    (
+                        _value_id(operands[2])
+                        if name == "ttg.async_copy_global_to_local"
+                        and len(operands) > 2
+                        else None
+                    ),
+                    input_token_ids,
+                    op.get_int_attr("num") if name == "ttg.async_wait" else None,
                 )
             )
-        elif name == "ttg.async_commit_group":
-            result_id = _value_id(op.get_result(0)) if op.get_num_results() else None
-            tokens.append(
-                _TokenPlan(result_id, "commit_group", None, None, None,
-                           tuple(_value_id(operand) for operand in _op_operands(op)), None)
-            )
-        elif name == "ttg.async_wait":
-            result_id = _value_id(op.get_result(0)) if op.get_num_results() else None
-            tokens.append(_TokenPlan(result_id, "wait_group", None, None, None, (), op.get_int_attr("num")))
     return tuple(tokens)
-
-
-def _validate_static_gemm_plan(plan, ops):
-    supported = {
-        "builtin.module",
-        "tt.func",
-        "tt.return",
-        "arith.constant",
-        "arith.addi",
-        "arith.muli",
-        "arith.andi",
-        "arith.cmpi",
-        "tt.get_program_id",
-        "tt.make_range",
-        "tt.expand_dims",
-        "tt.broadcast",
-        "tt.splat",
-        "tt.addptr",
-        "tt.store",
-        "tt.dot",
-        "ttg.local_alloc",
-        "ttg.memdesc_index",
-        "ttg.async_copy_global_to_local",
-        "ttg.async_commit_group",
-        "ttg.async_wait",
-        "ttg.local_load",
-        "ttg.convert_layout",
-    }
-    for op in ops:
-        name = op.get_name()
-        if name.startswith("ttng."):
-            raise ValueError(f"tlx_wave bridge GEMM planner rejects TMEM/NVIDIA storage op {name}")
-        if name not in supported:
-            raise ValueError(f"tlx_wave bridge GEMM planner does not support TTGIR op {name}")
-
-    for memdesc in plan.memdescs:
-        if memdesc.storage != "#ttg.shared_memory":
-            raise ValueError(
-                f"tlx_wave bridge GEMM planner supports only SMEM memdescs, got storage {memdesc.storage}"
-            )
-        if memdesc.layout is None or not memdesc.layout.startswith("#ttg.swizzled_shared"):
-            raise ValueError(f"tlx_wave bridge GEMM planner does not support LDS layout {memdesc.layout}")
-        if any(dim <= 0 for dim in memdesc.shape):
-            raise ValueError(f"tlx_wave bridge GEMM planner rejects dynamic LDS sizes in {memdesc.shape}")
-        if memdesc.element_type != "f16":
-            raise ValueError(
-                f"tlx_wave bridge GEMM planner supports only f16 LDS GEMM operands, got {memdesc.element_type}"
-            )
-        if memdesc.kind == "allocation":
-            if len(memdesc.shape) != 3 or len(memdesc.tile_shape) != 2:
-                raise ValueError(
-                    "tlx_wave bridge GEMM planner supports only static rank-2 tiles with static ring-buffer slots"
-                )
-        elif memdesc.kind == "view":
-            if len(memdesc.tile_shape) != 2 or memdesc.slot is None:
-                raise ValueError("tlx_wave bridge GEMM planner requires static rank-2 LDS views and static slots")
-
-    seen_views = set()
-    for memdesc in plan.memdescs:
-        if memdesc.kind != "view":
-            continue
-        key = (memdesc.base_value_id, memdesc.slot)
-        if key in seen_views:
-            raise ValueError("tlx_wave bridge GEMM planner rejects storage alias overlap between LDS views")
-        seen_views.add(key)
-
-    for op in ops:
-        if op.get_name() != "tt.dot":
-            continue
-        lhs = _element_type(_type_str(op.get_operand(0)))
-        rhs = _element_type(_type_str(op.get_operand(1)))
-        if lhs != "f16" or rhs != "f16":
-            raise ValueError(f"tlx_wave bridge GEMM planner supports only f16 GEMM operands, got {lhs} x {rhs}")
 
 
 def _build_bridge_plan(mod, kernel):
     ops = _walk_ops(mod)
     owners = _result_owner_map(ops)
     values_by_id = _build_value_plans(mod, kernel, ops)
+    op_plans = _build_op_plans(ops)
+    op_counts = {}
+    for op in ops:
+        name = op.get_name()
+        op_counts[name] = op_counts.get(name, 0) + 1
     memdescs_by_id = _build_memdesc_plans(ops, values_by_id)
-    layouts_by_id = _build_layout_plans(ops)
-    addresses = _build_address_plans(ops, values_by_id, memdescs_by_id, owners)
-    tokens = _build_token_plans(ops)
-    dot_count = sum(op.get_name() == "tt.dot" for op in ops)
-    async_copy_count = sum(op.get_name() == "ttg.async_copy_global_to_local" for op in ops)
-    store_count = sum(op.get_name() == "tt.store" for op in ops)
-
-    allocations = [memdesc for memdesc in memdescs_by_id.values() if memdesc.kind == "allocation"]
-    ring_slots = allocations[0].ring_slots if allocations else None
-    block_m = block_n = block_k = None
-    if allocations and len(allocations[0].tile_shape) == 2:
-        block_m, block_k = allocations[0].tile_shape
-    if len(allocations) > 1 and len(allocations[1].tile_shape) == 2:
-        _, block_n = allocations[1].tile_shape
-
-    plan = _BridgePlan(
-        "gemm" if dot_count else "generic",
+    return _BridgePlan(
+        "ttgir_graph",
+        op_counts,
+        op_plans,
         tuple(values_by_id.values()),
-        addresses,
-        tuple(layouts_by_id.values()),
+        _build_address_plans(ops, values_by_id, owners),
+        _build_layout_plans(ops),
         tuple(memdescs_by_id.values()),
-        tokens,
-        block_m,
-        block_n,
-        block_k,
-        ring_slots,
-        dot_count,
-        async_copy_count,
-        store_count,
+        _build_token_plans(ops, values_by_id),
     )
-    if plan.kind == "gemm":
-        _validate_static_gemm_plan(plan, ops)
-    return plan
 
 
 def _bridge_plan_metadata(plan):
     return {
         "kind": plan.kind,
-        "block_m": plan.block_m,
-        "block_n": plan.block_n,
-        "block_k": plan.block_k,
-        "ring_slots": plan.ring_slots,
-        "dot_count": plan.dot_count,
-        "async_copy_count": plan.async_copy_count,
-        "store_count": plan.store_count,
+        "op_counts": _jsonify(plan.op_counts),
+        "num_ops": len(plan.ops),
+        "num_values": len(plan.values),
+        "num_addresses": len(plan.addresses),
+        "num_layouts": len(plan.layouts),
+        "num_memdescs": len(plan.memdescs),
+        "num_tokens": len(plan.tokens),
+        "ops": _public_dicts(plan.ops),
+        "values": _public_dicts(plan.values),
         "addresses": _public_dicts(plan.addresses),
         "layouts": _public_dicts(plan.layouts),
         "memdescs": _public_dicts(plan.memdescs),
@@ -755,19 +785,12 @@ def _module_attrs(mod):
     num_ctas = _required_int_attr(op, "ttg.num-ctas")
     num_warps = _required_int_attr(op, "ttg.num-warps")
     threads_per_warp = _required_int_attr(op, "ttg.threads-per-warp")
-    has_explicit_local_mem_access = bool(op.get_bool_attr("tlx.has_explicit_local_mem_access"))
-    return _ModuleAttrs(target, num_ctas, num_warps, threads_per_warp, has_explicit_local_mem_access)
-
-
-def _wave_arg_type(name, signature_type):
-    if signature_type.startswith("*"):
-        element_type = signature_type[1:]
-        if not element_type:
-            raise ValueError(f"tlx_wave bridge does not yet support pointer argument %{name} with empty element type")
-        return f"!wave.ptr<#wave.global, {element_type}>", "pointer"
-    if signature_type in {"i1", "i8", "i16", "i32", "i64", "index", "f16", "bf16", "f32"}:
-        return signature_type, "scalar"
-    raise ValueError(f"tlx_wave bridge does not yet support kernel argument %{name} with type {signature_type}")
+    has_explicit_local_mem_access = bool(
+        op.get_bool_attr("tlx.has_explicit_local_mem_access")
+    )
+    return _ModuleAttrs(
+        target, num_ctas, num_warps, threads_per_warp, has_explicit_local_mem_access
+    )
 
 
 def _public_tt_func_ops(mod):
@@ -785,35 +808,51 @@ def _public_tt_func_ops(mod):
 def _kernel_from_module(mod):
     funcs = _public_tt_func_ops(mod)
     if len(funcs) != 1:
-        names = ", ".join(func.get_str_attr("sym_name") or "<unnamed>" for func in funcs) or "none"
-        raise ValueError(f"tlx_wave bridge supports exactly one public tt.func kernel, found {len(funcs)} ({names})")
+        names = (
+            ", ".join(func.get_str_attr("sym_name") or "<unnamed>" for func in funcs)
+            or "none"
+        )
+        raise ValueError(
+            f"tlx_wave bridge supports exactly one public tt.func kernel, found {len(funcs)} ({names})"
+        )
 
     op = funcs[0]
     name = op.get_str_attr("sym_name") or _entry_name(mod)
     fn = mod.get_function(name)
-    signature = mod.get_function_signature(fn)
-    if len(signature) != fn.get_num_args():
-        raise ValueError(
-            "tlx_wave bridge expected function signature length to match argument count, "
-            f"got {len(signature)} signature entries for {fn.get_num_args()} args"
-        )
 
     args = []
-    for index, signature_type in enumerate(signature):
+    for index in range(fn.get_num_args()):
         name_for_arg = f"arg{index}"
-        ttgir_type = str(fn.args(index).get_type())
-        wave_type, kind = _wave_arg_type(name_for_arg, signature_type)
-        args.append(_KernelArg(index, name_for_arg, signature_type, ttgir_type, wave_type, kind))
+        ttgir_type_obj = fn.args(index).get_type()
+        ttgir_type = _type_str(ttgir_type_obj)
+        wave_type, kind = _wave_arg_type(name_for_arg, ttgir_type_obj)
+        args.append(
+            _KernelArg(
+                index,
+                name_for_arg,
+                ttgir_type_obj,
+                ttgir_type,
+                _type_kind(ttgir_type_obj),
+                wave_type,
+                kind,
+            )
+        )
     return _Kernel(name, tuple(args), op.get_bool_attr("noinline"))
 
 
 def _validate_target(options, attrs):
     if options.arch != "gfx950":
-        raise ValueError(f"tlx_wave bridge only supports gfx950 Wave skeletons, got {options.arch}")
+        raise ValueError(
+            f"tlx_wave bridge only supports gfx950 Wave skeletons, got {options.arch}"
+        )
     if options.warp_size != 64:
-        raise ValueError(f"tlx_wave bridge only supports wave64 inputs, got warp_size={options.warp_size}")
+        raise ValueError(
+            f"tlx_wave bridge only supports wave64 inputs, got warp_size={options.warp_size}"
+        )
     if attrs.target != "hip:gfx950":
-        raise ValueError(f"tlx_wave bridge only supports TTGIR target hip:gfx950, got {attrs.target}")
+        raise ValueError(
+            f"tlx_wave bridge only supports TTGIR target hip:gfx950, got {attrs.target}"
+        )
     if attrs.threads_per_warp != 64:
         raise ValueError(
             "tlx_wave bridge only supports wave64 TTGIR, "
@@ -912,28 +951,31 @@ def _wave_opt():
     )
 
 
-def _binding_type(signature_type, w):
-    if signature_type.startswith("*"):
-        return w.ptr_type(_binding_type(signature_type[1:], w))
-    if signature_type == "i1":
+def _binding_type(ttgir_type, w):
+    pointee_type = ttgir_type.get_pointee_type()
+    if pointee_type is not None:
+        return w.ptr_type(_binding_type(pointee_type, w))
+    if ttgir_type.is_integer(1):
         return w.i1()
-    if signature_type == "i8":
+    if ttgir_type.is_integer(8):
         return w.i8()
-    if signature_type == "i16":
+    if ttgir_type.is_integer(16):
         return w.IntegerType.get_signless(16)
-    if signature_type == "i32":
+    if ttgir_type.is_integer(32):
         return w.i32()
-    if signature_type == "i64":
+    if ttgir_type.is_integer(64):
         return w.i64()
-    if signature_type == "index":
+    if ttgir_type.is_index():
         return w.index_type()
-    if signature_type == "f16":
+    if ttgir_type.is_fp16():
         return w.f16()
-    if signature_type == "bf16":
+    if ttgir_type.is_bf16():
         return w.bf16()
-    if signature_type == "f32":
+    if ttgir_type.is_fp32():
         return w.f32()
-    raise ValueError(f"tlx_wave bridge does not yet support Wave binding type {signature_type}")
+    raise ValueError(
+        f"tlx_wave bridge does not yet support Wave binding type {ttgir_type}"
+    )
 
 
 def _binding_i32_attr(w, value):
@@ -962,41 +1004,59 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
     scalar_count = sum(arg.kind == "scalar" for arg in kernel.args)
     with w.module() as module_builder:
         func_attrs = _binding_attrs(
-            w, {
+            w,
+            {
                 "pointer_count": pointer_count,
                 "scalar_count": scalar_count,
                 "wave_size": attrs.threads_per_warp,
                 "num_warps": attrs.num_warps,
-            })
+            },
+        )
         if kernel.noinline is not None:
-            func_attrs["tlx_wave.ttgir.noinline"] = _binding_bool_attr(w, kernel.noinline)
+            func_attrs["tlx_wave.ttgir.noinline"] = _binding_bool_attr(
+                w, kernel.noinline
+            )
 
-        arg_types = [_binding_type(arg.signature_type, w) for arg in kernel.args]
-        module_builder.module.operation.attributes["waveamdmachine.target"] = w.StringAttr.get(target_triple)
-        module_builder.module.operation.attributes["tlx_wave.source_target"] = w.StringAttr.get(attrs.target)
-        module_builder.module.operation.attributes["tlx_wave.num_ctas"] = _binding_i32_attr(w, attrs.num_ctas)
-        module_builder.module.operation.attributes["tlx_wave.num_warps"] = _binding_i32_attr(w, attrs.num_warps)
-        module_builder.module.operation.attributes["tlx_wave.threads_per_warp"] = _binding_i32_attr(
-            w, attrs.threads_per_warp)
-        module_builder.module.operation.attributes["tlx_wave.has_explicit_local_mem_access"] = _binding_bool_attr(
-            w, attrs.has_explicit_local_mem_access)
-        module_builder.module.operation.attributes["tlx_wave.plan.kind"] = w.StringAttr.get(plan.kind)
-        if plan.block_m is not None:
-            module_builder.module.operation.attributes["tlx_wave.plan.block_m"] = _binding_i32_attr(w, plan.block_m)
-        if plan.block_n is not None:
-            module_builder.module.operation.attributes["tlx_wave.plan.block_n"] = _binding_i32_attr(w, plan.block_n)
-        if plan.block_k is not None:
-            module_builder.module.operation.attributes["tlx_wave.plan.block_k"] = _binding_i32_attr(w, plan.block_k)
-        if plan.ring_slots is not None:
-            module_builder.module.operation.attributes["tlx_wave.plan.ring_slots"] = _binding_i32_attr(
-                w, plan.ring_slots)
-        module_builder.module.operation.attributes["tlx_wave.plan.num_addresses"] = _binding_i32_attr(
-            w, len(plan.addresses))
-        module_builder.module.operation.attributes["tlx_wave.plan.num_memdescs"] = _binding_i32_attr(
-            w, len(plan.memdescs))
-        module_builder.module.operation.attributes["tlx_wave.plan.num_tokens"] = _binding_i32_attr(
-            w, len(plan.tokens))
-        with module_builder.function(kernel.name, arg_types, kernel=True, attrs=func_attrs):
+        arg_types = [_binding_type(arg.ttgir_type_obj, w) for arg in kernel.args]
+        module_builder.module.operation.attributes["waveamdmachine.target"] = (
+            w.StringAttr.get(target_triple)
+        )
+        module_builder.module.operation.attributes["tlx_wave.source_target"] = (
+            w.StringAttr.get(attrs.target)
+        )
+        module_builder.module.operation.attributes["tlx_wave.num_ctas"] = (
+            _binding_i32_attr(w, attrs.num_ctas)
+        )
+        module_builder.module.operation.attributes["tlx_wave.num_warps"] = (
+            _binding_i32_attr(w, attrs.num_warps)
+        )
+        module_builder.module.operation.attributes["tlx_wave.threads_per_warp"] = (
+            _binding_i32_attr(w, attrs.threads_per_warp)
+        )
+        module_builder.module.operation.attributes[
+            "tlx_wave.has_explicit_local_mem_access"
+        ] = _binding_bool_attr(w, attrs.has_explicit_local_mem_access)
+        module_builder.module.operation.attributes["tlx_wave.plan.kind"] = (
+            w.StringAttr.get(plan.kind)
+        )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_ops"] = (
+            _binding_i32_attr(w, len(plan.ops))
+        )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_values"] = (
+            _binding_i32_attr(w, len(plan.values))
+        )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_addresses"] = (
+            _binding_i32_attr(w, len(plan.addresses))
+        )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_memdescs"] = (
+            _binding_i32_attr(w, len(plan.memdescs))
+        )
+        module_builder.module.operation.attributes["tlx_wave.plan.num_tokens"] = (
+            _binding_i32_attr(w, len(plan.tokens))
+        )
+        with module_builder.function(
+            kernel.name, arg_types, kernel=True, attrs=func_attrs
+        ):
             pass
         return str(module_builder.module)
 
@@ -1016,7 +1076,9 @@ def _verify_wave_skeleton(wave_text, wave_opt):
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"tlx_wave generated Wave skeleton failed wave-opt verification: {detail}")
+        raise RuntimeError(
+            f"tlx_wave generated Wave skeleton failed wave-opt verification: {detail}"
+        )
 
 
 def stop_before_wave_lowering(mod, metadata, options):
@@ -1044,13 +1106,21 @@ def stop_before_wave_lowering(mod, metadata, options):
     metadata["tlx_wave_threads_per_warp"] = attrs.threads_per_warp
     metadata["tlx_wave_num_ctas"] = attrs.num_ctas
     metadata["tlx_wave_num_kernel_args"] = len(kernel.args)
-    metadata["tlx_wave_num_pointer_args"] = sum(arg.kind == "pointer" for arg in kernel.args)
-    metadata["tlx_wave_num_scalar_args"] = sum(arg.kind == "scalar" for arg in kernel.args)
+    metadata["tlx_wave_num_pointer_args"] = sum(
+        arg.kind == "pointer" for arg in kernel.args
+    )
+    metadata["tlx_wave_num_scalar_args"] = sum(
+        arg.kind == "scalar" for arg in kernel.args
+    )
     metadata["tlx_wave_plan_kind"] = plan.kind
+    metadata["tlx_wave_plan_num_ops"] = len(plan.ops)
+    metadata["tlx_wave_plan_num_values"] = len(plan.values)
     metadata["tlx_wave_plan_num_addresses"] = len(plan.addresses)
     metadata["tlx_wave_plan_num_memdescs"] = len(plan.memdescs)
     metadata["tlx_wave_plan_num_tokens"] = len(plan.tokens)
-    metadata["tlx_wave_plan_json"] = json.dumps(_bridge_plan_metadata(plan), sort_keys=True)
+    metadata["tlx_wave_plan_json"] = json.dumps(
+        _bridge_plan_metadata(plan), sort_keys=True
+    )
     wave_text, builder = _emit_wave_skeleton(kernel, attrs, plan)
     wave_opt = _wave_opt()
     _verify_wave_skeleton(wave_text, wave_opt)

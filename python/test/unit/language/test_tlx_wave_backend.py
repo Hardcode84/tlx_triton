@@ -17,7 +17,9 @@ else:
     wave_bridge = None
 
 
-pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave backend is not installed")
+pytestmark = pytest.mark.skipif(
+    "tlx_wave" not in backends, reason="tlx_wave backend is not installed"
+)
 
 GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
 
@@ -35,7 +37,7 @@ def _tlx_wave_local_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
 
-    buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    buffers = tlx.local_alloc((BLOCK_SIZE,), tl.float32, 1)
     tile = tlx.local_view(buffers, 0)
     values = tl.load(in_ptr + offs, mask=mask, other=0.0)
     tlx.local_store(tile, values)
@@ -122,11 +124,20 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
     assert compiled.metadata.tlx_wave_num_kernel_args == 3
     assert compiled.metadata.tlx_wave_num_pointer_args == 2
     assert compiled.metadata.tlx_wave_num_scalar_args == 1
-    assert compiled.metadata.tlx_wave_plan_kind == "generic"
+    assert compiled.metadata.tlx_wave_plan_kind == "ttgir_graph"
+    assert compiled.metadata.tlx_wave_plan_num_ops > 0
+    assert compiled.metadata.tlx_wave_plan_num_values > 0
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
     assert "wave" in compiled.asm
+
+    plan = json.loads(compiled.metadata.tlx_wave_plan_json)
+    assert plan["kind"] == "ttgir_graph"
+    assert plan["op_counts"]["ttg.local_alloc"] == 1
+    assert plan["op_counts"]["ttg.local_store"] == 1
+    assert plan["op_counts"]["ttg.local_load"] == 1
+    assert plan["op_counts"]["tt.store"] == 1
 
     ttgir_artifact = _asm_text(compiled, "ttgir")
     assert "tt.func" in ttgir_artifact
@@ -143,7 +154,7 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
     assert 'tlx_wave.source_target = "hip:gfx950"' in wave_artifact
     assert "tlx_wave.num_warps = 4 : i32" in wave_artifact
     assert "tlx_wave.threads_per_warp = 64 : i32" in wave_artifact
-    assert 'tlx_wave.plan.kind = "generic"' in wave_artifact
+    assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
     assert "return" in wave_artifact
     assert "tt.func public" not in wave_artifact
     assert "ttg.local_alloc" not in wave_artifact
@@ -152,8 +163,20 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
 def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     src = ASTSource(
         fn=_tlx_wave_gemm_cutoff_kernel,
-        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32", "M": "i32", "N": "i32"},
-        constexprs={"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32, "K_ITERS": 2, "NUM_BUFFERS": 2},
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*fp32",
+            "M": "i32",
+            "N": "i32",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 32,
+            "K_ITERS": 2,
+            "NUM_BUFFERS": 2,
+        },
     )
 
     compiled = triton_compile(src, target=GFX950_WAVE)
@@ -165,10 +188,10 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert compiled.metadata.tlx_wave_num_kernel_args == 5
     assert compiled.metadata.tlx_wave_num_pointer_args == 3
     assert compiled.metadata.tlx_wave_num_scalar_args == 2
-    assert compiled.metadata.tlx_wave_plan_kind == "gemm"
-    assert compiled.metadata.tlx_wave_plan_num_addresses == 5
-    assert compiled.metadata.tlx_wave_plan_num_memdescs == 6
-    assert compiled.metadata.tlx_wave_plan_num_tokens == 8
+    assert compiled.metadata.tlx_wave_plan_kind == "ttgir_graph"
+    assert compiled.metadata.tlx_wave_plan_num_addresses >= 5
+    assert compiled.metadata.tlx_wave_plan_num_memdescs >= 6
+    assert compiled.metadata.tlx_wave_plan_num_tokens >= 8
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
@@ -199,56 +222,57 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert "tlx_wave.num_scalar_args = 2 : i32" in wave_artifact
     assert "tlx_wave.wave_size = 64 : i32" in wave_artifact
     assert "tlx_wave.has_explicit_local_mem_access = true" in wave_artifact
-    assert 'tlx_wave.plan.kind = "gemm"' in wave_artifact
-    assert "tlx_wave.plan.block_m = 32 : i32" in wave_artifact
-    assert "tlx_wave.plan.block_n = 32 : i32" in wave_artifact
-    assert "tlx_wave.plan.block_k = 32 : i32" in wave_artifact
-    assert "tlx_wave.plan.ring_slots = 2 : i32" in wave_artifact
+    assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
+    assert "tlx_wave.plan.num_addresses" in wave_artifact
+    assert "tlx_wave.plan.num_memdescs" in wave_artifact
+    assert "tlx_wave.plan.num_tokens" in wave_artifact
     assert "return" in wave_artifact
     assert "tt.func public" not in wave_artifact
     assert "ttg.local_alloc" not in wave_artifact
     assert "amdg." not in wave_artifact
 
     plan = json.loads(compiled.metadata.tlx_wave_plan_json)
-    assert plan["kind"] == "gemm"
-    assert plan["block_m"] == 32
-    assert plan["block_n"] == 32
-    assert plan["block_k"] == 32
-    assert plan["ring_slots"] == 2
-    assert plan["dot_count"] == 2
-    assert plan["async_copy_count"] == 4
-    assert plan["store_count"] == 1
+    assert plan["kind"] == "ttgir_graph"
+    assert plan["op_counts"]["ttg.local_alloc"] == 2
+    assert plan["op_counts"]["ttg.memdesc_index"] == 4
+    assert plan["op_counts"]["ttg.async_copy_global_to_local"] == 4
+    assert plan["op_counts"]["ttg.async_commit_group"] == 2
+    assert plan["op_counts"]["ttg.async_wait"] == 2
+    assert plan["op_counts"]["ttg.local_load"] == 4
+    assert plan["op_counts"]["tt.dot"] == 2
+    assert plan["op_counts"]["tt.store"] == 1
 
-    addresses = plan["addresses"]
-    assert [address["role"] for address in addresses] == ["a", "b", "a", "b", "c"]
-    assert [address["ring_slot"] for address in addresses] == [0, 0, 1, 1, None]
-    assert {address["role"]: address["element_type"] for address in addresses} == {"a": "f16", "b": "f16", "c": "f32"}
-    assert all(address["shape"] == [32, 32] for address in addresses)
-    assert all(address["variability"] == "tile-varying" for address in addresses)
-    assert all(address["offset_variability"] == "tile-varying" for address in addresses)
-    assert [addresses[0]["mask_variability"], addresses[1]["mask_variability"], addresses[-1]["mask_variability"]] == [
-        "lane-varying",
-        "lane-varying",
-        "tile-varying",
+    address_ops = [address["op"] for address in plan["addresses"]]
+    assert address_ops.count("ttg.async_copy_global_to_local") == 4
+    assert address_ops.count("ttg.local_load") == 4
+    assert address_ops.count("tt.store") == 1
+    assert all("role" not in address for address in plan["addresses"])
+    assert {
+        address["element_type"]
+        for address in plan["addresses"]
+        if address["op"] == "ttg.async_copy_global_to_local"
+    } == {"f16"}
+
+    allocations = [
+        memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "allocation"
     ]
-    assert addresses[0]["mask_varying_dims"] == [0]
-    assert addresses[1]["mask_varying_dims"] == [1]
-    assert addresses[-1]["mask_varying_dims"] == [0, 1]
-
-    allocations = [memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "allocation"]
     views = [memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "view"]
     assert len(allocations) == 2
     assert len(views) == 4
     assert all(memdesc["shape"] == [2, 32, 32] for memdesc in allocations)
-    assert all(memdesc["tile_shape"] == [32, 32] for memdesc in allocations + views)
+    assert all(memdesc["alloc_shape"] == [2, 32, 32] for memdesc in allocations)
+    assert all(memdesc["shape"] == [32, 32] for memdesc in views)
     assert all(memdesc["element_type"] == "f16" for memdesc in allocations + views)
-    assert all(memdesc["storage"] == "#ttg.shared_memory" for memdesc in allocations + views)
-    assert sorted(view["slot"] for view in views) == [0, 0, 1, 1]
+    assert all(
+        memdesc["memory_space"] == "#ttg.shared_memory"
+        for memdesc in allocations + views
+    )
+    assert sorted(view["static_index"] for view in views) == [0, 0, 1, 1]
 
-    token_kinds = [token["kind"] for token in plan["tokens"]]
-    assert token_kinds.count("async_copy") == 4
-    assert token_kinds.count("commit_group") == 2
-    assert token_kinds.count("wait_group") == 2
+    token_ops = [token["op"] for token in plan["tokens"]]
+    assert token_ops.count("ttg.async_copy_global_to_local") == 4
+    assert token_ops.count("ttg.async_commit_group") == 2
+    assert token_ops.count("ttg.async_wait") == 2
 
 
 def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
@@ -290,9 +314,9 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_non_f16_gemm_operands(tmp_path):
-    bad_dot = """
-  tt.func public @bad(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) attributes {noinline = false} {
+def test_tlx_wave_bridge_records_non_f16_dot_without_gemm_rejection(tmp_path):
+    dot_func = """
+  tt.func public @dot_kernel(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) attributes {noinline = false} {
     %lhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
     %rhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
     %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
@@ -300,7 +324,15 @@ def test_tlx_wave_bridge_rejects_non_f16_gemm_operands(tmp_path):
     tt.return
   }
 """
-    mod, ctx = _parse_ttgir(tmp_path, bad_dot)
-    with pytest.raises(ValueError, match="supports only f16 GEMM operands"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+    metadata = {}
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+    assert "func.func @dot_kernel" in wave
+    plan = json.loads(metadata["tlx_wave_plan_json"])
+    assert plan["kind"] == "ttgir_graph"
+    assert plan["op_counts"]["tt.dot"] == 1
+    assert any(
+        value["producer"] == "tt.dot" and value["element_type"] == "f32"
+        for value in plan["values"]
+    )
     del ctx

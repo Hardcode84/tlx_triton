@@ -103,4 +103,4 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}:stage3-gemm-plan"
+        return f"{self.target}:stage3-ttgir-graph-plan"
