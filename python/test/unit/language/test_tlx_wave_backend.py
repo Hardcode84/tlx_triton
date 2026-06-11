@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -121,6 +122,7 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
     assert compiled.metadata.tlx_wave_num_kernel_args == 3
     assert compiled.metadata.tlx_wave_num_pointer_args == 2
     assert compiled.metadata.tlx_wave_num_scalar_args == 1
+    assert compiled.metadata.tlx_wave_plan_kind == "generic"
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
@@ -141,6 +143,7 @@ def test_tlx_wave_scaffold_emits_wave_skeleton():
     assert 'tlx_wave.source_target = "hip:gfx950"' in wave_artifact
     assert "tlx_wave.num_warps = 4 : i32" in wave_artifact
     assert "tlx_wave.threads_per_warp = 64 : i32" in wave_artifact
+    assert 'tlx_wave.plan.kind = "generic"' in wave_artifact
     assert "return" in wave_artifact
     assert "tt.func public" not in wave_artifact
     assert "ttg.local_alloc" not in wave_artifact
@@ -162,6 +165,10 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert compiled.metadata.tlx_wave_num_kernel_args == 5
     assert compiled.metadata.tlx_wave_num_pointer_args == 3
     assert compiled.metadata.tlx_wave_num_scalar_args == 2
+    assert compiled.metadata.tlx_wave_plan_kind == "gemm"
+    assert compiled.metadata.tlx_wave_plan_num_addresses == 5
+    assert compiled.metadata.tlx_wave_plan_num_memdescs == 6
+    assert compiled.metadata.tlx_wave_plan_num_tokens == 8
     assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
     assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
     assert "ttgir" in compiled.asm
@@ -192,10 +199,56 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
     assert "tlx_wave.num_scalar_args = 2 : i32" in wave_artifact
     assert "tlx_wave.wave_size = 64 : i32" in wave_artifact
     assert "tlx_wave.has_explicit_local_mem_access = true" in wave_artifact
+    assert 'tlx_wave.plan.kind = "gemm"' in wave_artifact
+    assert "tlx_wave.plan.block_m = 32 : i32" in wave_artifact
+    assert "tlx_wave.plan.block_n = 32 : i32" in wave_artifact
+    assert "tlx_wave.plan.block_k = 32 : i32" in wave_artifact
+    assert "tlx_wave.plan.ring_slots = 2 : i32" in wave_artifact
     assert "return" in wave_artifact
     assert "tt.func public" not in wave_artifact
     assert "ttg.local_alloc" not in wave_artifact
     assert "amdg." not in wave_artifact
+
+    plan = json.loads(compiled.metadata.tlx_wave_plan_json)
+    assert plan["kind"] == "gemm"
+    assert plan["block_m"] == 32
+    assert plan["block_n"] == 32
+    assert plan["block_k"] == 32
+    assert plan["ring_slots"] == 2
+    assert plan["dot_count"] == 2
+    assert plan["async_copy_count"] == 4
+    assert plan["store_count"] == 1
+
+    addresses = plan["addresses"]
+    assert [address["role"] for address in addresses] == ["a", "b", "a", "b", "c"]
+    assert [address["ring_slot"] for address in addresses] == [0, 0, 1, 1, None]
+    assert {address["role"]: address["element_type"] for address in addresses} == {"a": "f16", "b": "f16", "c": "f32"}
+    assert all(address["shape"] == [32, 32] for address in addresses)
+    assert all(address["variability"] == "tile-varying" for address in addresses)
+    assert all(address["offset_variability"] == "tile-varying" for address in addresses)
+    assert [addresses[0]["mask_variability"], addresses[1]["mask_variability"], addresses[-1]["mask_variability"]] == [
+        "lane-varying",
+        "lane-varying",
+        "tile-varying",
+    ]
+    assert addresses[0]["mask_varying_dims"] == [0]
+    assert addresses[1]["mask_varying_dims"] == [1]
+    assert addresses[-1]["mask_varying_dims"] == [0, 1]
+
+    allocations = [memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "allocation"]
+    views = [memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "view"]
+    assert len(allocations) == 2
+    assert len(views) == 4
+    assert all(memdesc["shape"] == [2, 32, 32] for memdesc in allocations)
+    assert all(memdesc["tile_shape"] == [32, 32] for memdesc in allocations + views)
+    assert all(memdesc["element_type"] == "f16" for memdesc in allocations + views)
+    assert all(memdesc["storage"] == "#ttg.shared_memory" for memdesc in allocations + views)
+    assert sorted(view["slot"] for view in views) == [0, 0, 1, 1]
+
+    token_kinds = [token["kind"] for token in plan["tokens"]]
+    assert token_kinds.count("async_copy") == 4
+    assert token_kinds.count("commit_group") == 2
+    assert token_kinds.count("wait_group") == 2
 
 
 def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
@@ -233,5 +286,21 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
 
     with pytest.raises(ValueError, match="only supports wave64"):
         mod, ctx = _parse_ttgir(tmp_path, one_func, threads_per_warp=32)
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_non_f16_gemm_operands(tmp_path):
+    bad_dot = """
+  tt.func public @bad(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) attributes {noinline = false} {
+    %lhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, bad_dot)
+    with pytest.raises(ValueError, match="supports only f16 GEMM operands"):
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
