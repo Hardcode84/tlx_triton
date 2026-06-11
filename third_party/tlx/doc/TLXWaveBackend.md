@@ -165,6 +165,28 @@ Map:
 The bridge should treat memdesc view chains as address algebra, not as opaque
 values.
 
+View lowering should be staged, not pre-flattened in Python. Each TTGIR view op
+should contribute a small symbolic transform relative to its parent:
+
+- `ttg.memdesc_index` adds a slot stride times the selected slot;
+- `ttg.memdesc_subslice` adds the subslice base offset;
+- `ttg.memdesc_trans` permutes the logical index tuple before delegating to the
+  parent;
+- `ttg.memdesc_reshape` remaps through a linearized logical element index;
+- `ttg.memdesc_reinterpret` remaps through element-byte offsets and must reject
+  incompatible element-size or alignment cases.
+
+When a local load/store/DMA use materializes the final LDS pointer, the bridge
+should emit one `wave.index_expr` for each stage and bind the previous stage's
+result into the next stage. It may also emit chained `wave.ptr_add` operations
+when that is the natural representation. The Wave pipeline's
+`wave-combine-pointer-offsets` and `wave-simplify-index-exprs` passes are then
+responsible for composing and canonicalizing the staged expressions.
+
+The bridge must still know the TTGIR semantics of each view op. The Wave passes
+can merge symbolic expressions; they cannot infer Triton view semantics from an
+opaque offset.
+
 ### Layout Requirements
 
 TLX layout constraints are high-value bridge input.
@@ -408,12 +430,14 @@ Suggested core records:
 - `ValuePlan`: maps each TTGIR SSA value to uniform scalar, lane-varying SIMD,
   vector payload, fragment, token, or memdesc view.
 - `LayoutPlan`: interprets TTGIR/TLX encodings into lane/register ownership and
-  LDS address formulas.
+  staged LDS address transforms. Layout facts should come from typed Triton
+  Python bindings or C++ layout helpers, not from parsing attribute text.
 - `MemDescPlan`: tracks allocation base, shape, element type, layout, views, and
   alias arena.
 - `TokenPlan`: tracks conservative memory dependencies and explicit async tokens.
 - `AddressExprPlan`: recovers symbolic expressions for pointer and LDS offsets,
-  then emits `wave.index_expr`.
+  then emits staged `wave.index_expr` values that the Wave canonicalization
+  pipeline can merge.
 
 The most important part is `LayoutPlan`: TTGIR tensors are distributed tensors,
 while Wave values are explicit per-wave lane values. The bridge must interpret
@@ -490,6 +514,9 @@ Success criteria:
 - Explicit padded layout is preserved for a simple TDM-compatible buffer.
 - Conflicting explicit layouts fail loudly.
 - A simple `storage_alias_spec` produces one LDS arena with correct offsets.
+- Memdesc view chains are emitted as staged `wave.index_expr` / `wave.ptr_add`
+  operations, and a test runs `wave-combine-pointer-offsets` plus
+  `wave-simplify-index-exprs` to prove the Wave pipeline can fold the stages.
 
 ### Milestone 4: TDM Descriptor POC
 
@@ -504,6 +531,8 @@ Candidate tests:
 Success criteria:
 
 - Descriptor offsets lower to structured `wave.index_expr`.
+- Descriptor and memdesc view offsets are emitted as staged expressions rather
+  than as one bridge-precomposed string.
 - The result buffer layout is represented in the LDS address plan.
 - Unsupported descriptor groups are rejected with a clear diagnostic.
 
