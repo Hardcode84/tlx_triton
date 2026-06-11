@@ -13,7 +13,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     """TLX-first AMD Wave backend scaffold.
 
     This backend deliberately reuses the HIP/TLX frontend and TTIR/TTGIR
-    conversion path, then stops before lowering TTGIR to Wave.  The eventual
+    conversion path, then emits the current Wave IR handoff artifact.  The
     TTGIR-to-Wave bridge lives in Python so it can use Wave's own Python package
     and LLVM build without linking the two MLIR worlds in-process.
     """
@@ -103,4 +103,4 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}:stage1"
+        return f"{self.target}:stage2-wave-dsl-skeleton"

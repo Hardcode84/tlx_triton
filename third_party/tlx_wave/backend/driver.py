@@ -14,9 +14,8 @@ class _TLXWaveUtils:
 
     def load_binary(self, name, kernel, shared, device):
         raise RuntimeError(
-            "tlx_wave stage-1 scaffold stopped before Wave lowering; "
-            "no executable GPU binary was produced. Inspect compiled.asm['ttgir'] "
-            "or compiled.asm['wave'] for the cutoff TTGIR handoff."
+            "tlx_wave emitted Wave IR only; no executable GPU binary was produced. "
+            "Inspect compiled.asm['ttgir'] or compiled.asm['wave'] for the current handoff."
         )
 
 
