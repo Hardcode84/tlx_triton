@@ -244,6 +244,14 @@ std::vector<int64_t> toInt64Vector(ArrayRef<int64_t> values) {
   return std::vector<int64_t>(values.begin(), values.end());
 }
 
+template <typename T> std::vector<int64_t> toInt64Vector(ArrayRef<T> values) {
+  std::vector<int64_t> result;
+  result.reserve(values.size());
+  for (T value : values)
+    result.push_back(static_cast<int64_t>(value));
+  return result;
+}
+
 py::object printAttribute(Attribute attr) {
   if (!attr)
     return py::none();
@@ -660,6 +668,84 @@ void init_triton_ir(py::module_ &m) {
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
   py::class_<Attribute>(m, "attribute")
+      .def("is_dot_operand_encoding",
+           [](Attribute &self) { return isa<ttg::DotOperandEncodingAttr>(self); })
+      .def("get_dot_operand_op_idx",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::int_(dotOp.getOpIdx());
+             return py::none();
+           })
+      .def("get_dot_operand_k_width",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::int_(dotOp.getKWidth());
+             return py::none();
+           })
+      .def("get_dot_operand_parent",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::cast(dotOp.getParent());
+             return py::none();
+           })
+      .def("is_blocked_encoding",
+           [](Attribute &self) { return isa<ttg::BlockedEncodingAttr>(self); })
+      .def("get_blocked_size_per_thread",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getSizePerThread()));
+             return py::none();
+           })
+      .def("get_blocked_threads_per_warp",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getThreadsPerWarp()));
+             return py::none();
+           })
+      .def("get_blocked_warps_per_cta",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getWarpsPerCTA()));
+             return py::none();
+           })
+      .def("get_blocked_order",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getOrder()));
+             return py::none();
+           })
+      .def("is_swizzled_shared_encoding",
+           [](Attribute &self) {
+             return isa<ttg::SwizzledSharedEncodingAttr>(self);
+           })
+      .def("get_swizzled_shared_vec",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getVec());
+             return py::none();
+           })
+      .def("get_swizzled_shared_per_phase",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getPerPhase());
+             return py::none();
+           })
+      .def("get_swizzled_shared_max_phase",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getMaxPhase());
+             return py::none();
+           })
+      .def("get_swizzled_shared_order",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                      dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+                return py::cast(toInt64Vector(swizzled.getOrder()));
+              return py::none();
+            })
       .def("__str__", [](Attribute &self) {
         std::string str;
         llvm::raw_string_ostream os(str);
@@ -792,10 +878,20 @@ void init_triton_ir(py::module_ &m) {
              if (auto intAttr = dyn_cast<IntegerAttr>(attr))
                return py::int_(intAttr.getValue().getSExtValue());
 
+             if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+               return py::float_(floatAttr.getValueAsDouble());
+
              if (auto denseAttr = dyn_cast<DenseIntElementsAttr>(attr)) {
                if (denseAttr.isSplat())
                  return py::int_(
                      denseAttr.getSplatValue<APInt>().getSExtValue());
+               return py::none();
+             }
+
+             if (auto denseAttr = dyn_cast<DenseFPElementsAttr>(attr)) {
+               if (denseAttr.isSplat())
+                 return py::float_(
+                     denseAttr.getSplatValue<APFloat>().convertToDouble());
                return py::none();
              }
 
