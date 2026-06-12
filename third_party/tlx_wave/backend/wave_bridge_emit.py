@@ -599,7 +599,7 @@ def _require_lowered_value(wave_values, value_id, kind, context):
     if lowered is None:
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
-            "has not been lowered by its producer op"
+            "has not been lowered by a preceding ordered TTGIR op"
         )
     if not isinstance(lowered, _WaveValue) or lowered.kind != kind:
         got = lowered.kind if isinstance(lowered, _WaveValue) else type(lowered).__name__
@@ -1007,6 +1007,9 @@ def _emit_async_source_ptr(builder, state, kernel, address, w, width):
         )
     address_plan = state["values"][address.address_value_id]
     dim_bindings = _linear_dim_bindings(builder, address_plan, thread, w)
+    # Async copy inputs are regular SSA values. They must have been produced by
+    # earlier ordered op lowering; this path must not recursively lower a use-def
+    # slice around the async op.
     source = _materialize_pointer_value(
         builder,
         _require_lowered_value(

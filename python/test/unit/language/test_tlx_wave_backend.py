@@ -573,6 +573,57 @@ def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_async_inputs_are_ordered_shared_values(tmp_path):
+    shared_values_func = """
+  tt.func public @shared_async_inputs(%arg0: !tt.ptr<f32>, %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %limit = tt.splat %arg1 : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %mask = arith.cmpi ult, %range, %limit : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc mask %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %loaded = tt.load %ptr, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %loaded, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, shared_values_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    address_by_op = {address.op: address for address in plan.addresses}
+
+    async_address = address_by_op["ttg.async_copy_global_to_local"]
+    load_address = address_by_op["tt.load"]
+    store_address = address_by_op["tt.store"]
+    assert (
+        async_address.address_value_id
+        == load_address.address_value_id
+        == store_address.address_value_id
+    )
+    assert (
+        async_address.mask_value_id
+        == load_address.mask_value_id
+        == store_address.mask_value_id
+    )
+
+    producer_by_result = {
+        result_id: op.index
+        for op in plan.ops
+        for result_id in op.results
+    }
+    op_index = {op.name: op.index for op in plan.ops}
+    for value_id in (async_address.address_value_id, async_address.mask_value_id):
+        producer_index = producer_by_result[value_id]
+        assert producer_index < op_index["ttg.async_copy_global_to_local"]
+        assert producer_index < op_index["tt.load"]
+        assert producer_index < op_index["tt.store"]
+
+    assert not hasattr(wave_bridge_emit, "_ensure_lowered_dependency")
+    assert not hasattr(wave_bridge_emit, "_ensure_async_copy_inputs_lowered")
+    assert not hasattr(wave_bridge_emit, "_emit_async_tokens")
+    del ctx
+
+
 def test_tlx_wave_rejects_unlowered_non_dot_data_math_in_ordered_path():
     src = ASTSource(
         fn=_tlx_wave_unrelated_i32_math_kernel,
