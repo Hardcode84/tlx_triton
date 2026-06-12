@@ -220,64 +220,18 @@ def _parse_ttgir(
     return ir.parse_mlir_module(str(path), ctx), ctx
 
 
-def test_tlx_wave_scaffold_emits_wave_skeleton():
+def test_tlx_wave_rejects_non_dot_local_memory_in_ordered_path():
     src = ASTSource(
         fn=_tlx_wave_local_kernel,
         signature={"in_ptr": "*fp32", "out_ptr": "*fp32", "n_elements": "i32"},
         constexprs={"BLOCK_SIZE": 64},
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
-
-    assert compiled.metadata.target.backend == "tlx_wave"
-    assert compiled.metadata.arch == "gfx950"
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
-    assert compiled.metadata.tlx_wave_bridge_stage == "async-copy-tokens"
-    assert compiled.metadata.tlx_wave_num_kernel_args == 3
-    assert compiled.metadata.tlx_wave_num_pointer_args == 2
-    assert compiled.metadata.tlx_wave_num_scalar_args == 1
-    assert compiled.metadata.tlx_wave_plan_kind == "ttgir_graph"
-    assert compiled.metadata.tlx_wave_plan_num_ops > 0
-    assert compiled.metadata.tlx_wave_plan_num_values > 0
-    assert compiled.metadata.shared == 256
-    assert compiled.metadata.tlx_wave_lds_size_bytes == 256
-    assert compiled.metadata.tlx_wave_num_async_copies == 0
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
-    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 0
-    assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
-    assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
-    assert "ttgir" in compiled.asm
-    assert "wave" in compiled.asm
-
-    plan = json.loads(compiled.metadata.tlx_wave_plan_json)
-    assert plan["kind"] == "ttgir_graph"
-    assert plan["op_counts"]["ttg.local_alloc"] == 1
-    assert plan["op_counts"]["ttg.local_store"] == 1
-    assert plan["op_counts"]["ttg.local_load"] == 1
-    assert plan["op_counts"]["tt.store"] == 1
-
-    ttgir_artifact = _asm_text(compiled, "ttgir")
-    assert "tt.func" in ttgir_artifact
-    assert "ttg.local_alloc" in ttgir_artifact
-
-    wave_artifact = _asm_text(compiled, "wave")
-    assert 'waveamdmachine.target = "amdgcn-amd-amdhsa--gfx950"' in wave_artifact
-    assert "func.func @_tlx_wave_local_kernel" in wave_artifact
-    assert "%arg0: !wave.ptr<#wave.global, f32>" in wave_artifact
-    assert "%arg1: !wave.ptr<#wave.global, f32>" in wave_artifact
-    assert "%arg2: i32" in wave_artifact
-    assert "wave.kernel" in wave_artifact
-    assert 'tlx_wave.bridge.stage = "async-copy-tokens"' in wave_artifact
-    assert 'tlx_wave.source_target = "hip:gfx950"' in wave_artifact
-    assert "tlx_wave.num_warps = 4 : i32" in wave_artifact
-    assert "tlx_wave.threads_per_warp = 64 : i32" in wave_artifact
-    assert "tlx_wave.lds_size_bytes = 256 : i32" in wave_artifact
-    assert "tlx_wave.emitted.async_copies = 0 : i32" in wave_artifact
-    assert "wave.lds_size = 256 : i64" in wave_artifact
-    assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
-    assert "return" in wave_artifact
-    assert "tt.func public" not in wave_artifact
-    assert "ttg.local_alloc" not in wave_artifact
+    with pytest.raises(
+        ValueError,
+        match="unsupported TTGIR op.*tt\\.load|#ttg\\.dot_op.*ttg\\.local_load",
+    ):
+        triton_compile(src, target=GFX950_WAVE)
 
 
 def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
@@ -490,27 +444,37 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     assert wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA_KIND}"') == 1
 
 
-def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8():
-    src = ASTSource(
-        fn=_tlx_wave_i8_async_kernel,
-        signature={"in_ptr": "*i8", "out_ptr": "*i8"},
-        constexprs={"BLOCK_SIZE": 64},
+def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8(tmp_path):
+    async_i8_func = """
+  tt.func public @async_i8(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["shared"] == 64
+    assert metadata["tlx_wave_lds_size_bytes"] == 64
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
+    assert metadata["tlx_wave_num_async_commit_groups"] == 1
+    assert metadata["tlx_wave_num_async_waits"] == 1
+    assert metadata["tlx_wave_num_wave_barriers"] == 1
 
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
-    assert compiled.metadata.shared == 64
-    assert compiled.metadata.tlx_wave_lds_size_bytes == 64
-    assert compiled.metadata.tlx_wave_num_async_copies == 1
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
-    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 1
-    assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
-    assert compiled.metadata.tlx_wave_num_async_waits == 1
-    assert compiled.metadata.tlx_wave_num_wave_barriers == 1
-
-    wave_artifact = _asm_text(compiled, "wave")
-    assert 'tlx_wave.bridge.stage = "async-copy-tokens"' in wave_artifact
+    assert 'tlx_wave.bridge.stage = "ttgir-op-lowering"' in wave_artifact
     assert "tlx_wave.emitted.async_copies = 1 : i32" in wave_artifact
     assert "tlx_wave.emitted.dma_load_lds = 0 : i32" in wave_artifact
     assert "tlx_wave.emitted.load_store_fallbacks = 1 : i32" in wave_artifact
@@ -522,6 +486,7 @@ def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8():
     assert "wave.wait" in wave_artifact
     assert "wave.barrier" in wave_artifact
     assert "after %" in wave_artifact
+    del ctx
 
 
 def test_tlx_wave_bridge_rejects_async_copy_other():
@@ -552,12 +517,13 @@ def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
 
     wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
 
-    assert metadata["tlx_wave_status"] == "emitted_wave_async_tokens"
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_bridge_stage"] == "ttgir-op-lowering"
     assert "wave.cmpi" in wave
     del ctx
 
 
-def test_tlx_wave_async_token_stage_ignores_unrelated_i32_data_math():
+def test_tlx_wave_rejects_unlowered_non_dot_data_math_in_ordered_path():
     src = ASTSource(
         fn=_tlx_wave_unrelated_i32_math_kernel,
         signature={
@@ -570,10 +536,8 @@ def test_tlx_wave_async_token_stage_ignores_unrelated_i32_data_math():
         constexprs={"BLOCK_SIZE": 64},
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
-
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_async_tokens"
-    assert compiled.metadata.tlx_wave_bridge_stage == "async-copy-tokens"
+    with pytest.raises(ValueError, match="unsupported TTGIR op.*tt\\.load"):
+        triton_compile(src, target=GFX950_WAVE)
 
 
 def test_tlx_wave_bridge_uses_async_copy_operand_segments_for_other(tmp_path):
@@ -626,7 +590,7 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     assert "func.func @one" in wave
     assert "%arg0: !wave.ptr<#wave.global, f32>" in wave
     assert "%arg1: i32" in wave
-    assert metadata["tlx_wave_status"] == "emitted_wave_async_tokens"
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_wave_builder"] == "wave-dsl"
     assert metadata["tlx_wave_wave_opt"].endswith("wave-opt")
     del ctx
@@ -644,6 +608,24 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     with pytest.raises(ValueError, match="only supports wave64"):
         mod, ctx = _parse_ttgir(tmp_path, one_func, threads_per_warp=32)
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_bridge_plan_recurses_into_nested_regions(tmp_path):
+    region_func = """
+  tt.func public @region_kernel(%flag: i1) attributes {noinline = false} {
+    scf.if %flag {
+      %one = arith.constant 1 : i32
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, region_func)
+
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    assert plan.op_counts["scf.if"] == 1
+    assert plan.op_counts["arith.constant"] == 1
+    assert plan.op_counts["scf.yield"] == 1
     del ctx
 
 

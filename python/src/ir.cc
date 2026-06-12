@@ -596,6 +596,16 @@ void init_triton_ir(py::module_ &m) {
       .def("get_parent_region", &Region::getParentRegion, ret::reference)
       .def("size", [](Region &self) { return self.getBlocks().size(); })
       .def("empty", &Region::empty)
+      .def(
+          "get_block",
+          [](Region &self, unsigned index) -> Block & {
+            if (index >= self.getBlocks().size())
+              throw pybind11::index_error("Region block index out of range");
+            auto it = self.begin();
+            std::advance(it, index);
+            return *it;
+          },
+          ret::reference)
       .def("id", [](Region &self) { return (uint64_t)&self; })
       .def("push_back",
            [](Region &self, Block *block) { self.push_back(block); })
@@ -618,6 +628,18 @@ void init_triton_ir(py::module_ &m) {
                                  Location loc) { self.addArgument(ty, loc); })
       .def("get_num_arguments", &Block::getNumArguments)
       .def("get_argument", &Block::getArgument)
+      .def("get_num_operations",
+           [](Block &self) { return self.getOperations().size(); })
+      .def(
+          "get_operation",
+          [](Block &self, unsigned index) -> Operation & {
+            if (index >= self.getOperations().size())
+              throw pybind11::index_error("Block operation index out of range");
+            auto it = self.begin();
+            std::advance(it, index);
+            return *it;
+          },
+          ret::reference)
       .def("dump", &Block::dump)
       .def("move_before",
            [](Block &self, Block &dst) { self.moveBefore(&dst); })

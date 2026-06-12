@@ -403,15 +403,26 @@ def _public_dicts(records):
     return result
 
 
-def _walk_ops(mod):
+def _walk_block_ops(block):
     ops = []
-
-    def visit(op):
+    for op_index in range(block.get_num_operations()):
+        op = block.get_operation(op_index)
         ops.append(op)
-        return True
-
-    mod.walk(visit)
+        for region_index in range(op.get_num_regions()):
+            ops.extend(_walk_region_ops(op.get_region(region_index)))
     return tuple(ops)
+
+
+def _walk_region_ops(region):
+    ops = []
+    for block_index in range(region.size()):
+        ops.extend(_walk_block_ops(region.get_block(block_index)))
+    return tuple(ops)
+
+
+def _walk_ops(mod, kernel):
+    fn = mod.get_function(kernel.name)
+    return _walk_region_ops(fn.get_region(0))
 
 
 def _op_results(op):
@@ -912,7 +923,7 @@ def _build_token_plans(ops, values):
 
 
 def _build_bridge_plan(mod, kernel):
-    ops = _walk_ops(mod)
+    ops = _walk_ops(mod, kernel)
     owners = _result_owner_map(ops)
     values_by_id = _build_value_plans(mod, kernel, ops)
     op_plans = _build_op_plans(ops)
@@ -1008,18 +1019,6 @@ def _async_address_by_token(plan):
     }
 
 
-def _has_local_loads_after_wait(plan):
-    seen_wait = False
-    for token in plan.tokens:
-        if token.op == "ttg.async_wait":
-            seen_wait = True
-            break
-    if not seen_wait:
-        return False
-    return any(address.op == "ttg.local_load" for address in plan.addresses)
-
-
-
 def _values_by_id(plan):
     return {value.value_id: value for value in plan.values}
 
@@ -1037,14 +1036,10 @@ def _local_load_address_by_result(plan):
 
 
 def _bridge_stage(plan):
-    if plan.op_counts.get("tt.dot", 0):
-        return "ttgir-op-lowering"
-    return "async-copy-tokens"
+    return "ttgir-op-lowering"
 
 
 def _status_for_stage(stage):
-    if stage == "async-copy-tokens":
-        return "emitted_wave_async_tokens"
     return f"emitted_wave_{stage.replace('-', '_')}"
 
 

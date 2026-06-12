@@ -20,7 +20,6 @@ from .wave_bridge_plan import (
     _async_address_by_token,
     _bridge_stage,
     _compute_lds_layout,
-    _has_local_loads_after_wait,
     _local_load_address_by_result,
     _memdesc_size_bytes,
     _memdescs_by_id,
@@ -889,120 +888,15 @@ def _emit_generic_value_op(builder, state, op, w):
     return True
 
 
-def _ensure_lowered_dependency(builder, state, value_id, w, context, visiting=None):
-    wave_values = state["wave_values"]
-    if value_id is None or value_id in wave_values:
-        return
-    if visiting is None:
-        visiting = set()
-    if value_id in visiting:
-        raise ValueError(
-            f"tlx_wave bridge found a cycle while lowering {context}: "
-            f"TTGIR value {value_id}"
-        )
-
-    op = state["op_by_result"].get(value_id)
-    if op is None:
-        raise ValueError(
-            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
-            "has no producer op"
-        )
-
-    visiting.add(value_id)
-    try:
-        for operand_id in op.operands:
-            _ensure_lowered_dependency(
-                builder,
-                state,
-                operand_id,
-                w,
-                f"{context} dependency from {op.name}",
-                visiting,
-            )
-        if not _emit_generic_value_op(builder, state, op, w):
-            raise ValueError(
-                f"tlx_wave bridge cannot lower {context}: producer op "
-                f"{op.name} for TTGIR value {value_id} is not supported"
-            )
-        if value_id not in wave_values:
-            raise ValueError(
-                f"tlx_wave bridge cannot lower {context}: producer op "
-                f"{op.name} did not produce a Wave value for TTGIR value {value_id}"
-            )
-    finally:
-        visiting.remove(value_id)
-
-
-def _ensure_async_copy_inputs_lowered(builder, state, address, w):
-    _ensure_lowered_dependency(
-        builder,
-        state,
-        address.address_value_id,
-        w,
-        "ttg.async_copy_global_to_local source",
-    )
-    _ensure_lowered_dependency(
-        builder,
-        state,
-        address.mask_value_id,
-        w,
-        "ttg.async_copy_global_to_local mask",
-    )
-
-
-def _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats):
-    address_by_token = _async_address_by_token(plan)
-    needs_shared_ready_token = _has_local_loads_after_wait(plan)
-    state = _initial_lowering_state(builder, plan, w)
-    pending_copy_tokens = []
-    committed_groups = []
-    last_order_token = None
-    ready_tokens = []
-
-    for op in plan.ops:
-        if op.name == "ttg.async_copy_global_to_local":
-            token_id = op.results[0] if op.results else None
-            address = address_by_token.get(token_id)
-            if address is None:
-                raise ValueError("tlx_wave bridge could not match async copy token")
-            if last_order_token is None:
-                last_order_token = builder.token()
-            _ensure_async_copy_inputs_lowered(builder, state, address, w)
-            last_order_token = _emit_async_copy(
-                builder,
-                state,
-                kernel,
-                address,
-                lds_layout,
-                last_order_token,
-                w,
-                attrs.threads_per_warp,
-                stats,
-            )
-            pending_copy_tokens.append(last_order_token)
-        elif op.name == "ttg.async_commit_group":
-            group = _join_tokens(builder, tuple(pending_copy_tokens), stats)
-            pending_copy_tokens.clear()
-            committed_groups.append(group)
-            last_order_token = group
-            stats.commit_groups += 1
-        elif op.name == "ttg.async_wait":
-            keep_groups = int(op.attrs.get("num", 0) or 0)
-            wait_count = max(0, len(committed_groups) - keep_groups)
-            if wait_count:
-                waited_groups = tuple(committed_groups[:wait_count])
-                wait_token = _join_tokens(builder, waited_groups, stats)
-                builder.wait(wait_token)
-                stats.waits += 1
-                committed_groups = committed_groups[wait_count:]
-                last_order_token = wait_token
-                if needs_shared_ready_token:
-                    last_order_token = builder.barrier(wait_token)
-                    stats.barriers += 1
-            ready_tokens.append(
-                last_order_token if last_order_token is not None else builder.token()
-            )
-    return tuple(ready_tokens)
+_PLANNING_ONLY_OPS = {
+    "tt.return",
+    "ttg.local_alloc",
+    "ttg.memdesc_index",
+    "ttg.memdesc_subslice",
+    "ttg.memdesc_reinterpret",
+    "ttg.memdesc_reshape",
+    "ttg.memdesc_trans",
+}
 
 
 def _fragment_type_for_dot_operand(info, w):
@@ -1630,13 +1524,22 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
             _emit_dot_op(builder, op, values, wave_values, w, stats)
         elif op.name == "tt.store":
             _emit_store_op(builder, op, state, w)
+        elif op.name in _PLANNING_ONLY_OPS:
+            continue
+        else:
+            region_note = (
+                " with nested regions"
+                if getattr(op, "get_num_regions", lambda: 0)()
+                else ""
+            )
+            raise ValueError(
+                "tlx_wave bridge cannot lower unsupported TTGIR op in unified "
+                f"body lowering: {op.name}{region_note}"
+            )
 
 
 def _emit_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
-    if plan.op_counts.get("tt.dot", 0):
-        _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats)
-    else:
-        _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats)
+    _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats)
 
 
 
