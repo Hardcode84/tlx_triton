@@ -275,22 +275,30 @@ Map:
 This should be a later milestone after global memory, LDS, and token mappings
 work.
 
-## Async GEMM Bridge Requirements
+## Generic TTGIR-To-Wave Converter Requirements
 
-The stage-1 async GEMM probe reaches the `wave` handoff with the structure the
-bridge should consume directly:
+The bridge must be a faithful converter for the supported TTGIR subset, not a
+GEMM recognizer. Async GEMM is the first integration workload because it touches
+local memory, async tokens, layouts, fragments, MMA, and stores, but the bridge
+architecture should be organized around TTGIR op semantics and SSA values.
 
-- `ttg.local_alloc` for A and B LDS ring buffers;
-- `ttg.memdesc_index` / `ttg.memdesc_subview`-style views from `tlx.local_view`;
-- `ttg.async_copy_global_to_local` for global-to-LDS movement;
-- `ttg.async_commit_group` grouping A/B copy tokens;
-- `ttg.async_wait {num = ...}` before consuming LDS tiles;
-- `ttg.local_load` from LDS into dot operand encodings;
-- `tt.dot` over `#ttg.dot_op` operands;
-- ordinary `tt.store` for the C tile;
-- no `amdg.*` operations yet.
+The converter should consume cutoff TTGIR directly:
 
-The first Python bridge for async GEMM needs the following pieces.
+- scalar and tensor arithmetic that produces addresses, masks, loop indices, and
+  tile values;
+- `ttg.local_alloc` plus `ttg.memdesc_*` view operations;
+- `ttg.async_copy_global_to_local`, `ttg.async_commit_group`, and
+  `ttg.async_wait`;
+- `ttg.local_load` and `ttg.local_store`;
+- `ttg.convert_layout` and other layout-changing ops;
+- `tt.dot` and later `tt.dot_scaled`;
+- ordinary `tt.load` / `tt.store`;
+- no `amdg.*` operations.
+
+The converter should maintain a typed Wave value for each TTGIR SSA value it
+lowers. Pattern-level summaries such as `GemmLoopStatePlan` are useful only as
+debug metadata derived from the generic SSA lowering, not as required lowering
+inputs.
 
 ### 1. Module And Function Skeleton
 
@@ -308,21 +316,23 @@ The first Python bridge for async GEMM needs the following pieces.
 - Classify each expression as uniform, lane-varying, or tile-varying.
 - Preserve masks from pointer bounds checks and carry them into `wave.where`,
   predicated `wave.load`, or predicated DMA operations.
-- For GEMM, recover the affine forms for:
-  - A global addresses: `pid_m`, `offs_m`, `offs_k`, `stride_am`, `stride_ak`;
-  - B global addresses: `pid_n`, `offs_k`, `offs_n`, `stride_bk`, `stride_bn`;
-  - C global addresses: `offs_m`, `offs_n`, `stride_cm`, `stride_cn`.
+- Recover address and mask expressions by lowering the SSA producer graph for
+  each pointer or predicate value. The lowering may initially support only a
+  small op subset, but it should be expressed as op semantics, not as named
+  GEMM A/B/C formulas.
+- Reuse the same expression lowering for global loads, global stores, async
+  copy sources, LDS offsets, and masks.
 
 ### 3. LDS Allocation And Memdesc Views
 
 - Build an LDS allocation plan from each `ttg.local_alloc`.
-- Support the first async GEMM shape:
+- Support the first local-memory shape family:
   - SMEM only;
-  - static rank-2 tile shape plus leading ring-buffer dimension;
-  - static element type;
+  - static element type and shape;
+  - optional leading ring-buffer dimension;
   - no storage alias overlap initially.
-- Map `tlx.local_view` / memdesc index operations to `(allocation, slot,
-  logical_offset)` records instead of emitting Wave ops immediately.
+- Map `tlx.local_view` / memdesc view operations to staged address transforms
+  rather than to a single flattened Python-computed offset.
 - Emit final LDS bases and offsets when a local load/store/DMA use needs a
   concrete shared-memory pointer.
 
@@ -345,7 +355,7 @@ The first Python bridge for async GEMM needs the following pieces.
 
 ### 5. Local Loads And Dot Operands
 
-- Translate `ttg.local_load` from an A/B memdesc view into Wave shared loads.
+- Translate `ttg.local_load` from a memdesc view into Wave shared loads.
 - Interpret the result encoding, especially `#ttg.dot_op<{opIdx = 0|1,
   parent = ...}>`, as an MMA operand layout requirement.
 - Pack loaded values into the fragment representation expected by WaveAMD, for
@@ -366,32 +376,48 @@ The first Python bridge for async GEMM needs the following pieces.
 - Keep `tt.dot_scaled` and custom `tiles_per_warp` support out of the first
   async GEMM bridge unless needed by the chosen test kernel.
 
-### 7. Loop And Pipeline State
+### 7. Control, Pipeline, And Token State
 
-- Support the simple double-buffered pattern first:
-  - static ring-buffer slot selection via `%k % NUM_BUFFERS`;
-  - prefetch copy into the next slot;
-  - wait;
-  - load next A/B operands;
-  - dot into the carried accumulator.
-- Represent loop-carried values explicitly in bridge state:
-  - accumulator fragment;
-  - current A/B operand fragments;
-  - outstanding async token groups;
-  - current ring-buffer slot.
-- Do not rely on AMD pipeline passes. The bridge owns the token and slot model
-  once it branches before AMD lowering.
+- Represent control flow using the TTGIR/SCF op structure. A double-buffered
+  GEMM loop should fall out of generic handling for loop-carried SSA values,
+  token groups, and memdesc view indices.
+- Track memory tokens as first-class values. Async waits, barriers, local
+  stores, local loads with token operands, and global stores should all consume
+  and produce explicit Wave tokens where Wave requires ordering.
+- Ring-buffer slots are ordinary SSA/index expressions feeding memdesc view
+  operations. They should not require a GEMM-specific side table.
+- Do not rely on AMD pipeline passes. The bridge owns token and memdesc-view
+  semantics once it branches before AMD lowering.
 
-### 8. Output Store
+### 8. Generic Stores
 
-- Convert the final accumulator cast and `tt.store` to Wave global stores.
-- Preserve the C tile mask.
-- Keep stores ordered after the final MMA token dependencies, even if the Wave
-  arithmetic ops themselves are not token-producing.
+- Lower `tt.store` from its pointer, value, and optional mask operands, using
+  the same address and mask expression lowering used for loads.
+- Choose the store representation from the lowered Wave value type:
+  - SIMD scalar/vector values use `wave.store`;
+  - fragment values use `waveamd.fragment_unpack` plus `wave.store` or
+    `wave.fragment_store` when the target layout is supported;
+  - unsupported layout conversions fail before store emission.
+- Preserve store masks with `wave.where`.
+- Keep stores ordered after relevant memory dependencies. Arithmetic-only Wave
+  values do not produce tokens, so the converter should thread the latest
+  memory token conservatively until a more precise dependency model is added.
+
+### Rejected Prototype Shape
+
+Do not build the bridge around a GEMM-specific recognizer. In particular:
+
+- do not introduce lowering-required records named around GEMM loop state;
+- do not infer the bridge stage from the presence of `tt.dot` plus `tt.store`;
+- do not lower `tt.store` only when its source is a final GEMM accumulator;
+- do not reconstruct A/B/C formulas by name. Lower the underlying SSA graph
+  instead;
+- do not accept a layout merely because the current GEMM fixture happens to use
+  it. Layout validation must be explicit and tied to the Wave value emitted.
 
 ### Initial Unsupported Cases
 
-The first async GEMM bridge should reject these explicitly:
+The first converter should reject these explicitly:
 
 - TDM descriptor loads and stores;
 - dynamic tile shapes or dynamic LDS allocation sizes;
@@ -405,8 +431,10 @@ The first async GEMM bridge should reject these explicitly:
 
 ### Suggested First Acceptance Test
 
-Use the async double-buffer GEMM probe as the first bridge test. It should lower
-from cutoff TTGIR containing:
+Use the async double-buffer GEMM probe as the first integration test, but pair it
+with smaller TTGIR op-level tests for address expressions, masks, token
+threading, local loads, dot, and stores. The GEMM probe should lower from cutoff
+TTGIR containing:
 
 - two `ttg.local_alloc` ops;
 - four `ttg.async_copy_global_to_local` ops;
@@ -414,11 +442,13 @@ from cutoff TTGIR containing:
 - two `ttg.async_wait` ops;
 - four `ttg.local_load` ops;
 - two `tt.dot` ops;
+- one `tt.store` op;
 - zero `amdg.*` ops.
 
 The first passing criterion should be `wave-opt` acceptance of the emitted
-Wave/WaveAMD textual MLIR. Runtime correctness can follow once Wave lowering and
-HSACO loading are wired into the Triton backend.
+Wave/WaveAMD textual MLIR. That emitted MLIR must come from generic TTGIR op
+lowering. Runtime correctness can follow once Wave lowering and HSACO loading
+are wired into the Triton backend.
 
 ## Data Model In The Bridge
 
@@ -429,6 +459,9 @@ Suggested core records:
 
 - `ValuePlan`: maps each TTGIR SSA value to uniform scalar, lane-varying SIMD,
   vector payload, fragment, token, or memdesc view.
+- `WaveValue`: records the Wave SSA value or values produced for a TTGIR SSA
+  value, including its representation kind. Store and dot lowering should branch
+  on this representation rather than on kernel-level patterns.
 - `LayoutPlan`: interprets TTGIR/TLX encodings into lane/register ownership and
   staged LDS address transforms. Layout facts should come from typed Triton
   Python bindings or C++ layout helpers, not from parsing attribute text.
@@ -438,6 +471,10 @@ Suggested core records:
 - `AddressExprPlan`: recovers symbolic expressions for pointer and LDS offsets,
   then emits staged `wave.index_expr` values that the Wave canonicalization
   pipeline can merge.
+- `OpLoweringState`: owns the mapping from TTGIR SSA values to `WaveValue`,
+  token values, and control-flow scope state while lowering operations in order.
+  This is where loop-carried values are represented; it should not be specialized
+  as GEMM loop state.
 
 The most important part is `LayoutPlan`: TTGIR tensors are distributed tensors,
 while Wave values are explicit per-wave lane values. The bridge must interpret
