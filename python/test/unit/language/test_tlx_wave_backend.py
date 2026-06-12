@@ -263,6 +263,85 @@ def test_tlx_wave_lowers_non_dot_local_memory_roundtrip(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_static_memdesc_index_as_staged_transform(tmp_path):
+    local_func = """
+  tt.func public @static_view(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %slot = arith.constant 1 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %ptr : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %view = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<2x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    ttg.local_store %loaded, %view : tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %view : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["shared"] == 512
+    assert "wave.lds_size = 512 : i64" in wave_artifact
+    assert wave_artifact.count("wave.index_expr") >= 4
+    assert wave_artifact.count("wave.ptr_add") >= 4
+    del ctx
+
+
+def test_tlx_wave_lowers_dynamic_memdesc_index_as_ssa_transform(tmp_path):
+    local_func = """
+  tt.func public @dynamic_view(%arg0: !tt.ptr<f32>, %slot: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %ptr : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %view = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<2x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    ttg.local_store %loaded, %view : tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %view : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    view = next(memdesc for memdesc in plan.memdescs if memdesc.kind == "view")
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert view.view_op == "ttg.memdesc_index"
+    assert view.static_index is None
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["shared"] == 512
+    assert "wave.index_cast" in wave_artifact
+    assert wave_artifact.count("wave.index_expr") >= 4
+    assert wave_artifact.count("wave.ptr_add") >= 4
+    del ctx
+
+
+def test_tlx_wave_rejects_unsupported_memdesc_subslice_view(tmp_path):
+    local_func = """
+  tt.func public @subslice_view() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %view = ttg.memdesc_subslice %alloc [0, 0] : !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64>
+    %out = ttg.local_load %view : !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64> -> tensor<8x32xf32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(ValueError, match="unsupported memdesc view ttg\\.memdesc_subslice"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
 def test_tlx_wave_rejects_generic_tensor_layout_with_partial_coverage(tmp_path):
     partial_layout_func = """
   tt.func public @partial_layout(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
@@ -536,6 +615,42 @@ def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8(tmp_path):
     assert "wave.wait" in wave_artifact
     assert "wave.barrier" in wave_artifact
     assert "after %" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_fallback_for_unaligned_f16_view(tmp_path):
+    async_f16_view_func = """
+  tt.func public @async_f16_view(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
+    %slot = arith.constant 1 : i32
+    %limit = arith.constant 1 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x1xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %view = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<2x1xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 1 : i32, start = 0 : i32} : tensor<1xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<1x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<1xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %limit_splat = tt.splat %limit : i32 -> tensor<1xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %mask = arith.cmpi ult, %range, %limit_splat : tensor<1xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %view mask %mask : tensor<1x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <1xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_f16_view_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["shared"] == 16
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "waveamd.dma_load_lds" not in wave_artifact
     del ctx
 
 

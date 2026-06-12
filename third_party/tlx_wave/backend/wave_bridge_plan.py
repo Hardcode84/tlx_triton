@@ -1054,7 +1054,6 @@ def _memdesc_size_bytes(memdesc):
 
 def _compute_lds_layout(plan):
     offsets = {}
-    memdescs = {memdesc.value_id: memdesc for memdesc in plan.memdescs}
     cursor = 0
 
     for memdesc in plan.memdescs:
@@ -1064,28 +1063,7 @@ def _compute_lds_layout(plan):
         offsets[memdesc.value_id] = cursor
         cursor += _memdesc_size_bytes(memdesc)
 
-    def assign_view(memdesc):
-        if memdesc.value_id in offsets:
-            return offsets[memdesc.value_id]
-        if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
-            raise ValueError(
-                f"tlx_wave bridge cannot place LDS view {memdesc.name or memdesc.source} "
-                "without a known base memdesc"
-            )
-        base = memdescs[memdesc.base_value_id]
-        offset = assign_view(base)
-        if memdesc.view_op == "ttg.memdesc_index" and memdesc.static_index is not None:
-            offset += memdesc.static_index * _memdesc_size_bytes(memdesc)
-        offsets[memdesc.value_id] = offset
-        return offset
-
-    high_watermark = cursor
-    for memdesc in plan.memdescs:
-        if memdesc.kind == "view":
-            offset = assign_view(memdesc)
-            high_watermark = max(high_watermark, offset + _memdesc_size_bytes(memdesc))
-
-    return _LdsLayout(_align_to(high_watermark, 16), offsets)
+    return _LdsLayout(_align_to(cursor, 16), offsets)
 
 
 

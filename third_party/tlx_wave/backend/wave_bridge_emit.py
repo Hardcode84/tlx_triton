@@ -21,7 +21,6 @@ from .wave_bridge_plan import (
     _bridge_stage,
     _compute_lds_layout,
     _local_load_address_by_result,
-    _memdesc_size_bytes,
     _memdescs_by_id,
     _target_triple,
     _values_by_id,
@@ -509,14 +508,196 @@ def _linearized_tensor_offset(builder, shape, dim_bindings, w):
     return builder.index_expr(offset, dim_bindings)
 
 
-def _emit_memdesc_ptr(builder, memdesc, lds_layout, dim_bindings, width, w, context):
-    if memdesc.value_id not in lds_layout.offsets:
+def _memdesc_logical_size_bytes(memdesc):
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot size LDS memdesc {memdesc.name or memdesc.source} "
+            f"with element type {memdesc.element_type}"
+        )
+    return _product(memdesc.shape) * memdesc.element_byte_width
+
+
+def _unsupported_memdesc_view(context, memdesc):
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported memdesc view "
+        f"{memdesc.view_op}; view value={memdesc.value_id}, "
+        f"encoding={memdesc.encoding}"
+    )
+
+
+def _emit_memdesc_index_offset(
+    builder,
+    memdesc,
+    state,
+    pointer_element_bytes,
+    w,
+    context,
+):
+    if pointer_element_bytes is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_index view has "
+            f"unknown element byte width for {memdesc.element_type}"
+        )
+    view_bytes = _memdesc_logical_size_bytes(memdesc)
+    if memdesc.static_index is not None:
+        byte_offset = memdesc.static_index * view_bytes
+        if byte_offset % pointer_element_bytes:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_index byte "
+                f"offset {byte_offset} is not aligned to pointer element size "
+                f"{pointer_element_bytes}"
+            )
+        return builder.index_expr(w.sym_ctx.int_(byte_offset // pointer_element_bytes))
+    if view_bytes % pointer_element_bytes:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_index view size "
+            f"{view_bytes} is not aligned to pointer element size "
+            f"{pointer_element_bytes}"
+        )
+    stride = view_bytes // pointer_element_bytes
+    if len(memdesc.view_operands) < 2:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_index view "
+            "does not record an index operand"
+        )
+    slot = _materialize_index_value(
+        builder,
+        _require_lowered_value(
+            state["wave_values"],
+            memdesc.view_operands[1],
+            "index_expr",
+            f"{context} memdesc_index slot",
+        ),
+        {},
+        w,
+    )
+    slot_sym = w.sym(f"tlx_memdesc_{memdesc.value_id}_slot")
+    return builder.index_expr(slot_sym * stride, {slot_sym: slot})
+
+
+def _emit_memdesc_base_ptr(
+    builder,
+    memdesc,
+    memdescs,
+    lds_layout,
+    state,
+    pointer_element_type,
+    pointer_element_bytes,
+    w,
+    context,
+):
+    if memdesc.kind == "allocation":
+        if memdesc.value_id not in lds_layout.offsets:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: no LDS placement for "
+                f"memdesc {memdesc.value_id}"
+            )
+        return builder.lds_base(
+            pointer_element_type,
+            offset=lds_layout.offsets[memdesc.value_id],
+        )
+
+    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc view "
+            f"{memdesc.value_id} has no known base"
+        )
+    if memdesc.view_op != "ttg.memdesc_index":
+        _unsupported_memdesc_view(context, memdesc)
+
+    base = _emit_memdesc_base_ptr(
+        builder,
+        memdescs[memdesc.base_value_id],
+        memdescs,
+        lds_layout,
+        state,
+        pointer_element_type,
+        pointer_element_bytes,
+        w,
+        context,
+    )
+    return builder.ptr_add(
+        base,
+        _emit_memdesc_index_offset(
+            builder,
+            memdesc,
+            state,
+            pointer_element_bytes,
+            w,
+            context,
+        ),
+    )
+
+
+def _memdesc_base_is_aligned(
+    memdesc,
+    memdescs,
+    lds_layout,
+    pointer_element_bytes,
+    context,
+):
+    if pointer_element_bytes is None:
+        return False
+    if memdesc.kind == "allocation":
+        if memdesc.value_id not in lds_layout.offsets:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: no LDS placement for "
+                f"memdesc {memdesc.value_id}"
+            )
+        return lds_layout.offsets[memdesc.value_id] % pointer_element_bytes == 0
+
+    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc view "
+            f"{memdesc.value_id} has no known base"
+        )
+    if memdesc.view_op != "ttg.memdesc_index":
+        _unsupported_memdesc_view(context, memdesc)
+    if not _memdesc_base_is_aligned(
+        memdescs[memdesc.base_value_id],
+        memdescs,
+        lds_layout,
+        pointer_element_bytes,
+        context,
+    ):
+        return False
+
+    view_bytes = _memdesc_logical_size_bytes(memdesc)
+    if memdesc.static_index is not None:
+        return (memdesc.static_index * view_bytes) % pointer_element_bytes == 0
+    return view_bytes % pointer_element_bytes == 0
+
+
+def _emit_memdesc_ptr(
+    builder,
+    memdesc,
+    memdescs,
+    lds_layout,
+    state,
+    dim_bindings,
+    width,
+    w,
+    context,
+):
+    if memdesc.kind == "view" and memdesc.view_op != "ttg.memdesc_index":
+        _unsupported_memdesc_view(context, memdesc)
+    if memdesc.value_id not in lds_layout.offsets and memdesc.kind == "allocation":
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: no LDS placement for "
             f"memdesc {memdesc.value_id}"
         )
     element_type = _wave_element_type(memdesc.element_type, w, context)
-    base = builder.lds_base(element_type, offset=lds_layout.offsets[memdesc.value_id])
+    base = _emit_memdesc_base_ptr(
+        builder,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        element_type,
+        memdesc.element_byte_width,
+        w,
+        context,
+    )
     offset = _linearized_tensor_offset(builder, memdesc.shape, dim_bindings, w)
     return builder.ptr_add(
         base,
@@ -1094,16 +1275,24 @@ def _source_pointee_type(kernel, address):
     return pointee_type
 
 
-def _dma_packet_bytes(address, lds_offset):
+def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     if address.element_byte_width is None:
         return None
-    if lds_offset % 4 != 0:
-        return None
     if address.element_byte_width in (2, 4):
-        return 4
-    if address.element_byte_width == 16:
-        return 16
-    return None
+        packet_bytes = 4
+    elif address.element_byte_width == 16:
+        packet_bytes = 16
+    else:
+        return None
+    if not _memdesc_base_is_aligned(
+        memdesc,
+        memdescs,
+        lds_layout,
+        4,
+        "ttg.async_copy_global_to_local destination",
+    ):
+        return None
+    return packet_bytes
 
 
 def _emit_async_source_ptr(builder, state, kernel, address, w, width):
@@ -1139,9 +1328,11 @@ def _emit_async_copy(
 ):
     if address.memdesc_value_id is None:
         raise ValueError("tlx_wave bridge cannot lower async copy without LDS memdesc")
-    if address.memdesc_value_id not in lds_layout.offsets:
+    memdescs = state["memdescs"]
+    if address.memdesc_value_id not in memdescs:
         raise ValueError(
-            f"tlx_wave bridge has no LDS placement for memdesc {address.memdesc_value_id}"
+            "tlx_wave bridge cannot lower async copy: unknown LDS memdesc "
+            f"{address.memdesc_value_id}"
         )
     if address.other_value_id is not None:
         raise ValueError(
@@ -1150,7 +1341,7 @@ def _emit_async_copy(
             "LDS lanes undefined"
         )
 
-    lds_offset = lds_layout.offsets[address.memdesc_value_id]
+    memdesc = memdescs[address.memdesc_value_id]
     source, lane, element_type, dim_bindings = _emit_async_source_ptr(
         builder, state, kernel, address, w, width
     )
@@ -1170,17 +1361,37 @@ def _emit_async_copy(
         if address.mask_value_id is not None
         else None
     )
-    dma_bytes = _dma_packet_bytes(address, lds_offset)
+    dma_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
     stats.async_copies += 1
 
     def emit_copy(copy_after):
         if dma_bytes is not None:
-            destination = builder.lds_base(w.i32(), offset=lds_offset)
+            destination = _emit_memdesc_base_ptr(
+                builder,
+                memdesc,
+                memdescs,
+                lds_layout,
+                state,
+                w.i32(),
+                4,
+                w,
+                "ttg.async_copy_global_to_local destination",
+            )
             return builder.dma_load_lds(
                 source, destination, after=copy_after, bytes=dma_bytes
             )
 
-        destination_base = builder.lds_base(element_type, offset=lds_offset)
+        destination_base = _emit_memdesc_base_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            element_type,
+            address.element_byte_width,
+            w,
+            "ttg.async_copy_global_to_local destination",
+        )
         destination = builder.ptr_add(
             destination_base,
             lane,
@@ -1217,6 +1428,7 @@ def _initial_lowering_state(builder, plan, w):
     values = _values_by_id(plan)
     state = {
         "values": values,
+        "memdescs": _memdescs_by_id(plan),
         "op_by_result": _op_by_result_id(plan),
         "wave_values": {},
         "program_id_bindings": {},
@@ -1361,31 +1573,21 @@ def _validate_dot_local_load(value, memdesc, info):
     _validate_supported_dot_local_load_layout(value, memdesc, info)
 
 
-def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, w):
-    if memdesc.kind == "allocation":
-        if memdesc.value_id not in lds_layout.offsets:
-            _unsupported_local_load(value, "allocation has no LDS placement", memdesc)
-        return builder.lds_base(w.i32(), offset=lds_layout.offsets[memdesc.value_id])
-
-    if memdesc.view_op != "ttg.memdesc_index" or memdesc.static_index is None:
-        _unsupported_local_load(
-            value, f"unsupported memdesc view {memdesc.view_op}", memdesc
+def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, w):
+    try:
+        return _emit_memdesc_base_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            w.i32(),
+            4,
+            w,
+            "ttg.local_load",
         )
-    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
-        _unsupported_local_load(value, "memdesc view has no known base", memdesc)
-
-    base_ptr = _emit_memdesc_i32_ptr(
-        builder, value, memdescs[memdesc.base_value_id], memdescs, lds_layout, w
-    )
-    slot_bytes = _memdesc_size_bytes(memdesc)
-    if slot_bytes % 4:
-        _unsupported_local_load(
-            value, f"memdesc view size {slot_bytes} is not dword aligned", memdesc
-        )
-    view_offset = builder.index_expr(
-        w.sym_ctx.int_(memdesc.static_index * (slot_bytes // 4))
-    )
-    return builder.ptr_add(base_ptr, view_offset)
+    except ValueError as exc:
+        _unsupported_local_load(value, str(exc), memdesc)
 
 
 def _emit_local_load_fragment(
@@ -1396,15 +1598,12 @@ def _emit_local_load_fragment(
     memdescs,
     info,
     lds_layout,
+    state,
     after_token,
     w,
     stats,
 ):
     _validate_dot_local_load(value, memdesc, info)
-    if address.memdesc_value_id not in lds_layout.offsets:
-        raise ValueError(
-            f"tlx_wave bridge has no LDS placement for memdesc {address.memdesc_value_id}"
-        )
 
     lane = builder.lane_id(width=_GFX950_MMA_WAVE)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane")
@@ -1412,7 +1611,9 @@ def _emit_local_load_fragment(
         lane_sym * _GFX950_MMA_REGS,
         {lane_sym: lane},
     )
-    base = _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, w)
+    base = _emit_memdesc_i32_ptr(
+        builder, value, memdesc, memdescs, lds_layout, state, w
+    )
     ptr = builder.ptr_add(
         base,
         lane_offset,
@@ -1837,7 +2038,9 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
     ptr = _emit_memdesc_ptr(
         builder,
         memdesc,
+        memdescs,
         lds_layout,
+        state,
         dim_bindings,
         width,
         w,
@@ -1869,7 +2072,9 @@ def _emit_generic_local_load(
     address,
     value,
     memdesc,
+    memdescs,
     lds_layout,
+    state,
     after_token,
     w,
     stats,
@@ -1881,7 +2086,9 @@ def _emit_generic_local_load(
     ptr = _emit_memdesc_ptr(
         builder,
         memdesc,
+        memdescs,
         lds_layout,
+        state,
         dim_bindings,
         width,
         w,
@@ -2084,6 +2291,7 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                     memdescs,
                     info,
                     lds_layout,
+                    state,
                     after,
                     w,
                     stats,
@@ -2095,7 +2303,9 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                     address,
                     value,
                     memdesc,
+                    memdescs,
                     lds_layout,
+                    state,
                     after,
                     w,
                     stats,
