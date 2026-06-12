@@ -28,6 +28,16 @@ from .wave_bridge_plan import (
 )
 
 
+_WAVE_TOOL_NAMES = (
+    "wave-calibrate-report",
+    "wave-opt",
+    "wave-sim-report",
+    "wave-symbols-test",
+    "wave-translate",
+    "wavec",
+)
+
+
 @dataclass(frozen=True)
 class _WaveValue:
     kind: str
@@ -2150,13 +2160,23 @@ def _candidate_wave_python_paths():
         yield wave_build_dir / "python_packages" / "wave_mlir"
 
 
-def _candidate_wave_opt_paths():
-    override = os.environ.get("TRITON_WAVE_OPT")
+def _candidate_wave_tool_paths(tool_name, override=None):
     if override:
         yield Path(override)
 
+    tools_dir = os.environ.get("TRITON_WAVE_TOOLS_DIR")
+    if tools_dir:
+        yield Path(tools_dir) / tool_name
+
     for wave_build_dir in _wave_build_dirs():
-        yield wave_build_dir / "bin" / "wave-opt"
+        yield wave_build_dir / "bin" / tool_name
+
+
+def _candidate_wave_opt_paths():
+    yield from _candidate_wave_tool_paths(
+        "wave-opt",
+        override=os.environ.get("TRITON_WAVE_OPT"),
+    )
 
 
 def _existing_paths(candidates):
@@ -2190,16 +2210,23 @@ def _load_wave_dsl():
     return w
 
 
-def _wave_opt():
-    for path in _existing_paths(_candidate_wave_opt_paths()):
+def _wave_tool(tool_name, override_env=None):
+    override = os.environ.get(override_env) if override_env else None
+    for path in _existing_paths(_candidate_wave_tool_paths(tool_name, override)):
         if os.access(path, os.X_OK):
             return str(path)
-    candidates = "\n  ".join(str(path) for path in _candidate_wave_opt_paths())
-    raise RuntimeError(
-        "tlx_wave requires wave-opt from the third_party/wave submodule build. "
-        "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave so the Wave tools are built. "
-        f"Checked wave-opt candidates:\n  {candidates}"
+    candidates = "\n  ".join(
+        str(path) for path in _candidate_wave_tool_paths(tool_name, override)
     )
+    raise RuntimeError(
+        f"tlx_wave requires {tool_name} from the third_party/wave submodule build. "
+        "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave so the Wave tools are built. "
+        f"Checked {tool_name} candidates:\n  {candidates}"
+    )
+
+
+def _wave_opt():
+    return _wave_tool("wave-opt", override_env="TRITON_WAVE_OPT")
 
 
 def _binding_type(ttgir_type, w):

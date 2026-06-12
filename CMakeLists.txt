@@ -48,6 +48,68 @@ if(NOT TRITON_CACHE_PATH)
   message(FATAL_ERROR "TRITON_CACHE_PATH must be set or derivable from TRITON_HOME/HOME/USERPROFILE/HOMEPATH.")
 endif()
 
+set(TLX_WAVE_AUTO_BUILD_LLVM ON CACHE BOOL
+  "Run the Wave LLVM builder when tlx_wave cannot find MLIR Python bindings.")
+
+function(triton_tlx_wave_mlir_has_python_bindings LLVM_INSTALL_DIR OUT_VAR)
+  set(_mlir_config "${LLVM_INSTALL_DIR}/lib/cmake/mlir/MLIRConfig.cmake")
+  if(EXISTS "${_mlir_config}")
+    file(STRINGS "${_mlir_config}" _mlir_python_bindings
+      REGEX "set\\(MLIR_ENABLE_BINDINGS_PYTHON[ \t]+\"?ON\"?\\)")
+    if(_mlir_python_bindings)
+      set(${OUT_VAR} TRUE PARENT_SCOPE)
+      return()
+    endif()
+  endif()
+  set(${OUT_VAR} FALSE PARENT_SCOPE)
+endfunction()
+
+if("tlx_wave" IN_LIST TRITON_CODEGEN_BACKENDS)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wave/build_tools/build_llvm.py")
+    message(FATAL_ERROR
+      "tlx_wave requires the third_party/wave submodule. "
+      "Run `git submodule update --init --recursive third_party/wave`.")
+  endif()
+
+  if(NOT "${LLVM_SYSPATH}" STREQUAL "")
+    triton_tlx_wave_mlir_has_python_bindings("${LLVM_SYSPATH}" _tlx_wave_syspath_has_mlir_python)
+    if(NOT _tlx_wave_syspath_has_mlir_python)
+      message(FATAL_ERROR
+        "tlx_wave requires LLVM_SYSPATH='${LLVM_SYSPATH}' to have "
+        "MLIR_ENABLE_BINDINGS_PYTHON=ON. Run "
+        "`python third_party/wave/build_tools/build_llvm.py --python-bindings` "
+        "or point LLVM_SYSPATH at a compatible LLVM/MLIR install.")
+    endif()
+  else()
+    set(_tlx_wave_llvm_install "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wave/build/llvm-install")
+    triton_tlx_wave_mlir_has_python_bindings("${_tlx_wave_llvm_install}" _tlx_wave_local_has_mlir_python)
+    if(NOT _tlx_wave_local_has_mlir_python)
+      if(TRITON_OFFLINE_BUILD)
+        message(FATAL_ERROR
+          "tlx_wave requires an LLVM/MLIR install with MLIR Python bindings. "
+          "Run `python third_party/wave/build_tools/build_llvm.py --python-bindings` "
+          "or set LLVM_SYSPATH to a compatible install before configuring offline.")
+      endif()
+      find_package(Python3 REQUIRED COMPONENTS Interpreter)
+      set(_tlx_wave_build_llvm_args
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wave/build_tools/build_llvm.py"
+        "--python-bindings")
+      if(DEFINED ENV{MAX_JOBS} AND NOT "$ENV{MAX_JOBS}" STREQUAL "")
+        list(APPEND _tlx_wave_build_llvm_args "--jobs" "$ENV{MAX_JOBS}")
+      endif()
+      execute_process(
+        COMMAND
+          "${CMAKE_COMMAND}" -E env "LLVM_INSTALL_DIR="
+          ${_tlx_wave_build_llvm_args}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+    set(LLVM_SYSPATH "${_tlx_wave_llvm_install}" CACHE PATH
+      "Path to system LLVM installation" FORCE)
+  endif()
+endif()
+
 set(TRITON_BUILD_HELPER_COMMON_ARGS --triton-cache-path "${TRITON_CACHE_PATH}")
 if("${TRITON_OFFLINE_BUILD}")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-offline-build)

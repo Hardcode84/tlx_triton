@@ -126,16 +126,82 @@ class BackendInstaller:
         ]
 
 
-def prepare_third_party_submodule(name: str):
+def prepare_third_party_submodule(name: str, recursive: bool = False):
     if not is_git_repo():
         return
     try:
-        subprocess.run(["git", "submodule", "update", "--init", name], check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, cwd="third_party")
+        cmd = ["git", "submodule", "update", "--init"]
+        if recursive:
+            cmd.append("--recursive")
+        cmd.append(name)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="third_party")
     except subprocess.CalledProcessError:
         pass
     except FileNotFoundError:
         pass
+
+
+def mlir_install_has_python_bindings(llvm_install_dir) -> bool:
+    mlir_config = Path(llvm_install_dir) / "lib" / "cmake" / "mlir" / "MLIRConfig.cmake"
+    if not mlir_config.is_file():
+        return False
+    return re.search(
+        r"set\(MLIR_ENABLE_BINDINGS_PYTHON\s+\"?ON\"?\)",
+        mlir_config.read_text(),
+    ) is not None
+
+
+def get_cmake_define(cmake_args: list[str], name: str) -> Optional[str]:
+    direct_prefix = f"-D{name}="
+    typed_prefix = f"-D{name}:"
+    for arg in reversed(cmake_args):
+        if arg.startswith(direct_prefix):
+            return arg[len(direct_prefix):]
+        if arg.startswith(typed_prefix):
+            _, sep, value = arg.partition("=")
+            if sep:
+                return value
+    return None
+
+
+def ensure_tlx_wave_llvm(cmake_args: list[str], env: dict[str, str]):
+    if not any(backend.name == "tlx_wave" and not backend.is_external for backend in backends):
+        return
+
+    llvm_syspath = get_cmake_define(cmake_args, "LLVM_SYSPATH") or env.get("LLVM_SYSPATH")
+    if llvm_syspath:
+        if not mlir_install_has_python_bindings(llvm_syspath):
+            print(
+                "warning: LLVM_SYSPATH does not provide MLIR Python bindings; "
+                "the tlx_wave backend requires MLIR_ENABLE_BINDINGS_PYTHON=ON.",
+                file=sys.stderr,
+            )
+        return
+
+    llvm_install_dir = get_cmake_define(cmake_args, "LLVM_INSTALL_DIR") or env.get("LLVM_INSTALL_DIR")
+    if llvm_install_dir and mlir_install_has_python_bindings(llvm_install_dir):
+        cmake_args.append(f"-DLLVM_SYSPATH={llvm_install_dir}")
+        env["LLVM_SYSPATH"] = llvm_install_dir
+        return
+
+    wave_llvm_install = Path(get_base_dir()) / "third_party" / "wave" / "build" / "llvm-install"
+    if not mlir_install_has_python_bindings(wave_llvm_install):
+        if is_offline_build():
+            raise RuntimeError(
+                "tlx_wave requires an LLVM/MLIR install with MLIR Python bindings. "
+                "Run `python third_party/wave/build_tools/build_llvm.py --python-bindings` "
+                "or set LLVM_SYSPATH to a compatible install before building offline."
+            )
+        build_llvm = Path(get_base_dir()) / "third_party" / "wave" / "build_tools" / "build_llvm.py"
+        cmd = [sys.executable, str(build_llvm), "--python-bindings"]
+        if jobs := env.get("MAX_JOBS"):
+            cmd.extend(["--jobs", jobs])
+        build_env = env.copy()
+        build_env.pop("LLVM_INSTALL_DIR", None)
+        subprocess.check_call(cmd, cwd=get_base_dir(), env=build_env)
+
+    cmake_args.append(f"-DLLVM_SYSPATH={wave_llvm_install}")
+    env["LLVM_SYSPATH"] = str(wave_llvm_install)
 
 
 def get_build_type():
@@ -380,6 +446,7 @@ class CMakeBuild(build_ext):
             cmake_args += shlex.split(cmake_args_append)
 
         env = os.environ.copy()
+        ensure_tlx_wave_llvm(cmake_args, env)
         cmake_dir = get_cmake_dir()
         subprocess.check_call(["cmake", self.base_dir] + cmake_args, cwd=cmake_dir, env=env)
         update_symlink(Path(self.base_dir) / "compile_commands.json", cmake_dir / "compile_commands.json")
@@ -387,7 +454,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-prepare_third_party_submodule("wave")
+prepare_third_party_submodule("wave", recursive=True)
 backends = [*BackendInstaller.copy(["nvidia", "amd", "tlx_wave"]), *BackendInstaller.copy_externals()]
 
 

@@ -599,6 +599,38 @@ def test_tlx_wave_bridge_lowers_uniform_tensor_compare_mask(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_discovers_normal_build_wave_runtime(tmp_path, monkeypatch):
+    build_dir = tmp_path / "cmake.test"
+    python_package = build_dir / "python_packages" / "wave_mlir"
+    tools_dir = build_dir / "bin"
+    python_package.mkdir(parents=True)
+    tools_dir.mkdir()
+    for tool_name in wave_bridge_emit._WAVE_TOOL_NAMES:
+        tool = tools_dir / tool_name
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+
+    monkeypatch.delenv("TRITON_WAVE_OPT", raising=False)
+    monkeypatch.delenv("TRITON_WAVE_PYTHONPATH", raising=False)
+    monkeypatch.delenv("TRITON_WAVE_TOOLS_DIR", raising=False)
+    monkeypatch.setattr(
+        wave_bridge_emit,
+        "_cmake_build_dirs",
+        lambda: iter((build_dir,)),
+    )
+
+    assert list(
+        wave_bridge_emit._existing_paths(
+            wave_bridge_emit._candidate_wave_python_paths()
+        )
+    ) == [python_package.resolve()]
+    assert wave_bridge_emit._wave_opt() == str((tools_dir / "wave-opt").resolve())
+    for tool_name in wave_bridge_emit._WAVE_TOOL_NAMES:
+        assert wave_bridge_emit._wave_tool(tool_name) == str(
+            (tools_dir / tool_name).resolve()
+        )
+
+
 def test_tlx_wave_bridge_async_inputs_are_ordered_shared_values(tmp_path):
     shared_values_func = """
   tt.func public @shared_async_inputs(%arg0: !tt.ptr<f32>, %arg1: i32) attributes {noinline = false} {
