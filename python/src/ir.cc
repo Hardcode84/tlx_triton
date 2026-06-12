@@ -20,6 +20,7 @@
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
@@ -866,6 +867,16 @@ void init_triton_ir(py::module_ &m) {
              if (!ret)
                return py::none();
              return py::int_(ret.getInt());
+           })
+      .def("get_int_array_attr",
+           [](Operation &self, const std::string &name) -> py::object {
+             auto ret = self.getAttrOfType<DenseI32ArrayAttr>(name);
+             if (!ret)
+               return py::none();
+             py::list values;
+             for (int32_t value : ret.asArrayRef())
+               values.append(py::int_(value));
+             return std::move(values);
            })
       .def("get_constant_value",
            [](Operation &self) -> py::object {

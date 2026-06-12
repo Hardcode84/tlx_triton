@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .wave_bridge_plan import (
@@ -27,6 +28,66 @@ from .wave_bridge_plan import (
     _values_by_id,
 )
 
+
+@dataclass(frozen=True)
+class _WaveValue:
+    kind: str
+    value: object
+    physical_value_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _IndexExpr:
+    expr: object
+    bindings: dict
+
+
+@dataclass(frozen=True)
+class _DimBinding:
+    dim: int
+
+
+@dataclass(frozen=True)
+class _MaskConst:
+    value: bool
+
+
+@dataclass(frozen=True)
+class _MaskAnd:
+    lhs: object
+    rhs: object
+
+
+@dataclass(frozen=True)
+class _MaskCompare:
+    predicate: str
+    lhs: object
+    rhs: object
+
+
+@dataclass(frozen=True)
+class _PointerBase:
+    value: object
+
+
+@dataclass(frozen=True)
+class _PointerAdd:
+    base: object
+    offset: object
+
+
+_CMPI_PREDICATES = {
+    0: "eq",
+    1: "ne",
+    2: "slt",
+    3: "sle",
+    4: "sgt",
+    5: "sge",
+    6: "ult",
+    7: "ule",
+    8: "ugt",
+    9: "uge",
+}
 
 def _attr_method(attr, method):
     if attr is None:
@@ -93,6 +154,505 @@ def _same_blocked_encoding(lhs, rhs):
     )
 
 
+def _same_layout_encoding(lhs, rhs):
+    if lhs.encoding_attr is None or rhs.encoding_attr is None:
+        return lhs.encoding_attr is None and rhs.encoding_attr is None
+    if _attr_bool(lhs.encoding_attr, "is_blocked_encoding") and _attr_bool(
+        rhs.encoding_attr, "is_blocked_encoding"
+    ):
+        lhs_info = _blocked_encoding_info(
+            lhs.encoding_attr, lhs.encoding, "layout equality source"
+        )
+        rhs_info = _blocked_encoding_info(
+            rhs.encoding_attr, rhs.encoding, "layout equality result"
+        )
+        return _same_blocked_encoding(lhs_info, rhs_info)
+    return False
+
+
+def _set_wave_value(wave_values, value_id, kind, value, physical_value_id=None):
+    if physical_value_id is None and kind == "fragment":
+        physical_value_id = value_id
+    wave_values[value_id] = _WaveValue(kind, value, physical_value_id)
+
+
+def _raw_wave_value(value):
+    return value.value if isinstance(value, _WaveValue) else value
+
+
+def _physical_value_plan(values, lowered, value_id):
+    if isinstance(lowered, _WaveValue) and lowered.physical_value_id is not None:
+        return values[lowered.physical_value_id]
+    return values[value_id]
+
+
+def _require_wave_value(wave_values, value_id, kinds, context):
+    value = wave_values.get(value_id)
+    if value is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            "has not been lowered"
+        )
+    if not isinstance(value, _WaveValue):
+        return value
+    if value.kind not in kinds:
+        expected = ", ".join(kinds)
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            f"lowered as {value.kind}, expected {expected}"
+        )
+    return value.value
+
+
+def _op_by_result_id(plan):
+    return {
+        result_id: op
+        for op in plan.ops
+        for result_id in op.results
+    }
+
+
+def _dim_symbol(w, dim):
+    return w.sym(f"tlx_dim{dim}")
+
+
+def _is_bool_value(value):
+    return value.type == "i1" or value.element_type == "i1"
+
+
+def _is_integer_or_index_value(value):
+    types = {value.type, value.element_type}
+    return "index" in types or any(f"i{bits}" in types for bits in (1, 8, 16, 32, 64))
+
+
+def _maybe_splat(builder, value, force_width, w):
+    if force_width is None:
+        return value
+    if not w.SimdType.isinstance(value.type):
+        return builder.splat(value, width=force_width)
+    width = w.SimdType(value.type).width
+    if width != force_width:
+        raise ValueError(
+            "tlx_wave bridge cannot use SIMD value with mismatched lane width: "
+            f"got {width}, expected {force_width}"
+        )
+    return value
+
+
+def _dim_binding_value(dim_bindings, binding, w):
+    symbol = _dim_symbol(w, binding.dim)
+    value = dim_bindings.get(symbol)
+    if value is None:
+        raise ValueError(
+            "tlx_wave bridge cannot materialize layout-dependent index dim "
+            f"{binding.dim}; available dims={list(dim_bindings)}"
+        )
+    return value
+
+
+def _materialize_index_value(builder, source, dim_bindings, w, force_width=None):
+    if isinstance(source, _IndexExpr):
+        bindings = {
+            symbol: _materialize_index_value(builder, value, dim_bindings, w)
+            for symbol, value in source.bindings.items()
+        }
+        value = builder.index_expr(source.expr, bindings)
+        return _maybe_splat(builder, value, force_width, w)
+    if isinstance(source, _DimBinding):
+        return _maybe_splat(
+            builder, _dim_binding_value(dim_bindings, source, w), force_width, w
+        )
+    return _maybe_splat(builder, source, force_width, w)
+
+
+def _false_mask(builder, w, width):
+    lane = builder.lane_id(width=width)
+    return builder.cmpi("ne", lane, lane)
+
+
+def _true_mask(builder, w, width):
+    lane = builder.lane_id(width=width)
+    return builder.cmpi("eq", lane, lane)
+
+
+def _materialize_mask_value(builder, source, dim_bindings, w, width):
+    if isinstance(source, _MaskConst):
+        return _true_mask(builder, w, width) if source.value else _false_mask(builder, w, width)
+    if isinstance(source, _MaskAnd):
+        lhs = _materialize_mask_value(builder, source.lhs, dim_bindings, w, width)
+        rhs = _materialize_mask_value(builder, source.rhs, dim_bindings, w, width)
+        return builder.select(lhs, rhs, _false_mask(builder, w, width))
+    if isinstance(source, _MaskCompare):
+        lhs = _materialize_index_value(
+            builder, source.lhs, dim_bindings, w, force_width=width
+        )
+        rhs = _materialize_index_value(
+            builder, source.rhs, dim_bindings, w, force_width=width
+        )
+        return builder.cmpi(source.predicate, lhs, rhs)
+    return source
+
+
+def _materialize_pointer_value(builder, source, dim_bindings, w):
+    if isinstance(source, _PointerBase):
+        return source.value
+    if isinstance(source, _PointerAdd):
+        base = _materialize_pointer_value(builder, source.base, dim_bindings, w)
+        offset = _materialize_index_value(builder, source.offset, dim_bindings, w)
+        return builder.ptr_add(base, offset)
+    return source
+
+
+def _shift_index_dims(source, axis):
+    if isinstance(source, _DimBinding):
+        dim = source.dim + 1 if source.dim >= axis else source.dim
+        return _DimBinding(dim)
+    if isinstance(source, _IndexExpr):
+        return _IndexExpr(
+            source.expr,
+            {
+                symbol: _shift_index_dims(binding, axis)
+                for symbol, binding in source.bindings.items()
+            },
+        )
+    return source
+
+
+def _shift_mask_dims(source, axis):
+    if isinstance(source, _MaskAnd):
+        return _MaskAnd(
+            _shift_mask_dims(source.lhs, axis),
+            _shift_mask_dims(source.rhs, axis),
+        )
+    if isinstance(source, _MaskCompare):
+        return _MaskCompare(
+            source.predicate,
+            _shift_index_dims(source.lhs, axis),
+            _shift_index_dims(source.rhs, axis),
+        )
+    return source
+
+
+def _shift_pointer_dims(source, axis):
+    if isinstance(source, _PointerAdd):
+        return _PointerAdd(
+            _shift_pointer_dims(source.base, axis),
+            _shift_index_dims(source.offset, axis),
+        )
+    return source
+
+
+def _require_lowered_value(wave_values, value_id, kind, context):
+    lowered = wave_values.get(value_id)
+    if lowered is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            "has not been lowered by its producer op"
+        )
+    if not isinstance(lowered, _WaveValue) or lowered.kind != kind:
+        got = lowered.kind if isinstance(lowered, _WaveValue) else type(lowered).__name__
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            f"lowered as {got}, expected {kind}"
+        )
+    return lowered.value
+
+
+def _init_argument_wave_values(builder, values, wave_values, w):
+    for value in values.values():
+        if value.kind != "argument" or value.base_arg_index is None:
+            continue
+        arg = builder.args[value.base_arg_index]
+        if value.type_kind == "pointer":
+            _set_wave_value(
+                wave_values,
+                value.value_id,
+                "pointer_expr",
+                _PointerBase(arg),
+            )
+        elif value.type_kind == "scalar" and _is_integer_or_index_value(value):
+            bound = arg if value.type == "index" else builder.index_cast(arg, w.index_type())
+            symbol = w.sym(f"tlx_{value.base_arg_name}")
+            _set_wave_value(
+                wave_values,
+                value.value_id,
+                "index_expr",
+                _IndexExpr(symbol, {symbol: bound}),
+            )
+
+
+def _emit_constant_op(op, values, wave_values, w):
+    if len(op.results) != 1:
+        return
+    value = values[op.results[0]]
+    const = value.const_value
+    if _is_bool_value(value) and isinstance(const, (bool, int)):
+        _set_wave_value(
+            wave_values,
+            value.value_id,
+            "mask_expr",
+            _MaskConst(bool(const)),
+        )
+    elif (
+        _is_integer_or_index_value(value)
+        and isinstance(const, int)
+        and not isinstance(const, bool)
+    ):
+        _set_wave_value(
+            wave_values,
+            value.value_id,
+            "index_expr",
+            _IndexExpr(w.sym_ctx.int_(const), {}),
+        )
+
+
+def _emit_program_id_op(builder, state, op, values, wave_values, w):
+    if len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected tt.get_program_id with one result")
+    value = values[op.results[0]]
+    axis = int(op.attrs.get("axis", 0) or 0)
+    if axis not in (0, 1, 2):
+        raise ValueError(f"tlx_wave bridge cannot lower tt.get_program_id axis {axis}")
+    bindings = state["program_id_bindings"]
+    binding = bindings.get(axis)
+    if binding is None:
+        binding = builder.index_cast(builder.workgroup_id(axis), w.index_type())
+        bindings[axis] = binding
+    symbol = w.sym(f"tlx_program_id_{axis}")
+    _set_wave_value(
+        wave_values,
+        value.value_id,
+        "index_expr",
+        _IndexExpr(symbol, {symbol: binding}),
+    )
+
+
+def _emit_make_range_op(op, values, wave_values, w):
+    if len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected tt.make_range with one result")
+    value = values[op.results[0]]
+    if len(value.varying_dims) != 1:
+        raise ValueError(
+            "tlx_wave bridge expected tt.make_range to vary one dimension, "
+            f"got dims={value.varying_dims}, type={value.type}"
+        )
+    dim = value.varying_dims[0]
+    symbol = _dim_symbol(w, dim)
+    start = int(op.attrs.get("start", 0) or 0)
+    _set_wave_value(
+        wave_values,
+        value.value_id,
+        "index_expr",
+        _IndexExpr(symbol + start, {symbol: _DimBinding(dim)}),
+    )
+
+
+def _emit_index_binary_op(op, values, wave_values, w):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError(f"tlx_wave bridge expected {op.name} with two operands")
+    lhs = _require_lowered_value(
+        wave_values, op.operands[0], "index_expr", op.name
+    )
+    rhs = _require_lowered_value(
+        wave_values, op.operands[1], "index_expr", op.name
+    )
+    result = values[op.results[0]]
+    lhs_symbol = w.sym(f"tlx_v{result.value_id}_lhs")
+    rhs_symbol = w.sym(f"tlx_v{result.value_id}_rhs")
+    expr = lhs_symbol + rhs_symbol if op.name == "arith.addi" else lhs_symbol * rhs_symbol
+    _set_wave_value(
+        wave_values,
+        result.value_id,
+        "index_expr",
+        _IndexExpr(expr, {lhs_symbol: lhs, rhs_symbol: rhs}),
+    )
+
+
+def _emit_cmp_op(op, values, wave_values, w):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected arith.cmpi with two operands")
+    predicate = _CMPI_PREDICATES.get(int(op.attrs.get("predicate")))
+    if predicate is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower arith.cmpi predicate "
+            f"{op.attrs.get('predicate')}"
+        )
+    lhs = _require_lowered_value(
+        wave_values, op.operands[0], "index_expr", "arith.cmpi"
+    )
+    rhs = _require_lowered_value(
+        wave_values, op.operands[1], "index_expr", "arith.cmpi"
+    )
+    result = values[op.results[0]]
+    _set_wave_value(
+        wave_values,
+        result.value_id,
+        "mask_expr",
+        _MaskCompare(predicate, lhs, rhs),
+    )
+
+
+def _emit_mask_and_op(op, values, wave_values):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected arith.andi with two operands")
+    lhs = _require_lowered_value(
+        wave_values, op.operands[0], "mask_expr", "arith.andi"
+    )
+    rhs = _require_lowered_value(
+        wave_values, op.operands[1], "mask_expr", "arith.andi"
+    )
+    result = values[op.results[0]]
+    _set_wave_value(
+        wave_values,
+        result.value_id,
+        "mask_expr",
+        _MaskAnd(lhs, rhs),
+    )
+
+
+def _emit_addptr_op(op, values, wave_values):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected tt.addptr with two operands")
+    base = _require_lowered_value(
+        wave_values, op.operands[0], "pointer_expr", "tt.addptr"
+    )
+    offset = _require_lowered_value(
+        wave_values, op.operands[1], "index_expr", "tt.addptr"
+    )
+    result = values[op.results[0]]
+    _set_wave_value(
+        wave_values,
+        result.value_id,
+        "pointer_expr",
+        _PointerAdd(base, offset),
+    )
+
+
+def _product(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _delinearize_expr(w, linear, shape, order):
+    if len(shape) != len(order):
+        raise ValueError(
+            "tlx_wave bridge blocked layout has mismatched shape/order lengths: "
+            f"shape={shape}, order={order}"
+        )
+    coords = [w.sym_ctx.int_(0) for _ in shape]
+    remainder = linear
+    for dim in order:
+        extent = int(shape[dim])
+        coords[dim] = w.mod(remainder, extent)
+        remainder = w.floor(remainder / extent)
+    return tuple(coords)
+
+
+def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
+    raw_value = _raw_wave_value(wave_value)
+    if not value_plan.shape:
+        raise ValueError(
+            "tlx_wave bridge cannot lower tensor store without a ranked shape: "
+            f"type={value_plan.type}, producer={value_plan.producer}"
+        )
+    if len(value_plan.shape) > 2:
+        raise ValueError(
+            "tlx_wave bridge store lowering currently supports rank <= 2, "
+            f"got shape={value_plan.shape}"
+        )
+    frag = w.FragmentType(raw_value.type)
+    layout = _blocked_encoding_info(
+        value_plan.encoding_attr,
+        value_plan.encoding,
+        "fragment store physical value",
+    )
+    rank = len(value_plan.shape)
+    if (
+        len(layout.size_per_thread) != rank
+        or len(layout.threads_per_warp) != rank
+        or len(layout.warps_per_cta) != rank
+    ):
+        raise ValueError(
+            "tlx_wave bridge blocked layout rank does not match stored tensor: "
+            f"shape={value_plan.shape}, encoding={value_plan.encoding}"
+        )
+    if _product(layout.size_per_thread) != frag.registers:
+        raise ValueError(
+            "tlx_wave bridge cannot map fragment registers through blocked "
+            "layout with incompatible per-thread element count: "
+            f"registers={frag.registers}, sizePerThread={layout.size_per_thread}, "
+            f"encoding={value_plan.encoding}"
+        )
+    threads_per_warp = _product(layout.threads_per_warp)
+    if threads_per_warp != frag.wave_size:
+        raise ValueError(
+            "tlx_wave bridge cannot map fragment registers through blocked "
+            "layout with incompatible threadsPerWarp: "
+            f"fragment wave_size={frag.wave_size}, threadsPerWarp={layout.threads_per_warp}, "
+            f"encoding={value_plan.encoding}"
+        )
+    if component < 0 or component >= frag.registers:
+        raise ValueError(
+            f"tlx_wave bridge fragment component {component} is out of range "
+            f"for {frag.registers} registers"
+        )
+
+    thread = builder.workitem_id(axis=0, width=frag.wave_size)
+    thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_thread")
+    thread_expr = thread_sym
+    register_coords = _delinearize_expr(
+        w, w.sym_ctx.int_(component), layout.size_per_thread, layout.order
+    )
+    lane_coords = _delinearize_expr(
+        w, w.mod(thread_expr, threads_per_warp), layout.threads_per_warp, layout.order
+    )
+    warp_coords = _delinearize_expr(
+        w,
+        w.floor(thread_expr / threads_per_warp),
+        layout.warps_per_cta,
+        layout.order,
+    )
+    dim_bindings = {}
+    for dim in range(rank):
+        extent = value_plan.shape[dim]
+        expr = register_coords[dim] + layout.size_per_thread[dim] * (
+            lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim]
+        )
+        dim_bindings[_dim_symbol(w, dim)] = builder.index_expr(
+            w.mod(expr, extent),
+            {thread_sym: thread},
+        )
+    return dim_bindings, frag.wave_size
+
+
+def _linear_dim_bindings(builder, value_plan, thread, w):
+    rank = len(value_plan.shape)
+    if rank > 2:
+        raise ValueError(
+            "tlx_wave bridge async copy address lowering currently supports "
+            f"rank <= 2, got shape={value_plan.shape}"
+        )
+    if rank == 0:
+        return {}
+
+    thread_symbol = w.sym(f"tlx_async_{value_plan.value_id}_thread")
+    coords = _delinearize_expr(
+        w,
+        thread_symbol,
+        value_plan.shape,
+        tuple(reversed(range(rank))),
+    )
+    return {
+        _dim_symbol(w, dim): builder.index_expr(
+            coords[dim],
+            {thread_symbol: thread},
+        )
+        for dim in range(rank)
+    }
+
+
 def _dot_operand_encoding_info(value, context):
     attr = value.encoding_attr
     if attr is None or not _attr_bool(attr, "is_dot_operand_encoding"):
@@ -105,6 +665,52 @@ def _dot_operand_encoding_info(value, context):
         int(_attr_value(attr, "get_dot_operand_op_idx")),
         int(_attr_value(attr, "get_dot_operand_k_width")),
         _blocked_encoding_info(parent_attr, value.encoding, f"{context} parent"),
+    )
+
+
+def _same_dot_operand_encoding(lhs, rhs):
+    return (
+        lhs.op_idx == rhs.op_idx
+        and lhs.k_width == rhs.k_width
+        and _same_blocked_encoding(lhs.parent, rhs.parent)
+    )
+
+
+def _require_physical_dot_operand_fragment(values, wave_values, value, context):
+    lowered = wave_values.get(value.value_id)
+    if lowered is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower tt.dot: operand is not lowered from "
+            f"ttg.local_load; {context} encoding: {value.encoding}"
+        )
+    if isinstance(lowered, _WaveValue) and lowered.kind != "fragment":
+        raise ValueError(
+            "tlx_wave bridge cannot lower tt.dot: operand lowered as "
+            f"{lowered.kind}, expected fragment; {context} encoding: {value.encoding}"
+        )
+    physical_plan = _physical_value_plan(values, lowered, value.value_id)
+    if physical_plan.element_type != value.element_type or physical_plan.shape != value.shape:
+        raise ValueError(
+            "tlx_wave bridge cannot use a fragment with an unlowered dot operand "
+            "layout conversion that changes element type or shape; "
+            f"physical type={physical_plan.type}, operand type={value.type}"
+        )
+    physical_info = _dot_operand_encoding_info(
+        physical_plan, f"{context} physical fragment"
+    )
+    value_info = _dot_operand_encoding_info(value, context)
+    if not _same_dot_operand_encoding(physical_info, value_info):
+        raise ValueError(
+            "tlx_wave bridge cannot use a fragment through an unlowered dot "
+            f"operand layout conversion for {context}; "
+            f"physical encoding: {physical_plan.encoding}; "
+            f"operand encoding: {value.encoding}"
+        )
+    return _require_wave_value(
+        wave_values,
+        value.value_id,
+        ("fragment",),
+        context,
     )
 
 
@@ -138,20 +744,33 @@ def _dma_packet_bytes(address, lds_offset):
     return None
 
 
-def _emit_async_source_ptr(builder, kernel, address, w, width):
+def _emit_async_source_ptr(builder, state, kernel, address, w, width):
     pointee_type = _source_pointee_type(kernel, address)
     element_type = _binding_type(pointee_type, w)
     lane = builder.lane_id(width=width)
-    source_base = builder.args[address.base_arg_index]
-    return (
-        builder.ptr_add(source_base, lane, w.simd_ptr_type(element_type, width=width)),
-        lane,
-        element_type,
+    thread = builder.workitem_id(axis=0, width=width)
+    if address.address_value_id is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower async copy without a source address value"
+        )
+    address_plan = state["values"][address.address_value_id]
+    dim_bindings = _linear_dim_bindings(builder, address_plan, thread, w)
+    source = _materialize_pointer_value(
+        builder,
+        _require_lowered_value(
+            state["wave_values"],
+            address.address_value_id,
+            "pointer_expr",
+            "ttg.async_copy_global_to_local source",
+        ),
+        dim_bindings,
+        w,
     )
+    return source, lane, element_type, dim_bindings
 
 
 def _emit_async_copy(
-    builder, kernel, address, lds_layout, after_token, w, width, stats
+    builder, state, kernel, address, lds_layout, after_token, w, width, stats
 ):
     if address.memdesc_value_id is None:
         raise ValueError("tlx_wave bridge cannot lower async copy without LDS memdesc")
@@ -159,31 +778,67 @@ def _emit_async_copy(
         raise ValueError(
             f"tlx_wave bridge has no LDS placement for memdesc {address.memdesc_value_id}"
         )
+    if address.other_value_id is not None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local with "
+            "`other` values yet; emitting a masked copy would leave inactive "
+            "LDS lanes undefined"
+        )
 
     lds_offset = lds_layout.offsets[address.memdesc_value_id]
-    source, lane, element_type = _emit_async_source_ptr(
-        builder, kernel, address, w, width
+    source, lane, element_type, dim_bindings = _emit_async_source_ptr(
+        builder, state, kernel, address, w, width
+    )
+    mask = (
+        _materialize_mask_value(
+            builder,
+            _require_lowered_value(
+                state["wave_values"],
+                address.mask_value_id,
+                "mask_expr",
+                "ttg.async_copy_global_to_local mask",
+            ),
+            dim_bindings,
+            w,
+            width,
+        )
+        if address.mask_value_id is not None
+        else None
     )
     dma_bytes = _dma_packet_bytes(address, lds_offset)
     stats.async_copies += 1
-    if dma_bytes is not None:
-        destination = builder.lds_base(w.i32(), offset=lds_offset)
-        stats.dma_load_lds += 1
-        return builder.dma_load_lds(
-            source, destination, after=after_token, bytes=dma_bytes
-        )
 
-    destination_base = builder.lds_base(element_type, offset=lds_offset)
-    destination = builder.ptr_add(
-        destination_base,
-        lane,
-        w.simd_ptr_type(element_type, w.shared_address_space(), width),
-    )
-    values, load_token = builder.load(
-        source, w.simd_type(element_type, width), after=after_token
-    )
-    stats.load_store_fallbacks += 1
-    return builder.store(values, destination, after=load_token)
+    def emit_copy(copy_after):
+        if dma_bytes is not None:
+            destination = builder.lds_base(w.i32(), offset=lds_offset)
+            return builder.dma_load_lds(
+                source, destination, after=copy_after, bytes=dma_bytes
+            )
+
+        destination_base = builder.lds_base(element_type, offset=lds_offset)
+        destination = builder.ptr_add(
+            destination_base,
+            lane,
+            w.simd_ptr_type(element_type, w.shared_address_space(), width),
+        )
+        values, load_token = builder.load(
+            source, w.simd_type(element_type, width), after=copy_after
+        )
+        return builder.store(values, destination, after=load_token)
+
+    if dma_bytes is not None:
+        stats.dma_load_lds += 1
+    else:
+        stats.load_store_fallbacks += 1
+
+    if mask is None:
+        return emit_copy(after_token)
+    if after_token is None:
+        after_token = builder.token()
+    with builder.where(mask, [w.mem_token_type()]) as where_op:
+        token = emit_copy(after_token)
+        builder.yield_([token])
+    return where_op.results[0]
 
 
 def _join_tokens(builder, tokens, stats):
@@ -193,23 +848,129 @@ def _join_tokens(builder, tokens, stats):
     return builder.join(*tokens)
 
 
+def _initial_lowering_state(builder, plan, w):
+    values = _values_by_id(plan)
+    state = {
+        "values": values,
+        "op_by_result": _op_by_result_id(plan),
+        "wave_values": {},
+        "program_id_bindings": {},
+        "pending_copy_tokens": [],
+        "committed_groups": [],
+        "last_order_token": None,
+    }
+    _init_argument_wave_values(builder, values, state["wave_values"], w)
+    return state
+
+
+def _emit_generic_value_op(builder, state, op, w):
+    values = state["values"]
+    wave_values = state["wave_values"]
+    if op.name == "arith.constant":
+        _emit_constant_op(op, values, wave_values, w)
+    elif op.name == "tt.get_program_id":
+        _emit_program_id_op(builder, state, op, values, wave_values, w)
+    elif op.name == "tt.make_range":
+        _emit_make_range_op(op, values, wave_values, w)
+    elif op.name in {"tt.broadcast", "tt.splat", "tt.expand_dims"}:
+        _forward_lowered_value(op, values, wave_values)
+    elif op.name in {"arith.addi", "arith.muli"}:
+        _emit_index_binary_op(op, values, wave_values, w)
+    elif op.name == "arith.cmpi":
+        _emit_cmp_op(op, values, wave_values, w)
+    elif op.name == "arith.andi":
+        _emit_mask_and_op(op, values, wave_values)
+    elif op.name == "tt.addptr":
+        _emit_addptr_op(op, values, wave_values)
+    elif op.name == "ttg.convert_layout":
+        _forward_lowered_value(op, values, wave_values)
+    else:
+        return False
+    return True
+
+
+def _ensure_lowered_dependency(builder, state, value_id, w, context, visiting=None):
+    wave_values = state["wave_values"]
+    if value_id is None or value_id in wave_values:
+        return
+    if visiting is None:
+        visiting = set()
+    if value_id in visiting:
+        raise ValueError(
+            f"tlx_wave bridge found a cycle while lowering {context}: "
+            f"TTGIR value {value_id}"
+        )
+
+    op = state["op_by_result"].get(value_id)
+    if op is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            "has no producer op"
+        )
+
+    visiting.add(value_id)
+    try:
+        for operand_id in op.operands:
+            _ensure_lowered_dependency(
+                builder,
+                state,
+                operand_id,
+                w,
+                f"{context} dependency from {op.name}",
+                visiting,
+            )
+        if not _emit_generic_value_op(builder, state, op, w):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: producer op "
+                f"{op.name} for TTGIR value {value_id} is not supported"
+            )
+        if value_id not in wave_values:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: producer op "
+                f"{op.name} did not produce a Wave value for TTGIR value {value_id}"
+            )
+    finally:
+        visiting.remove(value_id)
+
+
+def _ensure_async_copy_inputs_lowered(builder, state, address, w):
+    _ensure_lowered_dependency(
+        builder,
+        state,
+        address.address_value_id,
+        w,
+        "ttg.async_copy_global_to_local source",
+    )
+    _ensure_lowered_dependency(
+        builder,
+        state,
+        address.mask_value_id,
+        w,
+        "ttg.async_copy_global_to_local mask",
+    )
+
+
 def _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats):
     address_by_token = _async_address_by_token(plan)
     needs_shared_ready_token = _has_local_loads_after_wait(plan)
+    state = _initial_lowering_state(builder, plan, w)
     pending_copy_tokens = []
     committed_groups = []
     last_order_token = None
     ready_tokens = []
 
-    for token in plan.tokens:
-        if token.op == "ttg.async_copy_global_to_local":
-            address = address_by_token.get(token.value_id)
+    for op in plan.ops:
+        if op.name == "ttg.async_copy_global_to_local":
+            token_id = op.results[0] if op.results else None
+            address = address_by_token.get(token_id)
             if address is None:
                 raise ValueError("tlx_wave bridge could not match async copy token")
             if last_order_token is None:
                 last_order_token = builder.token()
+            _ensure_async_copy_inputs_lowered(builder, state, address, w)
             last_order_token = _emit_async_copy(
                 builder,
+                state,
                 kernel,
                 address,
                 lds_layout,
@@ -219,14 +980,14 @@ def _emit_async_tokens(builder, kernel, attrs, plan, lds_layout, w, stats):
                 stats,
             )
             pending_copy_tokens.append(last_order_token)
-        elif token.op == "ttg.async_commit_group":
+        elif op.name == "ttg.async_commit_group":
             group = _join_tokens(builder, tuple(pending_copy_tokens), stats)
             pending_copy_tokens.clear()
             committed_groups.append(group)
             last_order_token = group
             stats.commit_groups += 1
-        elif token.op == "ttg.async_wait":
-            keep_groups = token.wait_group or 0
+        elif op.name == "ttg.async_wait":
+            keep_groups = int(op.attrs.get("num", 0) or 0)
             wait_count = max(0, len(committed_groups) - keep_groups)
             if wait_count:
                 waited_groups = tuple(committed_groups[:wait_count])
@@ -405,9 +1166,24 @@ def _emit_local_load_fragment(
     return fragment, token
 
 
-def _emit_accumulator_fragment(builder, value, wave_values, w, stats):
+def _emit_accumulator_fragment(builder, value, wave_values, w, stats, values=None):
     if value.value_id in wave_values:
-        return wave_values[value.value_id]
+        lowered = wave_values[value.value_id]
+        if values is not None and isinstance(lowered, _WaveValue):
+            physical_plan = _physical_value_plan(values, lowered, value.value_id)
+            if not _same_layout_encoding(physical_plan, value):
+                raise ValueError(
+                    "tlx_wave bridge cannot use a fragment with an unlowered "
+                    "layout conversion as a tt.dot accumulator; "
+                    f"physical encoding: {physical_plan.encoding}; "
+                    f"accumulator encoding: {value.encoding}"
+                )
+        return _require_wave_value(
+            wave_values,
+            value.value_id,
+            ("fragment",),
+            "tt.dot accumulator",
+        )
     if (
         value.producer == "arith.constant"
         and value.type_kind == "tensor"
@@ -417,7 +1193,7 @@ def _emit_accumulator_fragment(builder, value, wave_values, w, stats):
     ):
         zero = builder.constant(w.i32(), 0)
         fragment = builder.fragment_fill(zero, _acc_fragment_type(w))
-        wave_values[value.value_id] = fragment
+        _set_wave_value(wave_values, value.value_id, "fragment", fragment)
         stats.fragment_fills += 1
         return fragment
     raise ValueError(
@@ -514,72 +1290,309 @@ def _emit_dot_op(builder, op, values, wave_values, w, stats):
             f"role0 encoding: {role_values[0].encoding}; "
             f"role1 encoding: {role_values[1].encoding}"
         )
-    acc_fragment = _emit_accumulator_fragment(builder, acc, wave_values, w, stats)
+    acc_fragment = _emit_accumulator_fragment(
+        builder, acc, wave_values, w, stats, values=values
+    )
+    lhs_fragment = _require_physical_dot_operand_fragment(
+        values, wave_values, role_values[0], "tt.dot operand role0"
+    )
+    rhs_fragment = _require_physical_dot_operand_fragment(
+        values, wave_values, role_values[1], "tt.dot operand role1"
+    )
     dot = builder.mma(
         _GFX950_F16_MMA_KIND,
-        wave_values[role_values[0].value_id],
-        wave_values[role_values[1].value_id],
+        lhs_fragment,
+        rhs_fragment,
         acc_fragment,
     )
-    wave_values[result.value_id] = dot
+    _set_wave_value(wave_values, result.value_id, "fragment", dot)
     stats.mmas += 1
 
 
+def _forward_nonfragment_value(source):
+    if source.kind == "fragment":
+        raise ValueError("internal error: fragment value reached non-fragment forward")
+    return source
+
+
+def _shift_forwarded_value(source, axis):
+    if source.kind == "index_expr":
+        return _WaveValue(source.kind, _shift_index_dims(source.value, axis))
+    if source.kind == "mask_expr":
+        return _WaveValue(source.kind, _shift_mask_dims(source.value, axis))
+    if source.kind == "pointer_expr":
+        return _WaveValue(source.kind, _shift_pointer_dims(source.value, axis))
+    raise ValueError(
+        "tlx_wave bridge cannot lower tt.expand_dims for Wave value kind "
+        f"{source.kind}"
+    )
+
+
+def _forward_lowered_value(op, values, wave_values):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        raise ValueError(f"tlx_wave bridge expected {op.name} with one operand/result")
+    source_id = op.operands[0]
+    result_id = op.results[0]
+    source = wave_values.get(source_id)
+    if source is None:
+        return
+    source_plan = values[source_id]
+    result_plan = values[result_id]
+    if op.name in {"tt.broadcast", "tt.splat"}:
+        if isinstance(source, _WaveValue) and source.kind != "fragment":
+            wave_values[result_id] = _forward_nonfragment_value(source)
+            return
+        raise ValueError(
+            f"tlx_wave bridge cannot forward {op.name} for lowered "
+            f"{source.kind if isinstance(source, _WaveValue) else type(source).__name__} "
+            "value"
+        )
+
+    if op.name == "tt.expand_dims":
+        if not isinstance(source, _WaveValue):
+            raise ValueError("tlx_wave bridge internal error: untyped Wave value")
+        axis = int(op.attrs.get("axis", 0) or 0)
+        wave_values[result_id] = _shift_forwarded_value(source, axis)
+        return
+
+    if source_plan.element_type != result_plan.element_type:
+        raise ValueError(
+            "tlx_wave bridge cannot forward layout conversion with element type "
+            f"change: {source_plan.type} -> {result_plan.type}"
+        )
+    if source_plan.shape != result_plan.shape:
+        raise ValueError(
+            "tlx_wave bridge cannot forward layout conversion with shape change: "
+            f"{source_plan.shape} -> {result_plan.shape}"
+        )
+    if not isinstance(source, _WaveValue):
+        wave_values[result_id] = source
+        return
+    if source.kind != "fragment":
+        wave_values[result_id] = _forward_nonfragment_value(source)
+        return
+    if _same_layout_encoding(source_plan, result_plan):
+        wave_values[result_id] = source
+        return
+    wave_values[result_id] = _WaveValue(
+        source.kind,
+        source.value,
+        source.physical_value_id if source.physical_value_id is not None else source_id,
+    )
+
+
+def _validate_fragment_store_value(value_plan, physical_plan):
+    if value_plan.element_type != "f32" or value_plan.shape != _GFX950_MMA_SHAPE:
+        raise ValueError(
+            "tlx_wave bridge supports fragment tt.store only for f32 32x32 "
+            f"values, got type={value_plan.type}, encoding={value_plan.encoding}"
+        )
+    if (
+        physical_plan.element_type != value_plan.element_type
+        or physical_plan.shape != value_plan.shape
+    ):
+        raise ValueError(
+            "tlx_wave bridge cannot store fragment through a layout conversion "
+            "that changes element type or shape: "
+            f"physical type={physical_plan.type}, store type={value_plan.type}"
+        )
+    _blocked_encoding_info(
+        physical_plan.encoding_attr,
+        physical_plan.encoding,
+        "fragment store physical value",
+    )
+
+
+def _extract_fragment_component(regs, component, width, w):
+    wave = getattr(w, "wave", None)
+    if wave is None:
+        raise RuntimeError(
+            "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+            "generated wave dialect module"
+        )
+    return wave.ExtractOp(w.simd_type(w.i32(), width), regs, component).result
+
+
+def _emit_component_store(builder, value, ptr, mask, after_token, w):
+    if mask is None:
+        return builder.store(value, ptr, after=after_token)
+    if after_token is None:
+        after_token = builder.token()
+    with builder.where(mask, [w.mem_token_type()]) as where_op:
+        token = builder.store(value, ptr, after=after_token)
+        builder.yield_([token])
+    return where_op.results[0]
+
+
+def _emit_fragment_store(
+    builder,
+    state,
+    lowered,
+    physical_plan,
+    ptr_id,
+    mask_id,
+    after_token,
+    w,
+):
+    fragment = lowered.value
+    regs = builder.fragment_unpack(fragment)
+    frag = w.FragmentType(fragment.type)
+    token = after_token
+    for component in range(frag.registers):
+        dim_bindings, width = _store_dim_bindings(
+            builder, physical_plan, lowered, w, component=component
+        )
+        ptr = _materialize_pointer_value(
+            builder,
+            _require_lowered_value(
+                state["wave_values"],
+                ptr_id,
+                "pointer_expr",
+                "tt.store pointer",
+            ),
+            dim_bindings,
+            w,
+        )
+        mask = (
+            _materialize_mask_value(
+                builder,
+                _require_lowered_value(
+                    state["wave_values"],
+                    mask_id,
+                    "mask_expr",
+                    "tt.store mask",
+                ),
+                dim_bindings,
+                w,
+                width,
+            )
+            if mask_id is not None
+            else None
+        )
+        value = _extract_fragment_component(regs, component, width, w)
+        token = _emit_component_store(builder, value, ptr, mask, token, w)
+    return token
+
+
+def _emit_store_op(builder, op, state, w):
+    values = state["values"]
+    wave_values = state["wave_values"]
+    if len(op.operands) < 2:
+        raise ValueError("tlx_wave bridge expected tt.store with pointer and value")
+    ptr_id = op.operands[0]
+    value_id = op.operands[1]
+    mask_id = op.operands[2] if len(op.operands) > 2 else None
+    value_plan = values[value_id]
+    lowered = wave_values.get(value_id)
+    if lowered is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower tt.store: stored value "
+            f"{value_id} from {value_plan.producer} is not lowered"
+        )
+    if not isinstance(lowered, _WaveValue):
+        raise ValueError("tlx_wave bridge internal error: untyped Wave value")
+
+    if lowered.kind == "fragment":
+        physical_plan = _physical_value_plan(values, lowered, value_id)
+        _validate_fragment_store_value(value_plan, physical_plan)
+        state["last_order_token"] = _emit_fragment_store(
+            builder,
+            state,
+            lowered,
+            physical_plan,
+            ptr_id,
+            mask_id,
+            state["last_order_token"],
+            w,
+        )
+        return
+
+    if lowered.kind == "simd":
+        dim_bindings = {}
+        ptr = _materialize_pointer_value(
+            builder,
+            _require_lowered_value(
+                wave_values,
+                ptr_id,
+                "pointer_expr",
+                "tt.store pointer",
+            ),
+            dim_bindings,
+            w,
+        )
+        state["last_order_token"] = builder.store(
+            lowered.value, ptr, after=state["last_order_token"]
+        )
+        return
+
+    raise ValueError(
+        "tlx_wave bridge cannot lower tt.store for Wave value kind "
+        f"{lowered.kind}; stored TTGIR type={value_plan.type}"
+    )
+
+
 def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
-    values = _values_by_id(plan)
+    state = _initial_lowering_state(builder, plan, w)
+    values = state["values"]
     memdescs = _memdescs_by_id(plan)
     address_by_token = _async_address_by_token(plan)
     local_loads = _local_load_address_by_result(plan)
-    wave_values = {}
-    pending_copy_tokens = []
-    committed_groups = []
-    last_order_token = None
+    wave_values = state["wave_values"]
 
     for op in plan.ops:
+        if _emit_generic_value_op(builder, state, op, w):
+            continue
         if op.name == "ttg.async_copy_global_to_local":
             token_id = op.results[0] if op.results else None
             address = address_by_token.get(token_id)
             if address is None:
                 raise ValueError("tlx_wave bridge could not match async copy token")
-            if last_order_token is None:
-                last_order_token = builder.token()
-            last_order_token = _emit_async_copy(
+            if state["last_order_token"] is None:
+                state["last_order_token"] = builder.token()
+            state["last_order_token"] = _emit_async_copy(
                 builder,
+                state,
                 kernel,
                 address,
                 lds_layout,
-                last_order_token,
+                state["last_order_token"],
                 w,
                 attrs.threads_per_warp,
                 stats,
             )
             if token_id is not None:
-                wave_values[token_id] = last_order_token
-            pending_copy_tokens.append(last_order_token)
+                _set_wave_value(
+                    wave_values, token_id, "token", state["last_order_token"]
+                )
+            state["pending_copy_tokens"].append(state["last_order_token"])
         elif op.name == "ttg.async_commit_group":
-            group = _join_tokens(builder, tuple(pending_copy_tokens), stats)
-            pending_copy_tokens.clear()
-            committed_groups.append(group)
-            last_order_token = group
+            group = _join_tokens(
+                builder, tuple(state["pending_copy_tokens"]), stats
+            )
+            state["pending_copy_tokens"].clear()
+            state["committed_groups"].append(group)
+            state["last_order_token"] = group
             for result_id in op.results:
-                wave_values[result_id] = group
+                _set_wave_value(wave_values, result_id, "token", group)
             stats.commit_groups += 1
         elif op.name == "ttg.async_wait":
             keep_groups = int(op.attrs.get("num", 0) or 0)
-            wait_count = max(0, len(committed_groups) - keep_groups)
+            wait_count = max(0, len(state["committed_groups"]) - keep_groups)
             if wait_count:
-                waited_groups = tuple(committed_groups[:wait_count])
+                waited_groups = tuple(state["committed_groups"][:wait_count])
                 wait_token = _join_tokens(builder, waited_groups, stats)
                 builder.wait(wait_token)
                 stats.waits += 1
-                committed_groups = committed_groups[wait_count:]
-                last_order_token = builder.barrier(wait_token)
+                state["committed_groups"] = state["committed_groups"][wait_count:]
+                state["last_order_token"] = builder.barrier(wait_token)
                 stats.barriers += 1
             ready_token = (
-                last_order_token if last_order_token is not None else builder.token()
+                state["last_order_token"]
+                if state["last_order_token"] is not None
+                else builder.token()
             )
             for result_id in op.results:
-                wave_values[result_id] = ready_token
+                _set_wave_value(wave_values, result_id, "token", ready_token)
         elif op.name == "ttg.local_load":
             result_id = op.results[0] if op.results else None
             if result_id is None:
@@ -591,11 +1604,16 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                 _unsupported_local_load(value, "missing shared memdesc source")
             memdesc = memdescs[address.memdesc_value_id]
             after = (
-                wave_values.get(address.token_value_id)
+                _require_wave_value(
+                    wave_values,
+                    address.token_value_id,
+                    ("token",),
+                    "ttg.local_load token",
+                )
                 if address.token_value_id is not None
-                else last_order_token
+                else state["last_order_token"]
             )
-            fragment, last_order_token = _emit_local_load_fragment(
+            fragment, state["last_order_token"] = _emit_local_load_fragment(
                 builder,
                 address,
                 value,
@@ -607,9 +1625,11 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                 w,
                 stats,
             )
-            wave_values[result_id] = fragment
+            _set_wave_value(wave_values, result_id, "fragment", fragment)
         elif op.name == "tt.dot":
             _emit_dot_op(builder, op, values, wave_values, w, stats)
+        elif op.name == "tt.store":
+            _emit_store_op(builder, op, state, w)
 
 
 def _emit_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
@@ -887,4 +1907,3 @@ def _verify_wave_module(wave_text, wave_opt):
         raise RuntimeError(
             f"tlx_wave generated Wave module failed wave-opt verification: {detail}"
         )
-

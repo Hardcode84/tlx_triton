@@ -121,6 +121,7 @@ class _AddressExprPlan:
     base_arg_name: str | None
     offset_value_id: int | None
     mask_value_id: int | None
+    other_value_id: int | None
     token_value_id: int | None
     varying_dims: tuple[int, ...]
     variability: str
@@ -421,6 +422,53 @@ def _op_operands(op):
     return tuple(op.get_operand(index) for index in range(op.get_num_operands()))
 
 
+def _op_int_array_attr(op, name):
+    value = op.get_int_array_attr(name)
+    if value is None:
+        return None
+    return tuple(int(item) for item in value)
+
+
+def _async_copy_operands(op):
+    operands = _op_operands(op)
+    segments = _op_int_array_attr(op, "operandSegmentSizes")
+    if segments is None:
+        raise ValueError(
+            "tlx_wave bridge expected ttg.async_copy_global_to_local "
+            "operandSegmentSizes attribute"
+        )
+    if len(segments) != 4:
+        raise ValueError(
+            "tlx_wave bridge expected ttg.async_copy_global_to_local "
+            f"operandSegmentSizes with four entries, got {segments}"
+        )
+    if sum(segments) != len(operands):
+        raise ValueError(
+            "tlx_wave bridge found inconsistent ttg.async_copy_global_to_local "
+            f"operandSegmentSizes={segments} for {len(operands)} operands"
+        )
+    if segments[0] != 1 or segments[1] != 1:
+        raise ValueError(
+            "tlx_wave bridge expected ttg.async_copy_global_to_local source "
+            f"and destination operands, got operandSegmentSizes={segments}"
+        )
+    if segments[2] not in (0, 1) or segments[3] not in (0, 1):
+        raise ValueError(
+            "tlx_wave bridge expected optional single mask/other operands for "
+            f"ttg.async_copy_global_to_local, got operandSegmentSizes={segments}"
+        )
+
+    index = 0
+    address_value = operands[index]
+    index += segments[0]
+    memdesc_value = operands[index]
+    index += segments[1]
+    mask_value = operands[index] if segments[2] else None
+    index += segments[2]
+    other_value = operands[index] if segments[3] else None
+    return address_value, memdesc_value, mask_value, other_value
+
+
 def _result_owner_map(ops):
     owners = {}
     for op in ops:
@@ -595,13 +643,22 @@ def _build_value_plans(mod, kernel, ops):
 def _build_op_plans(ops):
     plans = []
     for index, op in enumerate(ops):
+        attrs = dict(op.get_attrs())
+        if op.get_name() in {
+            "tt.get_program_id",
+            "tt.get_num_programs",
+            "tt.expand_dims",
+        }:
+            axis = op.get_int_attr("axis")
+            if axis is not None:
+                attrs["axis"] = axis
         plans.append(
             _OpPlan(
                 index,
                 op.get_name(),
                 tuple(_value_id(operand) for operand in _op_operands(op)),
                 tuple(_value_id(result) for result in _op_results(op)),
-                dict(op.get_attrs()),
+                attrs,
             )
         )
     return tuple(plans)
@@ -726,13 +783,11 @@ def _address_plan(op, values, owners):
     name = op.get_name()
     operands = _op_operands(op)
     results = _op_results(op)
-    address_value = memdesc_value = value_value = mask_value = None
+    address_value = memdesc_value = value_value = mask_value = other_value = None
     result_value_id = token_value_id = None
 
     if name == "ttg.async_copy_global_to_local":
-        address_value = operands[0] if len(operands) > 0 else None
-        memdesc_value = operands[1] if len(operands) > 1 else None
-        mask_value = operands[2] if len(operands) > 2 else None
+        address_value, memdesc_value, mask_value, other_value = _async_copy_operands(op)
         token_value_id = _value_id(results[0]) if results else None
         result_value_id = token_value_id
     elif name == "tt.store":
@@ -788,6 +843,7 @@ def _address_plan(op, values, owners):
         source_plan.base_arg_name if source_plan is not None else None,
         offset_value_id,
         _value_id(mask_value) if mask_value is not None else None,
+        _value_id(other_value) if other_value is not None else None,
         token_value_id,
         source_plan.varying_dims if source_plan is not None else (),
         source_plan.variability if source_plan is not None else "uniform",
@@ -809,6 +865,11 @@ def _build_token_plans(ops, values):
         name = op.get_name()
         operands = _op_operands(op)
         results = _op_results(op)
+        async_source_value = async_memdesc_value = async_mask_value = None
+        if name == "ttg.async_copy_global_to_local":
+            async_source_value, async_memdesc_value, async_mask_value, _ = (
+                _async_copy_operands(op)
+            )
         result_token_id = (
             _value_id(results[0])
             if results and values.get(_value_id(results[0])).type_kind == "token"
@@ -829,21 +890,18 @@ def _build_token_plans(ops, values):
                     result_token_id,
                     name,
                     (
-                        _value_id(operands[0])
-                        if name == "ttg.async_copy_global_to_local"
-                        and len(operands) > 0
+                        _value_id(async_source_value)
+                        if async_source_value is not None
                         else None
                     ),
                     (
-                        _value_id(operands[1])
-                        if name == "ttg.async_copy_global_to_local"
-                        and len(operands) > 1
+                        _value_id(async_memdesc_value)
+                        if async_memdesc_value is not None
                         else None
                     ),
                     (
-                        _value_id(operands[2])
-                        if name == "ttg.async_copy_global_to_local"
-                        and len(operands) > 2
+                        _value_id(async_mask_value)
+                        if async_mask_value is not None
                         else None
                     ),
                     input_token_ids,
@@ -980,7 +1038,7 @@ def _local_load_address_by_result(plan):
 
 def _bridge_stage(plan):
     if plan.op_counts.get("tt.dot", 0):
-        return "gemm-local-load-dot"
+        return "ttgir-op-lowering"
     return "async-copy-tokens"
 
 
@@ -1109,4 +1167,3 @@ def _validate_target(options, attrs):
 
 def _target_triple(attrs):
     return attrs.target.replace("hip:", "amdgcn-amd-amdhsa--")
-
