@@ -13,9 +13,11 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile, make_
 
 if "tlx_wave" in backends:
     from triton.backends.tlx_wave import wave_bridge
+    from triton.backends.tlx_wave import wave_bridge_emit
     from triton.backends.tlx_wave import wave_bridge_plan
 else:
     wave_bridge = None
+    wave_bridge_emit = None
     wave_bridge_plan = None
 
 
@@ -222,18 +224,64 @@ def _parse_ttgir(
     return ir.parse_mlir_module(str(path), ctx), ctx
 
 
-def test_tlx_wave_rejects_non_dot_local_memory_in_ordered_path():
-    src = ASTSource(
-        fn=_tlx_wave_local_kernel,
-        signature={"in_ptr": "*fp32", "out_ptr": "*fp32", "n_elements": "i32"},
-        constexprs={"BLOCK_SIZE": 64},
+def test_tlx_wave_lowers_non_dot_local_memory_roundtrip(tmp_path):
+    local_func = """
+  tt.func public @local_roundtrip(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_ptr = tt.addptr %in_base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %in_ptr : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    ttg.local_store %loaded, %alloc : tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %alloc : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_ptr = tt.addptr %out_base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %out_ptr, %out : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
     )
 
-    with pytest.raises(
-        ValueError,
-        match="unsupported TTGIR op.*tt\\.load|#ttg\\.dot_op.*ttg\\.local_load",
-    ):
-        triton_compile(src, target=GFX950_WAVE)
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["shared"] == 256
+    assert metadata["tlx_wave_num_wave_local_loads"] == 1
+    assert metadata["tlx_wave_num_wave_barriers"] == 1
+    assert "func.func @local_roundtrip" in wave_artifact
+    assert wave_artifact.count("wave.load") == 2
+    assert wave_artifact.count("wave.store") == 2
+    assert "wave.lds_base" in wave_artifact
+    assert "#wave.shared" in wave_artifact
+    assert "#wave.global" in wave_artifact
+    assert "wave.barrier" in wave_artifact
+    assert "after %" in wave_artifact
+    assert "waveamd.mma" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_generic_tensor_layout_with_partial_coverage(tmp_path):
+    partial_layout_func = """
+  tt.func public @partial_layout(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %ptr = tt.addptr %base, %zero : tensor<32x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %loaded = tt.load %ptr : tensor<32x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, partial_layout_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    loaded = next(value for value in plan.values if value.producer == "tt.load")
+
+    with pytest.raises(ValueError, match="full tensor extent.*dim 0.*covers only 8"):
+        wave_bridge_emit._blocked_tensor_dim_bindings(
+            None, loaded, None, "tt.load result"
+        )
+    del ctx
 
 
 def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
@@ -538,7 +586,7 @@ def test_tlx_wave_rejects_unlowered_non_dot_data_math_in_ordered_path():
         constexprs={"BLOCK_SIZE": 64},
     )
 
-    with pytest.raises(ValueError, match="unsupported TTGIR op.*tt\\.load"):
+    with pytest.raises(ValueError, match="arith\\.addi.*lowered as simd"):
         triton_compile(src, target=GFX950_WAVE)
 
 
@@ -653,7 +701,7 @@ def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_unsupported_tt_load_with_dot(tmp_path):
+def test_tlx_wave_bridge_reaches_dot_validation_after_tt_load(tmp_path):
     dot_func = """
   tt.func public @dot_with_load(%p: !tt.ptr<f32>) attributes {noinline = false} {
     %base = tt.splat %p : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
@@ -667,14 +715,12 @@ def test_tlx_wave_bridge_rejects_unsupported_tt_load_with_dot(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, dot_func)
 
-    with pytest.raises(ValueError, match="unsupported TTGIR op.*tt\\.load"):
-        wave_bridge._build_bridge_plan(
-            mod, wave_bridge._kernel_from_module(mod)
-        )
+    with pytest.raises(ValueError, match="supports only f16 x f16"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_unsupported_local_store_with_dot(tmp_path):
+def test_tlx_wave_bridge_rejects_unlowered_local_store_value_with_dot(tmp_path):
     dot_func = """
   tt.func public @dot_with_local_store() attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
@@ -689,10 +735,8 @@ def test_tlx_wave_bridge_rejects_unsupported_local_store_with_dot(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, dot_func)
 
-    with pytest.raises(ValueError, match="unsupported TTGIR op.*ttg\\.local_store"):
-        wave_bridge._build_bridge_plan(
-            mod, wave_bridge._kernel_from_module(mod)
-        )
+    with pytest.raises(ValueError, match="ttg\\.local_store.*arith\\.constant"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 

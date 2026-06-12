@@ -189,11 +189,13 @@ _ORDERED_BODY_VALUE_OPS = {
 
 _ORDERED_BODY_EFFECT_OPS = {
     "tt.dot",
+    "tt.load",
     "tt.store",
     "ttg.async_commit_group",
     "ttg.async_copy_global_to_local",
     "ttg.async_wait",
     "ttg.local_load",
+    "ttg.local_store",
 }
 
 _ORDERED_BODY_PLANNED_OPS = {
