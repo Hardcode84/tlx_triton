@@ -290,6 +290,50 @@ def _maybe_splat(builder, value, force_width, w):
     return value
 
 
+def _is_wave_index_type(typ, w):
+    if typ is None:
+        return False
+    if str(typ) == "index":
+        return True
+    try:
+        return typ == w.index_type()
+    except AttributeError:
+        return False
+
+
+def _is_wave_simd_index_type(typ, w):
+    if typ is None:
+        return False
+    simd_type = getattr(w, "SimdType", None)
+    if simd_type is not None:
+        try:
+            if simd_type.isinstance(typ):
+                simd = simd_type(typ)
+                for attr in ("element_type", "elementType", "element"):
+                    element_type = getattr(simd, attr, None)
+                    if element_type is not None:
+                        return _is_wave_index_type(element_type, w)
+        except (AttributeError, TypeError):
+            pass
+    compact = str(typ).replace(" ", "")
+    return "simd<index" in compact or "xindex>" in compact
+
+
+def _wave_cmpi_operand(builder, value, w):
+    typ = getattr(value, "type", None)
+    if _is_wave_index_type(typ, w) or _is_wave_simd_index_type(typ, w):
+        return builder.index_cast(value, w.i64())
+    return value
+
+
+def _wave_cmpi(builder, predicate, lhs, rhs, w):
+    return builder.cmpi(
+        predicate,
+        _wave_cmpi_operand(builder, lhs, w),
+        _wave_cmpi_operand(builder, rhs, w),
+    )
+
+
 def _dim_binding_value(dim_bindings, binding, w):
     symbol = _dim_symbol(w, binding.dim)
     value = dim_bindings.get(symbol)
@@ -318,12 +362,12 @@ def _materialize_index_value(builder, source, dim_bindings, w, force_width=None)
 
 def _false_mask(builder, w, width):
     lane = builder.lane_id(width=width)
-    return builder.cmpi("ne", lane, lane)
+    return _wave_cmpi(builder, "ne", lane, lane, w)
 
 
 def _true_mask(builder, w, width):
     lane = builder.lane_id(width=width)
-    return builder.cmpi("eq", lane, lane)
+    return _wave_cmpi(builder, "eq", lane, lane, w)
 
 
 def _materialize_mask_value(builder, source, dim_bindings, w, width):
@@ -340,7 +384,7 @@ def _materialize_mask_value(builder, source, dim_bindings, w, width):
         rhs = _materialize_index_value(
             builder, source.rhs, dim_bindings, w, force_width=width
         )
-        return builder.cmpi(source.predicate, lhs, rhs)
+        return _wave_cmpi(builder, source.predicate, lhs, rhs, w)
     return source
 
 
@@ -422,7 +466,9 @@ def _wave_mask_and(builder, lhs, rhs, w, width):
     return builder.select(lhs, rhs, _false_mask(builder, w, width))
 
 
-def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
+def _blocked_layout_dim_bindings(
+    builder, value_plan, w, context, symbol_prefix, lowering_name
+):
     if value_plan.type_kind != "tensor" or not value_plan.shape:
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: expected ranked tensor, "
@@ -430,7 +476,7 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
         )
     if len(value_plan.shape) > 2:
         raise ValueError(
-            f"tlx_wave bridge generic tensor lowering supports rank <= 2 for "
+            f"tlx_wave bridge {lowering_name} supports rank <= 2 for "
             f"{context}, got shape={value_plan.shape}"
         )
     layout = _blocked_encoding_info(
@@ -450,9 +496,10 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
         )
     if any(size != 1 for size in layout.size_per_thread):
         raise ValueError(
-            "tlx_wave bridge generic tensor lowering currently supports only "
+            f"tlx_wave bridge {lowering_name} currently supports only "
             "one scalar element per workitem; "
-            f"got sizePerThread={layout.size_per_thread} for {context}"
+            f"got sizePerThread={layout.size_per_thread} for {context}; "
+            f"encoding={value_plan.encoding}"
         )
     for dim, extent in enumerate(value_plan.shape):
         covered = (
@@ -462,7 +509,7 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
         )
         if covered < extent:
             raise ValueError(
-                "tlx_wave bridge generic tensor lowering cannot cover the "
+                f"tlx_wave bridge {lowering_name} cannot cover the "
                 f"full tensor extent for {context}: dim {dim} has extent "
                 f"{extent}, but sizePerThread * threadsPerWarp * warpsPerCTA "
                 f"covers only {covered}; encoding={value_plan.encoding}"
@@ -470,7 +517,7 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
 
     width = _product(layout.threads_per_warp)
     thread = builder.workitem_id(axis=0, width=width)
-    thread_sym = w.sym(f"tlx_tensor_{value_plan.value_id}_thread")
+    thread_sym = w.sym(f"{symbol_prefix}_{value_plan.value_id}_thread")
     lane_coords = _delinearize_expr(
         w,
         w.mod(thread_sym, width),
@@ -494,9 +541,20 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
             builder.constant(w.index_type(), value_plan.shape[dim]),
             width=width,
         )
-        in_bounds = builder.cmpi("ult", coord, extent)
+        in_bounds = _wave_cmpi(builder, "ult", coord, extent, w)
         active = _wave_mask_and(builder, active, in_bounds, w, width)
     return dim_bindings, width, active
+
+
+def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
+    return _blocked_layout_dim_bindings(
+        builder,
+        value_plan,
+        w,
+        context,
+        "tlx_tensor",
+        "generic tensor lowering",
+    )
 
 
 def _linearized_tensor_offset(builder, shape, dim_bindings, w):
@@ -989,7 +1047,7 @@ def _emit_cmp_op(builder, op, values, wave_values, w):
             wave_values,
             result.value_id,
             "mask_expr",
-            builder.cmpi(predicate, lhs_value, rhs_value),
+            _wave_cmpi(builder, predicate, lhs_value, rhs_value, w),
         )
         return
     _set_wave_value(
@@ -1170,30 +1228,15 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     return dim_bindings, frag.wave_size
 
 
-def _linear_dim_bindings(builder, value_plan, thread, w):
-    rank = len(value_plan.shape)
-    if rank > 2:
-        raise ValueError(
-            "tlx_wave bridge async copy address lowering currently supports "
-            f"rank <= 2, got shape={value_plan.shape}"
-        )
-    if rank == 0:
-        return {}
-
-    thread_symbol = w.sym(f"tlx_async_{value_plan.value_id}_thread")
-    coords = _delinearize_expr(
+def _async_dim_bindings(builder, value_plan, w):
+    return _blocked_layout_dim_bindings(
+        builder,
+        value_plan,
         w,
-        thread_symbol,
-        value_plan.shape,
-        tuple(reversed(range(rank))),
+        "ttg.async_copy_global_to_local source",
+        "tlx_async",
+        "async copy address lowering",
     )
-    return {
-        _dim_symbol(w, dim): builder.index_expr(
-            coords[dim],
-            {thread_symbol: thread},
-        )
-        for dim in range(rank)
-    }
 
 
 def _dot_operand_encoding_info(value, context):
@@ -1295,17 +1338,16 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     return packet_bytes
 
 
-def _emit_async_source_ptr(builder, state, kernel, address, w, width):
+def _emit_async_source_ptr(builder, state, kernel, address, w):
     pointee_type = _source_pointee_type(kernel, address)
     element_type = _binding_type(pointee_type, w)
-    lane = builder.lane_id(width=width)
-    thread = builder.workitem_id(axis=0, width=width)
     if address.address_value_id is None:
         raise ValueError(
             "tlx_wave bridge cannot lower async copy without a source address value"
         )
     address_plan = state["values"][address.address_value_id]
-    dim_bindings = _linear_dim_bindings(builder, address_plan, thread, w)
+    dim_bindings, width, active = _async_dim_bindings(builder, address_plan, w)
+    lane = builder.lane_id(width=width)
     # Async copy inputs are regular SSA values. They must have been produced by
     # earlier ordered op lowering; this path must not recursively lower a use-def
     # slice around the async op.
@@ -1320,11 +1362,11 @@ def _emit_async_source_ptr(builder, state, kernel, address, w, width):
         dim_bindings,
         w,
     )
-    return source, lane, element_type, dim_bindings
+    return source, lane, element_type, dim_bindings, width, active
 
 
 def _emit_async_copy(
-    builder, state, kernel, address, lds_layout, after_token, w, width, stats
+    builder, state, kernel, address, lds_layout, after_token, w, stats
 ):
     if address.memdesc_value_id is None:
         raise ValueError("tlx_wave bridge cannot lower async copy without LDS memdesc")
@@ -1342,11 +1384,12 @@ def _emit_async_copy(
         )
 
     memdesc = memdescs[address.memdesc_value_id]
-    source, lane, element_type, dim_bindings = _emit_async_source_ptr(
-        builder, state, kernel, address, w, width
+    source, lane, element_type, dim_bindings, width, active = _emit_async_source_ptr(
+        builder, state, kernel, address, w
     )
-    mask = (
-        _materialize_mask_value(
+    mask = active
+    if address.mask_value_id is not None:
+        user_mask = _materialize_mask_value(
             builder,
             _require_lowered_value(
                 state["wave_values"],
@@ -1358,9 +1401,7 @@ def _emit_async_copy(
             w,
             width,
         )
-        if address.mask_value_id is not None
-        else None
-    )
+        mask = _wave_mask_and(builder, mask, user_mask, w, width)
     dma_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
     stats.async_copies += 1
 
@@ -2219,7 +2260,6 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                 lds_layout,
                 state["last_order_token"],
                 w,
-                attrs.threads_per_warp,
                 stats,
             )
             if token_id is not None:

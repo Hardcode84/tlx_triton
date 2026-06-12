@@ -921,10 +921,218 @@ def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
         assert not isinstance(lowered.value, wave_bridge_emit._PointerAdd)
 
 
+def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
+    class FakeExpr:
+        def __init__(self, text):
+            self.text = str(text)
+
+        def __str__(self):
+            return self.text
+
+        def __repr__(self):
+            return self.text
+
+        def __add__(self, other):
+            return FakeExpr(f"({self}+{other})")
+
+        def __radd__(self, other):
+            return FakeExpr(f"({other}+{self})")
+
+        def __mul__(self, other):
+            return FakeExpr(f"({self}*{other})")
+
+        def __rmul__(self, other):
+            return FakeExpr(f"({other}*{self})")
+
+        def __truediv__(self, other):
+            return FakeExpr(f"({self}/{other})")
+
+    class FakeSimdType:
+        def __init__(self, width, element_type="index"):
+            self.width = width
+            self.element_type = element_type
+
+    class FakeValue:
+        def __init__(self, name, typ=None):
+            self.name = name
+            self.type = typ
+
+    class FakeBlockedEncoding:
+        def __init__(self, size_per_thread, threads_per_warp, warps_per_cta, order):
+            self.size_per_thread = size_per_thread
+            self.threads_per_warp = threads_per_warp
+            self.warps_per_cta = warps_per_cta
+            self.order = order
+
+        def is_blocked_encoding(self):
+            return True
+
+        def get_blocked_size_per_thread(self):
+            return self.size_per_thread
+
+        def get_blocked_threads_per_warp(self):
+            return self.threads_per_warp
+
+        def get_blocked_warps_per_cta(self):
+            return self.warps_per_cta
+
+        def get_blocked_order(self):
+            return self.order
+
+    class FakeW:
+        class SimdType:
+            @staticmethod
+            def isinstance(typ):
+                return isinstance(typ, FakeSimdType)
+
+            def __init__(self, typ):
+                self.width = typ.width
+                self.element_type = typ.element_type
+
+        class sym_ctx:
+            @staticmethod
+            def int_(value):
+                return FakeExpr(value)
+
+        @staticmethod
+        def sym(name):
+            return FakeExpr(name)
+
+        @staticmethod
+        def mod(lhs, rhs):
+            return FakeExpr(f"mod({lhs},{rhs})")
+
+        @staticmethod
+        def floor(value):
+            return FakeExpr(f"floor({value})")
+
+        @staticmethod
+        def index_type():
+            return "index"
+
+        @staticmethod
+        def i64():
+            return "i64"
+
+    class FakeBuilder:
+        def __init__(self):
+            self.index_exprs = []
+            self.index_casts = []
+
+        def workitem_id(self, axis=0, width=64):
+            return FakeValue(f"thread{axis}", FakeSimdType(width, "i32"))
+
+        def index_expr(self, expr, bindings=None):
+            width = 1
+            if bindings:
+                widths = [
+                    binding.type.width
+                    for binding in bindings.values()
+                    if isinstance(binding.type, FakeSimdType)
+                ]
+                width = widths[0] if widths else width
+            value = FakeValue(f"idx{len(self.index_exprs)}", FakeSimdType(width))
+            self.index_exprs.append((expr, bindings or {}, value))
+            return value
+
+        def constant(self, typ, value):
+            return FakeValue(f"const{value}", typ)
+
+        def splat(self, value, width):
+            return FakeValue(f"splat{value.name}", FakeSimdType(width, value.type))
+
+        def index_cast(self, value, typ):
+            result = FakeValue(
+                f"cast{len(self.index_casts)}", FakeSimdType(value.type.width, typ)
+            )
+            self.index_casts.append((value, typ, result))
+            return result
+
+        def cmpi(self, predicate, lhs, rhs):
+            return FakeValue(f"{predicate}{lhs.name}", FakeSimdType(64))
+
+        def select(self, condition, true_value, false_value):
+            return FakeValue(f"select{condition.name}", true_value.type)
+
+        def lane_id(self, width=64):
+            return FakeValue("lane", FakeSimdType(width, "i32"))
+
+    encoding = (
+        "#ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], "
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
+    )
+    value_plan = SimpleNamespace(
+        value_id=42,
+        type_kind="tensor",
+        type="tensor<8x32x!tt.ptr<f32>>",
+        shape=(8, 32),
+        encoding=encoding,
+        encoding_attr=FakeBlockedEncoding((1, 1), (2, 32), (4, 1), (0, 1)),
+    )
+    builder = FakeBuilder()
+
+    bindings, width, active = wave_bridge_emit._async_dim_bindings(
+        builder, value_plan, FakeW()
+    )
+
+    assert width == 64
+    assert active is not None
+    dim0 = str(builder.index_exprs[0][0])
+    dim1 = str(builder.index_exprs[1][0])
+    assert "mod(mod(tlx_async_42_thread,64),2)" in dim0
+    assert "(2*mod(floor((tlx_async_42_thread/64)),4))" in dim0
+    assert "mod(floor((mod(tlx_async_42_thread,64)/2)),32)" in dim1
+    assert [cast[1] for cast in builder.index_casts] == ["i64"] * 4
+    assert all(cast[0].type.element_type == "index" for cast in builder.index_casts)
+    assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
+
+
+def test_tlx_wave_bridge_rejects_async_coords_with_size_per_thread():
+    class FakeBlockedEncoding:
+        def is_blocked_encoding(self):
+            return True
+
+        def get_blocked_size_per_thread(self):
+            return (2, 1)
+
+        def get_blocked_threads_per_warp(self):
+            return (2, 32)
+
+        def get_blocked_warps_per_cta(self):
+            return (4, 1)
+
+        def get_blocked_order(self):
+            return (0, 1)
+
+    class FakeW:
+        pass
+
+    encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [2, 32], "
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
+    )
+    value_plan = SimpleNamespace(
+        value_id=43,
+        type_kind="tensor",
+        type="tensor<16x32x!tt.ptr<f32>>",
+        shape=(16, 32),
+        encoding=encoding,
+        encoding_attr=FakeBlockedEncoding(),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge_emit._async_dim_bindings(None, value_plan, FakeW())
+    message = str(exc_info.value)
+    assert "async copy address lowering" in message
+    assert "sizePerThread=(2, 1)" in message
+    assert encoding in message
+
+
 def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
     class FakeSimdType:
-        def __init__(self, width):
+        def __init__(self, width, element_type="index"):
             self.width = width
+            self.element_type = element_type
 
     class FakeMaskType:
         def __init__(self, width):
@@ -959,15 +1167,28 @@ def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
 
             def __init__(self, typ):
                 self.width = typ.width
+                self.element_type = typ.element_type
+
+        @staticmethod
+        def i64():
+            return "i64"
 
     class FakeBuilder:
         def __init__(self):
             self.splats = []
+            self.index_casts = []
             self.cmpis = []
 
         def splat(self, value, width):
-            result = FakeValue(f"splat{len(self.splats)}", FakeSimdType(width))
+            result = FakeValue(f"splat{len(self.splats)}", FakeSimdType(width, value.type))
             self.splats.append((value, width, result))
+            return result
+
+        def index_cast(self, value, typ):
+            result = FakeValue(
+                f"cast{len(self.index_casts)}", FakeSimdType(value.type.width, typ)
+            )
+            self.index_casts.append((value, typ, result))
             return result
 
         def cmpi(self, predicate, lhs, rhs):
@@ -1006,9 +1227,12 @@ def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
     )
 
     assert [width for _, width, _ in builder.splats] == [64, 64]
+    assert [cast[1] for cast in builder.index_casts] == ["i64", "i64"]
+    assert builder.index_casts[0][0] is builder.splats[0][2]
+    assert builder.index_casts[1][0] is builder.splats[1][2]
     assert builder.cmpis[0][0] == "ult"
-    assert builder.cmpis[0][1] is builder.splats[0][2]
-    assert builder.cmpis[0][2] is builder.splats[1][2]
+    assert builder.cmpis[0][1] is builder.index_casts[0][2]
+    assert builder.cmpis[0][2] is builder.index_casts[1][2]
     assert wave_values[3].kind == "mask_expr"
     assert wave_values[3].value is builder.cmpis[0][3]
 
