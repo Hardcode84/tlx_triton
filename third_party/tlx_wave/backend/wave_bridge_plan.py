@@ -172,6 +172,47 @@ class _WaveAsyncStats:
     mmas: int = 0
 
 
+_ORDERED_BODY_VALUE_OPS = {
+    "arith.addi",
+    "arith.andi",
+    "arith.cmpi",
+    "arith.constant",
+    "arith.muli",
+    "tt.addptr",
+    "tt.broadcast",
+    "tt.expand_dims",
+    "tt.get_program_id",
+    "tt.make_range",
+    "tt.splat",
+    "ttg.convert_layout",
+}
+
+_ORDERED_BODY_EFFECT_OPS = {
+    "tt.dot",
+    "tt.store",
+    "ttg.async_commit_group",
+    "ttg.async_copy_global_to_local",
+    "ttg.async_wait",
+    "ttg.local_load",
+}
+
+_ORDERED_BODY_PLANNED_OPS = {
+    "tt.return",
+    "ttg.local_alloc",
+    "ttg.memdesc_index",
+    "ttg.memdesc_reinterpret",
+    "ttg.memdesc_reshape",
+    "ttg.memdesc_subslice",
+    "ttg.memdesc_trans",
+}
+
+_ORDERED_BODY_SUPPORTED_OPS = (
+    _ORDERED_BODY_VALUE_OPS
+    | _ORDERED_BODY_EFFECT_OPS
+    | _ORDERED_BODY_PLANNED_OPS
+)
+
+
 @dataclass(frozen=True)
 class _BlockedEncodingInfo:
     size_per_thread: tuple[int, ...]
@@ -432,6 +473,16 @@ def _validate_straight_line_kernel_ops(ops):
                 "tlx_wave bridge currently supports only straight-line TTGIR "
                 "kernel bodies; unsupported control-flow or nested-region op "
                 f"{op.get_name()} has {op.get_num_regions()} nested region(s)"
+            )
+
+
+def _validate_ordered_body_supported_ops(ops):
+    for op in ops:
+        name = op.get_name()
+        if name not in _ORDERED_BODY_SUPPORTED_OPS:
+            raise ValueError(
+                "tlx_wave bridge cannot lower unsupported TTGIR op in ordered "
+                f"body lowering: {name}"
             )
 
 
@@ -880,6 +931,18 @@ def _build_address_plans(ops, values, owners):
     return tuple(addresses)
 
 
+def _validate_address_feature_support(addresses):
+    for address in addresses:
+        if (
+            address.op == "ttg.async_copy_global_to_local"
+            and address.other_value_id is not None
+        ):
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "with `other` fill values yet"
+            )
+
+
 def _build_token_plans(ops, values):
     tokens = []
     for op in ops:
@@ -935,6 +998,7 @@ def _build_token_plans(ops, values):
 def _build_bridge_plan(mod, kernel):
     ops = _walk_ops(mod, kernel)
     _validate_straight_line_kernel_ops(ops)
+    _validate_ordered_body_supported_ops(ops)
     owners = _result_owner_map(ops)
     values_by_id = _build_value_plans(mod, kernel, ops)
     op_plans = _build_op_plans(ops)
@@ -943,12 +1007,14 @@ def _build_bridge_plan(mod, kernel):
         name = op.get_name()
         op_counts[name] = op_counts.get(name, 0) + 1
     memdescs_by_id = _build_memdesc_plans(ops, values_by_id)
+    address_plans = _build_address_plans(ops, values_by_id, owners)
+    _validate_address_feature_support(address_plans)
     return _BridgePlan(
         "ttgir_graph",
         op_counts,
         op_plans,
         tuple(values_by_id.values()),
-        _build_address_plans(ops, values_by_id, owners),
+        address_plans,
         _build_layout_plans(ops),
         tuple(memdescs_by_id.values()),
         _build_token_plans(ops, values_by_id),

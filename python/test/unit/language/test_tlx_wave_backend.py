@@ -13,8 +13,10 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile, make_
 
 if "tlx_wave" in backends:
     from triton.backends.tlx_wave import wave_bridge
+    from triton.backends.tlx_wave import wave_bridge_plan
 else:
     wave_bridge = None
+    wave_bridge_plan = None
 
 
 pytestmark = pytest.mark.skipif(
@@ -559,16 +561,22 @@ def test_tlx_wave_bridge_uses_async_copy_operand_segments_for_other(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_other_func)
 
-    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    kernel = wave_bridge._kernel_from_module(mod)
+    ops = wave_bridge_plan._walk_ops(mod, kernel)
+    owners = wave_bridge_plan._result_owner_map(ops)
+    values = wave_bridge_plan._build_value_plans(mod, kernel, ops)
+    addresses = wave_bridge_plan._build_address_plans(ops, values, owners)
     async_addresses = [
         address
-        for address in plan.addresses
+        for address in addresses
         if address.op == "ttg.async_copy_global_to_local"
     ]
 
     assert len(async_addresses) == 1
     assert async_addresses[0].mask_value_id is None
     assert async_addresses[0].other_value_id is not None
+    with pytest.raises(ValueError, match="async_copy_global_to_local.*`other`"):
+        wave_bridge_plan._validate_address_feature_support(addresses)
     del ctx
 
 
@@ -639,6 +647,49 @@ def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
     mod, ctx = _parse_ttgir(tmp_path, region_func)
 
     with pytest.raises(ValueError, match="straight-line TTGIR.*scf\\.if"):
+        wave_bridge._build_bridge_plan(
+            mod, wave_bridge._kernel_from_module(mod)
+        )
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_unsupported_tt_load_with_dot(tmp_path):
+    dot_func = """
+  tt.func public @dot_with_load(%p: !tt.ptr<f32>) attributes {noinline = false} {
+    %base = tt.splat %p : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %load = tt.load %base : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %lhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+
+    with pytest.raises(ValueError, match="unsupported TTGIR op.*tt\\.load"):
+        wave_bridge._build_bridge_plan(
+            mod, wave_bridge._kernel_from_module(mod)
+        )
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_unsupported_local_store_with_dot(tmp_path):
+    dot_func = """
+  tt.func public @dot_with_local_store() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    ttg.local_store %value, %alloc : tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %lhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+
+    with pytest.raises(ValueError, match="unsupported TTGIR op.*ttg\\.local_store"):
         wave_bridge._build_bridge_plan(
             mod, wave_bridge._kernel_from_module(mod)
         )
