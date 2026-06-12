@@ -573,6 +573,32 @@ def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_lowers_uniform_tensor_compare_mask(tmp_path):
+    uniform_mask_func = """
+  tt.func public @uniform_mask(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %lhs = tt.splat %arg1 : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %rhs = tt.splat %arg2 : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %mask = arith.cmpi ult, %lhs, %rhs : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %ptr, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %loaded, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, uniform_mask_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_bridge_stage"] == "ttgir-op-lowering"
+    assert "wave.splat" in wave
+    assert "wave.cmpi" in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_async_inputs_are_ordered_shared_values(tmp_path):
     shared_values_func = """
   tt.func public @shared_async_inputs(%arg0: !tt.ptr<f32>, %arg1: i32) attributes {noinline = false} {
@@ -622,6 +648,222 @@ def test_tlx_wave_bridge_async_inputs_are_ordered_shared_values(tmp_path):
     assert not hasattr(wave_bridge_emit, "_ensure_async_copy_inputs_lowered")
     assert not hasattr(wave_bridge_emit, "_emit_async_tokens")
     del ctx
+
+
+def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
+    class FakeExpr:
+        def __init__(self, text):
+            self.text = text
+
+        def __add__(self, other):
+            return FakeExpr(f"({self.text}+{other.text})")
+
+        def __mul__(self, other):
+            return FakeExpr(f"({self.text}*{other.text})")
+
+    class FakeMaskType:
+        def __init__(self, width):
+            self.width = width
+
+    class FakeValue:
+        def __init__(self, name, typ=None):
+            self.name = name
+            self.type = typ
+
+    class FakeW:
+        @staticmethod
+        def sym(name):
+            return FakeExpr(name)
+
+        class MaskType:
+            def __init__(self, typ):
+                self.width = typ.width
+
+    class FakeBuilder:
+        def __init__(self):
+            self.index_exprs = []
+            self.ptr_adds = []
+            self.cmpis = []
+            self.selects = []
+
+        def index_expr(self, expr, bindings=None):
+            value = FakeValue(f"idx{len(self.index_exprs)}")
+            self.index_exprs.append((expr, bindings or {}, value))
+            return value
+
+        def ptr_add(self, base, offset):
+            value = FakeValue(f"ptr{len(self.ptr_adds)}")
+            self.ptr_adds.append((base, offset, value))
+            return value
+
+        def cmpi(self, predicate, lhs, rhs):
+            value = FakeValue(f"mask{len(self.cmpis)}", FakeMaskType(64))
+            self.cmpis.append((predicate, lhs, rhs, value))
+            return value
+
+        def select(self, condition, true_value, false_value):
+            value = FakeValue(f"select{len(self.selects)}", true_value.type)
+            self.selects.append((condition, true_value, false_value, value))
+            return value
+
+        def lane_id(self, width=64):
+            return FakeValue("lane", FakeMaskType(width))
+
+    def plan(value_id):
+        return SimpleNamespace(value_id=value_id)
+
+    builder = FakeBuilder()
+    w = FakeW()
+    values = {value_id: plan(value_id) for value_id in range(1, 9)}
+    wave_values = {
+        1: wave_bridge_emit._WaveValue("index_expr", FakeValue("a")),
+        2: wave_bridge_emit._WaveValue("index_expr", FakeValue("b")),
+        6: wave_bridge_emit._WaveValue("pointer_expr", FakeValue("base")),
+    }
+
+    wave_bridge_emit._emit_index_binary_op(
+        builder,
+        SimpleNamespace(name="arith.muli", operands=(1, 2), results=(3,)),
+        values,
+        wave_values,
+        w,
+    )
+    wave_bridge_emit._emit_index_binary_op(
+        builder,
+        SimpleNamespace(name="arith.addi", operands=(3, 2), results=(4,)),
+        values,
+        wave_values,
+        w,
+    )
+    wave_bridge_emit._emit_cmp_op(
+        builder,
+        SimpleNamespace(
+            name="arith.cmpi", operands=(4, 2), results=(5,), attrs={"predicate": 6}
+        ),
+        values,
+        wave_values,
+        w,
+    )
+    wave_bridge_emit._emit_addptr_op(
+        builder,
+        SimpleNamespace(name="tt.addptr", operands=(6, 4), results=(7,)),
+        values,
+        wave_values,
+        w,
+    )
+    wave_bridge_emit._emit_mask_and_op(
+        builder,
+        SimpleNamespace(name="arith.andi", operands=(5, 5), results=(8,)),
+        values,
+        wave_values,
+        w,
+    )
+
+    assert len(builder.index_exprs) == 2
+    assert builder.index_exprs[0][2] in builder.index_exprs[1][1].values()
+    assert len(builder.cmpis) == 2
+    assert builder.cmpis[0][0] == "ult"
+    assert builder.cmpis[1][0] == "ne"
+    assert len(builder.ptr_adds) == 1
+    assert builder.ptr_adds[0][1] is builder.index_exprs[1][2]
+    assert len(builder.selects) == 1
+    for value_id in (3, 4, 5, 7, 8):
+        lowered = wave_values[value_id]
+        assert not isinstance(lowered.value, wave_bridge_emit._IndexExpr)
+        assert not isinstance(lowered.value, wave_bridge_emit._MaskCompare)
+        assert not isinstance(lowered.value, wave_bridge_emit._PointerAdd)
+
+
+def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
+    class FakeSimdType:
+        def __init__(self, width):
+            self.width = width
+
+    class FakeMaskType:
+        def __init__(self, width):
+            self.width = width
+
+    class FakeValue:
+        def __init__(self, name, typ="index"):
+            self.name = name
+            self.type = typ
+
+    class FakeBlockedEncoding:
+        def is_blocked_encoding(self):
+            return True
+
+        def get_blocked_size_per_thread(self):
+            return (1,)
+
+        def get_blocked_threads_per_warp(self):
+            return (64,)
+
+        def get_blocked_warps_per_cta(self):
+            return (1,)
+
+        def get_blocked_order(self):
+            return (0,)
+
+    class FakeW:
+        class SimdType:
+            @staticmethod
+            def isinstance(typ):
+                return isinstance(typ, FakeSimdType)
+
+            def __init__(self, typ):
+                self.width = typ.width
+
+    class FakeBuilder:
+        def __init__(self):
+            self.splats = []
+            self.cmpis = []
+
+        def splat(self, value, width):
+            result = FakeValue(f"splat{len(self.splats)}", FakeSimdType(width))
+            self.splats.append((value, width, result))
+            return result
+
+        def cmpi(self, predicate, lhs, rhs):
+            result = FakeValue(f"mask{len(self.cmpis)}", FakeMaskType(lhs.type.width))
+            self.cmpis.append((predicate, lhs, rhs, result))
+            return result
+
+    def plan(value_id, **kwargs):
+        return SimpleNamespace(value_id=value_id, **kwargs)
+
+    builder = FakeBuilder()
+    values = {
+        1: plan(1),
+        2: plan(2),
+        3: plan(
+            3,
+            type_kind="tensor",
+            shape=(64,),
+            encoding_attr=FakeBlockedEncoding(),
+            encoding="#ttg.blocked",
+        ),
+    }
+    wave_values = {
+        1: wave_bridge_emit._WaveValue("index_expr", FakeValue("lhs")),
+        2: wave_bridge_emit._WaveValue("index_expr", FakeValue("rhs")),
+    }
+
+    wave_bridge_emit._emit_cmp_op(
+        builder,
+        SimpleNamespace(
+            name="arith.cmpi", operands=(1, 2), results=(3,), attrs={"predicate": 6}
+        ),
+        values,
+        wave_values,
+        FakeW(),
+    )
+
+    assert [width for _, width, _ in builder.splats] == [64, 64]
+    assert builder.cmpis[0][0] == "ult"
+    assert builder.cmpis[0][1] is builder.splats[0][2]
+    assert builder.cmpis[0][2] is builder.splats[1][2]
+    assert wave_values[3].kind == "mask_expr"
+    assert wave_values[3].value is builder.cmpis[0][3]
 
 
 def test_tlx_wave_rejects_unlowered_non_dot_data_math_in_ordered_path():

@@ -75,6 +75,28 @@ class _PointerAdd:
     offset: object
 
 
+def _is_deferred_index(source):
+    if isinstance(source, _DimBinding):
+        return True
+    if isinstance(source, _IndexExpr):
+        return any(_is_deferred_index(value) for value in source.bindings.values())
+    return False
+
+
+def _is_deferred_mask(source):
+    if isinstance(source, _MaskAnd):
+        return _is_deferred_mask(source.lhs) or _is_deferred_mask(source.rhs)
+    if isinstance(source, _MaskCompare):
+        return _is_deferred_index(source.lhs) or _is_deferred_index(source.rhs)
+    return False
+
+
+def _is_deferred_pointer(source):
+    if isinstance(source, _PointerAdd):
+        return _is_deferred_pointer(source.base) or _is_deferred_index(source.offset)
+    return False
+
+
 _CMPI_PREDICATES = {
     0: "eq",
     1: "ne",
@@ -222,6 +244,27 @@ def _is_bool_value(value):
 def _is_integer_or_index_value(value):
     types = {value.type, value.element_type}
     return "index" in types or any(f"i{bits}" in types for bits in (1, 8, 16, 32, 64))
+
+
+def _tensor_lane_width(value_plan, context):
+    if getattr(value_plan, "type_kind", None) != "tensor":
+        return None
+    layout = _blocked_encoding_info(
+        value_plan.encoding_attr,
+        value_plan.encoding,
+        context,
+    )
+    rank = len(value_plan.shape)
+    if (
+        len(layout.size_per_thread) != rank
+        or len(layout.threads_per_warp) != rank
+        or len(layout.warps_per_cta) != rank
+    ):
+        raise ValueError(
+            f"tlx_wave bridge blocked layout rank does not match {context}: "
+            f"shape={value_plan.shape}, encoding={value_plan.encoding}"
+        )
+    return _product(layout.threads_per_warp)
 
 
 def _maybe_splat(builder, value, force_width, w):
@@ -620,20 +663,19 @@ def _init_argument_wave_values(builder, values, wave_values, w):
                 wave_values,
                 value.value_id,
                 "pointer_expr",
-                _PointerBase(arg),
+                arg,
             )
         elif value.type_kind == "scalar" and _is_integer_or_index_value(value):
             bound = arg if value.type == "index" else builder.index_cast(arg, w.index_type())
-            symbol = w.sym(f"tlx_{value.base_arg_name}")
             _set_wave_value(
                 wave_values,
                 value.value_id,
                 "index_expr",
-                _IndexExpr(symbol, {symbol: bound}),
+                bound,
             )
 
 
-def _emit_constant_op(op, values, wave_values, w):
+def _emit_constant_op(builder, op, values, wave_values, w):
     if len(op.results) != 1:
         return
     value = values[op.results[0]]
@@ -654,7 +696,7 @@ def _emit_constant_op(op, values, wave_values, w):
             wave_values,
             value.value_id,
             "index_expr",
-            _IndexExpr(w.sym_ctx.int_(const), {}),
+            builder.index_expr(w.sym_ctx.int_(const)),
         )
 
 
@@ -675,7 +717,7 @@ def _emit_program_id_op(builder, state, op, values, wave_values, w):
         wave_values,
         value.value_id,
         "index_expr",
-        _IndexExpr(symbol, {symbol: binding}),
+        builder.index_expr(symbol, {symbol: binding}),
     )
 
 
@@ -699,7 +741,7 @@ def _emit_make_range_op(op, values, wave_values, w):
     )
 
 
-def _emit_index_binary_op(op, values, wave_values, w):
+def _emit_index_binary_op(builder, op, values, wave_values, w):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError(f"tlx_wave bridge expected {op.name} with two operands")
     lhs = _require_lowered_value(
@@ -712,6 +754,18 @@ def _emit_index_binary_op(op, values, wave_values, w):
     lhs_symbol = w.sym(f"tlx_v{result.value_id}_lhs")
     rhs_symbol = w.sym(f"tlx_v{result.value_id}_rhs")
     expr = lhs_symbol + rhs_symbol if op.name == "arith.addi" else lhs_symbol * rhs_symbol
+    if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
+        lowered_lhs = _materialize_index_value(builder, lhs, {}, w)
+        lowered_rhs = _materialize_index_value(builder, rhs, {}, w)
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "index_expr",
+            builder.index_expr(
+                expr, {lhs_symbol: lowered_lhs, rhs_symbol: lowered_rhs}
+            ),
+        )
+        return
     _set_wave_value(
         wave_values,
         result.value_id,
@@ -720,7 +774,7 @@ def _emit_index_binary_op(op, values, wave_values, w):
     )
 
 
-def _emit_cmp_op(op, values, wave_values, w):
+def _emit_cmp_op(builder, op, values, wave_values, w):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected arith.cmpi with two operands")
     predicate = _CMPI_PREDICATES.get(int(op.attrs.get("predicate")))
@@ -736,6 +790,17 @@ def _emit_cmp_op(op, values, wave_values, w):
         wave_values, op.operands[1], "index_expr", "arith.cmpi"
     )
     result = values[op.results[0]]
+    if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
+        width = _tensor_lane_width(result, "arith.cmpi result")
+        lhs_value = _materialize_index_value(builder, lhs, {}, w, force_width=width)
+        rhs_value = _materialize_index_value(builder, rhs, {}, w, force_width=width)
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "mask_expr",
+            builder.cmpi(predicate, lhs_value, rhs_value),
+        )
+        return
     _set_wave_value(
         wave_values,
         result.value_id,
@@ -744,7 +809,7 @@ def _emit_cmp_op(op, values, wave_values, w):
     )
 
 
-def _emit_mask_and_op(op, values, wave_values):
+def _emit_mask_and_op(builder, op, values, wave_values, w):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected arith.andi with two operands")
     lhs = _require_lowered_value(
@@ -754,6 +819,30 @@ def _emit_mask_and_op(op, values, wave_values):
         wave_values, op.operands[1], "mask_expr", "arith.andi"
     )
     result = values[op.results[0]]
+    if not _is_deferred_mask(lhs) and not _is_deferred_mask(rhs):
+        width = None
+        for source in (lhs, rhs):
+            if not isinstance(source, _MaskConst):
+                width = w.MaskType(source.type).width
+                break
+        if width is None:
+            layout = _blocked_encoding_info(
+                result.encoding_attr,
+                result.encoding,
+                "arith.andi result",
+            )
+            width = _product(layout.threads_per_warp)
+        if isinstance(lhs, _MaskConst):
+            lhs = _materialize_mask_value(builder, lhs, {}, w, width)
+        if isinstance(rhs, _MaskConst):
+            rhs = _materialize_mask_value(builder, rhs, {}, w, width)
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "mask_expr",
+            builder.select(lhs, rhs, _false_mask(builder, w, width)),
+        )
+        return
     _set_wave_value(
         wave_values,
         result.value_id,
@@ -762,7 +851,7 @@ def _emit_mask_and_op(op, values, wave_values):
     )
 
 
-def _emit_addptr_op(op, values, wave_values):
+def _emit_addptr_op(builder, op, values, wave_values, w):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected tt.addptr with two operands")
     base = _require_lowered_value(
@@ -772,6 +861,17 @@ def _emit_addptr_op(op, values, wave_values):
         wave_values, op.operands[1], "index_expr", "tt.addptr"
     )
     result = values[op.results[0]]
+    if not _is_deferred_pointer(base) and not _is_deferred_index(offset):
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "pointer_expr",
+            builder.ptr_add(
+                _materialize_pointer_value(builder, base, {}, w),
+                _materialize_index_value(builder, offset, {}, w),
+            ),
+        )
+        return
     _set_wave_value(
         wave_values,
         result.value_id,
@@ -1122,7 +1222,7 @@ def _emit_generic_value_op(builder, state, op, w):
     values = state["values"]
     wave_values = state["wave_values"]
     if op.name == "arith.constant":
-        _emit_constant_op(op, values, wave_values, w)
+        _emit_constant_op(builder, op, values, wave_values, w)
     elif op.name == "tt.get_program_id":
         _emit_program_id_op(builder, state, op, values, wave_values, w)
     elif op.name == "tt.make_range":
@@ -1130,13 +1230,13 @@ def _emit_generic_value_op(builder, state, op, w):
     elif op.name in {"tt.broadcast", "tt.splat", "tt.expand_dims"}:
         _forward_lowered_value(op, values, wave_values)
     elif op.name in {"arith.addi", "arith.muli"}:
-        _emit_index_binary_op(op, values, wave_values, w)
+        _emit_index_binary_op(builder, op, values, wave_values, w)
     elif op.name == "arith.cmpi":
-        _emit_cmp_op(op, values, wave_values, w)
+        _emit_cmp_op(builder, op, values, wave_values, w)
     elif op.name == "arith.andi":
-        _emit_mask_and_op(op, values, wave_values)
+        _emit_mask_and_op(builder, op, values, wave_values, w)
     elif op.name == "tt.addptr":
-        _emit_addptr_op(op, values, wave_values)
+        _emit_addptr_op(builder, op, values, wave_values, w)
     elif op.name == "ttg.convert_layout":
         _forward_lowered_value(op, values, wave_values)
     else:
@@ -2033,6 +2133,7 @@ def _cmake_build_dirs():
 
 def _wave_build_dirs():
     for build_dir in _cmake_build_dirs():
+        yield build_dir
         yield build_dir / "third_party" / "tlx_wave" / "wave"
         yield build_dir / "third_party" / "wave"
     yield _repo_root() / "third_party" / "wave" / "build"
