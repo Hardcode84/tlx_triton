@@ -611,7 +611,23 @@ def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_plan_recurses_into_nested_regions(tmp_path):
+def test_tlx_wave_bridge_rejects_private_helper_funcs_before_emission(tmp_path):
+    helper_func = """
+  tt.func private @helper() {
+    tt.return
+  }
+  tt.func public @kernel(%p: !tt.ptr<f32>) attributes {noinline = false} {
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, helper_func)
+
+    with pytest.raises(ValueError, match="private/helper tt\\.func.*helper"):
+        wave_bridge._kernel_from_module(mod)
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
     region_func = """
   tt.func public @region_kernel(%flag: i1) attributes {noinline = false} {
     scf.if %flag {
@@ -622,10 +638,10 @@ def test_tlx_wave_bridge_plan_recurses_into_nested_regions(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, region_func)
 
-    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
-    assert plan.op_counts["scf.if"] == 1
-    assert plan.op_counts["arith.constant"] == 1
-    assert plan.op_counts["scf.yield"] == 1
+    with pytest.raises(ValueError, match="straight-line TTGIR.*scf\\.if"):
+        wave_bridge._build_bridge_plan(
+            mod, wave_bridge._kernel_from_module(mod)
+        )
     del ctx
 
 

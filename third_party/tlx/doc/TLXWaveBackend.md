@@ -415,11 +415,27 @@ Do not build the bridge around a GEMM-specific recognizer. In particular:
 - do not accept a layout merely because the current GEMM fixture happens to use
   it. Layout validation must be explicit and tied to the Wave value emitted.
 
+### Current Structural Subset
+
+The implemented bridge is currently a straight-line public-kernel converter. It
+accepts exactly one public `tt.func` and rejects any additional private/helper
+`tt.func` definitions before planning, because helper calls would otherwise be
+ignored or flattened without preserving function structure.
+
+Within the public kernel body, nested-region and control-flow ops such as
+`scf.if`, `scf.for`, and region-yielding pipeline constructs are rejected before
+Wave emission. Supporting these requires a region-preserving lowering state that
+maps block arguments, loop-carried SSA values, and memory tokens through the
+corresponding Wave/SCF structure; flattening nested ops into the top-level Wave
+function is not a valid fallback.
+
 ### Initial Unsupported Cases
 
 The first converter should reject these explicitly:
 
 - TDM descriptor loads and stores;
+- private/helper `tt.func` definitions;
+- nested-region or control-flow ops until region-preserving lowering is added;
 - dynamic tile shapes or dynamic LDS allocation sizes;
 - storage alias overlap;
 - TMEM or NVIDIA-only TLX storage;

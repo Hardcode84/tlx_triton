@@ -425,6 +425,16 @@ def _walk_ops(mod, kernel):
     return _walk_region_ops(fn.get_region(0))
 
 
+def _validate_straight_line_kernel_ops(ops):
+    for op in ops:
+        if op.get_num_regions():
+            raise ValueError(
+                "tlx_wave bridge currently supports only straight-line TTGIR "
+                "kernel bodies; unsupported control-flow or nested-region op "
+                f"{op.get_name()} has {op.get_num_regions()} nested region(s)"
+            )
+
+
 def _op_results(op):
     return tuple(op.get_result(index) for index in range(op.get_num_results()))
 
@@ -924,6 +934,7 @@ def _build_token_plans(ops, values):
 
 def _build_bridge_plan(mod, kernel):
     ops = _walk_ops(mod, kernel)
+    _validate_straight_line_kernel_ops(ops)
     owners = _result_owner_map(ops)
     values_by_id = _build_value_plans(mod, kernel, ops)
     op_plans = _build_op_plans(ops)
@@ -1105,6 +1116,18 @@ def _public_tt_func_ops(mod):
     return tuple(funcs)
 
 
+def _tt_func_ops(mod):
+    funcs = []
+
+    def visit(op):
+        if op.get_name() == "tt.func":
+            funcs.append(op)
+        return True
+
+    mod.walk(visit)
+    return tuple(funcs)
+
+
 def _kernel_from_module(mod):
     funcs = _public_tt_func_ops(mod)
     if len(funcs) != 1:
@@ -1118,6 +1141,19 @@ def _kernel_from_module(mod):
 
     op = funcs[0]
     name = op.get_str_attr("sym_name") or _entry_name(mod)
+    helper_funcs = [
+        func
+        for func in _tt_func_ops(mod)
+        if func.get_str_attr("sym_name") != name
+    ]
+    if helper_funcs:
+        names = ", ".join(
+            func.get_str_attr("sym_name") or "<unnamed>" for func in helper_funcs
+        )
+        raise ValueError(
+            "tlx_wave bridge currently supports exactly one tt.func and cannot "
+            f"preserve or inline private/helper tt.func definitions: {names}"
+        )
     fn = mod.get_function(name)
 
     args = []
