@@ -692,12 +692,84 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context, component=0):
 
 
 def _linearized_tensor_offset(builder, shape, dim_bindings, w):
+    return _materialize_index_value(
+        builder,
+        _linearized_tensor_offset_expr(shape, dim_bindings, w),
+        {},
+        w,
+    )
+
+
+def _linearized_tensor_offset_expr(shape, dim_bindings, w):
     offset = w.sym_ctx.int_(0)
     stride = 1
     for dim in reversed(range(len(shape))):
         offset = offset + _dim_symbol(w, dim) * stride
         stride *= int(shape[dim])
-    return builder.index_expr(offset, dim_bindings)
+    return _IndexExpr(offset, dict(dim_bindings))
+
+
+def _zero_index_expr(w):
+    return _IndexExpr(w.sym_ctx.int_(0), {})
+
+
+def _is_zero_index_source(source):
+    if isinstance(source, int):
+        return source == 0
+    if isinstance(source, _IndexExpr) and not source.bindings:
+        try:
+            return int(source.expr) == 0
+        except (TypeError, ValueError):
+            return str(source.expr) == "0"
+    return False
+
+
+def _stage_index_identity(w, memdesc, label, dim, source):
+    symbol = w.sym(f"tlx_memdesc_{memdesc.value_id}_{label}_{dim}")
+    return _IndexExpr(symbol, {symbol: source})
+
+
+def _stage_index_add_const(w, memdesc, label, dim, source, offset):
+    symbol = w.sym(f"tlx_memdesc_{memdesc.value_id}_{label}_{dim}")
+    return _IndexExpr(symbol + int(offset), {symbol: source})
+
+
+def _linearized_tensor_scaled_offset_expr(
+    shape,
+    dim_bindings,
+    scale,
+    divisor,
+    w,
+    context,
+):
+    if scale is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown memdesc element "
+            "byte width for LDS address"
+        )
+    if divisor is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown pointer element "
+            "byte width for LDS address"
+        )
+    offset = w.sym_ctx.int_(0)
+    stride = 1
+    for dim in reversed(range(len(shape))):
+        coefficient = stride * int(scale)
+        dim_symbol = _dim_symbol(w, dim)
+        dim_source = dim_bindings.get(dim_symbol)
+        if coefficient % int(divisor):
+            if _is_zero_index_source(dim_source):
+                stride *= int(shape[dim])
+                continue
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: byte offset for dim "
+                f"{dim} has stride {coefficient}, which is not aligned to "
+                f"pointer element size {divisor}"
+            )
+        offset = offset + dim_symbol * (coefficient // int(divisor))
+        stride *= int(shape[dim])
+    return _IndexExpr(offset, dict(dim_bindings))
 
 
 def _memdesc_logical_size_bytes(memdesc):
@@ -805,6 +877,151 @@ def _emit_memdesc_index_offset(
     return builder.index_expr(slot_sym * stride, {slot_sym: slot})
 
 
+def _base_memdesc(memdesc, memdescs, context):
+    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc view "
+            f"{memdesc.value_id} has no known base"
+        )
+    return memdescs[memdesc.base_value_id]
+
+
+def _memdesc_index_slot_source(memdesc, state, w, context):
+    if memdesc.static_index is not None:
+        return _IndexExpr(w.sym_ctx.int_(int(memdesc.static_index)), {})
+    if len(memdesc.view_operands) < 2:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_index view "
+            "does not record an index operand"
+        )
+    return _require_lowered_value(
+        state["wave_values"],
+        memdesc.view_operands[1],
+        "index_expr",
+        f"{context} memdesc_index slot",
+    )
+
+
+def _memdesc_subslice_offsets(memdesc, context):
+    offsets = tuple(int(offset) for offset in getattr(memdesc, "view_offsets", ()))
+    if len(offsets) != len(memdesc.shape):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_subslice "
+            f"records {len(offsets)} offset(s) for rank {len(memdesc.shape)}"
+        )
+    return offsets
+
+
+def _memdesc_trans_order(memdesc, context):
+    order = tuple(int(dim) for dim in getattr(memdesc, "view_order", ()))
+    rank = len(memdesc.shape)
+    if len(order) != rank or sorted(order) != list(range(rank)):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_trans order "
+            f"{order} is not a permutation of rank {rank}"
+        )
+    return order
+
+
+def _memdesc_parent_dim_bindings(
+    memdesc,
+    parent,
+    state,
+    dim_bindings,
+    w,
+    context,
+):
+    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+        return dim_bindings
+
+    if memdesc.view_op == "ttg.memdesc_index":
+        if len(parent.shape) != len(memdesc.shape) + 1:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_index "
+                f"parent rank {len(parent.shape)} does not drop to child rank "
+                f"{len(memdesc.shape)}"
+            )
+        parent_bindings = {
+            _dim_symbol(w, 0): _stage_index_identity(
+                w,
+                memdesc,
+                "index",
+                0,
+                _memdesc_index_slot_source(memdesc, state, w, context),
+            )
+        }
+        for dim in range(len(memdesc.shape)):
+            parent_bindings[_dim_symbol(w, dim + 1)] = _stage_index_identity(
+                w,
+                memdesc,
+                "index",
+                dim + 1,
+                dim_bindings[_dim_symbol(w, dim)],
+            )
+        return parent_bindings
+
+    if memdesc.view_op == "ttg.memdesc_subslice":
+        if len(parent.shape) != len(memdesc.shape):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_subslice "
+                f"parent rank {len(parent.shape)} does not match child rank "
+                f"{len(memdesc.shape)}"
+            )
+        offsets = _memdesc_subslice_offsets(memdesc, context)
+        return {
+            _dim_symbol(w, dim): _stage_index_add_const(
+                w,
+                memdesc,
+                "subslice",
+                dim,
+                dim_bindings[_dim_symbol(w, dim)],
+                offsets[dim],
+            )
+            for dim in range(len(memdesc.shape))
+        }
+
+    if memdesc.view_op == "ttg.memdesc_trans":
+        if len(parent.shape) != len(memdesc.shape):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_trans parent "
+                f"rank {len(parent.shape)} does not match child rank "
+                f"{len(memdesc.shape)}"
+            )
+        order = _memdesc_trans_order(memdesc, context)
+        parent_bindings = {}
+        for child_dim, parent_dim in enumerate(order):
+            parent_bindings[_dim_symbol(w, parent_dim)] = _stage_index_identity(
+                w,
+                memdesc,
+                "trans",
+                parent_dim,
+                dim_bindings[_dim_symbol(w, child_dim)],
+            )
+        return parent_bindings
+
+    if memdesc.view_op == "ttg.memdesc_reshape":
+        if _product(parent.shape) != _product(memdesc.shape):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_reshape "
+                f"changes logical element count from {_product(parent.shape)} "
+                f"to {_product(memdesc.shape)}"
+            )
+        linear = _linearized_tensor_offset_expr(memdesc.shape, dim_bindings, w)
+        linear_symbol = w.sym(f"tlx_memdesc_{memdesc.value_id}_reshape_linear")
+        coords = _delinearize_expr(
+            w,
+            linear_symbol,
+            parent.shape,
+            tuple(reversed(range(len(parent.shape)))),
+        )
+        return {
+            _dim_symbol(w, dim): _IndexExpr(coords[dim], {linear_symbol: linear})
+            for dim in range(len(parent.shape))
+        }
+
+    _unsupported_memdesc_view(context, memdesc)
+
+
 def _emit_memdesc_base_ptr(
     builder,
     memdesc,
@@ -827,15 +1044,15 @@ def _emit_memdesc_base_ptr(
             offset=lds_layout.offsets[memdesc.value_id],
         )
 
-    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
-        raise ValueError(
-            f"tlx_wave bridge cannot lower {context}: memdesc view "
-            f"{memdesc.value_id} has no known base"
-        )
-    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+    parent = _base_memdesc(memdesc, memdescs, context)
+    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS or memdesc.view_op in {
+        "ttg.memdesc_trans",
+        "ttg.memdesc_reshape",
+        "ttg.memdesc_reinterpret",
+    }:
         return _emit_memdesc_base_ptr(
             builder,
-            memdescs[memdesc.base_value_id],
+            parent,
             memdescs,
             lds_layout,
             state,
@@ -844,12 +1061,13 @@ def _emit_memdesc_base_ptr(
             w,
             context,
         )
-    if memdesc.view_op != "ttg.memdesc_index":
+
+    if memdesc.view_op not in {"ttg.memdesc_index", "ttg.memdesc_subslice"}:
         _unsupported_memdesc_view(context, memdesc)
 
     base = _emit_memdesc_base_ptr(
         builder,
-        memdescs[memdesc.base_value_id],
+        parent,
         memdescs,
         lds_layout,
         state,
@@ -858,17 +1076,95 @@ def _emit_memdesc_base_ptr(
         w,
         context,
     )
-    return builder.ptr_add(
-        base,
-        _emit_memdesc_index_offset(
+    if memdesc.view_op == "ttg.memdesc_index":
+        offset = _emit_memdesc_index_offset(
             builder,
             memdesc,
             state,
             pointer_element_bytes,
             w,
             context,
-        ),
+        )
+    else:
+        byte_offset = _memdesc_static_subslice_offset_bytes(
+            memdesc, parent, context
+        )
+        if byte_offset % pointer_element_bytes:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: memdesc_subslice "
+                f"byte offset {byte_offset} is not aligned to pointer element "
+                f"size {pointer_element_bytes}"
+            )
+        offset = builder.index_expr(
+            w.sym_ctx.int_(byte_offset // pointer_element_bytes)
+        )
+    return builder.ptr_add(base, offset)
+
+
+def _static_linear_offset(shape, coords):
+    if len(shape) != len(coords):
+        raise ValueError(
+            "tlx_wave bridge internal error: static offset rank mismatch "
+            f"for shape={shape}, coords={coords}"
+        )
+    offset = 0
+    stride = 1
+    for dim in reversed(range(len(shape))):
+        offset += int(coords[dim]) * stride
+        stride *= int(shape[dim])
+    return offset
+
+
+def _memdesc_static_subslice_offset_bytes(memdesc, parent, context):
+    if parent.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_subslice parent "
+            f"has unknown element byte width for {parent.element_type}"
+        )
+    shape = parent.alloc_shape or parent.shape
+    return (
+        _static_linear_offset(shape, _memdesc_subslice_offsets(memdesc, context))
+        * parent.element_byte_width
     )
+
+
+def _memdesc_subslice_is_contiguous(memdesc, context):
+    shape = tuple(int(dim) for dim in memdesc.shape)
+    alloc_shape = tuple(int(dim) for dim in (memdesc.alloc_shape or memdesc.shape))
+    offsets = _memdesc_subslice_offsets(memdesc, context)
+    if len(shape) != len(alloc_shape):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: memdesc_subslice shape "
+            f"rank {len(shape)} does not match alloc_shape rank {len(alloc_shape)}"
+        )
+    first_varying_dim = next(
+        (dim for dim, extent in enumerate(shape) if extent > 1),
+        None,
+    )
+    if first_varying_dim is None:
+        return True
+    for dim in range(first_varying_dim + 1, len(shape)):
+        if offsets[dim] != 0 or shape[dim] != alloc_shape[dim]:
+            return False
+    return True
+
+
+def _memdesc_dma_can_use_base_pointer(memdesc, memdescs, context):
+    if memdesc.kind == "allocation":
+        return True
+    parent = _base_memdesc(memdesc, memdescs, context)
+    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+        return _memdesc_dma_can_use_base_pointer(parent, memdescs, context)
+    if memdesc.view_op == "ttg.memdesc_index":
+        return _memdesc_dma_can_use_base_pointer(parent, memdescs, context)
+    if memdesc.view_op == "ttg.memdesc_subslice":
+        return (
+            _memdesc_dma_can_use_base_pointer(parent, memdescs, context)
+            and _memdesc_subslice_is_contiguous(memdesc, context)
+        )
+    if memdesc.view_op in {"ttg.memdesc_reshape", "ttg.memdesc_reinterpret"}:
+        return _memdesc_dma_can_use_base_pointer(parent, memdescs, context)
+    return False
 
 
 def _memdesc_base_is_aligned(
@@ -888,23 +1184,31 @@ def _memdesc_base_is_aligned(
             )
         return lds_layout.offsets[memdesc.value_id] % pointer_element_bytes == 0
 
-    if memdesc.base_value_id is None or memdesc.base_value_id not in memdescs:
-        raise ValueError(
-            f"tlx_wave bridge cannot lower {context}: memdesc view "
-            f"{memdesc.value_id} has no known base"
-        )
+    parent = _base_memdesc(memdesc, memdescs, context)
     if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
         return _memdesc_base_is_aligned(
-            memdescs[memdesc.base_value_id],
+            parent,
             memdescs,
             lds_layout,
             pointer_element_bytes,
             context,
         )
-    if memdesc.view_op != "ttg.memdesc_index":
+    if memdesc.view_op in {
+        "ttg.memdesc_trans",
+        "ttg.memdesc_reshape",
+        "ttg.memdesc_reinterpret",
+    }:
+        return _memdesc_base_is_aligned(
+            parent,
+            memdescs,
+            lds_layout,
+            pointer_element_bytes,
+            context,
+        )
+    if memdesc.view_op not in {"ttg.memdesc_index", "ttg.memdesc_subslice"}:
         _unsupported_memdesc_view(context, memdesc)
     if not _memdesc_base_is_aligned(
-        memdescs[memdesc.base_value_id],
+        parent,
         memdescs,
         lds_layout,
         pointer_element_bytes,
@@ -912,10 +1216,17 @@ def _memdesc_base_is_aligned(
     ):
         return False
 
-    view_bytes = _memdesc_logical_size_bytes(memdesc)
-    if memdesc.static_index is not None:
-        return (memdesc.static_index * view_bytes) % pointer_element_bytes == 0
-    return view_bytes % pointer_element_bytes == 0
+    if memdesc.view_op == "ttg.memdesc_index":
+        view_bytes = _memdesc_logical_size_bytes(memdesc)
+        if memdesc.static_index is not None:
+            return (memdesc.static_index * view_bytes) % pointer_element_bytes == 0
+        return view_bytes % pointer_element_bytes == 0
+
+    return (
+        _memdesc_static_subslice_offset_bytes(memdesc, parent, context)
+        % pointer_element_bytes
+        == 0
+    )
 
 
 def _emit_memdesc_ptr(
@@ -929,20 +1240,8 @@ def _emit_memdesc_ptr(
     w,
     context,
 ):
-    if (
-        memdesc.kind == "view"
-        and memdesc.view_op != "ttg.memdesc_index"
-        and memdesc.view_op not in _TRANSPARENT_MEMDESC_VIEW_OPS
-    ):
-        _unsupported_memdesc_view(context, memdesc)
-    _validate_generic_shared_layout(memdesc, context)
-    if memdesc.value_id not in lds_layout.offsets and memdesc.kind == "allocation":
-        raise ValueError(
-            f"tlx_wave bridge cannot lower {context}: no LDS placement for "
-            f"memdesc {memdesc.value_id}"
-        )
     element_type = _wave_element_type(memdesc.element_type, w, context)
-    base = _emit_memdesc_base_ptr(
+    return _emit_memdesc_ptr_for_type(
         builder,
         memdesc,
         memdescs,
@@ -950,14 +1249,182 @@ def _emit_memdesc_ptr(
         state,
         element_type,
         memdesc.element_byte_width,
+        dim_bindings,
+        width,
         w,
         context,
     )
-    offset = _linearized_tensor_offset(builder, memdesc.shape, dim_bindings, w)
+
+
+def _emit_memdesc_ptr_for_type(
+    builder,
+    memdesc,
+    memdescs,
+    lds_layout,
+    state,
+    pointer_element_type,
+    pointer_element_bytes,
+    dim_bindings,
+    width,
+    w,
+    context,
+):
+    if pointer_element_bytes is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown pointer element "
+            "byte width for LDS address"
+        )
+    if memdesc.kind == "view" and memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+        _validate_generic_shared_layout(memdesc, context)
+        return _emit_memdesc_ptr_for_type(
+            builder,
+            _base_memdesc(memdesc, memdescs, context),
+            memdescs,
+            lds_layout,
+            state,
+            pointer_element_type,
+            pointer_element_bytes,
+            dim_bindings,
+            width,
+            w,
+            context,
+        )
+
+    if memdesc.kind == "view" and memdesc.view_op == "ttg.memdesc_reinterpret":
+        _validate_generic_shared_layout(memdesc, context)
+        base = _emit_memdesc_base_ptr(
+            builder,
+            _base_memdesc(memdesc, memdescs, context),
+            memdescs,
+            lds_layout,
+            state,
+            pointer_element_type,
+            pointer_element_bytes,
+            w,
+            context,
+        )
+        offset = _linearized_tensor_scaled_offset_expr(
+            memdesc.shape,
+            dim_bindings,
+            memdesc.element_byte_width,
+            pointer_element_bytes,
+            w,
+            context,
+        )
+        return builder.ptr_add(
+            base,
+            _materialize_index_value(builder, offset, {}, w),
+            w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
+        )
+
+    if memdesc.kind == "view" and memdesc.view_op in {
+        "ttg.memdesc_index",
+        "ttg.memdesc_subslice",
+    }:
+        parent = _base_memdesc(memdesc, memdescs, context)
+        if parent.kind != "allocation":
+            return _emit_memdesc_ptr_for_type(
+                builder,
+                parent,
+                memdescs,
+                lds_layout,
+                state,
+                pointer_element_type,
+                pointer_element_bytes,
+                _memdesc_parent_dim_bindings(
+                    memdesc,
+                    parent,
+                    state,
+                    dim_bindings,
+                    w,
+                    context,
+                ),
+                width,
+                w,
+                context,
+            )
+        _validate_generic_shared_layout(memdesc, context)
+        base = _emit_memdesc_base_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            pointer_element_type,
+            pointer_element_bytes,
+            w,
+            context,
+        )
+        offset_shape = (
+            memdesc.alloc_shape
+            if memdesc.view_op == "ttg.memdesc_subslice"
+            else memdesc.shape
+        )
+        offset = _linearized_tensor_scaled_offset_expr(
+            offset_shape,
+            dim_bindings,
+            memdesc.element_byte_width,
+            pointer_element_bytes,
+            w,
+            context,
+        )
+        return builder.ptr_add(
+            base,
+            _materialize_index_value(builder, offset, {}, w),
+            w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
+        )
+
+    if memdesc.kind == "view" and memdesc.view_op in {
+        "ttg.memdesc_trans",
+        "ttg.memdesc_reshape",
+    }:
+        parent = _base_memdesc(memdesc, memdescs, context)
+        return _emit_memdesc_ptr_for_type(
+            builder,
+            parent,
+            memdescs,
+            lds_layout,
+            state,
+            pointer_element_type,
+            pointer_element_bytes,
+            _memdesc_parent_dim_bindings(
+                memdesc,
+                parent,
+                state,
+                dim_bindings,
+                w,
+                context,
+            ),
+            width,
+            w,
+            context,
+        )
+
+    if memdesc.kind != "allocation":
+        _unsupported_memdesc_view(context, memdesc)
+
+    _validate_generic_shared_layout(memdesc, context)
+    if memdesc.value_id not in lds_layout.offsets and memdesc.kind == "allocation":
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: no LDS placement for "
+            f"memdesc {memdesc.value_id}"
+        )
+    base = builder.lds_base(
+        pointer_element_type,
+        offset=lds_layout.offsets[memdesc.value_id],
+    )
+    offset = _linearized_tensor_scaled_offset_expr(
+        memdesc.shape,
+        dim_bindings,
+        memdesc.element_byte_width,
+        pointer_element_bytes,
+        w,
+        context,
+    )
     return builder.ptr_add(
         base,
-        offset,
-        w.simd_ptr_type(element_type, w.shared_address_space(), width),
+        _materialize_index_value(builder, offset, {}, w),
+        w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
     )
 
 
@@ -1994,6 +2461,12 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
             and address.shape == memdesc.shape
             and shared == _GFX950_SHARED_LAYOUT
         )
+    ):
+        return None
+    if not _memdesc_dma_can_use_base_pointer(
+        memdesc,
+        memdescs,
+        "ttg.async_copy_global_to_local destination",
     ):
         return None
     if not _memdesc_base_is_aligned(

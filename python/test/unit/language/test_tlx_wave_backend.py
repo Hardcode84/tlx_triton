@@ -693,7 +693,8 @@ def test_tlx_wave_lowers_dynamic_memdesc_index_as_ssa_transform(tmp_path):
     assert view.static_index is None
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["shared"] == 512
-    assert "wave.index_cast" in wave_artifact
+    assert "arith.index_cast %arg1" in wave_artifact
+    assert "tlx_memdesc_" in wave_artifact
     assert wave_artifact.count("wave.index_expr") >= 4
     assert wave_artifact.count("wave.ptr_add") >= 4
     del ctx
@@ -817,19 +818,87 @@ def test_tlx_wave_rejects_unsupported_storage_alias_overlap(tmp_path):
     del ctx
 
 
-def test_tlx_wave_rejects_unsupported_memdesc_subslice_view(tmp_path):
+def test_tlx_wave_lowers_memdesc_subslice_as_staged_transform(tmp_path):
     local_func = """
   tt.func public @subslice_view() attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
-    %view = ttg.memdesc_subslice %alloc [0, 0] : !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64>
+    %view = ttg.memdesc_subslice %alloc [0, 32] : !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64>
     %out = ttg.local_load %view : !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64> -> tensor<8x32xf32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
     tt.return
   }
 """
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    view = next(memdesc for memdesc in plan.memdescs if memdesc.kind == "view")
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert view.view_op == "ttg.memdesc_subslice"
+    assert view.view_offsets == (0, 32)
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "ttg.memdesc_subslice" not in wave_artifact
+    assert wave_artifact.count("wave.index_expr") >= 4
+    assert wave_artifact.count("wave.ptr_add") >= 2
+    del ctx
+
+
+def test_tlx_wave_async_copy_strided_subslice_uses_fallback(tmp_path):
+    local_func = """
+  tt.func public @async_subslice(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %view = ttg.memdesc_subslice %alloc [0, 32] : !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64>
+    %offsets = arith.constant dense<0> : tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %ptr = tt.addptr %base, %offsets : tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %view : tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>> -> <8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable, 8x64>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    lds_layout = wave_bridge_plan._compute_lds_layout(plan)
+    memdescs = wave_bridge_plan._memdescs_by_id(plan)
+    address = next(
+        address
+        for address in plan.addresses
+        if address.op == "ttg.async_copy_global_to_local"
+    )
+    memdesc = memdescs[address.memdesc_value_id]
+
+    assert memdesc.view_op == "ttg.memdesc_subslice"
+    assert wave_bridge_emit._dma_packet_bytes(
+        address, memdesc, memdescs, lds_layout
+    ) is None
+    del ctx
+
+
+def test_tlx_wave_lowers_subslice_of_trans_view(tmp_path):
+    local_func = """
+  tt.func public @trans_subslice_view() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %trans = ttg.memdesc_trans %alloc {order = array<i32: 1, 0>} : !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x8xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>, #ttg.shared_memory, mutable>
+    %view = ttg.memdesc_subslice %trans [16, 0] : !ttg.memdesc<32x8xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x8xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>, #ttg.shared_memory, mutable, 32x8>
+    %out = ttg.local_load %view : !ttg.memdesc<16x8xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>, #ttg.shared_memory, mutable, 32x8> -> tensor<16x8xf32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, local_func)
 
-    with pytest.raises(ValueError, match="unsupported memdesc view ttg\\.memdesc_subslice"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "ttg.memdesc_trans" not in wave_artifact
+    assert "ttg.memdesc_subslice" not in wave_artifact
+    assert "tlx_memdesc_" in wave_artifact
+    assert "wave.load" in wave_artifact
     del ctx
 
 
@@ -855,11 +924,11 @@ def test_tlx_wave_rejects_unsupported_memdesc_subslice_view(tmp_path):
             "!ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>",
             "ttg.memdesc_reinterpret %alloc",
             "!ttg.memdesc<256xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>",
-            "tensor<256xi8, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>",
+            "tensor<256xi8, #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>",
         ),
     ],
 )
-def test_tlx_wave_rejects_unsupported_memdesc_transform_views(
+def test_tlx_wave_lowers_memdesc_transform_views(
     tmp_path, func_name, alloc_type, view_op, view_type, tensor_type
 ):
     local_func = f"""
@@ -870,11 +939,24 @@ def test_tlx_wave_rejects_unsupported_memdesc_transform_views(
     tt.return
   }}
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    view = next(memdesc for memdesc in plan.memdescs if memdesc.kind == "view")
 
     view_name = view_op.split()[0]
-    with pytest.raises(ValueError, match=rf"unsupported memdesc view {view_name}"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert view.view_op == view_name
+    if view_name == "ttg.memdesc_trans":
+        assert view.view_order == (1, 0)
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert view_name not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert wave_artifact.count("wave.index_expr") >= 2
+    assert wave_artifact.count("wave.ptr_add") >= 1
     del ctx
 
 

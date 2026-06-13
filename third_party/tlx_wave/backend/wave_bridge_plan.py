@@ -119,6 +119,8 @@ class _MemDescPlan:
     view_op: str | None
     view_operands: tuple[int, ...]
     static_index: int | None
+    view_offsets: tuple[int, ...]
+    view_order: tuple[int, ...]
     alias_spec_value_id: int | None = None
 
 
@@ -1174,6 +1176,8 @@ def _memdesc_plan_from_value(
     view_op=None,
     view_operands=(),
     static_index=None,
+    view_offsets=(),
+    view_order=(),
     alias_spec_value_id=None,
 ):
     type_plan = _type_plan(_value_type(value))
@@ -1198,6 +1202,8 @@ def _memdesc_plan_from_value(
         view_op,
         view_operands,
         static_index,
+        view_offsets,
+        view_order,
         alias_spec_value_id,
     )
 
@@ -1238,6 +1244,16 @@ def _build_memdesc_plans(ops, values):
                 if name == "ttg.memdesc_index" and len(operands) > 1
                 else None
             )
+            view_offsets = (
+                _op_int_array_attr(op, "offsets")
+                if name == "ttg.memdesc_subslice"
+                else None
+            )
+            view_order = (
+                _op_int_array_attr(op, "order")
+                if name == "ttg.memdesc_trans"
+                else None
+            )
             plan = _memdesc_plan_from_value(
                 result,
                 name,
@@ -1247,6 +1263,8 @@ def _build_memdesc_plans(ops, values):
                 view_op=name,
                 view_operands=tuple(_value_id(operand) for operand in operands),
                 static_index=static_index,
+                view_offsets=view_offsets or (),
+                view_order=view_order or (),
             )
             view_index += 1
             memdescs[plan.value_id] = plan
