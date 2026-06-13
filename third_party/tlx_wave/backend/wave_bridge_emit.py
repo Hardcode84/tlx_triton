@@ -45,6 +45,11 @@ class _WaveValue:
 
 
 @dataclass(frozen=True)
+class _DotOperandFragmentLoad:
+    info: _DotOperandEncodingInfo
+
+
+@dataclass(frozen=True)
 class _IndexExpr:
     expr: object
     bindings: dict
@@ -1807,9 +1812,9 @@ def _acc_fragment_type(w):
     )
 
 
-def _unsupported_local_load(value, reason, memdesc=None):
+def _unsupported_fragment_local_load(value, reason, memdesc=None):
     message = (
-        "tlx_wave bridge cannot lower ttg.local_load for WaveAMD MMA: "
+        "tlx_wave bridge cannot pack ttg.local_load as a WaveAMD fragment: "
         f"{reason}. original TTGIR encoding: {value.encoding}"
     )
     if memdesc is not None:
@@ -1819,7 +1824,7 @@ def _unsupported_local_load(value, reason, memdesc=None):
 
 def _validate_supported_dot_local_load_layout(value, memdesc, info):
     if not _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
-        _unsupported_local_load(
+        _unsupported_fragment_local_load(
             value,
             "current flat gfx950 fragment loader supports only dot operand "
             "parent layout sizePerThread=(2, 2), threadsPerWarp=(4, 16), "
@@ -1834,9 +1839,9 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
             memdesc.encoding_attr, memdesc.encoding, "ttg.local_load memdesc"
         )
     except ValueError as exc:
-        _unsupported_local_load(value, str(exc), memdesc)
+        _unsupported_fragment_local_load(value, str(exc), memdesc)
     if shared != _GFX950_SHARED_LAYOUT:
-        _unsupported_local_load(
+        _unsupported_fragment_local_load(
             value,
             "current flat gfx950 fragment loader supports only "
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
@@ -1847,34 +1852,48 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
         )
 
 
-def _validate_dot_local_load(value, memdesc, info):
+def _validate_dot_operand_fragment_load(value, memdesc, info):
     if value.element_type != "f16" or value.element_byte_width != 2:
-        _unsupported_local_load(
-            value, f"expected f16 dot operand, got {value.element_type}"
+        _unsupported_fragment_local_load(
+            value, f"expected f16 dot operand, got {value.element_type}", memdesc
         )
     if value.shape != _GFX950_MMA_SHAPE:
-        _unsupported_local_load(
-            value, f"expected static 32x32 operand shape, got {value.shape}"
+        _unsupported_fragment_local_load(
+            value, f"expected static 32x32 operand shape, got {value.shape}", memdesc
         )
     if info.op_idx not in (0, 1):
-        _unsupported_local_load(value, f"expected opIdx 0/1, got {info.op_idx}")
+        _unsupported_fragment_local_load(
+            value, f"expected opIdx 0/1, got {info.op_idx}", memdesc
+        )
     if info.k_width not in (0, 4, 32):
-        _unsupported_local_load(
-            value, f"expected kWidth 0, 4, or 32 for gfx950 f16 MFMA, got {info.k_width}"
+        _unsupported_fragment_local_load(
+            value,
+            f"expected kWidth 0, 4, or 32 for gfx950 f16 MFMA, got {info.k_width}",
+            memdesc,
         )
     if memdesc.element_type != "f16" or memdesc.element_byte_width != 2:
-        _unsupported_local_load(
+        _unsupported_fragment_local_load(
             value,
             f"expected f16 shared memdesc source, got {memdesc.element_type}",
             memdesc,
         )
     if memdesc.shape != _GFX950_MMA_SHAPE:
-        _unsupported_local_load(
+        _unsupported_fragment_local_load(
             value,
             f"expected 32x32 shared memdesc source, got {memdesc.shape}",
             memdesc,
         )
     _validate_supported_dot_local_load_layout(value, memdesc, info)
+
+
+def _physical_local_load_fragment_capability(value, memdesc):
+    if value.encoding_attr is None or not _attr_bool(
+        value.encoding_attr, "is_dot_operand_encoding"
+    ):
+        return None
+    info = _dot_operand_encoding_info(value, "ttg.local_load result")
+    _validate_dot_operand_fragment_load(value, memdesc, info)
+    return _DotOperandFragmentLoad(info)
 
 
 def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, w):
@@ -1891,24 +1910,22 @@ def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, 
             "ttg.local_load",
         )
     except ValueError as exc:
-        _unsupported_local_load(value, str(exc), memdesc)
+        _unsupported_fragment_local_load(value, str(exc), memdesc)
 
 
-def _emit_local_load_fragment(
+def _emit_dot_operand_fragment_load(
     builder,
     address,
     value,
     memdesc,
     memdescs,
-    info,
+    capability,
     lds_layout,
     state,
     after_token,
     w,
     stats,
 ):
-    _validate_dot_local_load(value, memdesc, info)
-
     lane = builder.lane_id(width=_GFX950_MMA_WAVE)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane")
     lane_offset = builder.index_expr(
@@ -1924,7 +1941,7 @@ def _emit_local_load_fragment(
         w.simd_ptr_type(w.i32(), w.shared_address_space(), _GFX950_MMA_WAVE),
     )
     fragment, token = builder.fragment_load(
-        ptr, _fragment_type_for_dot_operand(info, w), after=after_token
+        ptr, _fragment_type_for_dot_operand(capability.info, w), after=after_token
     )
     stats.local_loads += 1
     stats.fragment_packs += 1
@@ -2472,6 +2489,68 @@ def _emit_generic_local_load(
     return tuple(components), token
 
 
+def _emit_local_load_op(builder, op, state, local_loads, lds_layout, w, stats):
+    values = state["values"]
+    wave_values = state["wave_values"]
+    memdescs = state["memdescs"]
+    result_id = op.results[0] if op.results else None
+    if result_id is None:
+        raise ValueError("tlx_wave bridge expected ttg.local_load result")
+    value = values[result_id]
+    address = local_loads.get(result_id)
+    if address is None or address.memdesc_value_id is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.local_load: missing shared "
+            f"memdesc source. original TTGIR encoding: {value.encoding}"
+        )
+    memdesc = memdescs[address.memdesc_value_id]
+    after = (
+        _require_wave_value(
+            wave_values,
+            address.token_value_id,
+            ("token",),
+            "ttg.local_load token",
+        )
+        if address.token_value_id is not None
+        else state["last_order_token"]
+    )
+
+    fragment_capability = _physical_local_load_fragment_capability(value, memdesc)
+    if fragment_capability is not None:
+        fragment, state["last_order_token"] = _emit_dot_operand_fragment_load(
+            builder,
+            address,
+            value,
+            memdesc,
+            memdescs,
+            fragment_capability,
+            lds_layout,
+            state,
+            after,
+            w,
+            stats,
+        )
+        _set_wave_value(wave_values, result_id, "fragment", fragment)
+        return
+
+    loaded, state["last_order_token"] = _emit_generic_local_load(
+        builder,
+        address,
+        value,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        after,
+        w,
+        stats,
+    )
+    if isinstance(loaded, tuple):
+        _set_wave_value(wave_values, result_id, "simd_tuple", loaded)
+    else:
+        _set_wave_value(wave_values, result_id, "simd", loaded)
+
+
 def _emit_store_op(builder, op, state, w):
     values = state["values"]
     wave_values = state["wave_values"]
@@ -2634,60 +2713,9 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                 builder, op, state, memdescs, lds_layout, w, stats
             )
         elif op.name == "ttg.local_load":
-            result_id = op.results[0] if op.results else None
-            if result_id is None:
-                raise ValueError("tlx_wave bridge expected ttg.local_load result")
-            value = values[result_id]
-            address = local_loads.get(result_id)
-            if address is None or address.memdesc_value_id is None:
-                _unsupported_local_load(value, "missing shared memdesc source")
-            memdesc = memdescs[address.memdesc_value_id]
-            after = (
-                _require_wave_value(
-                    wave_values,
-                    address.token_value_id,
-                    ("token",),
-                    "ttg.local_load token",
-                )
-                if address.token_value_id is not None
-                else state["last_order_token"]
+            _emit_local_load_op(
+                builder, op, state, local_loads, lds_layout, w, stats
             )
-            if (
-                value.encoding_attr is not None
-                and _attr_bool(value.encoding_attr, "is_dot_operand_encoding")
-            ):
-                info = _dot_operand_encoding_info(value, "ttg.local_load result")
-                fragment, state["last_order_token"] = _emit_local_load_fragment(
-                    builder,
-                    address,
-                    value,
-                    memdesc,
-                    memdescs,
-                    info,
-                    lds_layout,
-                    state,
-                    after,
-                    w,
-                    stats,
-                )
-                _set_wave_value(wave_values, result_id, "fragment", fragment)
-            else:
-                loaded, state["last_order_token"] = _emit_generic_local_load(
-                    builder,
-                    address,
-                    value,
-                    memdesc,
-                    memdescs,
-                    lds_layout,
-                    state,
-                    after,
-                    w,
-                    stats,
-                )
-                if isinstance(loaded, tuple):
-                    _set_wave_value(wave_values, result_id, "simd_tuple", loaded)
-                else:
-                    _set_wave_value(wave_values, result_id, "simd", loaded)
         elif op.name == "tt.dot":
             _emit_dot_op(builder, op, values, wave_values, w, stats)
         elif op.name == "tt.store":
