@@ -62,6 +62,8 @@ def stop_before_wave_lowering(mod, metadata, options):
     metadata["tlx_wave_plan_num_addresses"] = len(plan.addresses)
     metadata["tlx_wave_plan_num_memdescs"] = len(plan.memdescs)
     metadata["tlx_wave_plan_num_layouts"] = len(plan.layouts)
+    metadata["tlx_wave_plan_num_layout_constraints"] = len(plan.layout_constraints)
+    metadata["tlx_wave_plan_num_storage_aliases"] = len(plan.storage_aliases)
     metadata["tlx_wave_plan_num_tokens"] = len(plan.tokens)
     metadata["tlx_wave_plan_json"] = json.dumps(
         _bridge_plan_metadata(plan), sort_keys=True

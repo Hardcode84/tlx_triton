@@ -461,6 +461,98 @@ def test_tlx_wave_lowers_dynamic_memdesc_index_as_ssa_transform(tmp_path):
     del ctx
 
 
+def test_tlx_wave_records_memdesc_require_layout_constraint(tmp_path):
+    local_func = """
+  tt.func public @required_layout() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %req = tlx.require_layout %alloc : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %req : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    constraint = plan.layout_constraints[0]
+    view = next(memdesc for memdesc in plan.memdescs if memdesc.source == "tlx.require_layout")
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert constraint.op == "tlx.require_layout"
+    assert constraint.value_kind == "memdesc"
+    assert view.view_op == "tlx.require_layout"
+    assert view.base_value_id == constraint.source_value_id
+    assert metadata["tlx_wave_plan_num_layout_constraints"] == 1
+    assert "tlx_wave.plan.num_layout_constraints" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_conflicting_require_layout_constraints(tmp_path):
+    local_func = """
+  tt.func public @conflicting_layouts() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %req0 = tlx.require_layout %alloc : !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %req1 = tlx.require_layout %alloc : !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(ValueError, match="conflicting tlx\\.require_layout"):
+        wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    del ctx
+
+
+def test_tlx_wave_storage_alias_allocs_share_smem_arena(tmp_path):
+    local_func = """
+  tt.func public @alias_arena() attributes {noinline = false} {
+    %spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %a = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %b = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    lds_layout = wave_bridge_plan._compute_lds_layout(plan)
+    alias_allocs = [
+        memdesc for memdesc in plan.memdescs if memdesc.alias_spec_value_id is not None
+    ]
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert len(alias_allocs) == 2
+    assert lds_layout.size_bytes == 256
+    assert len({lds_layout.offsets[memdesc.value_id] for memdesc in alias_allocs}) == 1
+    assert metadata["shared"] == 256
+    assert metadata["tlx_wave_plan_num_storage_aliases"] == 3
+    assert "tlx_wave.plan.num_storage_aliases" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_unsupported_storage_alias_overlap(tmp_path):
+    local_func = """
+  tt.func public @alias_distinct_overlap() attributes {noinline = false} {
+    %spec = tlx.storage_alias_spec storage = smem : !tlx.storage_alias_spec<smem>
+    %a = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %b = tlx.storage_alias_local_alloc %spec : !tlx.storage_alias_spec<smem> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %group = tlx.reuse_group(%a, %b) group_kind = distinct : (!ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>, !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>) -> !tlx.reuse_group<distinct>
+    tlx.set_buffer_overlap(%spec, %group) : (!tlx.storage_alias_spec<smem>, !tlx.reuse_group<distinct>) -> ()
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(ValueError, match="tlx\\.set_buffer_overlap.*distinct"):
+        wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    del ctx
+
+
 def test_tlx_wave_rejects_unsupported_memdesc_subslice_view(tmp_path):
     local_func = """
   tt.func public @subslice_view() attributes {noinline = false} {
@@ -486,6 +578,25 @@ def test_tlx_wave_rejects_generic_2d_shared_local_addressing(tmp_path):
     %loaded = tt.load %ptr : tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
     ttg.local_store %loaded, %alloc : tensor<8x32xf32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported shared-memory encoding for generic LDS addressing",
+    ):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_rejects_required_generic_shared_encoding(tmp_path):
+    local_func = """
+  tt.func public @required_unsupported_shared() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %req = tlx.require_layout %alloc : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %req : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.return
   }
 """

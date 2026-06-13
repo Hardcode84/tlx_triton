@@ -88,6 +88,20 @@ class _LayoutPlan:
 
 
 @dataclass(frozen=True)
+class _LayoutConstraintPlan:
+    op: str
+    source_value_id: int
+    result_value_id: int
+    value_kind: str
+    source_type: str
+    result_type: str
+    source_encoding: str | None
+    result_encoding: str | None
+    source_memory_space: str | None
+    result_memory_space: str | None
+
+
+@dataclass(frozen=True)
 class _MemDescPlan:
     value_id: int
     kind: str
@@ -105,6 +119,20 @@ class _MemDescPlan:
     view_op: str | None
     view_operands: tuple[int, ...]
     static_index: int | None
+    alias_spec_value_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _StorageAliasPlan:
+    op: str
+    value_id: int | None
+    spec_value_id: int | None
+    alloc_value_id: int | None
+    storage: str | None
+    buffer_size_bytes: int | None
+    group_kind: str | None
+    group_size: int | None
+    elements: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -146,7 +174,9 @@ class _BridgePlan:
     values: tuple[_ValuePlan, ...]
     addresses: tuple[_AddressExprPlan, ...]
     layouts: tuple[_LayoutPlan, ...]
+    layout_constraints: tuple[_LayoutConstraintPlan, ...]
     memdescs: tuple[_MemDescPlan, ...]
+    storage_aliases: tuple[_StorageAliasPlan, ...]
     tokens: tuple[_TokenPlan, ...]
 
 
@@ -184,6 +214,9 @@ _ORDERED_BODY_VALUE_OPS = {
     "tt.get_program_id",
     "tt.make_range",
     "tt.splat",
+    "tlx.local_alias",
+    "tlx.release_layout",
+    "tlx.require_layout",
     "ttg.convert_layout",
 }
 
@@ -200,6 +233,10 @@ _ORDERED_BODY_EFFECT_OPS = {
 
 _ORDERED_BODY_PLANNED_OPS = {
     "tt.return",
+    "tlx.reuse_group",
+    "tlx.set_buffer_overlap",
+    "tlx.storage_alias_local_alloc",
+    "tlx.storage_alias_spec",
     "ttg.local_alloc",
     "ttg.memdesc_index",
     "ttg.memdesc_reinterpret",
@@ -293,28 +330,57 @@ def _type_str(type_obj):
     return str(type_obj)
 
 
+def _type_method(type_obj, method, default=None):
+    fn = getattr(type_obj, method, None)
+    if fn is None:
+        return default
+    return fn()
+
+
+def _type_predicate(type_obj, method):
+    return bool(_type_method(type_obj, method, False))
+
+
+def _type_is_integer_width(type_obj, width):
+    fn = getattr(type_obj, "is_integer", None)
+    if fn is None:
+        return False
+    return bool(fn(width))
+
+
 def _scalar_byte_width(type_obj):
     if type_obj is None:
         return None
-    if type_obj.is_integer(1) or type_obj.is_integer(8):
+    if _type_is_integer_width(type_obj, 1) or _type_is_integer_width(type_obj, 8):
         return 1
-    if type_obj.is_integer(16) or type_obj.is_fp16() or type_obj.is_bf16():
+    if (
+        _type_is_integer_width(type_obj, 16)
+        or _type_predicate(type_obj, "is_fp16")
+        or _type_predicate(type_obj, "is_bf16")
+    ):
         return 2
-    if type_obj.is_integer(32) or type_obj.is_fp32():
+    if (
+        _type_is_integer_width(type_obj, 32)
+        or _type_predicate(type_obj, "is_fp32")
+    ):
         return 4
-    if type_obj.is_integer(64) or type_obj.is_fp64() or type_obj.is_index():
+    if (
+        _type_is_integer_width(type_obj, 64)
+        or _type_predicate(type_obj, "is_fp64")
+        or _type_predicate(type_obj, "is_index")
+    ):
         return 8
     return None
 
 
 def _type_kind(type_obj):
-    if type_obj.is_memdesc():
+    if _type_predicate(type_obj, "is_memdesc"):
         return "memdesc"
-    if type_obj.is_ranked_tensor():
+    if _type_predicate(type_obj, "is_ranked_tensor"):
         return "tensor"
-    if type_obj.is_ptr():
+    if _type_predicate(type_obj, "is_ptr"):
         return "pointer"
-    if type_obj.is_async_token():
+    if _type_predicate(type_obj, "is_async_token"):
         return "token"
     if _is_scalar_type(type_obj):
         return "scalar"
@@ -322,11 +388,11 @@ def _type_kind(type_obj):
 
 
 def _type_plan(type_obj):
-    element_type = type_obj.get_element_type()
-    pointee_type = type_obj.get_pointee_type()
-    encoding_attr = type_obj.get_encoding()
+    element_type = _type_method(type_obj, "get_element_type")
+    pointee_type = _type_method(type_obj, "get_pointee_type")
+    encoding_attr = _type_method(type_obj, "get_encoding")
     if pointee_type is None and element_type is not None:
-        pointee_type = element_type.get_pointee_type()
+        pointee_type = _type_method(element_type, "get_pointee_type")
     element_byte_width = _scalar_byte_width(element_type)
     if element_byte_width is None:
         element_byte_width = _scalar_byte_width(pointee_type)
@@ -335,16 +401,16 @@ def _type_plan(type_obj):
     return _TypePlan(
         _type_str(type_obj),
         _type_kind(type_obj),
-        _tuple_or_empty(type_obj.get_shape()),
+        _tuple_or_empty(_type_method(type_obj, "get_shape")),
         _type_str(element_type) if element_type is not None else None,
         element_byte_width,
         _type_str(pointee_type) if pointee_type is not None else None,
         _attr_str(encoding_attr),
         encoding_attr,
-        _attr_str(type_obj.get_memory_space()),
-        type_obj.get_mutable_memory(),
-        _tuple_or_empty(type_obj.get_alloc_shape()),
-        type_obj.get_address_space(),
+        _attr_str(_type_method(type_obj, "get_memory_space")),
+        _type_method(type_obj, "get_mutable_memory"),
+        _tuple_or_empty(_type_method(type_obj, "get_alloc_shape")),
+        _type_method(type_obj, "get_address_space"),
     )
 
 
@@ -374,12 +440,12 @@ def _address_element_byte_width(type_obj):
 
 def _is_scalar_type(type_obj):
     return (
-        type_obj.is_index()
-        or type_obj.is_fp16()
-        or type_obj.is_bf16()
-        or type_obj.is_fp32()
-        or type_obj.is_fp64()
-        or any(type_obj.is_integer(width) for width in (1, 8, 16, 32, 64))
+        _type_predicate(type_obj, "is_index")
+        or _type_predicate(type_obj, "is_fp16")
+        or _type_predicate(type_obj, "is_bf16")
+        or _type_predicate(type_obj, "is_fp32")
+        or _type_predicate(type_obj, "is_fp64")
+        or any(_type_is_integer_width(type_obj, width) for width in (1, 8, 16, 32, 64))
     )
 
 
@@ -764,7 +830,270 @@ def _build_layout_plans(ops):
     return tuple(layouts.values())
 
 
+_LAYOUT_CONSTRAINT_OPS = {"tlx.require_layout", "tlx.release_layout"}
+
+
+def _layout_constraint_plan(op):
+    name = op.get_name()
+    if name not in _LAYOUT_CONSTRAINT_OPS:
+        return None
+    operands = _op_operands(op)
+    results = _op_results(op)
+    if len(operands) != 1 or len(results) != 1:
+        raise ValueError(
+            f"tlx_wave bridge expected {name} with one operand and one result"
+        )
+    source = _type_plan(_value_type(operands[0]))
+    result = _type_plan(_value_type(results[0]))
+    if source.kind != result.kind:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {name}: source/result type kinds "
+            f"differ ({source.kind} -> {result.kind})"
+        )
+    if source.kind not in {"memdesc", "tensor"}:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {name}: unsupported layout "
+            f"constraint type {source.raw}"
+        )
+    if name == "tlx.release_layout" and source.kind != "tensor":
+        raise ValueError(
+            "tlx_wave bridge cannot lower tlx.release_layout: expected tensor "
+            f"constraint, got {source.raw}"
+        )
+    if source.shape != result.shape or source.element_type != result.element_type:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {name}: layout constraint changes "
+            f"shape or element type ({source.raw} -> {result.raw})"
+        )
+    if source.memory_space != result.memory_space:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {name}: layout constraint changes "
+            f"memory space ({source.memory_space} -> {result.memory_space})"
+        )
+    return _LayoutConstraintPlan(
+        name,
+        _value_id(operands[0]),
+        _value_id(results[0]),
+        source.kind,
+        source.raw,
+        result.raw,
+        source.encoding,
+        result.encoding,
+        source.memory_space,
+        result.memory_space,
+    )
+
+
+def _build_layout_constraint_plans(ops):
+    constraints = []
+    requirements_by_source = {}
+    for op in ops:
+        plan = _layout_constraint_plan(op)
+        if plan is None:
+            continue
+        if plan.op == "tlx.require_layout":
+            previous = requirements_by_source.get(plan.source_value_id)
+            if previous is not None and (
+                previous.result_encoding != plan.result_encoding
+                or previous.result_memory_space != plan.result_memory_space
+            ):
+                raise ValueError(
+                    "tlx_wave bridge cannot lower conflicting "
+                    "tlx.require_layout constraints for TTGIR value "
+                    f"{plan.source_value_id}: {previous.result_type} vs "
+                    f"{plan.result_type}"
+                )
+            requirements_by_source[plan.source_value_id] = plan
+        constraints.append(plan)
+    return tuple(constraints)
+
+
+def _op_attr_text(op, name):
+    attr = dict(op.get_attrs()).get(name)
+    return None if attr is None else str(attr)
+
+
+def _storage_kind_from_text(*texts):
+    for text in texts:
+        if text is None:
+            continue
+        compact = text.replace(" ", "")
+        if "smemCluster" in compact or "smem_cluster" in compact:
+            return "smemCluster"
+        if "smem" in compact:
+            return "smem"
+        if "tmem" in compact:
+            return "tmem"
+    return None
+
+
+def _reuse_group_kind_from_text(*texts):
+    for text in texts:
+        if text is None:
+            continue
+        compact = text.replace(" ", "")
+        if "distinct" in compact:
+            return "distinct"
+        if "shared" in compact:
+            return "shared"
+    return None
+
+
+def _storage_alias_plan(op, values):
+    name = op.get_name()
+    operands = _op_operands(op)
+    results = _op_results(op)
+    if name == "tlx.storage_alias_spec":
+        if len(results) != 1:
+            raise ValueError(
+                "tlx_wave bridge expected tlx.storage_alias_spec to produce one result"
+            )
+        result_id = _value_id(results[0])
+        storage = _storage_kind_from_text(
+            _op_attr_text(op, "storage"), values[result_id].type
+        )
+        if storage != "smem":
+            raise ValueError(
+                "tlx_wave bridge cannot lower tlx.storage_alias_spec: "
+                f"unsupported storage {storage or 'unknown'}; only smem is supported"
+            )
+        return _StorageAliasPlan(
+            name,
+            result_id,
+            result_id,
+            None,
+            storage,
+            op.get_int_attr("buffer_size_bytes"),
+            None,
+            None,
+            (),
+        )
+    if name == "tlx.storage_alias_local_alloc":
+        if len(operands) != 1 or len(results) != 1:
+            raise ValueError(
+                "tlx_wave bridge expected tlx.storage_alias_local_alloc with "
+                "one spec operand and one memdesc result"
+            )
+        spec_id = _value_id(operands[0])
+        result_id = _value_id(results[0])
+        spec_plan = values.get(spec_id)
+        storage = _storage_kind_from_text(
+            spec_plan.type if spec_plan is not None else None
+        )
+        if storage != "smem":
+            raise ValueError(
+                "tlx_wave bridge cannot lower tlx.storage_alias_local_alloc: "
+                f"unsupported storage {storage or 'unknown'}; only smem is supported"
+            )
+        return _StorageAliasPlan(
+            name,
+            result_id,
+            spec_id,
+            result_id,
+            storage,
+            None,
+            None,
+            None,
+            (),
+        )
+    if name == "tlx.reuse_group":
+        if len(results) != 1:
+            raise ValueError("tlx_wave bridge expected tlx.reuse_group result")
+        result_id = _value_id(results[0])
+        return _StorageAliasPlan(
+            name,
+            result_id,
+            None,
+            None,
+            None,
+            None,
+            _reuse_group_kind_from_text(
+                _op_attr_text(op, "group_kind"), values[result_id].type
+            ),
+            op.get_int_attr("group_size") or 1,
+            tuple(_value_id(operand) for operand in operands),
+        )
+    if name == "tlx.set_buffer_overlap":
+        if len(operands) != 2:
+            raise ValueError(
+                "tlx_wave bridge expected tlx.set_buffer_overlap with spec and group"
+            )
+        return _StorageAliasPlan(
+            name,
+            None,
+            _value_id(operands[0]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            (_value_id(operands[1]),),
+        )
+    return None
+
+
+def _build_storage_alias_plans(ops, values):
+    aliases = []
+    specs = set()
+    alloc_specs = {}
+    groups = {}
+    overlaps = {}
+    for op in ops:
+        plan = _storage_alias_plan(op, values)
+        if plan is None:
+            continue
+        if plan.op == "tlx.storage_alias_spec":
+            specs.add(plan.spec_value_id)
+        elif plan.op == "tlx.storage_alias_local_alloc":
+            if plan.spec_value_id not in specs:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower "
+                    "tlx.storage_alias_local_alloc: referenced "
+                    f"tlx.storage_alias_spec {plan.spec_value_id} is not known"
+                )
+            alloc_specs[plan.alloc_value_id] = plan.spec_value_id
+        elif plan.op == "tlx.reuse_group":
+            groups[plan.value_id] = plan
+        elif plan.op == "tlx.set_buffer_overlap":
+            if plan.spec_value_id not in specs:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.set_buffer_overlap: "
+                    f"unknown tlx.storage_alias_spec {plan.spec_value_id}"
+                )
+            if plan.spec_value_id in overlaps:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.set_buffer_overlap: "
+                    f"duplicate overlap constraint for spec {plan.spec_value_id}"
+                )
+            group_id = plan.elements[0]
+            group = groups.get(group_id)
+            if group is None:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.set_buffer_overlap: "
+                    f"unknown tlx.reuse_group {group_id}"
+                )
+            if group.group_kind != "shared" or group.group_size != 1:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.set_buffer_overlap: "
+                    "only flat shared reuse_group constraints with group_size=1 "
+                    f"are supported, got group_kind={group.group_kind}, "
+                    f"group_size={group.group_size}"
+                )
+            for element in group.elements:
+                if element not in alloc_specs or alloc_specs[element] != plan.spec_value_id:
+                    raise ValueError(
+                        "tlx_wave bridge cannot lower tlx.set_buffer_overlap: "
+                        "reuse_group element does not reference the same "
+                        f"tlx.storage_alias_spec {plan.spec_value_id}"
+                    )
+            overlaps[plan.spec_value_id] = group_id
+        aliases.append(plan)
+    return tuple(aliases)
+
+
 _MEMDESC_VIEW_OPS = {
+    "tlx.local_alias",
+    "tlx.require_layout",
     "ttg.memdesc_index",
     "ttg.memdesc_subslice",
     "ttg.memdesc_reinterpret",
@@ -782,6 +1111,7 @@ def _memdesc_plan_from_value(
     view_op=None,
     view_operands=(),
     static_index=None,
+    alias_spec_value_id=None,
 ):
     type_plan = _type_plan(_value_type(value))
     if type_plan.kind != "memdesc":
@@ -805,6 +1135,7 @@ def _memdesc_plan_from_value(
         view_op,
         view_operands,
         static_index,
+        alias_spec_value_id,
     )
 
 
@@ -821,8 +1152,23 @@ def _build_memdesc_plans(ops, values):
             )
             alloc_index += 1
             memdescs[plan.value_id] = plan
+        elif name == "tlx.storage_alias_local_alloc":
+            result = op.get_result(0)
+            operands = _op_operands(op)
+            plan = _memdesc_plan_from_value(
+                result,
+                name,
+                "allocation",
+                name=f"alias_alloc{alloc_index}",
+                alias_spec_value_id=_value_id(operands[0]) if operands else None,
+            )
+            alloc_index += 1
+            memdescs[plan.value_id] = plan
         elif name in _MEMDESC_VIEW_OPS:
             result = op.get_result(0)
+            type_plan = _type_plan(_value_type(result))
+            if type_plan.kind != "memdesc":
+                continue
             operands = _op_operands(op)
             static_index = (
                 _const_int(values.get(_value_id(operands[1])))
@@ -1008,6 +1354,8 @@ def _build_bridge_plan(mod, kernel):
     for op in ops:
         name = op.get_name()
         op_counts[name] = op_counts.get(name, 0) + 1
+    layout_constraints = _build_layout_constraint_plans(ops)
+    storage_aliases = _build_storage_alias_plans(ops, values_by_id)
     memdescs_by_id = _build_memdesc_plans(ops, values_by_id)
     address_plans = _build_address_plans(ops, values_by_id, owners)
     _validate_address_feature_support(address_plans)
@@ -1018,7 +1366,9 @@ def _build_bridge_plan(mod, kernel):
         tuple(values_by_id.values()),
         address_plans,
         _build_layout_plans(ops),
+        layout_constraints,
         tuple(memdescs_by_id.values()),
+        storage_aliases,
         _build_token_plans(ops, values_by_id),
     )
 
@@ -1031,13 +1381,17 @@ def _bridge_plan_metadata(plan):
         "num_values": len(plan.values),
         "num_addresses": len(plan.addresses),
         "num_layouts": len(plan.layouts),
+        "num_layout_constraints": len(plan.layout_constraints),
         "num_memdescs": len(plan.memdescs),
+        "num_storage_aliases": len(plan.storage_aliases),
         "num_tokens": len(plan.tokens),
         "ops": _public_dicts(plan.ops),
         "values": _public_dicts(plan.values),
         "addresses": _public_dicts(plan.addresses),
         "layouts": _public_dicts(plan.layouts),
+        "layout_constraints": _public_dicts(plan.layout_constraints),
         "memdescs": _public_dicts(plan.memdescs),
+        "storage_aliases": _public_dicts(plan.storage_aliases),
         "tokens": _public_dicts(plan.tokens),
     }
 
@@ -1052,16 +1406,75 @@ def _memdesc_size_bytes(memdesc):
     return _product(shape) * memdesc.element_byte_width
 
 
+def _storage_alias_specs(plan):
+    return {
+        alias.spec_value_id: alias
+        for alias in plan.storage_aliases
+        if alias.op == "tlx.storage_alias_spec"
+    }
+
+
+def _storage_alias_allocs_by_spec(plan):
+    allocs = {}
+    for memdesc in plan.memdescs:
+        if memdesc.alias_spec_value_id is None:
+            continue
+        allocs.setdefault(memdesc.alias_spec_value_id, []).append(memdesc)
+    return allocs
+
+
+def _validate_storage_alias_liveness(plan, allocs_by_spec):
+    alias_alloc_ids = {
+        memdesc.value_id
+        for allocs in allocs_by_spec.values()
+        for memdesc in allocs
+    }
+    for alias in plan.storage_aliases:
+        if alias.op != "tlx.reuse_group":
+            continue
+        for element in alias.elements:
+            if element not in alias_alloc_ids:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.reuse_group: only flat "
+                    "SMEM alias allocations are supported; unsupported nested "
+                    f"or non-alias element {element}"
+                )
+
+
 def _compute_lds_layout(plan):
     offsets = {}
     cursor = 0
+    specs = _storage_alias_specs(plan)
+    alias_allocs_by_spec = _storage_alias_allocs_by_spec(plan)
+    _validate_storage_alias_liveness(plan, alias_allocs_by_spec)
 
     for memdesc in plan.memdescs:
-        if memdesc.kind != "allocation":
+        if memdesc.kind != "allocation" or memdesc.alias_spec_value_id is not None:
             continue
         cursor = _align_to(cursor, 16)
         offsets[memdesc.value_id] = cursor
         cursor += _memdesc_size_bytes(memdesc)
+
+    for spec_id, allocs in alias_allocs_by_spec.items():
+        spec = specs.get(spec_id)
+        if spec is None:
+            raise ValueError(
+                "tlx_wave bridge cannot lower tlx.storage_alias_local_alloc: "
+                f"missing tlx.storage_alias_spec {spec_id}"
+            )
+        arena_size = max((_memdesc_size_bytes(memdesc) for memdesc in allocs), default=0)
+        if spec.buffer_size_bytes is not None:
+            if spec.buffer_size_bytes < arena_size:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower tlx.storage_alias_spec: "
+                    f"explicit size {spec.buffer_size_bytes} bytes is smaller "
+                    f"than required SMEM arena size {arena_size} bytes"
+                )
+            arena_size = spec.buffer_size_bytes
+        cursor = _align_to(cursor, 16)
+        for memdesc in allocs:
+            offsets[memdesc.value_id] = cursor
+        cursor += arena_size
 
     return _LdsLayout(_align_to(cursor, 16), offsets)
 

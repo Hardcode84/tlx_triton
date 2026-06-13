@@ -326,7 +326,9 @@ def _is_wave_simd_index_type(typ, w):
 
 def _wave_cmpi_operand(builder, value, w):
     typ = getattr(value, "type", None)
-    if _is_wave_index_type(typ, w) or _is_wave_simd_index_type(typ, w):
+    if _is_wave_simd_index_type(typ, w):
+        return value
+    if _is_wave_index_type(typ, w):
         return builder.index_cast(value, w.i64())
     return value
 
@@ -612,6 +614,9 @@ def _unsupported_memdesc_view(context, memdesc):
     )
 
 
+_TRANSPARENT_MEMDESC_VIEW_OPS = {"tlx.local_alias", "tlx.require_layout"}
+
+
 def _is_identity_shared_layout(memdesc, shared):
     return (
         len(memdesc.shape) == 1
@@ -721,6 +726,18 @@ def _emit_memdesc_base_ptr(
             f"tlx_wave bridge cannot lower {context}: memdesc view "
             f"{memdesc.value_id} has no known base"
         )
+    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+        return _emit_memdesc_base_ptr(
+            builder,
+            memdescs[memdesc.base_value_id],
+            memdescs,
+            lds_layout,
+            state,
+            pointer_element_type,
+            pointer_element_bytes,
+            w,
+            context,
+        )
     if memdesc.view_op != "ttg.memdesc_index":
         _unsupported_memdesc_view(context, memdesc)
 
@@ -770,6 +787,14 @@ def _memdesc_base_is_aligned(
             f"tlx_wave bridge cannot lower {context}: memdesc view "
             f"{memdesc.value_id} has no known base"
         )
+    if memdesc.view_op in _TRANSPARENT_MEMDESC_VIEW_OPS:
+        return _memdesc_base_is_aligned(
+            memdescs[memdesc.base_value_id],
+            memdescs,
+            lds_layout,
+            pointer_element_bytes,
+            context,
+        )
     if memdesc.view_op != "ttg.memdesc_index":
         _unsupported_memdesc_view(context, memdesc)
     if not _memdesc_base_is_aligned(
@@ -798,7 +823,11 @@ def _emit_memdesc_ptr(
     w,
     context,
 ):
-    if memdesc.kind == "view" and memdesc.view_op != "ttg.memdesc_index":
+    if (
+        memdesc.kind == "view"
+        and memdesc.view_op != "ttg.memdesc_index"
+        and memdesc.view_op not in _TRANSPARENT_MEMDESC_VIEW_OPS
+    ):
         _unsupported_memdesc_view(context, memdesc)
     _validate_generic_shared_layout(memdesc, context)
     if memdesc.value_id not in lds_layout.offsets and memdesc.kind == "allocation":
@@ -1768,7 +1797,12 @@ def _emit_generic_value_op(builder, state, op, w):
         _emit_mask_and_op(builder, op, values, wave_values, w)
     elif op.name == "tt.addptr":
         _emit_addptr_op(builder, op, values, wave_values, w)
-    elif op.name == "ttg.convert_layout":
+    elif op.name in {
+        "tlx.local_alias",
+        "tlx.release_layout",
+        "tlx.require_layout",
+        "ttg.convert_layout",
+    }:
         _forward_lowered_value(op, values, wave_values)
     else:
         return False
@@ -1777,6 +1811,10 @@ def _emit_generic_value_op(builder, state, op, w):
 
 _PLANNING_ONLY_OPS = {
     "tt.return",
+    "tlx.reuse_group",
+    "tlx.set_buffer_overlap",
+    "tlx.storage_alias_local_alloc",
+    "tlx.storage_alias_spec",
     "ttg.local_alloc",
     "ttg.memdesc_index",
     "ttg.memdesc_subslice",
@@ -2957,6 +2995,12 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
         module_builder.module.operation.attributes["tlx_wave.plan.num_layouts"] = (
             _binding_i32_attr(w, len(plan.layouts))
         )
+        module_builder.module.operation.attributes[
+            "tlx_wave.plan.num_layout_constraints"
+        ] = _binding_i32_attr(w, len(plan.layout_constraints))
+        module_builder.module.operation.attributes[
+            "tlx_wave.plan.num_storage_aliases"
+        ] = _binding_i32_attr(w, len(plan.storage_aliases))
         module_builder.module.operation.attributes["tlx_wave.plan.num_tokens"] = (
             _binding_i32_attr(w, len(plan.tokens))
         )
