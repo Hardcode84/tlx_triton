@@ -1229,6 +1229,84 @@ def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8(tmp_path):
     del ctx
 
 
+def test_tlx_wave_async_copy_wait_pipeline_loop_carries_mem_tokens(tmp_path):
+    pipeline_func = """
+  tt.func public @async_i8_pipeline(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c2 = arith.constant 2 : index
+    %c1 = arith.constant 1 : index
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %init_wait = ttg.async_wait {num = 0 : i32}
+    %loop = scf.for %iv = %c0 to %c2 step %c1 iter_args(%prev = %init_wait) -> (!ttg.async.token) {
+      %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+      %group = ttg.async_commit_group tokens %token
+      %wait = ttg.async_wait %prev, %group {num = 1 : i32}
+      %loaded = ttg.local_load %alloc token %wait : !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xi8, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+      scf.yield %group : !ttg.async.token
+    }
+    %flush = ttg.async_wait %loop {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, pipeline_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_async_commit_groups"] == 1
+    assert metadata["tlx_wave_num_async_waits"] == 2
+    assert metadata["tlx_wave_num_wave_barriers"] == 2
+    assert "scf.for" in wave_artifact
+    assert "iter_args" in wave_artifact
+    assert wave_artifact.count("wave.wait") == 2
+    assert wave_artifact.count("wave.barrier") == 2
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
+    async_i8_func = """
+  tt.func public @async_i8_multi_in_flight(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+    %alloc0 = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %alloc1 = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %t0 = ttg.async_copy_global_to_local %ptr, %alloc0 : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %t1 = ttg.async_copy_global_to_local %ptr, %alloc1 : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %g0 = ttg.async_commit_group tokens %t0
+    %g1 = ttg.async_commit_group
+    %wait0 = ttg.async_wait %g0, %g1 {num = 1 : i32}
+    %wait1 = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 2
+    assert metadata["tlx_wave_num_async_commit_groups"] == 2
+    assert metadata["tlx_wave_num_async_waits"] == 2
+    assert metadata["tlx_wave_num_wave_barriers"] == 2
+    assert wave_artifact.count("wave.wait") == 2
+    assert wave_artifact.count("wave.barrier") == 2
+    assert wave_artifact.count("wave.join") >= 4
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_async_copy_fallback_scalarizes_multicomponent_layout(tmp_path):
     async_i8_func = """
   tt.func public @async_i8_multicomponent(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
@@ -2216,6 +2294,30 @@ def test_tlx_wave_bridge_lowers_scalar_compare_if_condition(tmp_path):
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert "arith.cmpi slt" in wave
     assert "scf.if" in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_nested_side_effects_under_if(tmp_path):
+    region_func = """
+  tt.func public @if_nested_for_store(%flag: i1, %arg0: !tt.ptr<i32>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = arith.constant dense<0> : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    scf.if %flag {
+      scf.for %iv = %c0 to %c1 step %c1 {
+        tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+      }
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, region_func)
+
+    with pytest.raises(ValueError, match="side effects inside scf\\.if.*scf\\.for"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 

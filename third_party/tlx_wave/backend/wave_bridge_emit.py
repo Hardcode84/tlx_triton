@@ -74,6 +74,19 @@ class _ScalarBool:
 
 
 @dataclass(frozen=True)
+class _MemState:
+    root_token: object | None = None
+    open_async_tokens: tuple[object, ...] = ()
+    committed_groups: tuple[object, ...] = ()
+    committed_group_capacity: int | None = None
+
+
+@dataclass(frozen=True)
+class _LoopMemShape:
+    group_count: int
+
+
+@dataclass(frozen=True)
 class _MaskAnd:
     lhs: object
     rhs: object
@@ -2141,6 +2154,166 @@ def _join_tokens(builder, tokens, stats):
     return builder.join(*tokens)
 
 
+def _mem_state(state):
+    return state["mem_state"]
+
+
+def _set_mem_state(state, mem_state):
+    state["mem_state"] = mem_state
+
+
+def _copy_mem_state(mem_state):
+    return _MemState(
+        mem_state.root_token,
+        tuple(mem_state.open_async_tokens),
+        tuple(mem_state.committed_groups),
+        mem_state.committed_group_capacity,
+    )
+
+
+def _mem_root(state):
+    return _mem_state(state).root_token
+
+
+def _ensure_mem_root(builder, state):
+    mem_state = _mem_state(state)
+    if mem_state.root_token is not None:
+        return mem_state.root_token
+    token = builder.token()
+    _set_mem_state(
+        state,
+        _MemState(
+            token,
+            mem_state.open_async_tokens,
+            mem_state.committed_groups,
+            mem_state.committed_group_capacity,
+        ),
+    )
+    return token
+
+
+def _set_mem_root(state, token):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            token,
+            mem_state.open_async_tokens,
+            mem_state.committed_groups,
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _append_open_async_token(state, token):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            mem_state.open_async_tokens + (token,),
+            mem_state.committed_groups,
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _clear_open_async_tokens(state):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            (),
+            mem_state.committed_groups,
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _remove_token_values(values, removed):
+    removed_ids = {id(value) for value in removed}
+    if not removed_ids:
+        return tuple(values)
+    return tuple(value for value in values if id(value) not in removed_ids)
+
+
+def _remove_open_async_tokens(state, tokens):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            _remove_token_values(mem_state.open_async_tokens, tokens),
+            mem_state.committed_groups,
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _append_committed_group(state, token):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            mem_state.open_async_tokens,
+            mem_state.committed_groups + (token,),
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _set_committed_groups(state, groups):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            mem_state.open_async_tokens,
+            tuple(groups),
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _remove_committed_groups(state, groups):
+    mem_state = _mem_state(state)
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            mem_state.open_async_tokens,
+            _remove_token_values(mem_state.committed_groups, groups),
+            mem_state.committed_group_capacity,
+        ),
+    )
+
+
+def _cap_committed_groups(state):
+    mem_state = _mem_state(state)
+    capacity = mem_state.committed_group_capacity
+    if capacity is None or len(mem_state.committed_groups) <= capacity:
+        return
+    _set_mem_state(
+        state,
+        _MemState(
+            mem_state.root_token,
+            mem_state.open_async_tokens,
+            mem_state.committed_groups[-capacity:] if capacity else (),
+            capacity,
+        ),
+    )
+
+
+def _open_async_tokens(state):
+    return _mem_state(state).open_async_tokens
+
+
+def _committed_groups(state):
+    return _mem_state(state).committed_groups
+
+
 def _initial_lowering_state(builder, plan, w):
     values = _values_by_id(plan)
     state = {
@@ -2149,9 +2322,7 @@ def _initial_lowering_state(builder, plan, w):
         "op_by_result": _op_by_result_id(plan),
         "wave_values": {},
         "program_id_bindings": {},
-        "pending_copy_tokens": [],
-        "committed_groups": [],
-        "last_order_token": None,
+        "mem_state": _MemState(),
     }
     _init_argument_wave_values(builder, values, state["wave_values"], w)
     return state
@@ -2221,6 +2392,7 @@ def _save_control_scope(state):
     return (
         state["wave_values"],
         state["program_id_bindings"],
+        state["mem_state"],
     )
 
 
@@ -2232,7 +2404,7 @@ def _enter_control_scope(state):
 
 
 def _restore_control_scope(state, saved):
-    state["wave_values"], state["program_id_bindings"] = saved
+    state["wave_values"], state["program_id_bindings"], state["mem_state"] = saved
 
 
 def _control_kind_for_value_plan(value_plan, context):
@@ -2371,12 +2543,16 @@ def _emit_scoped_control_block(
     stats,
     control_context,
     bindings=(),
+    mem_state=None,
+    capture_mem_state=False,
 ):
     saved = _enter_control_scope(state)
     try:
+        if mem_state is not None:
+            state["mem_state"] = mem_state
         for value_id, lowered in bindings:
             state["wave_values"][value_id] = lowered
-        return _emit_raw_block(
+        yielded = _emit_raw_block(
             builder,
             kernel,
             raw_ops,
@@ -2386,6 +2562,9 @@ def _emit_scoped_control_block(
             stats,
             control_context=control_context,
         )
+        if capture_mem_state:
+            return yielded, _copy_mem_state(state["mem_state"])
+        return yielded
     finally:
         _restore_control_scope(state, saved)
 
@@ -2475,6 +2654,100 @@ def _materialize_for_bound(builder, state, value_id, w, context):
     return _control_value_to_mlir(builder, lowered, w, context)
 
 
+def _walk_raw_region_ops(raw_ops):
+    for raw_op in raw_ops:
+        yield raw_op
+        for region_index in range(raw_op.get_num_regions()):
+            region = raw_op.get_region(region_index)
+            for block_index in range(region.size()):
+                yield from _walk_raw_region_ops(
+                    _raw_block_ops(region.get_block(block_index))
+                )
+
+
+def _raw_ops_have_memory_effects(raw_ops):
+    return any(
+        raw_op.get_name() in _CONTROL_REGION_EFFECT_OPS
+        for raw_op in _walk_raw_region_ops(raw_ops)
+    )
+
+
+def _raw_op_has_memory_effects(raw_op):
+    return _raw_ops_have_memory_effects((raw_op,))
+
+
+def _max_async_wait_keep(raw_ops):
+    keep = 0
+    for raw_op in _walk_raw_region_ops(raw_ops):
+        if raw_op.get_name() == "ttg.async_wait":
+            keep = max(keep, int(raw_op.get_int_attr("num") or 0))
+    return keep
+
+
+def _loop_hidden_mem_init(builder, state, raw_ops):
+    if not _raw_ops_have_memory_effects(raw_ops):
+        return (), None
+    group_count = max(
+        len(_committed_groups(state)), _max_async_wait_keep(raw_ops)
+    )
+    groups = tuple(_committed_groups(state))
+    if len(groups) < group_count:
+        groups = (
+            tuple(builder.token() for _ in range(group_count - len(groups)))
+            + groups
+        )
+    elif len(groups) > group_count:
+        groups = groups[-group_count:]
+    return (_ensure_mem_root(builder, state),) + groups, _LoopMemShape(group_count)
+
+
+def _loop_mem_state_from_iter_args(iter_args, shape):
+    if shape is None:
+        return None
+    if len(iter_args) != 1 + shape.group_count:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: hidden memory state has "
+            f"{len(iter_args)} iter arg(s), expected {1 + shape.group_count}"
+        )
+    return _MemState(iter_args[0], (), tuple(iter_args[1:]), shape.group_count)
+
+
+def _loop_hidden_mem_yields(body_mem_state, shape):
+    if shape is None:
+        return ()
+    if body_mem_state is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: missing loop memory state"
+        )
+    if body_mem_state.open_async_tokens:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for with uncommitted async copies "
+            "live across the loop backedge"
+        )
+    if len(body_mem_state.committed_groups) != shape.group_count:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: async committed-group queue "
+            "changes shape across the loop backedge; add an async_wait that "
+            "keeps a static number of groups"
+        )
+    if body_mem_state.root_token is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: missing hidden root memory token"
+        )
+    return (body_mem_state.root_token,) + tuple(body_mem_state.committed_groups)
+
+
+def _apply_loop_hidden_mem_results(state, results, shape):
+    if shape is None:
+        return
+    if len(results) != 1 + shape.group_count:
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: hidden memory result count "
+            f"{len(results)} does not match shape {1 + shape.group_count}"
+        )
+    _set_mem_state(state, _MemState(results[0], (), tuple(results[1:])))
+
+
 def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
     if len(op.operands) < 3:
         raise ValueError("tlx_wave bridge expected scf.for with at least 3 operands")
@@ -2487,7 +2760,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
     lower = _materialize_for_bound(builder, state, op.operands[0], w, "scf.for lower")
     upper = _materialize_for_bound(builder, state, op.operands[1], w, "scf.for upper")
     step = _materialize_for_bound(builder, state, op.operands[2], w, "scf.for step")
-    init_values = []
+    user_init_values = []
     carry_kinds = []
     for index, (init_id, result_id) in enumerate(zip(init_ids, op.results)):
         value_plan = state["values"][result_id]
@@ -2502,7 +2775,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
             expected_kind,
             f"unsupported loop-carried scf.for value {index}",
         )
-        init_values.append(
+        user_init_values.append(
             _control_value_to_mlir(
                 builder,
                 lowered,
@@ -2513,22 +2786,31 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
         carry_kinds.append(expected_kind)
 
     body_block = _single_region_block(raw_op, 0, "scf.for body")
+    body_ops = _raw_block_ops(body_block)
     body_args = _raw_block_args(body_block)
-    if len(body_args) != 1 + len(init_values):
+    if len(body_args) != 1 + len(user_init_values):
         raise ValueError(
             "tlx_wave bridge cannot lower scf.for: body argument count "
-            f"{len(body_args)} does not match induction plus {len(init_values)} "
+            f"{len(body_args)} does not match induction plus {len(user_init_values)} "
             "iter_arg(s)"
         )
 
-    if init_values:
-        with builder.for_loop(lower, upper, step, init_values) as for_op:
+    hidden_init_values, mem_shape = _loop_hidden_mem_init(builder, state, body_ops)
+    all_init_values = tuple(user_init_values) + tuple(hidden_init_values)
+
+    if all_init_values:
+        with builder.for_loop(lower, upper, step, all_init_values) as for_op:
             iter_args = tuple(for_op.inner_iter_args)
-            if len(iter_args) != len(init_values):
+            if len(iter_args) != len(all_init_values):
                 raise ValueError(
                     "tlx_wave bridge cannot lower scf.for: Wave loop exposes "
-                    f"{len(iter_args)} iter arg(s), expected {len(init_values)}"
+                    f"{len(iter_args)} iter arg(s), expected {len(all_init_values)}"
                 )
+            user_iter_args = iter_args[: len(user_init_values)]
+            hidden_iter_args = iter_args[len(user_init_values) :]
+            body_mem_state = _loop_mem_state_from_iter_args(
+                hidden_iter_args, mem_shape
+            )
             bindings = [
                 (
                     _value_id(body_args[0]),
@@ -2541,20 +2823,29 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
                     _WaveValue(kind, iter_arg),
                 )
                 for block_arg, kind, iter_arg in zip(
-                    body_args[1:], carry_kinds, iter_args
+                    body_args[1:], carry_kinds, user_iter_args
                 )
             )
-            yielded = _emit_scoped_control_block(
+            scoped_result = _emit_scoped_control_block(
                 builder,
                 kernel,
-                _raw_block_ops(body_block),
+                body_ops,
                 state,
                 lds_layout,
                 w,
                 stats,
                 "scf.for",
                 bindings=tuple(bindings),
+                mem_state=body_mem_state,
+                capture_mem_state=mem_shape is not None,
             )
+            if mem_shape is not None:
+                yielded, yielded_mem_state = scoped_result
+            else:
+                yielded = scoped_result
+                yielded_mem_state = None
+            if yielded is None and not op.results:
+                yielded = ()
             yield_values, yield_kinds = _control_yields_for_result_ids(
                 builder, state, yielded, op.results, w, "scf.for"
             )
@@ -2563,13 +2854,17 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
                     "tlx_wave bridge cannot lower scf.for: iter_arg/yield "
                     f"kinds differ ({tuple(carry_kinds)} vs {yield_kinds})"
                 )
-            builder.yield_(yield_values)
+            hidden_yields = _loop_hidden_mem_yields(yielded_mem_state, mem_shape)
+            builder.yield_(yield_values + hidden_yields)
         for result_id, result_kind, result in zip(
-            op.results, carry_kinds, for_op.results
+            op.results, carry_kinds, for_op.results[: len(op.results)]
         ):
             _set_control_result(
                 state["wave_values"], result_id, result_kind, result
             )
+        _apply_loop_hidden_mem_results(
+            state, for_op.results[len(op.results) :], mem_shape
+        )
         return
 
     with builder.for_loop(lower, upper, step) as induction:
@@ -2582,7 +2877,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
         yielded = _emit_scoped_control_block(
             builder,
             kernel,
-            _raw_block_ops(body_block),
+            body_ops,
             state,
             lds_layout,
             w,
@@ -3227,7 +3522,7 @@ def _emit_global_load_op(builder, op, state, w):
         result_plan, "tt.load result", "generic tensor lowering"
     )
     components = []
-    token = state["last_order_token"]
+    token = _mem_root(state)
     for component in range(component_count):
         dim_bindings, width, active = _blocked_tensor_dim_bindings(
             builder, result_plan, w, "tt.load result", component=component
@@ -3286,7 +3581,7 @@ def _emit_global_load_op(builder, op, state, w):
             w,
         )
         components.append(loaded)
-    state["last_order_token"] = token
+    _set_mem_root(state, token)
     if component_count == 1:
         _set_wave_value(wave_values, result_id, "simd", components[0])
     else:
@@ -3320,7 +3615,7 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
     component_count = _blocked_layout_component_count(
         value_plan, "ttg.local_store value", "generic tensor lowering"
     )
-    token = state["last_order_token"]
+    token = _mem_root(state)
     for component in range(component_count):
         dim_bindings, width, active = _blocked_tensor_dim_bindings(
             builder, value_plan, w, "ttg.local_store value", component=component
@@ -3353,7 +3648,7 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
             token,
             w,
         )
-    state["last_order_token"] = builder.barrier(token)
+    _set_mem_root(state, builder.barrier(token))
     stats.barriers += 1
 
 
@@ -3433,12 +3728,12 @@ def _emit_local_load_op(builder, op, state, local_loads, lds_layout, w, stats):
             "ttg.local_load token",
         )
         if address.token_value_id is not None
-        else state["last_order_token"]
+        else _mem_root(state)
     )
 
     fragment_capability = _physical_local_load_fragment_capability(value, memdesc)
     if fragment_capability is not None:
-        fragment, state["last_order_token"] = _emit_dot_operand_fragment_load(
+        fragment, token = _emit_dot_operand_fragment_load(
             builder,
             address,
             value,
@@ -3451,10 +3746,11 @@ def _emit_local_load_op(builder, op, state, local_loads, lds_layout, w, stats):
             w,
             stats,
         )
+        _set_mem_root(state, token)
         _set_wave_value(wave_values, result_id, "fragment", fragment)
         return
 
-    loaded, state["last_order_token"] = _emit_generic_local_load(
+    loaded, token = _emit_generic_local_load(
         builder,
         address,
         value,
@@ -3466,6 +3762,7 @@ def _emit_local_load_op(builder, op, state, local_loads, lds_layout, w, stats):
         w,
         stats,
     )
+    _set_mem_root(state, token)
     if isinstance(loaded, tuple):
         _set_wave_value(wave_values, result_id, "simd_tuple", loaded)
     else:
@@ -3493,23 +3790,24 @@ def _emit_store_op(builder, op, state, w):
     if lowered.kind == "fragment":
         physical_plan = _physical_value_plan(values, lowered, value_id)
         _validate_fragment_store_value(value_plan, physical_plan)
-        state["last_order_token"] = _emit_fragment_store(
+        token = _emit_fragment_store(
             builder,
             state,
             lowered,
             physical_plan,
             ptr_id,
             mask_id,
-            state["last_order_token"],
+            _mem_root(state),
             w,
         )
+        _set_mem_root(state, token)
         return
 
     if lowered.kind in {"simd", "simd_tuple", "index_expr"}:
         component_count = _blocked_layout_component_count(
             value_plan, "tt.store value", "generic tensor lowering"
         )
-        token = state["last_order_token"]
+        token = _mem_root(state)
         for component in range(component_count):
             dim_bindings, width, active = _blocked_tensor_dim_bindings(
                 builder, value_plan, w, "tt.store value", component=component
@@ -3557,7 +3855,7 @@ def _emit_store_op(builder, op, state, w):
                 token,
                 w,
             )
-        state["last_order_token"] = token
+        _set_mem_root(state, token)
         return
 
     raise ValueError(
@@ -3581,9 +3879,9 @@ def _emit_ordered_raw_op(
     values = state["values"]
     wave_values = state["wave_values"]
 
-    if control_context is not None and op.name in _CONTROL_REGION_EFFECT_OPS:
+    if control_context == "scf.if" and _raw_op_has_memory_effects(raw_op):
         raise ValueError(
-            "tlx_wave bridge cannot lower side-effecting op inside "
+            "tlx_wave bridge cannot lower side effects inside "
             f"{control_context} yet: {op.name}"
         )
     if _emit_generic_value_op(builder, state, op, w):
@@ -3599,45 +3897,71 @@ def _emit_ordered_raw_op(
         address = state["address_by_token"].get(token_id)
         if address is None:
             raise ValueError("tlx_wave bridge could not match async copy token")
-        if state["last_order_token"] is None:
-            state["last_order_token"] = builder.token()
-        state["last_order_token"] = _emit_async_copy(
+        token = _emit_async_copy(
             builder,
             state,
             kernel,
             address,
             lds_layout,
-            state["last_order_token"],
+            _ensure_mem_root(builder, state),
             w,
             stats,
         )
         if token_id is not None:
-            _set_wave_value(
-                wave_values, token_id, "token", state["last_order_token"]
-            )
-        state["pending_copy_tokens"].append(state["last_order_token"])
+            _set_wave_value(wave_values, token_id, "token", token)
+        _append_open_async_token(state, token)
     elif op.name == "ttg.async_commit_group":
-        group = _join_tokens(builder, tuple(state["pending_copy_tokens"]), stats)
-        state["pending_copy_tokens"].clear()
-        state["committed_groups"].append(group)
-        state["last_order_token"] = group
+        input_tokens = tuple(
+            _require_wave_value(
+                wave_values,
+                token_id,
+                ("token",),
+                "ttg.async_commit_group token",
+            )
+            for token_id in op.operands
+        )
+        group = _join_tokens(
+            builder,
+            input_tokens if input_tokens else _open_async_tokens(state),
+            stats,
+        )
+        if input_tokens:
+            _remove_open_async_tokens(state, input_tokens)
+        else:
+            _clear_open_async_tokens(state)
+        _append_committed_group(state, group)
+        _set_mem_root(state, group)
         for result_id in op.results:
             _set_wave_value(wave_values, result_id, "token", group)
         stats.commit_groups += 1
     elif op.name == "ttg.async_wait":
         keep_groups = int(op.attrs.get("num", 0) or 0)
-        wait_count = max(0, len(state["committed_groups"]) - keep_groups)
+        input_groups = tuple(
+            _require_wave_value(
+                wave_values,
+                token_id,
+                ("token",),
+                "ttg.async_wait token",
+            )
+            for token_id in op.operands
+        )
+        groups = input_groups if input_groups else _committed_groups(state)
+        wait_count = max(0, len(groups) - keep_groups)
         if wait_count:
-            waited_groups = tuple(state["committed_groups"][:wait_count])
+            waited_groups = tuple(groups[:wait_count])
             wait_token = _join_tokens(builder, waited_groups, stats)
             builder.wait(wait_token)
             stats.waits += 1
-            state["committed_groups"] = state["committed_groups"][wait_count:]
-            state["last_order_token"] = builder.barrier(wait_token)
+            if input_groups:
+                _remove_committed_groups(state, waited_groups)
+            else:
+                _set_committed_groups(state, groups[wait_count:])
+            _set_mem_root(state, builder.barrier(wait_token))
             stats.barriers += 1
+        _cap_committed_groups(state)
         ready_token = (
-            state["last_order_token"]
-            if state["last_order_token"] is not None
+            _mem_root(state)
+            if _mem_root(state) is not None
             else builder.token()
         )
         for result_id in op.results:
