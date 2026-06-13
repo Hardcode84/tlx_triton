@@ -296,6 +296,76 @@ def test_tlx_wave_lowers_multicomponent_blocked_local_roundtrip(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_simd_convert_layout_component_permutation(tmp_path):
+    source_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
+    )
+    result_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
+        "warpsPerCTA = [4, 1], order = [1, 0]}>"
+    )
+    convert_func = f"""
+  tt.func public @simd_convert_component_permutation(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {{noinline = false}} {{
+    %zero = arith.constant dense<0> : tensor<8x8xi32, {source_encoding}>
+    %in_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, {source_encoding}>
+    %in_ptr = tt.addptr %in_base, %zero : tensor<8x8x!tt.ptr<f32>, {source_encoding}>, tensor<8x8xi32, {source_encoding}>
+    %loaded = tt.load %in_ptr : tensor<8x8x!tt.ptr<f32>, {source_encoding}>
+    %converted = ttg.convert_layout %loaded : tensor<8x8xf32, {source_encoding}> -> tensor<8x8xf32, {result_encoding}>
+    %out_zero = arith.constant dense<0> : tensor<8x8xi32, {result_encoding}>
+    %out_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, {result_encoding}>
+    %out_ptr = tt.addptr %out_base, %out_zero : tensor<8x8x!tt.ptr<f32>, {result_encoding}>, tensor<8x8xi32, {result_encoding}>
+    tt.store %out_ptr, %converted : tensor<8x8x!tt.ptr<f32>, {result_encoding}>
+    tt.return
+  }}
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, convert_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert wave_artifact.count("wave.load") == 4
+    assert wave_artifact.count("wave.store") == 4
+    del ctx
+
+
+def test_tlx_wave_rejects_incompatible_simd_convert_layout(tmp_path):
+    source_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
+    )
+    result_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 32], "
+        "warpsPerCTA = [2, 1], order = [0, 1]}>"
+    )
+    convert_func = f"""
+  tt.func public @simd_convert_incompatible(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {{noinline = false}} {{
+    %zero = arith.constant dense<0> : tensor<8x8xi32, {source_encoding}>
+    %in_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, {source_encoding}>
+    %in_ptr = tt.addptr %in_base, %zero : tensor<8x8x!tt.ptr<f32>, {source_encoding}>, tensor<8x8xi32, {source_encoding}>
+    %loaded = tt.load %in_ptr : tensor<8x8x!tt.ptr<f32>, {source_encoding}>
+    %converted = ttg.convert_layout %loaded : tensor<8x8xf32, {source_encoding}> -> tensor<8x8xf32, {result_encoding}>
+    %out_zero = arith.constant dense<0> : tensor<8x8xi32, {result_encoding}>
+    %out_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, {result_encoding}>
+    %out_ptr = tt.addptr %out_base, %out_zero : tensor<8x8x!tt.ptr<f32>, {result_encoding}>, tensor<8x8xi32, {result_encoding}>
+    tt.store %out_ptr, %converted : tensor<8x8x!tt.ptr<f32>, {result_encoding}>
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(tmp_path, convert_func)
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "ttg.convert_layout for SIMD tensor data" in message
+    assert source_encoding in message
+    assert result_encoding in message
+    del ctx
+
+
 def test_tlx_wave_lowers_static_memdesc_index_as_staged_transform(tmp_path):
     local_func = """
   tt.func public @static_view(%arg0: !tt.ptr<f32>) attributes {noinline = false} {

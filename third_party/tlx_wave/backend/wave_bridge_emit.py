@@ -1236,6 +1236,145 @@ def _delinearize_expr(w, linear, shape, order):
     return tuple(coords)
 
 
+def _delinearize_index(linear, shape, order):
+    if len(shape) != len(order):
+        raise ValueError(
+            "tlx_wave bridge blocked layout has mismatched shape/order lengths: "
+            f"shape={shape}, order={order}"
+        )
+    coords = [0 for _ in shape]
+    remainder = int(linear)
+    for dim in order:
+        extent = int(shape[dim])
+        coords[dim] = remainder % extent
+        remainder //= extent
+    return tuple(coords)
+
+
+def _blocked_layout_static_coord(layout, thread, component):
+    width = _product(layout.threads_per_warp)
+    lane_coords = _delinearize_index(
+        thread % width,
+        layout.threads_per_warp,
+        layout.order,
+    )
+    warp_coords = _delinearize_index(
+        thread // width,
+        layout.warps_per_cta,
+        layout.order,
+    )
+    component_coords = _delinearize_index(
+        component,
+        layout.size_per_thread,
+        layout.order,
+    )
+    return tuple(
+        component_coords[dim]
+        + layout.size_per_thread[dim]
+        * (lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim])
+        for dim in range(len(layout.size_per_thread))
+    )
+
+
+def _layout_thread_count(layout):
+    return _product(layout.threads_per_warp) * _product(layout.warps_per_cta)
+
+
+def _simd_convert_error(reason, source_plan, result_plan):
+    raise ValueError(
+        "tlx_wave bridge cannot lower ttg.convert_layout for SIMD tensor data: "
+        f"{reason}; source encoding: {source_plan.encoding}; "
+        f"result encoding: {result_plan.encoding}"
+    )
+
+
+def _simd_components_for_layout(source, source_plan, component_count, context):
+    if source.kind == "simd":
+        if component_count != 1:
+            raise ValueError(
+                f"tlx_wave bridge internal error while lowering {context}: "
+                f"single SIMD value for {component_count} layout components; "
+                f"encoding={source_plan.encoding}"
+            )
+        return (source.value,)
+    if source.kind == "simd_tuple":
+        if len(source.value) != component_count:
+            raise ValueError(
+                f"tlx_wave bridge internal error while lowering {context}: "
+                f"SIMD tuple has {len(source.value)} components, expected "
+                f"{component_count}; encoding={source_plan.encoding}"
+            )
+        return tuple(source.value)
+    raise ValueError(
+        f"tlx_wave bridge internal error while lowering {context}: "
+        f"expected SIMD value, got {source.kind}"
+    )
+
+
+def _blocked_layout_component_permutation(source_plan, result_plan):
+    source_layout = _blocked_tensor_layout_info(
+        source_plan,
+        "ttg.convert_layout source",
+        "SIMD layout conversion",
+    )
+    result_layout = _blocked_tensor_layout_info(
+        result_plan,
+        "ttg.convert_layout result",
+        "SIMD layout conversion",
+    )
+    source_width = _product(source_layout.threads_per_warp)
+    result_width = _product(result_layout.threads_per_warp)
+    if source_width != result_width:
+        _simd_convert_error(
+            f"SIMD widths differ ({source_width} -> {result_width})",
+            source_plan,
+            result_plan,
+        )
+    source_threads = _layout_thread_count(source_layout)
+    result_threads = _layout_thread_count(result_layout)
+    if source_threads != result_threads:
+        _simd_convert_error(
+            f"CTA thread counts differ ({source_threads} -> {result_threads})",
+            source_plan,
+            result_plan,
+        )
+
+    source_components = _product(source_layout.size_per_thread)
+    result_components = _product(result_layout.size_per_thread)
+    permutation = []
+    for result_component in range(result_components):
+        source_component = None
+        for candidate in range(source_components):
+            matches = True
+            for thread in range(result_threads):
+                result_coord = _blocked_layout_static_coord(
+                    result_layout, thread, result_component
+                )
+                if any(
+                    result_coord[dim] >= result_plan.shape[dim]
+                    for dim in range(len(result_plan.shape))
+                ):
+                    continue
+                source_coord = _blocked_layout_static_coord(
+                    source_layout, thread, candidate
+                )
+                if source_coord != result_coord:
+                    matches = False
+                    break
+            if matches:
+                source_component = candidate
+                break
+        if source_component is None:
+            _simd_convert_error(
+                "conversion requires a lane-dependent remap, which is not "
+                "representable by the current Wave SIMD tuple value model",
+                source_plan,
+                result_plan,
+            )
+        permutation.append(source_component)
+    return tuple(permutation)
+
+
 def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     raw_value = _raw_wave_value(wave_value)
     if not value_plan.shape:
@@ -1954,6 +2093,32 @@ def _shift_forwarded_value(source, axis):
     )
 
 
+def _convert_simd_layout(source, source_plan, result_plan):
+    source_count = _blocked_layout_component_count(
+        source_plan,
+        "ttg.convert_layout source",
+        "SIMD layout conversion",
+    )
+    result_count = _blocked_layout_component_count(
+        result_plan,
+        "ttg.convert_layout result",
+        "SIMD layout conversion",
+    )
+    source_components = _simd_components_for_layout(
+        source, source_plan, source_count, "ttg.convert_layout"
+    )
+    permutation = _blocked_layout_component_permutation(source_plan, result_plan)
+    if len(permutation) != result_count:
+        raise ValueError(
+            "tlx_wave bridge internal error: convert_layout permutation length "
+            f"{len(permutation)} does not match result components {result_count}"
+        )
+    result_components = tuple(source_components[index] for index in permutation)
+    if result_count == 1:
+        return _WaveValue("simd", result_components[0])
+    return _WaveValue("simd_tuple", result_components)
+
+
 def _forward_lowered_value(op, values, wave_values):
     if len(op.operands) != 1 or len(op.results) != 1:
         raise ValueError(f"tlx_wave bridge expected {op.name} with one operand/result")
@@ -1998,12 +2163,10 @@ def _forward_lowered_value(op, values, wave_values):
         if source.kind in {"simd", "simd_tuple"} and not _same_layout_encoding(
             source_plan, result_plan
         ):
-            raise ValueError(
-                "tlx_wave bridge cannot forward layout conversion for SIMD "
-                "tensor data without a register/layout conversion; "
-                f"source encoding: {source_plan.encoding}; "
-                f"result encoding: {result_plan.encoding}"
+            wave_values[result_id] = _convert_simd_layout(
+                source, source_plan, result_plan
             )
+            return
         wave_values[result_id] = _forward_nonfragment_value(source)
         return
     if _same_layout_encoding(source_plan, result_plan):
