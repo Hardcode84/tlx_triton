@@ -618,12 +618,14 @@ _TRANSPARENT_MEMDESC_VIEW_OPS = {"tlx.local_alias", "tlx.require_layout"}
 
 
 def _is_identity_shared_layout(memdesc, shared):
+    rank = len(memdesc.shape)
+    contiguous_order = tuple(reversed(range(rank)))
     return (
-        len(memdesc.shape) == 1
+        rank >= 1
         and shared.vec == 1
         and shared.per_phase == 1
         and shared.max_phase == 1
-        and shared.order == (0,)
+        and shared.order == contiguous_order
     )
 
 
@@ -640,9 +642,10 @@ def _validate_generic_shared_layout(memdesc, context):
         return
     raise ValueError(
         f"tlx_wave bridge cannot lower {context}: unsupported shared-memory "
-        "encoding for generic LDS addressing; expected one-dimensional "
+        "encoding for generic LDS addressing; expected contiguous unswizzled "
         "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
-        "order = [0]}> until shared-layout transforms are implemented; "
+        "order = [rank-1, ..., 0]}> until shared-layout transforms are "
+        "implemented; "
         f"got shape={memdesc.shape}, vec={shared.vec}, "
         f"perPhase={shared.per_phase}, maxPhase={shared.max_phase}, "
         f"order={shared.order}, encoding={memdesc.encoding}"
