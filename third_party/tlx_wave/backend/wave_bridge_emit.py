@@ -1021,6 +1021,28 @@ def _require_lowered_value(wave_values, value_id, kind, context):
     return lowered.value
 
 
+def _require_typed_wave_value(wave_values, value_id, context):
+    lowered = wave_values.get(value_id)
+    if lowered is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            "has not been lowered by a preceding ordered TTGIR op"
+        )
+    if not isinstance(lowered, _WaveValue):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: TTGIR value {value_id} "
+            f"lowered as {type(lowered).__name__}, expected typed Wave value"
+        )
+    return lowered
+
+
+def _arith_mixed_error(op_name, lhs, rhs):
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {op_name}: unsupported mixed "
+        f"formula/data operands lowered as {lhs.kind} and {rhs.kind}"
+    )
+
+
 def _init_argument_wave_values(builder, values, wave_values, w):
     for value in values.values():
         if value.kind != "argument" or value.base_arg_index is None:
@@ -1142,6 +1164,123 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
     )
 
 
+def _validate_simd_operand_layout(operand_plan, result_plan, op_name):
+    if operand_plan.type_kind != "tensor" or result_plan.type_kind != "tensor":
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op_name} as SIMD data: expected "
+            f"tensor operands/results, got {operand_plan.type} -> {result_plan.type}"
+        )
+    if operand_plan.shape != result_plan.shape:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op_name} as SIMD data: operand "
+            f"shape {operand_plan.shape} does not match result shape "
+            f"{result_plan.shape}"
+        )
+    if not _same_layout_encoding(operand_plan, result_plan):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op_name} as SIMD data through "
+            "an implicit layout conversion; operand encoding: "
+            f"{operand_plan.encoding}; result encoding: {result_plan.encoding}"
+        )
+
+
+def _simd_splat_index_operand(builder, source, result_plan, width, w, context):
+    if _is_deferred_index(source):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: deferred address/index "
+            "formula cannot be mixed with SIMD tensor data"
+        )
+    scalar = _materialize_index_value(builder, source, {}, w)
+    element_type = _wave_element_type(result_plan.element_type, w, context)
+    if _is_wave_index_type(getattr(scalar, "type", None), w):
+        scalar = builder.index_cast(scalar, element_type)
+    return builder.splat(scalar, width=width)
+
+
+def _simd_arith_operand_components(
+    builder,
+    values,
+    lowered,
+    operand_id,
+    result_plan,
+    component_count,
+    width,
+    w,
+    context,
+    *,
+    require_same_element=True,
+):
+    operand_plan = values[operand_id]
+    if lowered.kind in {"simd", "simd_tuple"}:
+        _validate_simd_operand_layout(operand_plan, result_plan, context)
+        if require_same_element and operand_plan.element_type != result_plan.element_type:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context} as SIMD data: "
+                f"operand element type {operand_plan.element_type} does not "
+                f"match result element type {result_plan.element_type}"
+            )
+        return _simd_components_for_layout(
+            lowered, operand_plan, component_count, context
+        )
+    if lowered.kind == "index_expr":
+        component = _simd_splat_index_operand(
+            builder, lowered.value, result_plan, width, w, context
+        )
+        return tuple(component for _ in range(component_count))
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context} as SIMD data: operand "
+        f"{operand_id} lowered as {lowered.kind}"
+    )
+
+
+def _result_wave_value_from_components(components):
+    if len(components) == 1:
+        return _WaveValue("simd", components[0])
+    return _WaveValue("simd_tuple", tuple(components))
+
+
+def _emit_simd_binary_op(builder, op, values, wave_values, w, kind):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError(f"tlx_wave bridge expected {op.name} with two operands")
+    result = values[op.results[0]]
+    if result.type_kind != "tensor" or not _is_integer_or_index_value(result):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op.name} as SIMD data: expected "
+            f"integer tensor result, got {result.type}"
+        )
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
+    component_count = _blocked_layout_component_count(
+        result, f"{op.name} result", "SIMD data arithmetic"
+    )
+    width = _tensor_lane_width(result, f"{op.name} result")
+    lhs_components = _simd_arith_operand_components(
+        builder, values, lhs, op.operands[0], result, component_count, width, w, op.name
+    )
+    rhs_components = _simd_arith_operand_components(
+        builder, values, rhs, op.operands[1], result, component_count, width, w, op.name
+    )
+    components = tuple(
+        builder.binary(kind, lhs_component, rhs_component)
+        for lhs_component, rhs_component in zip(lhs_components, rhs_components)
+    )
+    wave_values[result.value_id] = _result_wave_value_from_components(components)
+
+
+def _emit_arith_binary_op(builder, op, values, wave_values, w):
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
+    if lhs.kind == "index_expr" and rhs.kind == "index_expr":
+        _emit_index_binary_op(builder, op, values, wave_values, w)
+        return
+    data_kinds = {"simd", "simd_tuple", "index_expr"}
+    if lhs.kind in data_kinds and rhs.kind in data_kinds:
+        binary_kind = w.BinaryKind.AddI if op.name == "arith.addi" else w.BinaryKind.MulI
+        _emit_simd_binary_op(builder, op, values, wave_values, w, binary_kind)
+        return
+    _arith_mixed_error(op.name, lhs, rhs)
+
+
 def _emit_cmp_op(builder, op, values, wave_values, w):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected arith.cmpi with two operands")
@@ -1175,6 +1314,77 @@ def _emit_cmp_op(builder, op, values, wave_values, w):
         "mask_expr",
         _MaskCompare(predicate, lhs, rhs),
     )
+
+
+def _emit_simd_cmp_op(builder, op, values, wave_values, w, predicate):
+    result = values[op.results[0]]
+    if result.type_kind != "tensor" or not _is_bool_value(result):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower arith.cmpi as SIMD data: expected "
+            f"i1 tensor result, got {result.type}"
+        )
+    component_count = _blocked_layout_component_count(
+        result, "arith.cmpi result", "SIMD data compare"
+    )
+    if component_count != 1:
+        raise ValueError(
+            "tlx_wave bridge cannot lower arith.cmpi as SIMD data for "
+            f"multi-component tensor layouts yet; encoding={result.encoding}"
+        )
+    width = _tensor_lane_width(result, "arith.cmpi result")
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], "arith.cmpi")
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], "arith.cmpi")
+    lhs_components = _simd_arith_operand_components(
+        builder,
+        values,
+        lhs,
+        op.operands[0],
+        result,
+        component_count,
+        width,
+        w,
+        "arith.cmpi",
+        require_same_element=False,
+    )
+    rhs_components = _simd_arith_operand_components(
+        builder,
+        values,
+        rhs,
+        op.operands[1],
+        result,
+        component_count,
+        width,
+        w,
+        "arith.cmpi",
+        require_same_element=False,
+    )
+    _set_wave_value(
+        wave_values,
+        result.value_id,
+        "mask_expr",
+        _wave_cmpi(builder, predicate, lhs_components[0], rhs_components[0], w),
+    )
+
+
+def _emit_typed_cmp_op(builder, op, values, wave_values, w):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected arith.cmpi with two operands")
+    predicate = _CMPI_PREDICATES.get(int(op.attrs.get("predicate")))
+    if predicate is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower arith.cmpi predicate "
+            f"{op.attrs.get('predicate')}"
+        )
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], "arith.cmpi")
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], "arith.cmpi")
+    if lhs.kind == "index_expr" and rhs.kind == "index_expr":
+        _emit_cmp_op(builder, op, values, wave_values, w)
+        return
+    data_kinds = {"simd", "simd_tuple", "index_expr"}
+    if lhs.kind in data_kinds and rhs.kind in data_kinds:
+        _emit_simd_cmp_op(builder, op, values, wave_values, w, predicate)
+        return
+    _arith_mixed_error("arith.cmpi", lhs, rhs)
 
 
 def _emit_mask_and_op(builder, op, values, wave_values, w):
@@ -1217,6 +1427,21 @@ def _emit_mask_and_op(builder, op, values, wave_values, w):
         "mask_expr",
         _MaskAnd(lhs, rhs),
     )
+
+
+def _emit_typed_and_op(builder, op, values, wave_values, w):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected arith.andi with two operands")
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], "arith.andi")
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], "arith.andi")
+    if lhs.kind == "mask_expr" and rhs.kind == "mask_expr":
+        _emit_mask_and_op(builder, op, values, wave_values, w)
+        return
+    data_kinds = {"simd", "simd_tuple", "index_expr"}
+    if lhs.kind in data_kinds and rhs.kind in data_kinds:
+        _emit_simd_binary_op(builder, op, values, wave_values, w, w.BinaryKind.AndI)
+        return
+    _arith_mixed_error("arith.andi", lhs, rhs)
 
 
 def _emit_addptr_op(builder, op, values, wave_values, w):
@@ -1790,11 +2015,11 @@ def _emit_generic_value_op(builder, state, op, w):
     elif op.name in {"tt.broadcast", "tt.splat", "tt.expand_dims"}:
         _forward_lowered_value(op, values, wave_values)
     elif op.name in {"arith.addi", "arith.muli"}:
-        _emit_index_binary_op(builder, op, values, wave_values, w)
+        _emit_arith_binary_op(builder, op, values, wave_values, w)
     elif op.name == "arith.cmpi":
-        _emit_cmp_op(builder, op, values, wave_values, w)
+        _emit_typed_cmp_op(builder, op, values, wave_values, w)
     elif op.name == "arith.andi":
-        _emit_mask_and_op(builder, op, values, wave_values, w)
+        _emit_typed_and_op(builder, op, values, wave_values, w)
     elif op.name == "tt.addptr":
         _emit_addptr_op(builder, op, values, wave_values, w)
     elif op.name in {
