@@ -260,6 +260,22 @@ def _is_integer_or_index_value(value):
     return "index" in types or any(f"i{bits}" in types for bits in (1, 8, 16, 32, 64))
 
 
+def _scalar_data_type(value):
+    if value.type_kind != "scalar":
+        return None
+    if value.type in {"f16", "bf16", "f32"}:
+        return value.type
+    return None
+
+
+def _is_data_tensor(value):
+    return (
+        value.type_kind == "tensor"
+        and value.pointee_type is None
+        and value.element_type in {"i8", "i16", "i32", "i64", "f16", "bf16", "f32"}
+    )
+
+
 def _tensor_lane_width(value_plan, context):
     if getattr(value_plan, "type_kind", None) != "tensor":
         return None
@@ -919,9 +935,13 @@ def _materialize_tensor_data(
             )
         return value
     if lowered.kind == "index_expr":
-        raise ValueError(
-            f"tlx_wave bridge cannot lower {context}: integer index_expr data "
-            "needs explicit value-type materialization"
+        return _simd_splat_index_operand(
+            builder,
+            lowered.value,
+            value_plan,
+            width,
+            w,
+            context,
         )
     raise ValueError(
         f"tlx_wave bridge cannot lower {context}: value lowered as {lowered.kind}; "
@@ -1066,6 +1086,13 @@ def _init_argument_wave_values(builder, values, wave_values, w):
                 "index_expr",
                 bound,
             )
+        elif value.type_kind == "scalar" and _scalar_data_type(value) is not None:
+            _set_wave_value(
+                wave_values,
+                value.value_id,
+                "scalar",
+                arg,
+            )
 
 
 def _emit_constant_op(builder, op, values, wave_values, w):
@@ -1090,6 +1117,19 @@ def _emit_constant_op(builder, op, values, wave_values, w):
             value.value_id,
             "index_expr",
             builder.index_expr(w.sym_ctx.int_(const)),
+        )
+    elif _scalar_data_type(value) is not None and isinstance(const, (int, float)):
+        _set_wave_value(
+            wave_values,
+            value.value_id,
+            "scalar",
+            _constant_value(
+                builder,
+                value.type,
+                const,
+                w,
+                "arith.constant scalar data",
+            ),
         )
 
 
@@ -2015,7 +2055,9 @@ def _emit_generic_value_op(builder, state, op, w):
         _emit_program_id_op(builder, state, op, values, wave_values, w)
     elif op.name == "tt.make_range":
         _emit_make_range_op(op, values, wave_values, w)
-    elif op.name in {"tt.broadcast", "tt.splat", "tt.expand_dims"}:
+    elif op.name in {"tt.broadcast", "tt.splat"}:
+        _emit_splat_or_broadcast_op(builder, op, values, wave_values, w)
+    elif op.name == "tt.expand_dims":
         _forward_lowered_value(op, values, wave_values)
     elif op.name in {"arith.addi", "arith.muli"}:
         _emit_arith_binary_op(builder, op, values, wave_values, w)
@@ -2402,6 +2444,104 @@ def _convert_simd_layout(source, source_plan, result_plan):
     return _WaveValue("simd_tuple", result_components)
 
 
+def _simd_splat_from_scalar(builder, scalar, result_plan, w, context):
+    if not _is_data_tensor(result_plan):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context} as tensor data: "
+            f"unsupported result type {result_plan.type}"
+        )
+    component_count = _blocked_layout_component_count(
+        result_plan,
+        f"{context} result",
+        "SIMD tensor splat",
+    )
+    width = _tensor_lane_width(result_plan, f"{context} result")
+    component = builder.splat(scalar, width=width)
+    if component_count == 1:
+        return _WaveValue("simd", component)
+    return _WaveValue("simd_tuple", tuple(component for _ in range(component_count)))
+
+
+def _broadcast_uniform_simd_data(source, source_plan, result_plan, context):
+    if source_plan.element_type != result_plan.element_type:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context} for SIMD tensor data with "
+            f"element type change: {source_plan.type} -> {result_plan.type}"
+        )
+    if not _is_data_tensor(result_plan):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context} as SIMD tensor data: "
+            f"unsupported result type {result_plan.type}"
+        )
+    source_count = _blocked_layout_component_count(
+        source_plan,
+        f"{context} source",
+        "SIMD tensor broadcast",
+    )
+    result_count = _blocked_layout_component_count(
+        result_plan,
+        f"{context} result",
+        "SIMD tensor broadcast",
+    )
+    source_width = _tensor_lane_width(source_plan, f"{context} source")
+    result_width = _tensor_lane_width(result_plan, f"{context} result")
+    if source_width != result_width:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context} for SIMD tensor data: "
+            f"SIMD widths differ ({source_width} -> {result_width}); "
+            f"source encoding: {source_plan.encoding}; "
+            f"result encoding: {result_plan.encoding}"
+        )
+    if source_plan.shape == result_plan.shape:
+        if _same_layout_encoding(source_plan, result_plan):
+            return _forward_nonfragment_value(source)
+        return _convert_simd_layout(source, source_plan, result_plan)
+    if source_plan.varying_dims:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context} for non-uniform SIMD "
+            f"tensor data with shape change: source shape {source_plan.shape}, "
+            f"result shape {result_plan.shape}, varying dims="
+            f"{source_plan.varying_dims}"
+        )
+    source_components = _simd_components_for_layout(
+        source, source_plan, source_count, context
+    )
+    component = source_components[0]
+    if result_count == 1:
+        return _WaveValue("simd", component)
+    return _WaveValue("simd_tuple", tuple(component for _ in range(result_count)))
+
+
+def _emit_splat_or_broadcast_op(builder, op, values, wave_values, w):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        raise ValueError(f"tlx_wave bridge expected {op.name} with one operand/result")
+    source_id = op.operands[0]
+    result_id = op.results[0]
+    source = wave_values.get(source_id)
+    if source is None:
+        return
+    if not isinstance(source, _WaveValue):
+        raise ValueError("tlx_wave bridge internal error: untyped Wave value")
+    source_plan = values[source_id]
+    result_plan = values[result_id]
+    if source.kind in {"pointer_expr", "index_expr", "mask_expr"}:
+        wave_values[result_id] = _forward_nonfragment_value(source)
+        return
+    if source.kind == "scalar":
+        wave_values[result_id] = _simd_splat_from_scalar(
+            builder, source.value, result_plan, w, op.name
+        )
+        return
+    if op.name == "tt.broadcast" and source.kind in {"simd", "simd_tuple"}:
+        wave_values[result_id] = _broadcast_uniform_simd_data(
+            source, source_plan, result_plan, op.name
+        )
+        return
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {op.name} for lowered {source.kind} value"
+    )
+
+
 def _forward_lowered_value(op, values, wave_values):
     if len(op.operands) != 1 or len(op.results) != 1:
         raise ValueError(f"tlx_wave bridge expected {op.name} with one operand/result")
@@ -2412,16 +2552,6 @@ def _forward_lowered_value(op, values, wave_values):
         return
     source_plan = values[source_id]
     result_plan = values[result_id]
-    if op.name in {"tt.broadcast", "tt.splat"}:
-        if isinstance(source, _WaveValue) and source.kind != "fragment":
-            wave_values[result_id] = _forward_nonfragment_value(source)
-            return
-        raise ValueError(
-            f"tlx_wave bridge cannot forward {op.name} for lowered "
-            f"{source.kind if isinstance(source, _WaveValue) else type(source).__name__} "
-            "value"
-        )
-
     if op.name == "tt.expand_dims":
         if not isinstance(source, _WaveValue):
             raise ValueError("tlx_wave bridge internal error: untyped Wave value")
@@ -2850,7 +2980,7 @@ def _emit_store_op(builder, op, state, w):
         )
         return
 
-    if lowered.kind in {"simd", "simd_tuple"}:
+    if lowered.kind in {"simd", "simd_tuple", "index_expr"}:
         component_count = _blocked_layout_component_count(
             value_plan, "tt.store value", "generic tensor lowering"
         )
