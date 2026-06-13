@@ -171,6 +171,7 @@ class _BridgePlan:
     kind: str
     op_counts: dict[str, int]
     ops: tuple[_OpPlan, ...]
+    body_ops: tuple[object, ...]
     values: tuple[_ValuePlan, ...]
     addresses: tuple[_AddressExprPlan, ...]
     layouts: tuple[_LayoutPlan, ...]
@@ -232,6 +233,9 @@ _ORDERED_BODY_EFFECT_OPS = {
 }
 
 _ORDERED_BODY_PLANNED_OPS = {
+    "scf.for",
+    "scf.if",
+    "scf.yield",
     "tt.return",
     "tlx.reuse_group",
     "tlx.set_buffer_overlap",
@@ -534,12 +538,16 @@ def _walk_ops(mod, kernel):
     return _walk_region_ops(fn.get_region(0))
 
 
+_SUPPORTED_REGION_OPS = {"scf.for", "scf.if"}
+
+
 def _validate_straight_line_kernel_ops(ops):
     for op in ops:
-        if op.get_num_regions():
+        if op.get_num_regions() and op.get_name() not in _SUPPORTED_REGION_OPS:
             raise ValueError(
-                "tlx_wave bridge currently supports only straight-line TTGIR "
-                "kernel bodies; unsupported control-flow or nested-region op "
+                "tlx_wave bridge supports recursive TTGIR lowering only for "
+                "scf.if/scf.for regions; unsupported control-flow or "
+                "nested-region op "
                 f"{op.get_name()} has {op.get_num_regions()} nested region(s)"
             )
 
@@ -560,6 +568,30 @@ def _op_results(op):
 
 def _op_operands(op):
     return tuple(op.get_operand(index) for index in range(op.get_num_operands()))
+
+
+def _block_arguments(block):
+    return tuple(block.get_argument(index) for index in range(block.get_num_arguments()))
+
+
+def _walk_blocks_in_region(region):
+    blocks = []
+    for block_index in range(region.size()):
+        block = region.get_block(block_index)
+        blocks.append(block)
+        for op_index in range(block.get_num_operations()):
+            op = block.get_operation(op_index)
+            for region_index in range(op.get_num_regions()):
+                blocks.extend(_walk_blocks_in_region(op.get_region(region_index)))
+    return tuple(blocks)
+
+
+def _kernel_body_ops(mod, kernel):
+    fn = mod.get_function(kernel.name)
+    block = fn.get_region(0).get_block(0)
+    return tuple(
+        block.get_operation(index) for index in range(block.get_num_operations())
+    )
 
 
 def _op_int_array_attr(op, name):
@@ -684,6 +716,30 @@ def _argument_value_plan(value, index):
     )
 
 
+def _block_argument_value_plan(value):
+    type_plan = _type_plan(_value_type(value))
+    return _ValuePlan(
+        _value_id(value),
+        "block_argument",
+        "block_argument",
+        None,
+        type_plan.raw,
+        type_plan.kind,
+        type_plan.shape,
+        type_plan.element_type,
+        type_plan.element_byte_width,
+        type_plan.pointee_type,
+        type_plan.encoding,
+        type_plan.encoding_attr,
+        type_plan.memory_space,
+        None,
+        None,
+        None,
+        (),
+        "uniform",
+    )
+
+
 def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
     value_id = _value_id(result)
     if value_id in arg_info:
@@ -768,6 +824,13 @@ def _build_value_plans(mod, kernel, ops):
         arg_info[_value_id(arg_value)] = (index, f"arg{index}")
         arg_plan = _argument_value_plan(arg_value, index)
         values[arg_plan.value_id] = arg_plan
+    for block in _walk_blocks_in_region(fn.get_region(0)):
+        for block_arg in _block_arguments(block):
+            value_id = _value_id(block_arg)
+            if value_id in values:
+                continue
+            plan = _block_argument_value_plan(block_arg)
+            values[plan.value_id] = plan
 
     for op in ops:
         operands = _op_operands(op)
@@ -1363,6 +1426,7 @@ def _build_bridge_plan(mod, kernel):
         "ttgir_graph",
         op_counts,
         op_plans,
+        _kernel_body_ops(mod, kernel),
         tuple(values_by_id.values()),
         address_plans,
         _build_layout_plans(ops),

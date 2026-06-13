@@ -3,6 +3,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from .wave_bridge_plan import (
     _GFX950_DOT_PARENT_LAYOUT,
@@ -23,6 +24,7 @@ from .wave_bridge_plan import (
     _local_load_address_by_result,
     _memdescs_by_id,
     _target_triple,
+    _value_id,
     _values_by_id,
 )
 
@@ -63,6 +65,12 @@ class _DimBinding:
 @dataclass(frozen=True)
 class _MaskConst:
     value: bool
+
+
+@dataclass(frozen=True)
+class _ScalarBool:
+    value: object
+    const_value: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +223,10 @@ def _raw_wave_value(value):
     return value.value if isinstance(value, _WaveValue) else value
 
 
+def _scalar_mlir_value(value):
+    return value.value if isinstance(value, _ScalarBool) else value
+
+
 def _physical_value_plan(values, lowered, value_id):
     if isinstance(lowered, _WaveValue) and lowered.physical_value_id is not None:
         return values[lowered.physical_value_id]
@@ -245,6 +257,64 @@ def _op_by_result_id(plan):
         for op in plan.ops
         for result_id in op.results
     }
+
+
+def _raw_op_plan(raw_op):
+    attrs = dict(raw_op.get_attrs())
+    if raw_op.get_name() in {
+        "tt.get_program_id",
+        "tt.get_num_programs",
+        "tt.expand_dims",
+    }:
+        axis = raw_op.get_int_attr("axis")
+        if axis is not None:
+            attrs["axis"] = axis
+    return SimpleNamespace(
+        index=-1,
+        name=raw_op.get_name(),
+        operands=tuple(
+            _value_id(raw_op.get_operand(index))
+            for index in range(raw_op.get_num_operands())
+        ),
+        results=tuple(
+            _value_id(raw_op.get_result(index))
+            for index in range(raw_op.get_num_results())
+        ),
+        attrs=attrs,
+        raw_op=raw_op,
+    )
+
+
+def _raw_block_ops(block):
+    return tuple(
+        block.get_operation(index) for index in range(block.get_num_operations())
+    )
+
+
+def _raw_block_args(block):
+    return tuple(
+        block.get_argument(index) for index in range(block.get_num_arguments())
+    )
+
+
+def _single_region_block(raw_op, region_index, context):
+    if region_index >= raw_op.get_num_regions():
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: missing region "
+            f"{region_index}"
+        )
+    region = raw_op.get_region(region_index)
+    if region.empty():
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: region {region_index} "
+            "is empty"
+        )
+    if region.size() != 1:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected one block in "
+            f"region {region_index}, got {region.size()}"
+        )
+    return region.get_block(0)
 
 
 def _dim_symbol(w, dim):
@@ -355,6 +425,10 @@ def _wave_cmpi(builder, predicate, lhs, rhs, w):
         _wave_cmpi_operand(builder, lhs, w),
         _wave_cmpi_operand(builder, rhs, w),
     )
+
+
+def _arith_cmpi(builder, predicate, lhs, rhs, w):
+    return w.arith.CmpIOp(w.CmpIPredicate[predicate], lhs, rhs).result
 
 
 def _dim_binding_value(dim_bindings, binding, w):
@@ -1078,6 +1152,13 @@ def _init_argument_wave_values(builder, values, wave_values, w):
                 "pointer_expr",
                 arg,
             )
+        elif value.type_kind == "scalar" and _is_bool_value(value):
+            _set_wave_value(
+                wave_values,
+                value.value_id,
+                "scalar",
+                _ScalarBool(arg),
+            )
         elif value.type_kind == "scalar" and _is_integer_or_index_value(value):
             bound = arg if value.type == "index" else builder.index_cast(arg, w.index_type())
             _set_wave_value(
@@ -1100,7 +1181,17 @@ def _emit_constant_op(builder, op, values, wave_values, w):
         return
     value = values[op.results[0]]
     const = value.const_value
-    if _is_bool_value(value) and isinstance(const, (bool, int)):
+    if value.type_kind == "scalar" and _is_bool_value(value) and isinstance(const, (bool, int)):
+        _set_wave_value(
+            wave_values,
+            value.value_id,
+            "scalar",
+            _ScalarBool(
+                _constant_value(builder, "i1", const, w, "arith.constant scalar i1"),
+                bool(const),
+            ),
+        )
+    elif _is_bool_value(value) and isinstance(const, (bool, int)):
         _set_wave_value(
             wave_values,
             value.value_id,
@@ -1340,6 +1431,26 @@ def _emit_cmp_op(builder, op, values, wave_values, w):
         wave_values, op.operands[1], "index_expr", "arith.cmpi"
     )
     result = values[op.results[0]]
+    if result.type_kind == "scalar":
+        if not _is_bool_value(result):
+            raise ValueError(
+                "tlx_wave bridge cannot lower scalar arith.cmpi with "
+                f"non-i1 result {result.type}"
+            )
+        if _is_deferred_index(lhs) or _is_deferred_index(rhs):
+            raise ValueError(
+                "tlx_wave bridge cannot lower scalar arith.cmpi from "
+                "layout-dependent operands"
+            )
+        lhs_value = _materialize_index_value(builder, lhs, {}, w)
+        rhs_value = _materialize_index_value(builder, rhs, {}, w)
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "scalar",
+            _arith_cmpi(builder, predicate, lhs_value, rhs_value, w),
+        )
+        return
     if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
         width = _tensor_lane_width(result, "arith.cmpi result")
         lhs_value = _materialize_index_value(builder, lhs, {}, w, force_width=width)
@@ -2094,6 +2205,398 @@ _PLANNING_ONLY_OPS = {
 }
 
 
+_CONTROL_REGION_EFFECT_OPS = {
+    "tt.dot",
+    "tt.load",
+    "tt.store",
+    "ttg.async_commit_group",
+    "ttg.async_copy_global_to_local",
+    "ttg.async_wait",
+    "ttg.local_load",
+    "ttg.local_store",
+}
+
+
+def _save_control_scope(state):
+    return (
+        state["wave_values"],
+        state["program_id_bindings"],
+    )
+
+
+def _enter_control_scope(state):
+    saved = _save_control_scope(state)
+    state["wave_values"] = dict(state["wave_values"])
+    state["program_id_bindings"] = dict(state["program_id_bindings"])
+    return saved
+
+
+def _restore_control_scope(state, saved):
+    state["wave_values"], state["program_id_bindings"] = saved
+
+
+def _control_kind_for_value_plan(value_plan, context):
+    if value_plan.type_kind == "token":
+        return "token"
+    if value_plan.type_kind == "scalar" and _is_bool_value(value_plan):
+        return "scalar"
+    if value_plan.type_kind == "scalar" and _is_integer_or_index_value(value_plan):
+        return "index_expr"
+    if value_plan.type_kind == "scalar" and _scalar_data_type(value_plan) is not None:
+        return "scalar"
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported control-flow "
+        f"value type {value_plan.type}"
+    )
+
+
+def _control_result_type(value_plan, w, context):
+    kind = _control_kind_for_value_plan(value_plan, context)
+    if kind == "token":
+        return w.mem_token_type()
+    if kind == "index_expr":
+        return w.index_type()
+    return _wave_element_type(value_plan.type, w, context)
+
+
+def _validate_control_value_kind(lowered, expected_kind, context):
+    if not isinstance(lowered, _WaveValue):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected typed Wave "
+            f"value, got {type(lowered).__name__}"
+        )
+    if lowered.kind != expected_kind:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: yielded value lowered as "
+            f"{lowered.kind}, expected {expected_kind}"
+        )
+
+
+def _control_value_to_mlir(builder, lowered, w, context):
+    if not isinstance(lowered, _WaveValue):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected typed Wave "
+            f"value, got {type(lowered).__name__}"
+        )
+    if lowered.kind == "index_expr":
+        if _is_deferred_index(lowered.value):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: layout-dependent "
+                "index expression cannot be used as a control-flow value"
+            )
+        return _materialize_index_value(builder, lowered.value, {}, w)
+    if lowered.kind in {"scalar", "token"}:
+        return _scalar_mlir_value(lowered.value)
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported control-flow "
+        f"value lowered as {lowered.kind}"
+    )
+
+
+def _set_control_result(wave_values, value_id, kind, value):
+    if kind not in {"index_expr", "scalar", "token"}:
+        raise ValueError(
+            f"tlx_wave bridge internal error: unsupported SCF result kind {kind}"
+        )
+    _set_wave_value(wave_values, value_id, kind, value)
+
+
+def _control_condition_value(builder, state, op, w):
+    if len(op.operands) != 1:
+        raise ValueError("tlx_wave bridge expected scf.if with one condition")
+    lowered = _require_typed_wave_value(
+        state["wave_values"], op.operands[0], "scf.if condition"
+    )
+    if lowered.kind == "scalar":
+        value_plan = state["values"][op.operands[0]]
+        if not _is_bool_value(value_plan):
+            raise ValueError(
+                "tlx_wave bridge cannot lower scf.if condition: expected "
+                f"scalar i1, got {value_plan.type}"
+            )
+        return _scalar_mlir_value(lowered.value)
+    if lowered.kind == "mask_expr" and isinstance(lowered.value, _MaskConst):
+        return _constant_value(
+            builder,
+            "i1",
+            lowered.value.value,
+            w,
+            "scf.if constant condition",
+        )
+    raise ValueError(
+        "tlx_wave bridge cannot lower scf.if condition: expected scalar i1, "
+        f"got lowered {lowered.kind}"
+    )
+
+
+def _control_yields_for_result_ids(builder, state, yielded, result_ids, w, context):
+    if yielded is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: missing scf.yield"
+        )
+    if len(yielded) != len(result_ids):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: scf.yield has "
+            f"{len(yielded)} value(s), expected {len(result_ids)}"
+        )
+    materialized = []
+    kinds = []
+    for index, (lowered, result_id) in enumerate(zip(yielded, result_ids)):
+        value_plan = state["values"][result_id]
+        expected_kind = _control_kind_for_value_plan(
+            value_plan, f"{context} result {index}"
+        )
+        _validate_control_value_kind(
+            lowered, expected_kind, f"{context} result {index}"
+        )
+        materialized.append(
+            _control_value_to_mlir(
+                builder,
+                lowered,
+                w,
+                f"{context} result {index}",
+            )
+        )
+        kinds.append(expected_kind)
+    return tuple(materialized), tuple(kinds)
+
+
+def _emit_scoped_control_block(
+    builder,
+    kernel,
+    raw_ops,
+    state,
+    lds_layout,
+    w,
+    stats,
+    control_context,
+    bindings=(),
+):
+    saved = _enter_control_scope(state)
+    try:
+        for value_id, lowered in bindings:
+            state["wave_values"][value_id] = lowered
+        return _emit_raw_block(
+            builder,
+            kernel,
+            raw_ops,
+            state,
+            lds_layout,
+            w,
+            stats,
+            control_context=control_context,
+        )
+    finally:
+        _restore_control_scope(state, saved)
+
+
+def _emit_scf_if_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
+    condition = _control_condition_value(builder, state, op, w)
+    result_types = tuple(
+        _control_result_type(
+            state["values"][result_id],
+            w,
+            f"scf.if result {index}",
+        )
+        for index, result_id in enumerate(op.results)
+    )
+    has_else = raw_op.get_num_regions() > 1 and not raw_op.get_region(1).empty()
+    if result_types and not has_else:
+        raise ValueError(
+            "tlx_wave bridge cannot lower result-bearing scf.if without an "
+            "else region"
+        )
+    then_block = _single_region_block(raw_op, 0, "scf.if then")
+    else_block = (
+        _single_region_block(raw_op, 1, "scf.if else") if has_else else None
+    )
+    result_kinds = ()
+    if_builder_ref = None
+    with builder.if_(condition, result_types, otherwise=has_else) as if_builder:
+        if_builder_ref = if_builder
+        then_yielded = _emit_scoped_control_block(
+            builder,
+            kernel,
+            _raw_block_ops(then_block),
+            state,
+            lds_layout,
+            w,
+            stats,
+            "scf.if",
+        )
+        if result_types:
+            then_values, result_kinds = _control_yields_for_result_ids(
+                builder, state, then_yielded, op.results, w, "scf.if then"
+            )
+            builder.yield_(then_values)
+        if has_else:
+            with if_builder.otherwise():
+                else_yielded = _emit_scoped_control_block(
+                    builder,
+                    kernel,
+                    _raw_block_ops(else_block),
+                    state,
+                    lds_layout,
+                    w,
+                    stats,
+                    "scf.if",
+                )
+                if result_types:
+                    else_values, else_kinds = _control_yields_for_result_ids(
+                        builder,
+                        state,
+                        else_yielded,
+                        op.results,
+                        w,
+                        "scf.if else",
+                    )
+                    if else_kinds != result_kinds:
+                        raise ValueError(
+                            "tlx_wave bridge cannot lower scf.if: then/else "
+                            f"yield kinds differ ({result_kinds} vs {else_kinds})"
+                        )
+                    builder.yield_(else_values)
+    if result_types:
+        for result_id, result_kind, result in zip(
+            op.results, result_kinds, if_builder_ref.op.results
+        ):
+            _set_control_result(
+                state["wave_values"], result_id, result_kind, result
+            )
+
+
+def _materialize_for_bound(builder, state, value_id, w, context):
+    lowered = _require_typed_wave_value(state["wave_values"], value_id, context)
+    if lowered.kind != "index_expr":
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected index_expr, "
+            f"got {lowered.kind}"
+        )
+    return _control_value_to_mlir(builder, lowered, w, context)
+
+
+def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
+    if len(op.operands) < 3:
+        raise ValueError("tlx_wave bridge expected scf.for with at least 3 operands")
+    init_ids = op.operands[3:]
+    if len(init_ids) != len(op.results):
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: iter_args/result count "
+            f"mismatch ({len(init_ids)} init arg(s), {len(op.results)} result(s))"
+        )
+    lower = _materialize_for_bound(builder, state, op.operands[0], w, "scf.for lower")
+    upper = _materialize_for_bound(builder, state, op.operands[1], w, "scf.for upper")
+    step = _materialize_for_bound(builder, state, op.operands[2], w, "scf.for step")
+    init_values = []
+    carry_kinds = []
+    for index, (init_id, result_id) in enumerate(zip(init_ids, op.results)):
+        value_plan = state["values"][result_id]
+        expected_kind = _control_kind_for_value_plan(
+            value_plan, f"unsupported loop-carried scf.for value {index}"
+        )
+        lowered = _require_typed_wave_value(
+            state["wave_values"], init_id, f"scf.for iter_arg {index}"
+        )
+        _validate_control_value_kind(
+            lowered,
+            expected_kind,
+            f"unsupported loop-carried scf.for value {index}",
+        )
+        init_values.append(
+            _control_value_to_mlir(
+                builder,
+                lowered,
+                w,
+                f"scf.for iter_arg {index}",
+            )
+        )
+        carry_kinds.append(expected_kind)
+
+    body_block = _single_region_block(raw_op, 0, "scf.for body")
+    body_args = _raw_block_args(body_block)
+    if len(body_args) != 1 + len(init_values):
+        raise ValueError(
+            "tlx_wave bridge cannot lower scf.for: body argument count "
+            f"{len(body_args)} does not match induction plus {len(init_values)} "
+            "iter_arg(s)"
+        )
+
+    if init_values:
+        with builder.for_loop(lower, upper, step, init_values) as for_op:
+            iter_args = tuple(for_op.inner_iter_args)
+            if len(iter_args) != len(init_values):
+                raise ValueError(
+                    "tlx_wave bridge cannot lower scf.for: Wave loop exposes "
+                    f"{len(iter_args)} iter arg(s), expected {len(init_values)}"
+                )
+            bindings = [
+                (
+                    _value_id(body_args[0]),
+                    _WaveValue("index_expr", for_op.induction_variable),
+                )
+            ]
+            bindings.extend(
+                (
+                    _value_id(block_arg),
+                    _WaveValue(kind, iter_arg),
+                )
+                for block_arg, kind, iter_arg in zip(
+                    body_args[1:], carry_kinds, iter_args
+                )
+            )
+            yielded = _emit_scoped_control_block(
+                builder,
+                kernel,
+                _raw_block_ops(body_block),
+                state,
+                lds_layout,
+                w,
+                stats,
+                "scf.for",
+                bindings=tuple(bindings),
+            )
+            yield_values, yield_kinds = _control_yields_for_result_ids(
+                builder, state, yielded, op.results, w, "scf.for"
+            )
+            if yield_kinds != tuple(carry_kinds):
+                raise ValueError(
+                    "tlx_wave bridge cannot lower scf.for: iter_arg/yield "
+                    f"kinds differ ({tuple(carry_kinds)} vs {yield_kinds})"
+                )
+            builder.yield_(yield_values)
+        for result_id, result_kind, result in zip(
+            op.results, carry_kinds, for_op.results
+        ):
+            _set_control_result(
+                state["wave_values"], result_id, result_kind, result
+            )
+        return
+
+    with builder.for_loop(lower, upper, step) as induction:
+        bindings = (
+            (
+                _value_id(body_args[0]),
+                _WaveValue("index_expr", induction),
+            ),
+        )
+        yielded = _emit_scoped_control_block(
+            builder,
+            kernel,
+            _raw_block_ops(body_block),
+            state,
+            lds_layout,
+            w,
+            stats,
+            "scf.for",
+            bindings=bindings,
+        )
+        if yielded not in (None, ()):
+            raise ValueError(
+                "tlx_wave bridge cannot lower scf.for without iter_args: "
+                f"body yielded {len(yielded)} value(s)"
+            )
+
+
 def _fragment_type_for_dot_operand(info, w):
     if info.op_idx not in (0, 1):
         raise ValueError(
@@ -2456,10 +2959,26 @@ def _simd_splat_from_scalar(builder, scalar, result_plan, w, context):
         "SIMD tensor splat",
     )
     width = _tensor_lane_width(result_plan, f"{context} result")
-    component = builder.splat(scalar, width=width)
+    component = builder.splat(_scalar_mlir_value(scalar), width=width)
     if component_count == 1:
         return _WaveValue("simd", component)
     return _WaveValue("simd_tuple", tuple(component for _ in range(component_count)))
+
+
+def _mask_splat_from_scalar(source, source_plan, result_plan, context):
+    if result_plan.type_kind == "tensor" and _is_bool_value(result_plan):
+        if source_plan.type_kind != "scalar" or not _is_bool_value(source_plan):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: non-i1 scalar splat "
+                f"to tensor mask from {source_plan.type}"
+            )
+        if isinstance(source.value, _ScalarBool) and source.value.const_value is not None:
+            return _WaveValue("mask_expr", _MaskConst(source.value.const_value))
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: dynamic scalar i1 splat "
+            "to tensor mask is not supported yet"
+        )
+    return None
 
 
 def _broadcast_uniform_simd_data(source, source_plan, result_plan, context):
@@ -2528,6 +3047,12 @@ def _emit_splat_or_broadcast_op(builder, op, values, wave_values, w):
         wave_values[result_id] = _forward_nonfragment_value(source)
         return
     if source.kind == "scalar":
+        mask_splat = _mask_splat_from_scalar(
+            source, source_plan, result_plan, op.name
+        )
+        if mask_splat is not None:
+            wave_values[result_id] = mask_splat
+            return
         wave_values[result_id] = _simd_splat_from_scalar(
             builder, source.value, result_plan, w, op.name
         )
@@ -3041,93 +3566,156 @@ def _emit_store_op(builder, op, state, w):
     )
 
 
-def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
-    state = _initial_lowering_state(builder, plan, w)
+def _emit_ordered_raw_op(
+    builder,
+    kernel,
+    raw_op,
+    state,
+    lds_layout,
+    w,
+    stats,
+    *,
+    control_context=None,
+):
+    op = _raw_op_plan(raw_op)
     values = state["values"]
-    memdescs = _memdescs_by_id(plan)
-    address_by_token = _async_address_by_token(plan)
-    local_loads = _local_load_address_by_result(plan)
     wave_values = state["wave_values"]
 
-    for op in plan.ops:
-        if _emit_generic_value_op(builder, state, op, w):
-            continue
-        if op.name == "tt.load":
-            _emit_global_load_op(builder, op, state, w)
-        elif op.name == "ttg.async_copy_global_to_local":
-            token_id = op.results[0] if op.results else None
-            address = address_by_token.get(token_id)
-            if address is None:
-                raise ValueError("tlx_wave bridge could not match async copy token")
-            if state["last_order_token"] is None:
-                state["last_order_token"] = builder.token()
-            state["last_order_token"] = _emit_async_copy(
-                builder,
-                state,
-                kernel,
-                address,
-                lds_layout,
-                state["last_order_token"],
-                w,
-                stats,
+    if control_context is not None and op.name in _CONTROL_REGION_EFFECT_OPS:
+        raise ValueError(
+            "tlx_wave bridge cannot lower side-effecting op inside "
+            f"{control_context} yet: {op.name}"
+        )
+    if _emit_generic_value_op(builder, state, op, w):
+        return
+    if op.name == "scf.if":
+        _emit_scf_if_op(builder, kernel, raw_op, op, state, lds_layout, w, stats)
+    elif op.name == "scf.for":
+        _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats)
+    elif op.name == "tt.load":
+        _emit_global_load_op(builder, op, state, w)
+    elif op.name == "ttg.async_copy_global_to_local":
+        token_id = op.results[0] if op.results else None
+        address = state["address_by_token"].get(token_id)
+        if address is None:
+            raise ValueError("tlx_wave bridge could not match async copy token")
+        if state["last_order_token"] is None:
+            state["last_order_token"] = builder.token()
+        state["last_order_token"] = _emit_async_copy(
+            builder,
+            state,
+            kernel,
+            address,
+            lds_layout,
+            state["last_order_token"],
+            w,
+            stats,
+        )
+        if token_id is not None:
+            _set_wave_value(
+                wave_values, token_id, "token", state["last_order_token"]
             )
-            if token_id is not None:
-                _set_wave_value(
-                    wave_values, token_id, "token", state["last_order_token"]
+        state["pending_copy_tokens"].append(state["last_order_token"])
+    elif op.name == "ttg.async_commit_group":
+        group = _join_tokens(builder, tuple(state["pending_copy_tokens"]), stats)
+        state["pending_copy_tokens"].clear()
+        state["committed_groups"].append(group)
+        state["last_order_token"] = group
+        for result_id in op.results:
+            _set_wave_value(wave_values, result_id, "token", group)
+        stats.commit_groups += 1
+    elif op.name == "ttg.async_wait":
+        keep_groups = int(op.attrs.get("num", 0) or 0)
+        wait_count = max(0, len(state["committed_groups"]) - keep_groups)
+        if wait_count:
+            waited_groups = tuple(state["committed_groups"][:wait_count])
+            wait_token = _join_tokens(builder, waited_groups, stats)
+            builder.wait(wait_token)
+            stats.waits += 1
+            state["committed_groups"] = state["committed_groups"][wait_count:]
+            state["last_order_token"] = builder.barrier(wait_token)
+            stats.barriers += 1
+        ready_token = (
+            state["last_order_token"]
+            if state["last_order_token"] is not None
+            else builder.token()
+        )
+        for result_id in op.results:
+            _set_wave_value(wave_values, result_id, "token", ready_token)
+    elif op.name == "ttg.local_store":
+        _emit_generic_local_store_op(
+            builder, op, state, state["memdescs"], lds_layout, w, stats
+        )
+    elif op.name == "ttg.local_load":
+        _emit_local_load_op(
+            builder, op, state, state["local_loads"], lds_layout, w, stats
+        )
+    elif op.name == "tt.dot":
+        _emit_dot_op(builder, op, values, wave_values, w, stats)
+    elif op.name == "tt.store":
+        _emit_store_op(builder, op, state, w)
+    elif op.name in _PLANNING_ONLY_OPS:
+        return
+    else:
+        region_note = (
+            " with nested regions"
+            if getattr(raw_op, "get_num_regions", lambda: 0)()
+            else ""
+        )
+        raise ValueError(
+            "tlx_wave bridge cannot lower unsupported TTGIR op in unified "
+            f"body lowering: {op.name}{region_note}"
+        )
+
+
+def _emit_raw_block(
+    builder,
+    kernel,
+    raw_ops,
+    state,
+    lds_layout,
+    w,
+    stats,
+    *,
+    control_context=None,
+):
+    for raw_op in raw_ops:
+        if raw_op.get_name() == "scf.yield":
+            op = _raw_op_plan(raw_op)
+            return tuple(
+                _require_typed_wave_value(
+                    state["wave_values"],
+                    operand_id,
+                    f"{control_context or 'top-level'} scf.yield",
                 )
-            state["pending_copy_tokens"].append(state["last_order_token"])
-        elif op.name == "ttg.async_commit_group":
-            group = _join_tokens(
-                builder, tuple(state["pending_copy_tokens"]), stats
+                for operand_id in op.operands
             )
-            state["pending_copy_tokens"].clear()
-            state["committed_groups"].append(group)
-            state["last_order_token"] = group
-            for result_id in op.results:
-                _set_wave_value(wave_values, result_id, "token", group)
-            stats.commit_groups += 1
-        elif op.name == "ttg.async_wait":
-            keep_groups = int(op.attrs.get("num", 0) or 0)
-            wait_count = max(0, len(state["committed_groups"]) - keep_groups)
-            if wait_count:
-                waited_groups = tuple(state["committed_groups"][:wait_count])
-                wait_token = _join_tokens(builder, waited_groups, stats)
-                builder.wait(wait_token)
-                stats.waits += 1
-                state["committed_groups"] = state["committed_groups"][wait_count:]
-                state["last_order_token"] = builder.barrier(wait_token)
-                stats.barriers += 1
-            ready_token = (
-                state["last_order_token"]
-                if state["last_order_token"] is not None
-                else builder.token()
-            )
-            for result_id in op.results:
-                _set_wave_value(wave_values, result_id, "token", ready_token)
-        elif op.name == "ttg.local_store":
-            _emit_generic_local_store_op(
-                builder, op, state, memdescs, lds_layout, w, stats
-            )
-        elif op.name == "ttg.local_load":
-            _emit_local_load_op(
-                builder, op, state, local_loads, lds_layout, w, stats
-            )
-        elif op.name == "tt.dot":
-            _emit_dot_op(builder, op, values, wave_values, w, stats)
-        elif op.name == "tt.store":
-            _emit_store_op(builder, op, state, w)
-        elif op.name in _PLANNING_ONLY_OPS:
-            continue
-        else:
-            region_note = (
-                " with nested regions"
-                if getattr(op, "get_num_regions", lambda: 0)()
-                else ""
-            )
-            raise ValueError(
-                "tlx_wave bridge cannot lower unsupported TTGIR op in unified "
-                f"body lowering: {op.name}{region_note}"
-            )
+        _emit_ordered_raw_op(
+            builder,
+            kernel,
+            raw_op,
+            state,
+            lds_layout,
+            w,
+            stats,
+            control_context=control_context,
+        )
+    return None
+
+
+def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
+    state = _initial_lowering_state(builder, plan, w)
+    state["address_by_token"] = _async_address_by_token(plan)
+    state["local_loads"] = _local_load_address_by_result(plan)
+    _emit_raw_block(
+        builder,
+        kernel,
+        plan.body_ops,
+        state,
+        lds_layout,
+        w,
+        stats,
+    )
 
 
 def _emit_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):

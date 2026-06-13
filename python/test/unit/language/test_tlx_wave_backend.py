@@ -1359,6 +1359,31 @@ def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_lowers_splatted_scalar_i1_constant_mask(tmp_path):
+    mask_func = """
+  tt.func public @scalar_i1_mask(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %true = arith.constant true
+    %mask = tt.splat %true : i1 -> tensor<64xi1, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %ptr, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %loaded, %mask : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, mask_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.cmpi" in wave
+    assert "wave.load" in wave
+    assert "wave.store" in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_lowers_uniform_tensor_compare_mask(tmp_path):
     uniform_mask_func = """
   tt.func public @uniform_mask(%arg0: !tt.ptr<f32>, %arg1: i32, %arg2: i32) attributes {noinline = false} {
@@ -2150,7 +2175,7 @@ def test_tlx_wave_bridge_rejects_private_helper_funcs_before_emission(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
+def test_tlx_wave_bridge_lowers_if_without_results(tmp_path):
     region_func = """
   tt.func public @region_kernel(%flag: i1) attributes {noinline = false} {
     scf.if %flag {
@@ -2159,12 +2184,38 @@ def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
     tt.return
   }
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, region_func)
 
-    with pytest.raises(ValueError, match="straight-line TTGIR.*scf\\.if"):
-        wave_bridge._build_bridge_plan(
-            mod, wave_bridge._kernel_from_module(mod)
-        )
+    wave = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "scf.if" in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_lowers_scalar_compare_if_condition(tmp_path):
+    region_func = """
+  tt.func public @region_kernel(%lhs: i32, %rhs: i32) attributes {noinline = false} {
+    %flag = arith.cmpi slt, %lhs, %rhs : i32
+    scf.if %flag {
+      %one = arith.constant 1 : i32
+    }
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, region_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "arith.cmpi slt" in wave
+    assert "scf.if" in wave
     del ctx
 
 
@@ -2205,15 +2256,39 @@ def test_tlx_wave_bridge_rejects_nested_regions_before_emission(tmp_path):
         ),
     ],
 )
-def test_tlx_wave_bridge_rejects_value_yielding_control_flow_before_emission(
+def test_tlx_wave_bridge_lowers_value_yielding_control_flow(
     tmp_path, local_func, op_name
 ):
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, local_func)
 
-    with pytest.raises(ValueError, match=rf"straight-line TTGIR.*{op_name}"):
-        wave_bridge._build_bridge_plan(
-            mod, wave_bridge._kernel_from_module(mod)
-        )
+    wave = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert op_name in wave
+    assert "scf.yield" in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_unsupported_loop_carried_tensor(tmp_path):
+    local_func = """
+  tt.func public @for_tensor_iter_arg_kernel() attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    %init = arith.constant dense<0> : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %result = scf.for %iv = %c0 to %c4 step %c1 iter_args(%carried = %init) -> (tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>) {
+      scf.yield %carried : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(ValueError, match="unsupported loop-carried"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
