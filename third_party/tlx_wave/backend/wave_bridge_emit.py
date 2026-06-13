@@ -466,9 +466,7 @@ def _wave_mask_and(builder, lhs, rhs, w, width):
     return builder.select(lhs, rhs, _false_mask(builder, w, width))
 
 
-def _blocked_layout_dim_bindings(
-    builder, value_plan, w, context, symbol_prefix, lowering_name
-):
+def _blocked_tensor_layout_info(value_plan, context, lowering_name):
     if value_plan.type_kind != "tensor" or not value_plan.shape:
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: expected ranked tensor, "
@@ -494,13 +492,26 @@ def _blocked_layout_dim_bindings(
             f"tlx_wave bridge blocked layout rank does not match {context}: "
             f"shape={value_plan.shape}, encoding={value_plan.encoding}"
         )
-    if any(size != 1 for size in layout.size_per_thread):
+    return layout
+
+
+def _blocked_layout_component_count(value_plan, context, lowering_name):
+    layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
+    return _product(layout.size_per_thread)
+
+
+def _blocked_layout_dim_bindings(
+    builder, value_plan, w, context, symbol_prefix, lowering_name, component=0
+):
+    layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
+    component_count = _product(layout.size_per_thread)
+    if component < 0 or component >= component_count:
         raise ValueError(
-            f"tlx_wave bridge {lowering_name} currently supports only "
-            "one scalar element per workitem; "
-            f"got sizePerThread={layout.size_per_thread} for {context}; "
+            f"tlx_wave bridge {lowering_name} component {component} is out of "
+            f"range for {context}: sizePerThread={layout.size_per_thread}, "
             f"encoding={value_plan.encoding}"
         )
+    rank = len(value_plan.shape)
     for dim, extent in enumerate(value_plan.shape):
         covered = (
             layout.size_per_thread[dim]
@@ -530,11 +541,23 @@ def _blocked_layout_dim_bindings(
         layout.warps_per_cta,
         layout.order,
     )
+    component_coords = (
+        _delinearize_expr(
+            w, w.sym_ctx.int_(component), layout.size_per_thread, layout.order
+        )
+        if component_count != 1
+        else None
+    )
 
     dim_bindings = {}
     active = None
     for dim in range(rank):
-        coord_expr = lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim]
+        tile_coord = lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim]
+        coord_expr = (
+            component_coords[dim] + layout.size_per_thread[dim] * tile_coord
+            if component_coords is not None
+            else tile_coord
+        )
         coord = builder.index_expr(coord_expr, {thread_sym: thread})
         dim_bindings[_dim_symbol(w, dim)] = coord
         extent = builder.splat(
@@ -546,7 +569,7 @@ def _blocked_layout_dim_bindings(
     return dim_bindings, width, active
 
 
-def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
+def _blocked_tensor_dim_bindings(builder, value_plan, w, context, component=0):
     return _blocked_layout_dim_bindings(
         builder,
         value_plan,
@@ -554,6 +577,7 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context):
         context,
         "tlx_tensor",
         "generic tensor lowering",
+        component=component,
     )
 
 
@@ -816,10 +840,17 @@ def _validate_generic_local_tensor(value_plan, memdesc, context):
         )
 
 
-def _materialize_tensor_data(builder, lowered, value_plan, width, w, context):
+def _materialize_tensor_data(
+    builder, lowered, value_plan, width, w, context, component=0
+):
     if not isinstance(lowered, _WaveValue):
         raise ValueError(f"tlx_wave bridge internal error: untyped {context} value")
     if lowered.kind == "simd":
+        if component != 0:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: requested component "
+                f"{component} from single-component SIMD value"
+            )
         if not w.SimdType.isinstance(lowered.value.type):
             raise ValueError(
                 f"tlx_wave bridge cannot lower {context}: value is not SIMD"
@@ -831,6 +862,25 @@ def _materialize_tensor_data(builder, lowered, value_plan, width, w, context):
                 f"does not match layout width {width}"
             )
         return lowered.value
+    if lowered.kind == "simd_tuple":
+        if component < 0 or component >= len(lowered.value):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: component {component} "
+                f"is out of range for {len(lowered.value)} SIMD components"
+            )
+        value = lowered.value[component]
+        if not w.SimdType.isinstance(value.type):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: component "
+                f"{component} is not SIMD"
+            )
+        got_width = w.SimdType(value.type).width
+        if got_width != width:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: component {component} "
+                f"SIMD width {got_width} does not match layout width {width}"
+            )
+        return value
     if lowered.kind == "index_expr":
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: integer index_expr data "
@@ -842,12 +892,14 @@ def _materialize_tensor_data(builder, lowered, value_plan, width, w, context):
     )
 
 
-def _load_other_value(builder, state, other_id, result_plan, width, w, context):
+def _load_other_value(
+    builder, state, other_id, result_plan, width, w, context, component=0
+):
     other_plan = state["values"][other_id]
     lowered = state["wave_values"].get(other_id)
-    if isinstance(lowered, _WaveValue) and lowered.kind == "simd":
+    if isinstance(lowered, _WaveValue) and lowered.kind in {"simd", "simd_tuple"}:
         return _materialize_tensor_data(
-            builder, lowered, result_plan, width, w, context
+            builder, lowered, result_plan, width, w, context, component=component
         )
     if (
         other_plan.producer == "arith.constant"
@@ -1261,7 +1313,7 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     return dim_bindings, frag.wave_size
 
 
-def _async_dim_bindings(builder, value_plan, w):
+def _async_dim_bindings(builder, value_plan, w, component=0):
     return _blocked_layout_dim_bindings(
         builder,
         value_plan,
@@ -1269,6 +1321,7 @@ def _async_dim_bindings(builder, value_plan, w):
         "ttg.async_copy_global_to_local source",
         "tlx_async",
         "async copy address lowering",
+        component=component,
     )
 
 
@@ -1389,7 +1442,7 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     return packet_bytes
 
 
-def _emit_async_source_ptr(builder, state, kernel, address, w):
+def _emit_async_source_ptr(builder, state, kernel, address, w, component=0):
     pointee_type = _source_pointee_type(kernel, address)
     element_type = _binding_type(pointee_type, w)
     if address.address_value_id is None:
@@ -1397,7 +1450,9 @@ def _emit_async_source_ptr(builder, state, kernel, address, w):
             "tlx_wave bridge cannot lower async copy without a source address value"
         )
     address_plan = state["values"][address.address_value_id]
-    dim_bindings, width, active = _async_dim_bindings(builder, address_plan, w)
+    dim_bindings, width, active = _async_dim_bindings(
+        builder, address_plan, w, component=component
+    )
     # Async copy inputs are regular SSA values. They must have been produced by
     # earlier ordered op lowering; this path must not recursively lower a use-def
     # slice around the async op.
@@ -1434,8 +1489,15 @@ def _emit_async_copy(
         )
 
     memdesc = memdescs[address.memdesc_value_id]
-    source, element_type, dim_bindings, width, active = _emit_async_source_ptr(
-        builder, state, kernel, address, w
+    if address.address_value_id is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower async copy without a source address value"
+        )
+    address_plan = state["values"][address.address_value_id]
+    component_count = _blocked_layout_component_count(
+        address_plan,
+        "ttg.async_copy_global_to_local source",
+        "async copy address lowering",
     )
     if address.element_type != memdesc.element_type:
         raise ValueError(
@@ -1443,70 +1505,81 @@ def _emit_async_copy(
             f"source element type {address.element_type} does not match "
             f"destination memdesc element type {memdesc.element_type}"
         )
-    mask = active
-    if address.mask_value_id is not None:
-        user_mask = _materialize_mask_value(
-            builder,
-            _require_lowered_value(
-                state["wave_values"],
-                address.mask_value_id,
-                "mask_expr",
-                "ttg.async_copy_global_to_local mask",
-            ),
-            dim_bindings,
-            w,
-            width,
-        )
-        mask = _wave_mask_and(builder, mask, user_mask, w, width)
-    dma_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
+    dma_bytes = (
+        _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
+        if component_count == 1
+        else None
+    )
     stats.async_copies += 1
-
-    def emit_copy(copy_after):
-        if dma_bytes is not None:
-            destination = _emit_memdesc_base_ptr(
-                builder,
-                memdesc,
-                memdescs,
-                lds_layout,
-                state,
-                w.i32(),
-                4,
-                w,
-                "ttg.async_copy_global_to_local destination",
-            )
-            return builder.dma_load_lds(
-                source, destination, after=copy_after, bytes=dma_bytes
-            )
-
-        destination = _emit_memdesc_ptr(
-            builder,
-            memdesc,
-            memdescs,
-            lds_layout,
-            state,
-            dim_bindings,
-            width,
-            w,
-            "ttg.async_copy_global_to_local destination",
-        )
-        values, load_token = builder.load(
-            source, w.simd_type(element_type, width), after=copy_after
-        )
-        return builder.store(values, destination, after=load_token)
-
     if dma_bytes is not None:
         stats.dma_load_lds += 1
     else:
         stats.load_store_fallbacks += 1
 
-    if mask is None:
-        return emit_copy(after_token)
-    if after_token is None:
-        after_token = builder.token()
-    with builder.where(mask, [w.mem_token_type()]) as where_op:
-        token = emit_copy(after_token)
-        builder.yield_([token])
-    return where_op.results[0]
+    token = after_token
+    for component in range(component_count):
+        source, element_type, dim_bindings, width, active = _emit_async_source_ptr(
+            builder, state, kernel, address, w, component=component
+        )
+        mask = active
+        if address.mask_value_id is not None:
+            user_mask = _materialize_mask_value(
+                builder,
+                _require_lowered_value(
+                    state["wave_values"],
+                    address.mask_value_id,
+                    "mask_expr",
+                    "ttg.async_copy_global_to_local mask",
+                ),
+                dim_bindings,
+                w,
+                width,
+            )
+            mask = _wave_mask_and(builder, mask, user_mask, w, width)
+
+        def emit_copy(copy_after):
+            if dma_bytes is not None:
+                destination = _emit_memdesc_base_ptr(
+                    builder,
+                    memdesc,
+                    memdescs,
+                    lds_layout,
+                    state,
+                    w.i32(),
+                    4,
+                    w,
+                    "ttg.async_copy_global_to_local destination",
+                )
+                return builder.dma_load_lds(
+                    source, destination, after=copy_after, bytes=dma_bytes
+                )
+
+            destination = _emit_memdesc_ptr(
+                builder,
+                memdesc,
+                memdescs,
+                lds_layout,
+                state,
+                dim_bindings,
+                width,
+                w,
+                "ttg.async_copy_global_to_local destination",
+            )
+            values, load_token = builder.load(
+                source, w.simd_type(element_type, width), after=copy_after
+            )
+            return builder.store(values, destination, after=load_token)
+
+        if mask is None:
+            token = emit_copy(token)
+            continue
+        if token is None:
+            token = builder.token()
+        with builder.where(mask, [w.mem_token_type()]) as where_op:
+            component_token = emit_copy(token)
+            builder.yield_([component_token])
+        token = where_op.results[0]
+    return token
 
 
 def _join_tokens(builder, tokens, stats):
@@ -1922,7 +1995,7 @@ def _forward_lowered_value(op, values, wave_values):
         wave_values[result_id] = source
         return
     if source.kind != "fragment":
-        if source.kind == "simd" and not _same_layout_encoding(
+        if source.kind in {"simd", "simd_tuple"} and not _same_layout_encoding(
             source_plan, result_plan
         ):
             raise ValueError(
@@ -2049,61 +2122,74 @@ def _emit_global_load_op(builder, op, state, w):
 
     result_id = op.results[0]
     result_plan = values[result_id]
-    dim_bindings, width, active = _blocked_tensor_dim_bindings(
-        builder, result_plan, w, "tt.load result"
+    component_count = _blocked_layout_component_count(
+        result_plan, "tt.load result", "generic tensor lowering"
     )
-    ptr = _materialize_pointer_value(
-        builder,
-        _require_lowered_value(
-            wave_values,
-            op.operands[0],
-            "pointer_expr",
-            "tt.load pointer",
-        ),
-        dim_bindings,
-        w,
-    )
-    mask = active
-    if len(op.operands) > 1:
-        user_mask = _materialize_mask_value(
+    components = []
+    token = state["last_order_token"]
+    for component in range(component_count):
+        dim_bindings, width, active = _blocked_tensor_dim_bindings(
+            builder, result_plan, w, "tt.load result", component=component
+        )
+        ptr = _materialize_pointer_value(
             builder,
             _require_lowered_value(
                 wave_values,
-                op.operands[1],
-                "mask_expr",
-                "tt.load mask",
+                op.operands[0],
+                "pointer_expr",
+                "tt.load pointer",
             ),
             dim_bindings,
             w,
-            width,
         )
-        mask = _wave_mask_and(builder, mask, user_mask, w, width)
+        mask = active
+        if len(op.operands) > 1:
+            user_mask = _materialize_mask_value(
+                builder,
+                _require_lowered_value(
+                    wave_values,
+                    op.operands[1],
+                    "mask_expr",
+                    "tt.load mask",
+                ),
+                dim_bindings,
+                w,
+                width,
+            )
+            mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
-    result_type = _simd_type_for_value(result_plan, width, w, "tt.load result")
-    fallback = (
-        _load_other_value(
-            builder,
-            state,
-            op.operands[2],
-            result_plan,
-            width,
-            w,
-            "tt.load other",
+        result_type = _simd_type_for_value(result_plan, width, w, "tt.load result")
+        fallback = (
+            _load_other_value(
+                builder,
+                state,
+                op.operands[2],
+                result_plan,
+                width,
+                w,
+                "tt.load other",
+                component=component,
+            )
+            if len(op.operands) > 2
+            else _zero_simd_value(
+                builder, result_plan, width, w, "tt.load inactive lanes"
+            )
         )
-        if len(op.operands) > 2
-        else _zero_simd_value(builder, result_plan, width, w, "tt.load inactive lanes")
-    )
-    loaded, token = _emit_masked_load(
-        builder,
-        ptr,
-        result_type,
-        mask,
-        fallback,
-        state["last_order_token"],
-        w,
-    )
+        loaded, token = _emit_masked_load(
+            builder,
+            ptr,
+            result_type,
+            mask,
+            fallback,
+            token,
+            w,
+        )
+        components.append(loaded)
     state["last_order_token"] = token
-    _set_wave_value(wave_values, result_id, "simd", loaded)
+    if component_count == 1:
+        _set_wave_value(wave_values, result_id, "simd", components[0])
+    else:
+        _set_wave_value(wave_values, result_id, "simd_tuple", tuple(components))
 
 
 def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, stats):
@@ -2124,37 +2210,48 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
     value_plan = values[value_id]
     memdesc = memdescs[memdesc_id]
     _validate_generic_local_tensor(value_plan, memdesc, "ttg.local_store")
-    dim_bindings, width, active = _blocked_tensor_dim_bindings(
-        builder, value_plan, w, "ttg.local_store value"
-    )
-    ptr = _emit_memdesc_ptr(
-        builder,
-        memdesc,
-        memdescs,
-        lds_layout,
-        state,
-        dim_bindings,
-        width,
-        w,
-        "ttg.local_store",
-    )
     lowered = wave_values.get(value_id)
     if lowered is None:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.local_store: stored value "
             f"{value_id} from {value_plan.producer} has not been lowered"
         )
-    data = _materialize_tensor_data(
-        builder, lowered, value_plan, width, w, "ttg.local_store"
+    component_count = _blocked_layout_component_count(
+        value_plan, "ttg.local_store value", "generic tensor lowering"
     )
-    token = _emit_component_store(
-        builder,
-        data,
-        ptr,
-        active,
-        state["last_order_token"],
-        w,
-    )
+    token = state["last_order_token"]
+    for component in range(component_count):
+        dim_bindings, width, active = _blocked_tensor_dim_bindings(
+            builder, value_plan, w, "ttg.local_store value", component=component
+        )
+        ptr = _emit_memdesc_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            dim_bindings,
+            width,
+            w,
+            "ttg.local_store",
+        )
+        data = _materialize_tensor_data(
+            builder,
+            lowered,
+            value_plan,
+            width,
+            w,
+            "ttg.local_store",
+            component=component,
+        )
+        token = _emit_component_store(
+            builder,
+            data,
+            ptr,
+            active,
+            token,
+            w,
+        )
     state["last_order_token"] = builder.barrier(token)
     stats.barriers += 1
 
@@ -2172,33 +2269,44 @@ def _emit_generic_local_load(
     stats,
 ):
     _validate_generic_local_tensor(value, memdesc, "ttg.local_load")
-    dim_bindings, width, active = _blocked_tensor_dim_bindings(
-        builder, value, w, "ttg.local_load result"
+    component_count = _blocked_layout_component_count(
+        value, "ttg.local_load result", "generic tensor lowering"
     )
-    ptr = _emit_memdesc_ptr(
-        builder,
-        memdesc,
-        memdescs,
-        lds_layout,
-        state,
-        dim_bindings,
-        width,
-        w,
-        "ttg.local_load",
-    )
-    result_type = _simd_type_for_value(value, width, w, "ttg.local_load result")
-    fallback = _zero_simd_value(builder, value, width, w, "ttg.local_load inactive")
-    loaded, token = _emit_masked_load(
-        builder,
-        ptr,
-        result_type,
-        active,
-        fallback,
-        after_token,
-        w,
-    )
+    components = []
+    token = after_token
+    for component in range(component_count):
+        dim_bindings, width, active = _blocked_tensor_dim_bindings(
+            builder, value, w, "ttg.local_load result", component=component
+        )
+        ptr = _emit_memdesc_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            dim_bindings,
+            width,
+            w,
+            "ttg.local_load",
+        )
+        result_type = _simd_type_for_value(value, width, w, "ttg.local_load result")
+        fallback = _zero_simd_value(
+            builder, value, width, w, "ttg.local_load inactive"
+        )
+        loaded, token = _emit_masked_load(
+            builder,
+            ptr,
+            result_type,
+            active,
+            fallback,
+            token,
+            w,
+        )
+        components.append(loaded)
     stats.local_loads += 1
-    return loaded, token
+    if component_count == 1:
+        return components[0], token
+    return tuple(components), token
 
 
 def _emit_store_op(builder, op, state, w):
@@ -2234,47 +2342,59 @@ def _emit_store_op(builder, op, state, w):
         )
         return
 
-    if lowered.kind == "simd":
-        dim_bindings, width, active = _blocked_tensor_dim_bindings(
-            builder, value_plan, w, "tt.store value"
+    if lowered.kind in {"simd", "simd_tuple"}:
+        component_count = _blocked_layout_component_count(
+            value_plan, "tt.store value", "generic tensor lowering"
         )
-        ptr = _materialize_pointer_value(
-            builder,
-            _require_lowered_value(
-                wave_values,
-                ptr_id,
-                "pointer_expr",
-                "tt.store pointer",
-            ),
-            dim_bindings,
-            w,
-        )
-        mask = active
-        if mask_id is not None:
-            user_mask = _materialize_mask_value(
+        token = state["last_order_token"]
+        for component in range(component_count):
+            dim_bindings, width, active = _blocked_tensor_dim_bindings(
+                builder, value_plan, w, "tt.store value", component=component
+            )
+            ptr = _materialize_pointer_value(
                 builder,
                 _require_lowered_value(
                     wave_values,
-                    mask_id,
-                    "mask_expr",
-                    "tt.store mask",
+                    ptr_id,
+                    "pointer_expr",
+                    "tt.store pointer",
                 ),
                 dim_bindings,
                 w,
-                width,
             )
-            mask = _wave_mask_and(builder, mask, user_mask, w, width)
-        value = _materialize_tensor_data(
-            builder, lowered, value_plan, width, w, "tt.store"
-        )
-        state["last_order_token"] = _emit_component_store(
-            builder,
-            value,
-            ptr,
-            mask,
-            state["last_order_token"],
-            w,
-        )
+            mask = active
+            if mask_id is not None:
+                user_mask = _materialize_mask_value(
+                    builder,
+                    _require_lowered_value(
+                        wave_values,
+                        mask_id,
+                        "mask_expr",
+                        "tt.store mask",
+                    ),
+                    dim_bindings,
+                    w,
+                    width,
+                )
+                mask = _wave_mask_and(builder, mask, user_mask, w, width)
+            value = _materialize_tensor_data(
+                builder,
+                lowered,
+                value_plan,
+                width,
+                w,
+                "tt.store",
+                component=component,
+            )
+            token = _emit_component_store(
+                builder,
+                value,
+                ptr,
+                mask,
+                token,
+                w,
+            )
+        state["last_order_token"] = token
         return
 
     raise ValueError(
@@ -2401,7 +2521,10 @@ def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
                     w,
                     stats,
                 )
-                _set_wave_value(wave_values, result_id, "simd", loaded)
+                if isinstance(loaded, tuple):
+                    _set_wave_value(wave_values, result_id, "simd_tuple", loaded)
+                else:
+                    _set_wave_value(wave_values, result_id, "simd", loaded)
         elif op.name == "tt.dot":
             _emit_dot_op(builder, op, values, wave_values, w, stats)
         elif op.name == "tt.store":
