@@ -342,6 +342,28 @@ def test_tlx_wave_rejects_unsupported_memdesc_subslice_view(tmp_path):
     del ctx
 
 
+def test_tlx_wave_rejects_generic_2d_shared_local_addressing(tmp_path):
+    local_func = """
+  tt.func public @generic_shared_2d(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %ptr = tt.addptr %base, %zero : tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %loaded = tt.load %ptr : tensor<8x32x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    ttg.local_store %loaded, %alloc : tensor<8x32xf32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>> -> !ttg.memdesc<8x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported shared-memory encoding for generic LDS addressing",
+    ):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
 def test_tlx_wave_rejects_generic_tensor_layout_with_partial_coverage(tmp_path):
     partial_layout_func = """
   tt.func public @partial_layout(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
@@ -651,6 +673,30 @@ def test_tlx_wave_async_copy_fallback_for_unaligned_f16_view(tmp_path):
     assert "wave.load" in wave_artifact
     assert "wave.store" in wave_artifact
     assert "waveamd.dma_load_lds" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_async_copy_2d_shared_destination_without_layout_transform(
+    tmp_path,
+):
+    async_i8_2d_func = """
+  tt.func public @async_i8_2d(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<8x32x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %ptr = tt.addptr %base, %zero : tensor<8x32x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<8x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<8x32x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>> -> <8x32xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, async_i8_2d_func)
+
+    with pytest.raises(
+        ValueError,
+        match="ttg\\.async_copy_global_to_local destination.*"
+        "unsupported shared-memory encoding",
+    ):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 

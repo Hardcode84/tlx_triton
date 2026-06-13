@@ -583,6 +583,38 @@ def _unsupported_memdesc_view(context, memdesc):
     )
 
 
+def _is_identity_shared_layout(memdesc, shared):
+    return (
+        len(memdesc.shape) == 1
+        and shared.vec == 1
+        and shared.per_phase == 1
+        and shared.max_phase == 1
+        and shared.order == (0,)
+    )
+
+
+def _validate_generic_shared_layout(memdesc, context):
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr, memdesc.encoding, context
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: {exc}"
+        ) from exc
+    if _is_identity_shared_layout(memdesc, shared):
+        return
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported shared-memory "
+        "encoding for generic LDS addressing; expected one-dimensional "
+        "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
+        "order = [0]}> until shared-layout transforms are implemented; "
+        f"got shape={memdesc.shape}, vec={shared.vec}, "
+        f"perPhase={shared.per_phase}, maxPhase={shared.max_phase}, "
+        f"order={shared.order}, encoding={memdesc.encoding}"
+    )
+
+
 def _emit_memdesc_index_offset(
     builder,
     memdesc,
@@ -739,6 +771,7 @@ def _emit_memdesc_ptr(
 ):
     if memdesc.kind == "view" and memdesc.view_op != "ttg.memdesc_index":
         _unsupported_memdesc_view(context, memdesc)
+    _validate_generic_shared_layout(memdesc, context)
     if memdesc.value_id not in lds_layout.offsets and memdesc.kind == "allocation":
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: no LDS placement for "
@@ -1327,6 +1360,24 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
         packet_bytes = 16
     else:
         return None
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr,
+            memdesc.encoding,
+            "ttg.async_copy_global_to_local destination",
+        )
+    except ValueError:
+        return None
+    if not (
+        _is_identity_shared_layout(memdesc, shared)
+        or (
+            memdesc.element_type == "f16"
+            and memdesc.shape == _GFX950_MMA_SHAPE
+            and address.shape == memdesc.shape
+            and shared == _GFX950_SHARED_LAYOUT
+        )
+    ):
+        return None
     if not _memdesc_base_is_aligned(
         memdesc,
         memdescs,
@@ -1347,7 +1398,6 @@ def _emit_async_source_ptr(builder, state, kernel, address, w):
         )
     address_plan = state["values"][address.address_value_id]
     dim_bindings, width, active = _async_dim_bindings(builder, address_plan, w)
-    lane = builder.lane_id(width=width)
     # Async copy inputs are regular SSA values. They must have been produced by
     # earlier ordered op lowering; this path must not recursively lower a use-def
     # slice around the async op.
@@ -1362,7 +1412,7 @@ def _emit_async_source_ptr(builder, state, kernel, address, w):
         dim_bindings,
         w,
     )
-    return source, lane, element_type, dim_bindings, width, active
+    return source, element_type, dim_bindings, width, active
 
 
 def _emit_async_copy(
@@ -1384,9 +1434,15 @@ def _emit_async_copy(
         )
 
     memdesc = memdescs[address.memdesc_value_id]
-    source, lane, element_type, dim_bindings, width, active = _emit_async_source_ptr(
+    source, element_type, dim_bindings, width, active = _emit_async_source_ptr(
         builder, state, kernel, address, w
     )
+    if address.element_type != memdesc.element_type:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local: "
+            f"source element type {address.element_type} does not match "
+            f"destination memdesc element type {memdesc.element_type}"
+        )
     mask = active
     if address.mask_value_id is not None:
         user_mask = _materialize_mask_value(
@@ -1422,21 +1478,16 @@ def _emit_async_copy(
                 source, destination, after=copy_after, bytes=dma_bytes
             )
 
-        destination_base = _emit_memdesc_base_ptr(
+        destination = _emit_memdesc_ptr(
             builder,
             memdesc,
             memdescs,
             lds_layout,
             state,
-            element_type,
-            address.element_byte_width,
+            dim_bindings,
+            width,
             w,
             "ttg.async_copy_global_to_local destination",
-        )
-        destination = builder.ptr_add(
-            destination_base,
-            lane,
-            w.simd_ptr_type(element_type, w.shared_address_space(), width),
         )
         values, load_token = builder.load(
             source, w.simd_type(element_type, width), after=copy_after
