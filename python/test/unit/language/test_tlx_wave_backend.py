@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -536,16 +535,16 @@ def test_tlx_wave_lowers_dot_accumulator_chain_and_fragment_store(tmp_path):
 def test_tlx_wave_lowers_multicomponent_blocked_local_roundtrip(tmp_path):
     local_func = """
   tt.func public @multi_component_roundtrip(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {noinline = false} {
-    %alloc = ttg.local_alloc : () -> !ttg.memdesc<65xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
-    %range = tt.make_range {end = 65 : i32, start = 0 : i32} : tensor<65xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %in_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %in_ptr = tt.addptr %in_base, %range : tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<65xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %loaded = tt.load %in_ptr : tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    ttg.local_store %loaded, %alloc : tensor<65xf32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<65xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
-    %out = ttg.local_load %alloc : !ttg.memdesc<65xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<65xf32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %out_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %out_ptr = tt.addptr %out_base, %range : tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<65xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    tt.store %out_ptr, %out : tensor<65x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_ptr = tt.addptr %in_base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %loaded = tt.load %in_ptr : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    ttg.local_store %loaded, %alloc : tensor<64xf32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %alloc : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_ptr = tt.addptr %out_base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %out_ptr, %out : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.return
   }
 """
@@ -557,7 +556,7 @@ def test_tlx_wave_lowers_multicomponent_blocked_local_roundtrip(tmp_path):
     )
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["shared"] == 260
+    assert metadata["shared"] == 256
     assert metadata["tlx_wave_num_wave_local_loads"] == 1
     assert metadata["tlx_wave_num_wave_barriers"] == 1
     assert wave_artifact.count("wave.load") == 4
@@ -609,7 +608,7 @@ def test_tlx_wave_rejects_incompatible_simd_convert_layout(tmp_path):
     )
     result_encoding = (
         "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [2, 32], "
-        "warpsPerCTA = [2, 1], order = [0, 1]}>"
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
     )
     convert_func = f"""
   tt.func public @simd_convert_incompatible(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {{noinline = false}} {{
@@ -693,7 +692,7 @@ def test_tlx_wave_lowers_dynamic_memdesc_index_as_ssa_transform(tmp_path):
     assert view.static_index is None
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["shared"] == 512
-    assert "arith.index_cast %arg1" in wave_artifact
+    assert "arith.index_cast %arg1" not in wave_artifact
     assert "tlx_memdesc_" in wave_artifact
     assert wave_artifact.count("wave.index_expr") >= 4
     assert wave_artifact.count("wave.ptr_add") >= 4
@@ -845,7 +844,7 @@ def test_tlx_wave_lowers_memdesc_subslice_as_staged_transform(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_strided_subslice_uses_fallback(tmp_path):
+def test_tlx_wave_async_copy_strided_subslice_rejects_without_dma(tmp_path):
     local_func = """
   tt.func public @async_subslice(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
@@ -871,9 +870,12 @@ def test_tlx_wave_async_copy_strided_subslice_uses_fallback(tmp_path):
     memdesc = memdescs[address.memdesc_value_id]
 
     assert memdesc.view_op == "ttg.memdesc_subslice"
-    assert wave_bridge_emit._dma_packet_bytes(
-        address, memdesc, memdescs, lds_layout
-    ) is None
+    assert (
+        wave_bridge_emit._dma_packet_bytes(address, memdesc, memdescs, lds_layout)
+        is None
+    )
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
@@ -1035,7 +1037,7 @@ def test_tlx_wave_rejects_required_generic_shared_encoding(tmp_path):
     del ctx
 
 
-def test_tlx_wave_rejects_generic_tensor_layout_with_partial_coverage(tmp_path):
+def test_tlx_wave_lowers_generic_tensor_layout_with_repeated_components(tmp_path):
     partial_layout_func = """
   tt.func public @partial_layout(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
     %zero = arith.constant dense<0> : tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
@@ -1045,18 +1047,27 @@ def test_tlx_wave_rejects_generic_tensor_layout_with_partial_coverage(tmp_path):
     tt.return
   }
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, partial_layout_func)
     plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
     loaded = next(value for value in plan.values if value.producer == "tt.load")
 
-    with pytest.raises(ValueError, match="full tensor extent.*dim 0.*covers only 8"):
-        wave_bridge_emit._blocked_tensor_dim_bindings(
-            None, loaded, None, "tt.load result"
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert (
+        wave_bridge_emit._blocked_layout_component_count(
+            loaded, "tt.load result", "generic tensor lowering"
         )
+        == 4
+    )
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert wave_artifact.count("wave.load") == 4
     del ctx
 
 
-def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
+def test_tlx_wave_gemm_cutoff_rejects_unfaithful_async_dma():
     src = ASTSource(
         fn=_tlx_wave_gemm_cutoff_kernel,
         signature={
@@ -1075,154 +1086,8 @@ def test_tlx_wave_gemm_cutoff_preserves_async_gemm_shape():
         },
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
-
-    assert compiled.metadata.target == GFX950_WAVE
-    assert compiled.metadata.num_ctas == 1
-    assert compiled.metadata.warp_size == 64
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_bridge_stage == "ttgir-op-lowering"
-    assert compiled.metadata.tlx_wave_num_kernel_args == 5
-    assert compiled.metadata.tlx_wave_num_pointer_args == 3
-    assert compiled.metadata.tlx_wave_num_scalar_args == 2
-    assert compiled.metadata.tlx_wave_plan_kind == "ttgir_graph"
-    assert compiled.metadata.tlx_wave_plan_num_addresses >= 5
-    assert compiled.metadata.tlx_wave_plan_num_memdescs >= 6
-    assert compiled.metadata.tlx_wave_plan_num_tokens >= 8
-    assert compiled.metadata.shared == 8192
-    assert compiled.metadata.tlx_wave_lds_size_bytes == 8192
-    assert compiled.metadata.tlx_wave_num_async_copies == 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
-    assert compiled.metadata.tlx_wave_num_load_store_fallbacks == 0
-    assert compiled.metadata.tlx_wave_num_async_commit_groups == 2
-    assert compiled.metadata.tlx_wave_num_async_waits == 2
-    assert compiled.metadata.tlx_wave_num_wave_barriers == 2
-    assert compiled.metadata.tlx_wave_num_wave_local_loads == 4
-    assert compiled.metadata.tlx_wave_num_fragment_packs == 4
-    assert compiled.metadata.tlx_wave_num_fragment_fills == 1
-    assert compiled.metadata.tlx_wave_num_mmas == 2
-    assert compiled.metadata.tlx_wave_wave_builder == "wave-dsl"
-    assert compiled.metadata.tlx_wave_wave_opt.endswith("wave-opt")
-    assert "ttgir" in compiled.asm
-    assert "wave" in compiled.asm
-
-    ttgir_artifact = _asm_text(compiled, "ttgir")
-    assert ttgir_artifact.count("ttg.local_alloc") >= 2
-    assert "ttg.memdesc_index" in ttgir_artifact
-    assert ttgir_artifact.count("ttg.async_copy_global_to_local") >= 4
-    assert ttgir_artifact.count("ttg.async_commit_group") >= 2
-    assert ttgir_artifact.count("ttg.async_wait") >= 2
-    assert ttgir_artifact.count("ttg.local_load") >= 4
-    assert ttgir_artifact.count("tt.dot") >= 2
-    assert ttgir_artifact.count("tt.get_program_id") >= 2
-    assert "ttg.convert_layout" in ttgir_artifact
-    assert "tt.store" in ttgir_artifact
-    assert "amdg." not in ttgir_artifact
-
-    wave_artifact = _asm_text(compiled, "wave")
-    assert 'waveamdmachine.target = "amdgcn-amd-amdhsa--gfx950"' in wave_artifact
-    assert "func.func @_tlx_wave_gemm_cutoff_kernel" in wave_artifact
-    assert "%arg0: !wave.ptr<#wave.global, f16>" in wave_artifact
-    assert "%arg1: !wave.ptr<#wave.global, f16>" in wave_artifact
-    assert "%arg2: !wave.ptr<#wave.global, f32>" in wave_artifact
-    assert "%arg3: i32" in wave_artifact
-    assert "%arg4: i32" in wave_artifact
-    assert "wave.kernel" in wave_artifact
-    assert 'tlx_wave.bridge.stage = "ttgir-op-lowering"' in wave_artifact
-    assert "tlx_wave.num_pointer_args = 3 : i32" in wave_artifact
-    assert "tlx_wave.num_scalar_args = 2 : i32" in wave_artifact
-    assert "tlx_wave.wave_size = 64 : i32" in wave_artifact
-    assert "tlx_wave.has_explicit_local_mem_access = true" in wave_artifact
-    assert "tlx_wave.lds_size_bytes = 8192 : i32" in wave_artifact
-    assert "tlx_wave.emitted.async_copies = 4 : i32" in wave_artifact
-    assert "tlx_wave.emitted.dma_load_lds = 4 : i32" in wave_artifact
-    assert "tlx_wave.emitted.load_store_fallbacks = 0 : i32" in wave_artifact
-    assert "tlx_wave.emitted.local_loads = 4 : i32" in wave_artifact
-    assert "tlx_wave.emitted.fragment_packs = 4 : i32" in wave_artifact
-    assert "tlx_wave.emitted.fragment_fills = 1 : i32" in wave_artifact
-    assert "tlx_wave.emitted.mmas = 2 : i32" in wave_artifact
-    assert "wave.lds_size = 8192 : i64" in wave_artifact
-    assert 'tlx_wave.plan.kind = "ttgir_graph"' in wave_artifact
-    assert "tlx_wave.plan.num_addresses" in wave_artifact
-    assert "tlx_wave.plan.num_memdescs" in wave_artifact
-    assert "tlx_wave.plan.num_tokens" in wave_artifact
-    assert "return" in wave_artifact
-    assert wave_artifact.count("waveamd.dma_load_lds") == 4
-    assert wave_artifact.count("wave.join") == 4
-    assert wave_artifact.count("wave.wait") == 2
-    assert wave_artifact.count("wave.barrier") == 2
-    assert wave_artifact.count("wave.load") == 4
-    assert wave_artifact.count("waveamd.fragment_pack") == 4
-    assert wave_artifact.count("waveamd.fragment_fill") == 1
-    assert wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA_KIND}"') == 2
-    assert wave_artifact.count("waveamd.fragment_unpack") == 1
-    assert wave_artifact.count("wave.extract") == 4
-    assert wave_artifact.count("wave.where") == 8
-    assert wave_artifact.count("wave.select") >= 4
-    assert wave_artifact.count("wave.store") == 4
-    assert wave_artifact.count("wave.cmpi") >= 3
-    assert wave_artifact.count("wave.index_expr") >= 4
-    assert wave_artifact.count("wave.workgroup_id") == 2
-    assert wave_artifact.count("wave.workitem_id") >= 8
-    assert wave_artifact.count("wave.ptr_add") >= 8
-    assert "!waveamd.fragment<0, f16, 16, 16, 64, 4>" in wave_artifact
-    assert "!waveamd.fragment<1, f16, 16, 16, 64, 4>" in wave_artifact
-    assert "!waveamd.fragment<2, f32, 16, 16, 64, 4>" in wave_artifact
-    assert "after %" in wave_artifact
-    assert "tt.func public" not in wave_artifact
-    assert "ttg.local_alloc" not in wave_artifact
-    assert "amdg." not in wave_artifact
-
-    plan = json.loads(compiled.metadata.tlx_wave_plan_json)
-    assert plan["kind"] == "ttgir_graph"
-    assert plan["op_counts"]["ttg.local_alloc"] == 2
-    assert plan["op_counts"]["ttg.memdesc_index"] == 4
-    assert plan["op_counts"]["ttg.async_copy_global_to_local"] == 4
-    assert plan["op_counts"]["ttg.async_commit_group"] == 2
-    assert plan["op_counts"]["ttg.async_wait"] == 2
-    assert plan["op_counts"]["ttg.local_load"] == 4
-    assert plan["op_counts"]["tt.dot"] == 2
-    assert plan["op_counts"]["tt.get_program_id"] == 2
-    assert plan["op_counts"]["tt.store"] == 1
-    assert all("encoding_attr" not in value for value in plan["values"])
-    assert any(
-        value["producer"] == "ttg.local_load"
-        and value["encoding"]
-        and "#ttg.dot_op" in value["encoding"]
-        for value in plan["values"]
-    )
-
-    address_ops = [address["op"] for address in plan["addresses"]]
-    assert address_ops.count("ttg.async_copy_global_to_local") == 4
-    assert address_ops.count("ttg.local_load") == 4
-    assert address_ops.count("tt.store") == 1
-    assert all("role" not in address for address in plan["addresses"])
-    assert {
-        address["element_type"]
-        for address in plan["addresses"]
-        if address["op"] == "ttg.async_copy_global_to_local"
-    } == {"f16"}
-
-    allocations = [
-        memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "allocation"
-    ]
-    views = [memdesc for memdesc in plan["memdescs"] if memdesc["kind"] == "view"]
-    assert len(allocations) == 2
-    assert len(views) == 4
-    assert all(memdesc["shape"] == [2, 32, 32] for memdesc in allocations)
-    assert all(memdesc["alloc_shape"] == [2, 32, 32] for memdesc in allocations)
-    assert all(memdesc["shape"] == [32, 32] for memdesc in views)
-    assert all(memdesc["element_type"] == "f16" for memdesc in allocations + views)
-    assert all(
-        memdesc["memory_space"] == "#ttg.shared_memory"
-        for memdesc in allocations + views
-    )
-    assert sorted(view["static_index"] for view in views) == [0, 0, 1, 1]
-
-    token_ops = [token["op"] for token in plan["tokens"]]
-    assert token_ops.count("ttg.async_copy_global_to_local") == 4
-    assert token_ops.count("ttg.async_commit_group") == 2
-    assert token_ops.count("ttg.async_wait") == 2
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        triton_compile(src, target=GFX950_WAVE)
 
 
 def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
@@ -1242,31 +1107,11 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
         },
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
-
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_num_async_copies == 2
-    assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
-    assert compiled.metadata.tlx_wave_num_async_waits == 1
-    assert compiled.metadata.tlx_wave_num_wave_barriers == 1
-    assert compiled.metadata.tlx_wave_num_wave_local_loads == 2
-    assert compiled.metadata.tlx_wave_num_mmas == 1
-
-    ttgir_artifact = _asm_text(compiled, "ttgir")
-    assert "ttg.local_load" in ttgir_artifact
-    assert " token " in ttgir_artifact
-
-    wave_artifact = _asm_text(compiled, "wave")
-    load_lines = [
-        line.strip() for line in wave_artifact.splitlines() if "wave.load" in line
-    ]
-    assert len(load_lines) == 2
-    assert all(" after %" in line for line in load_lines)
-    assert wave_artifact.count("wave.barrier") == 1
-    assert wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA_KIND}"') == 1
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        triton_compile(src, target=GFX950_WAVE)
 
 
-def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8(tmp_path):
+def test_tlx_wave_async_copy_rejects_i8_without_dma(tmp_path):
     async_i8_func = """
   tt.func public @async_i8(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
@@ -1279,54 +1124,29 @@ def test_tlx_wave_async_copy_fallback_emits_load_store_for_i8(tmp_path):
     tt.return
   }
 """
-    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
 
-    wave_artifact = wave_bridge.stop_before_wave_lowering(
-        mod, metadata, _wave_bridge_options()
-    )
-
-    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["shared"] == 64
-    assert metadata["tlx_wave_lds_size_bytes"] == 64
-    assert metadata["tlx_wave_num_async_copies"] == 1
-    assert metadata["tlx_wave_num_dma_load_lds"] == 0
-    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
-    assert metadata["tlx_wave_num_async_commit_groups"] == 1
-    assert metadata["tlx_wave_num_async_waits"] == 1
-    assert metadata["tlx_wave_num_wave_barriers"] == 1
-
-    assert 'tlx_wave.bridge.stage = "ttgir-op-lowering"' in wave_artifact
-    assert "tlx_wave.emitted.async_copies = 1 : i32" in wave_artifact
-    assert "tlx_wave.emitted.dma_load_lds = 0 : i32" in wave_artifact
-    assert "tlx_wave.emitted.load_store_fallbacks = 1 : i32" in wave_artifact
-    assert "wave.lds_size = 64 : i64" in wave_artifact
-    assert "wave.load" in wave_artifact
-    assert "wave.store" in wave_artifact
-    assert "waveamd.dma_load_lds" not in wave_artifact
-    assert "wave.join" in wave_artifact
-    assert "wave.wait" in wave_artifact
-    assert "wave.barrier" in wave_artifact
-    assert "after %" in wave_artifact
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
 def test_tlx_wave_async_copy_wait_pipeline_loop_carries_mem_tokens(tmp_path):
     pipeline_func = """
-  tt.func public @async_i8_pipeline(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+  tt.func public @async_f32_pipeline(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
     %c2 = arith.constant 2 : index
     %c1 = arith.constant 1 : index
-    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %init_wait = ttg.async_wait {num = 0 : i32}
     %loop = scf.for %iv = %c0 to %c2 step %c1 iter_args(%prev = %init_wait) -> (!ttg.async.token) {
-      %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+      %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
       %group = ttg.async_commit_group tokens %token
       %wait = ttg.async_wait %prev, %group {num = 1 : i32}
-      %loaded = ttg.local_load %alloc token %wait : !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xi8, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+      %loaded = ttg.local_load %alloc token %wait : !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable> -> tensor<64xf32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
       scf.yield %group : !ttg.async.token
     }
     %flush = ttg.async_wait %loop {num = 0 : i32}
@@ -1342,11 +1162,13 @@ def test_tlx_wave_async_copy_wait_pipeline_loop_carries_mem_tokens(tmp_path):
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
     assert metadata["tlx_wave_num_async_commit_groups"] == 1
     assert metadata["tlx_wave_num_async_waits"] == 2
     assert metadata["tlx_wave_num_wave_barriers"] == 2
     assert "scf.for" in wave_artifact
     assert "iter_args" in wave_artifact
+    assert wave_artifact.count("waveamd.dma_load_lds") == 1
     assert wave_artifact.count("wave.wait") == 2
     assert wave_artifact.count("wave.barrier") == 2
     assert "ttg.async_copy_global_to_local" not in wave_artifact
@@ -1354,15 +1176,15 @@ def test_tlx_wave_async_copy_wait_pipeline_loop_carries_mem_tokens(tmp_path):
 
 
 def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
-    async_i8_func = """
-  tt.func public @async_i8_multi_in_flight(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
-    %alloc0 = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
-    %alloc1 = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    async_f32_func = """
+  tt.func public @async_f32_multi_in_flight(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %alloc0 = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %alloc1 = ttg.local_alloc : () -> !ttg.memdesc<64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %t0 = ttg.async_copy_global_to_local %ptr, %alloc0 : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
-    %t1 = ttg.async_copy_global_to_local %ptr, %alloc1 : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %t0 = ttg.async_copy_global_to_local %ptr, %alloc0 : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %t1 = ttg.async_copy_global_to_local %ptr, %alloc1 : tensor<64x!tt.ptr<f32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
     %g0 = ttg.async_commit_group tokens %t0
     %g1 = ttg.async_commit_group
     %wait0 = ttg.async_wait %g0, %g1 {num = 1 : i32}
@@ -1371,7 +1193,7 @@ def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
   }
 """
     metadata = {}
-    mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
+    mod, ctx = _parse_ttgir(tmp_path, async_f32_func)
 
     wave_artifact = wave_bridge.stop_before_wave_lowering(
         mod, metadata, _wave_bridge_options()
@@ -1379,9 +1201,11 @@ def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_async_copies"] == 2
+    assert metadata["tlx_wave_num_dma_load_lds"] == 2
     assert metadata["tlx_wave_num_async_commit_groups"] == 2
     assert metadata["tlx_wave_num_async_waits"] == 2
     assert metadata["tlx_wave_num_wave_barriers"] == 2
+    assert wave_artifact.count("waveamd.dma_load_lds") == 2
     assert wave_artifact.count("wave.wait") == 2
     assert wave_artifact.count("wave.barrier") == 2
     assert wave_artifact.count("wave.join") >= 4
@@ -1389,38 +1213,27 @@ def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_fallback_scalarizes_multicomponent_layout(tmp_path):
+def test_tlx_wave_async_copy_rejects_multicomponent_layout_without_dma(tmp_path):
     async_i8_func = """
   tt.func public @async_i8_multicomponent(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
-    %alloc = ttg.local_alloc : () -> !ttg.memdesc<65xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
-    %range = tt.make_range {end = 65 : i32, start = 0 : i32} : tensor<65xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<65x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %ptr = tt.addptr %base, %range : tensor<65x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<65xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<65x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <65xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
     %group = ttg.async_commit_group tokens %token
     %wait = ttg.async_wait %group {num = 0 : i32}
     tt.return
   }
 """
-    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
 
-    wave_artifact = wave_bridge.stop_before_wave_lowering(
-        mod, metadata, _wave_bridge_options()
-    )
-
-    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["shared"] == 65
-    assert metadata["tlx_wave_num_async_copies"] == 1
-    assert metadata["tlx_wave_num_dma_load_lds"] == 0
-    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
-    assert wave_artifact.count("wave.load") == 2
-    assert wave_artifact.count("wave.store") == 2
-    assert "waveamd.dma_load_lds" not in wave_artifact
+    with pytest.raises(ValueError, match="source blocked layout maps to 2 components"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
-def test_tlx_wave_async_copy_fallback_for_unaligned_f16_view(tmp_path):
+def test_tlx_wave_async_copy_rejects_unaligned_f16_view_without_dma(tmp_path):
     async_f16_view_func = """
   tt.func public @async_f16_view(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
     %slot = arith.constant 1 : i32
@@ -1438,25 +1251,14 @@ def test_tlx_wave_async_copy_fallback_for_unaligned_f16_view(tmp_path):
     tt.return
   }
 """
-    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_f16_view_func)
 
-    wave_artifact = wave_bridge.stop_before_wave_lowering(
-        mod, metadata, _wave_bridge_options()
-    )
-
-    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["shared"] == 16
-    assert metadata["tlx_wave_num_async_copies"] == 1
-    assert metadata["tlx_wave_num_dma_load_lds"] == 0
-    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
-    assert "wave.load" in wave_artifact
-    assert "wave.store" in wave_artifact
-    assert "waveamd.dma_load_lds" not in wave_artifact
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
-def test_tlx_wave_async_copy_fallback_lowers_2d_contiguous_shared_destination(
+def test_tlx_wave_async_copy_rejects_2d_i8_without_dma(
     tmp_path,
 ):
     async_i8_2d_func = """
@@ -1469,19 +1271,10 @@ def test_tlx_wave_async_copy_fallback_lowers_2d_contiguous_shared_destination(
     tt.return
   }
 """
-    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_i8_2d_func)
 
-    wave_artifact = wave_bridge.stop_before_wave_lowering(
-        mod, metadata, _wave_bridge_options()
-    )
-
-    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["tlx_wave_num_async_copies"] == 1
-    assert metadata["tlx_wave_num_load_store_fallbacks"] == 1
-    assert "wave.load" in wave_artifact
-    assert "wave.store" in wave_artifact
-    assert "waveamd.dma_load_lds" not in wave_artifact
+    with pytest.raises(ValueError, match="without faithful DMA"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
@@ -1515,6 +1308,9 @@ def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_bridge_stage"] == "ttgir-op-lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    assert "waveamd.dma_load_lds" in wave
     assert "wave.cmpi" in wave
     del ctx
 
@@ -1699,8 +1495,8 @@ def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
             self.cmpis = []
             self.selects = []
 
-        def index_expr(self, expr, bindings=None):
-            value = FakeValue(f"idx{len(self.index_exprs)}")
+        def index_expr(self, expr, bindings=None, result_type=None):
+            value = FakeValue(f"idx{len(self.index_exprs)}", result_type)
             self.index_exprs.append((expr, bindings or {}, value))
             return value
 
@@ -1723,7 +1519,7 @@ def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
             return FakeValue("lane", FakeMaskType(width))
 
     def plan(value_id):
-        return SimpleNamespace(value_id=value_id)
+        return SimpleNamespace(value_id=value_id, type_kind="index")
 
     builder = FakeBuilder()
     w = FakeW()
@@ -1860,6 +1656,9 @@ def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
             def int_(value):
                 return FakeExpr(value)
 
+        class CastKind:
+            IntConvert = "IntConvert"
+
         @staticmethod
         def sym(name):
             return FakeExpr(name)
@@ -1880,15 +1679,20 @@ def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
         def i64():
             return "i64"
 
+        @staticmethod
+        def simd_type(element_type, width):
+            return FakeSimdType(width, element_type)
+
     class FakeBuilder:
         def __init__(self):
             self.index_exprs = []
             self.index_casts = []
+            self.casts = []
 
         def workitem_id(self, axis=0, width=64):
             return FakeValue(f"thread{axis}", FakeSimdType(width, "i32"))
 
-        def index_expr(self, expr, bindings=None):
+        def index_expr(self, expr, bindings=None, result_type=None):
             width = 1
             if bindings:
                 widths = [
@@ -1897,7 +1701,10 @@ def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
                     if isinstance(binding.type, FakeSimdType)
                 ]
                 width = widths[0] if widths else width
-            value = FakeValue(f"idx{len(self.index_exprs)}", FakeSimdType(width))
+            value = FakeValue(
+                f"idx{len(self.index_exprs)}",
+                result_type or FakeSimdType(width),
+            )
             self.index_exprs.append((expr, bindings or {}, value))
             return value
 
@@ -1912,6 +1719,11 @@ def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
                 f"cast{len(self.index_casts)}", FakeSimdType(value.type.width, typ)
             )
             self.index_casts.append((value, typ, result))
+            return result
+
+        def cast(self, value, typ, kind):
+            result = FakeValue(f"wavecast{len(self.casts)}", typ)
+            self.casts.append((value, typ, kind, result))
             return result
 
         def cmpi(self, predicate, lhs, rhs):
@@ -1948,9 +1760,64 @@ def test_tlx_wave_bridge_async_coords_use_blocked_layout_order():
     assert "mod(mod(tlx_async_42_thread,64),2)" in dim0
     assert "(2*mod(floor((tlx_async_42_thread/64)),4))" in dim0
     assert "mod(floor((mod(tlx_async_42_thread,64)/2)),32)" in dim1
-    assert [cast[1] for cast in builder.index_casts] == ["i64"] * 4
-    assert all(cast[0].type.element_type == "index" for cast in builder.index_casts)
+    assert builder.index_casts == []
+    assert builder.casts == []
+    assert [expr[2].type.element_type for expr in builder.index_exprs[:2]] == [
+        "index",
+        "index",
+    ]
+    assert [expr[2].type.width for expr in builder.index_exprs[:2]] == [64, 64]
     assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
+
+
+def test_tlx_wave_bridge_blocked_layout_repeated_components_cover_extent():
+    class FakeBlockedEncoding:
+        def is_blocked_encoding(self):
+            return True
+
+        def get_blocked_size_per_thread(self):
+            return (1, 1)
+
+        def get_blocked_threads_per_warp(self):
+            return (2, 32)
+
+        def get_blocked_warps_per_cta(self):
+            return (4, 1)
+
+        def get_blocked_order(self):
+            return (1, 0)
+
+    value_plan = SimpleNamespace(
+        value_id=44,
+        type_kind="tensor",
+        type="tensor<32x32x!tt.ptr<f32>>",
+        shape=(32, 32),
+        encoding=(
+            "#ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], "
+            "warpsPerCTA = [4, 1], order = [1, 0]}>"
+        ),
+        encoding_attr=FakeBlockedEncoding(),
+    )
+    layout = wave_bridge_emit._blocked_tensor_layout_info(
+        value_plan,
+        "ttg.async_copy_global_to_local source",
+        "async copy address lowering",
+    )
+
+    assert (
+        wave_bridge_emit._blocked_layout_component_count(
+            value_plan,
+            "ttg.async_copy_global_to_local source",
+            "async copy address lowering",
+        )
+        == 4
+    )
+    assert wave_bridge_emit._blocked_layout_static_coord(
+        layout, value_plan.shape, thread=0, component=0
+    ) == (0, 0)
+    assert wave_bridge_emit._blocked_layout_static_coord(
+        layout, value_plan.shape, thread=0, component=3
+    ) == (24, 0)
 
 
 def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
@@ -2020,6 +1887,9 @@ def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
             def int_(value):
                 return FakeExpr(value)
 
+        class CastKind:
+            IntConvert = "IntConvert"
+
         @staticmethod
         def sym(name):
             return FakeExpr(name)
@@ -2040,15 +1910,20 @@ def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
         def i64():
             return "i64"
 
+        @staticmethod
+        def simd_type(element_type, width):
+            return FakeSimdType(width, element_type)
+
     class FakeBuilder:
         def __init__(self):
             self.index_exprs = []
             self.index_casts = []
+            self.casts = []
 
         def workitem_id(self, axis=0, width=64):
             return FakeValue(f"thread{axis}", FakeSimdType(width, "i32"))
 
-        def index_expr(self, expr, bindings=None):
+        def index_expr(self, expr, bindings=None, result_type=None):
             width = 1
             if bindings:
                 widths = [
@@ -2057,7 +1932,10 @@ def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
                     if isinstance(binding.type, FakeSimdType)
                 ]
                 width = widths[0] if widths else width
-            value = FakeValue(f"idx{len(self.index_exprs)}", FakeSimdType(width))
+            value = FakeValue(
+                f"idx{len(self.index_exprs)}",
+                result_type or FakeSimdType(width),
+            )
             self.index_exprs.append((expr, bindings or {}, value))
             return value
 
@@ -2072,6 +1950,11 @@ def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
                 f"cast{len(self.index_casts)}", FakeSimdType(value.type.width, typ)
             )
             self.index_casts.append((value, typ, result))
+            return result
+
+        def cast(self, value, typ, kind):
+            result = FakeValue(f"wavecast{len(self.casts)}", typ)
+            self.casts.append((value, typ, kind, result))
             return result
 
         def cmpi(self, predicate, lhs, rhs):
@@ -2210,12 +2093,10 @@ def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
     )
 
     assert [width for _, width, _ in builder.splats] == [64, 64]
-    assert [cast[1] for cast in builder.index_casts] == ["i64", "i64"]
-    assert builder.index_casts[0][0] is builder.splats[0][2]
-    assert builder.index_casts[1][0] is builder.splats[1][2]
+    assert builder.index_casts == []
     assert builder.cmpis[0][0] == "ult"
-    assert builder.cmpis[0][1] is builder.index_casts[0][2]
-    assert builder.cmpis[0][2] is builder.index_casts[1][2]
+    assert builder.cmpis[0][1] is builder.splats[0][2]
+    assert builder.cmpis[0][2] is builder.splats[1][2]
     assert wave_values[3].kind == "mask_expr"
     assert wave_values[3].value is builder.cmpis[0][3]
 

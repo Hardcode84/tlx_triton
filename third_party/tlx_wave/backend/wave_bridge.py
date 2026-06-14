@@ -73,7 +73,6 @@ def stop_before_wave_lowering(mod, metadata, options):
     metadata["tlx_wave_lds_size_bytes"] = wave_stats.lds_size_bytes
     metadata["tlx_wave_num_async_copies"] = wave_stats.async_copies
     metadata["tlx_wave_num_dma_load_lds"] = wave_stats.dma_load_lds
-    metadata["tlx_wave_num_load_store_fallbacks"] = wave_stats.load_store_fallbacks
     metadata["tlx_wave_num_async_commit_groups"] = wave_stats.commit_groups
     metadata["tlx_wave_num_async_waits"] = wave_stats.waits
     metadata["tlx_wave_num_wave_joins"] = wave_stats.joins

@@ -607,35 +607,64 @@ def _blocked_tensor_layout_info(value_plan, context, lowering_name):
 
 def _blocked_layout_component_count(value_plan, context, lowering_name):
     layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
-    return _product(layout.size_per_thread)
+    return _product(
+        _blocked_layout_component_shape(
+            value_plan.shape,
+            layout,
+            context,
+            lowering_name,
+        )
+    )
+
+
+def _ceil_div(lhs, rhs):
+    return (int(lhs) + int(rhs) - 1) // int(rhs)
+
+
+def _blocked_layout_dim_coverage(layout, dim, context, lowering_name):
+    covered = (
+        int(layout.size_per_thread[dim])
+        * int(layout.threads_per_warp[dim])
+        * int(layout.warps_per_cta[dim])
+    )
+    if covered <= 0:
+        raise ValueError(
+            f"tlx_wave bridge {lowering_name} cannot lower {context}: "
+            f"dim {dim} has non-positive blocked layout coverage {covered}; "
+            f"sizePerThread={layout.size_per_thread}, "
+            f"threadsPerWarp={layout.threads_per_warp}, "
+            f"warpsPerCTA={layout.warps_per_cta}"
+        )
+    return covered
+
+
+def _blocked_layout_component_shape(shape, layout, context, lowering_name):
+    component_shape = []
+    for dim, extent in enumerate(shape):
+        covered = _blocked_layout_dim_coverage(layout, dim, context, lowering_name)
+        repeats = max(1, _ceil_div(extent, covered))
+        component_shape.append(int(layout.size_per_thread[dim]) * repeats)
+    return tuple(component_shape)
 
 
 def _blocked_layout_dim_bindings(
     builder, value_plan, w, context, symbol_prefix, lowering_name, component=0
 ):
     layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
-    component_count = _product(layout.size_per_thread)
+    component_shape = _blocked_layout_component_shape(
+        value_plan.shape,
+        layout,
+        context,
+        lowering_name,
+    )
+    component_count = _product(component_shape)
     if component < 0 or component >= component_count:
         raise ValueError(
             f"tlx_wave bridge {lowering_name} component {component} is out of "
-            f"range for {context}: sizePerThread={layout.size_per_thread}, "
+            f"range for {context}: componentShape={component_shape}, "
             f"encoding={value_plan.encoding}"
         )
     rank = len(value_plan.shape)
-    for dim, extent in enumerate(value_plan.shape):
-        covered = (
-            layout.size_per_thread[dim]
-            * layout.threads_per_warp[dim]
-            * layout.warps_per_cta[dim]
-        )
-        if covered < extent:
-            raise ValueError(
-                f"tlx_wave bridge {lowering_name} cannot cover the "
-                f"full tensor extent for {context}: dim {dim} has extent "
-                f"{extent}, but sizePerThread * threadsPerWarp * warpsPerCTA "
-                f"covers only {covered}; encoding={value_plan.encoding}"
-            )
-
     width = _product(layout.threads_per_warp)
     thread = builder.workitem_id(axis=0, width=width)
     thread_sym = w.sym(f"{symbol_prefix}_{value_plan.value_id}_thread")
@@ -652,9 +681,7 @@ def _blocked_layout_dim_bindings(
         layout.order,
     )
     component_coords = (
-        _delinearize_expr(
-            w, w.sym_ctx.int_(component), layout.size_per_thread, layout.order
-        )
+        _delinearize_expr(w, w.sym_ctx.int_(component), component_shape, layout.order)
         if component_count != 1
         else None
     )
@@ -663,10 +690,19 @@ def _blocked_layout_dim_bindings(
     active = None
     for dim in range(rank):
         tile_coord = lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim]
-        coord_expr = (
-            component_coords[dim] + layout.size_per_thread[dim] * tile_coord
+        expanded_component = (
+            component_coords[dim]
             if component_coords is not None
-            else tile_coord
+            else w.sym_ctx.int_(0)
+        )
+        size_per_thread = int(layout.size_per_thread[dim])
+        covered = _blocked_layout_dim_coverage(layout, dim, context, lowering_name)
+        local_component = w.mod(expanded_component, size_per_thread)
+        repeat_component = w.floor(expanded_component / size_per_thread)
+        coord_expr = (
+            local_component
+            + size_per_thread * tile_coord
+            + covered * repeat_component
         )
         coord = builder.index_expr(coord_expr, {thread_sym: thread})
         dim_bindings[_dim_symbol(w, dim)] = coord
@@ -1640,12 +1676,12 @@ def _init_argument_wave_values(builder, values, wave_values, w):
                 _ScalarBool(arg),
             )
         elif value.type_kind == "scalar" and _is_integer_or_index_value(value):
-            bound = arg if value.type == "index" else builder.index_cast(arg, w.index_type())
+            symbol = w.sym(f"tlx_arg_{value.value_id}")
             _set_wave_value(
                 wave_values,
                 value.value_id,
                 "index_expr",
-                bound,
+                builder.index_expr(symbol, {symbol: arg}),
             )
         elif value.type_kind == "scalar" and _scalar_data_type(value) is not None:
             _set_wave_value(
@@ -1714,7 +1750,7 @@ def _emit_program_id_op(builder, state, op, values, wave_values, w):
     bindings = state["program_id_bindings"]
     binding = bindings.get(axis)
     if binding is None:
-        binding = builder.index_cast(builder.workgroup_id(axis), w.index_type())
+        binding = builder.workgroup_id(axis)
         bindings[axis] = binding
     symbol = w.sym(f"tlx_program_id_{axis}")
     _set_wave_value(
@@ -2144,7 +2180,7 @@ def _delinearize_index(linear, shape, order):
     return tuple(coords)
 
 
-def _blocked_layout_static_coord(layout, thread, component):
+def _blocked_layout_static_coord(layout, shape, thread, component):
     width = _product(layout.threads_per_warp)
     lane_coords = _delinearize_index(
         thread % width,
@@ -2156,17 +2192,35 @@ def _blocked_layout_static_coord(layout, thread, component):
         layout.warps_per_cta,
         layout.order,
     )
+    component_shape = _blocked_layout_component_shape(
+        shape,
+        layout,
+        "ttg.convert_layout tensor shape",
+        "SIMD layout conversion",
+    )
     component_coords = _delinearize_index(
         component,
-        layout.size_per_thread,
+        component_shape,
         layout.order,
     )
-    return tuple(
-        component_coords[dim]
-        + layout.size_per_thread[dim]
-        * (lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim])
-        for dim in range(len(layout.size_per_thread))
-    )
+    coords = []
+    for dim in range(len(layout.size_per_thread)):
+        size_per_thread = int(layout.size_per_thread[dim])
+        covered = _blocked_layout_dim_coverage(
+            layout,
+            dim,
+            "ttg.convert_layout tensor shape",
+            "SIMD layout conversion",
+        )
+        local_component = component_coords[dim] % size_per_thread
+        repeat_component = component_coords[dim] // size_per_thread
+        coords.append(
+            local_component
+            + size_per_thread
+            * (lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim])
+            + covered * repeat_component
+        )
+    return tuple(coords)
 
 
 def _layout_thread_count(layout):
@@ -2232,8 +2286,16 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
             result_plan,
         )
 
-    source_components = _product(source_layout.size_per_thread)
-    result_components = _product(result_layout.size_per_thread)
+    source_components = _blocked_layout_component_count(
+        source_plan,
+        "ttg.convert_layout source",
+        "SIMD layout conversion",
+    )
+    result_components = _blocked_layout_component_count(
+        result_plan,
+        "ttg.convert_layout result",
+        "SIMD layout conversion",
+    )
     permutation = []
     for result_component in range(result_components):
         source_component = None
@@ -2241,7 +2303,7 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
             matches = True
             for thread in range(result_threads):
                 result_coord = _blocked_layout_static_coord(
-                    result_layout, thread, result_component
+                    result_layout, result_plan.shape, thread, result_component
                 )
                 if any(
                     result_coord[dim] >= result_plan.shape[dim]
@@ -2249,7 +2311,7 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
                 ):
                     continue
                 source_coord = _blocked_layout_static_coord(
-                    source_layout, thread, candidate
+                    source_layout, source_plan.shape, thread, candidate
                 )
                 if source_coord != result_coord:
                     matches = False
@@ -2480,6 +2542,25 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     return packet_bytes
 
 
+def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout, component_count):
+    context = (
+        "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+        "without faithful DMA"
+    )
+    if component_count != 1:
+        raise ValueError(
+            f"{context}: source blocked layout maps to {component_count} "
+            "components; repeated or multicomponent DMA lowering is not implemented"
+        )
+    packet_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
+    if packet_bytes is None:
+        raise ValueError(
+            f"{context}: unsupported source element width, destination shared "
+            "layout, memdesc view, or LDS alignment for waveamd.dma_load_lds"
+        )
+    return packet_bytes
+
+
 def _emit_async_source_ptr(builder, state, kernel, address, w, component=0):
     pointee_type = _source_pointee_type(kernel, address)
     element_type = _binding_type(pointee_type, w)
@@ -2543,20 +2624,15 @@ def _emit_async_copy(
             f"source element type {address.element_type} does not match "
             f"destination memdesc element type {memdesc.element_type}"
         )
-    dma_bytes = (
-        _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
-        if component_count == 1
-        else None
+    dma_bytes = _require_dma_packet_bytes(
+        address, memdesc, memdescs, lds_layout, component_count
     )
     stats.async_copies += 1
-    if dma_bytes is not None:
-        stats.dma_load_lds += 1
-    else:
-        stats.load_store_fallbacks += 1
+    stats.dma_load_lds += 1
 
     token = after_token
     for component in range(component_count):
-        source, element_type, dim_bindings, width, active = _emit_async_source_ptr(
+        source, _element_type, dim_bindings, width, active = _emit_async_source_ptr(
             builder, state, kernel, address, w, component=component
         )
         mask = active
@@ -2576,37 +2652,20 @@ def _emit_async_copy(
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
         def emit_copy(copy_after):
-            if dma_bytes is not None:
-                destination = _emit_memdesc_base_ptr(
-                    builder,
-                    memdesc,
-                    memdescs,
-                    lds_layout,
-                    state,
-                    w.i32(),
-                    4,
-                    w,
-                    "ttg.async_copy_global_to_local destination",
-                )
-                return builder.dma_load_lds(
-                    source, destination, after=copy_after, bytes=dma_bytes
-                )
-
-            destination = _emit_memdesc_ptr(
+            destination = _emit_memdesc_base_ptr(
                 builder,
                 memdesc,
                 memdescs,
                 lds_layout,
                 state,
-                dim_bindings,
-                width,
+                w.i32(),
+                4,
                 w,
                 "ttg.async_copy_global_to_local destination",
             )
-            values, load_token = builder.load(
-                source, w.simd_type(element_type, width), after=copy_after
+            return builder.dma_load_lds(
+                source, destination, after=copy_after, bytes=dma_bytes
             )
-            return builder.store(values, destination, after=load_token)
 
         if mask is None:
             token = emit_copy(token)
@@ -4765,9 +4824,6 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
         module_builder.module.operation.attributes["tlx_wave.emitted.dma_load_lds"] = (
             _binding_i32_attr(w, stats.dma_load_lds)
         )
-        module_builder.module.operation.attributes[
-            "tlx_wave.emitted.load_store_fallbacks"
-        ] = _binding_i32_attr(w, stats.load_store_fallbacks)
         module_builder.module.operation.attributes["tlx_wave.emitted.joins"] = (
             _binding_i32_attr(w, stats.joins)
         )

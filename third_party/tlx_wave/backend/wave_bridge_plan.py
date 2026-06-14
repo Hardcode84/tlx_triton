@@ -194,7 +194,6 @@ class _WaveAsyncStats:
     lds_size_bytes: int = 0
     async_copies: int = 0
     dma_load_lds: int = 0
-    load_store_fallbacks: int = 0
     commit_groups: int = 0
     waits: int = 0
     joins: int = 0
