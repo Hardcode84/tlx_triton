@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .wave_bridge_plan import (
+    _ASSUME_TREE_OPS,
     _GFX950_DOT_PARENT_LAYOUT,
     _GFX950_F16_MMA_KIND,
     _GFX950_MMA_M,
@@ -84,6 +85,15 @@ class _MemState:
 @dataclass(frozen=True)
 class _LoopMemShape:
     group_count: int
+
+
+@dataclass(frozen=True)
+class _AssumeFact:
+    value_id: int
+    kind: str
+    lower: int | None = None
+    upper: int | None = None
+    divisor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +280,67 @@ def _op_by_result_id(plan):
         for op in plan.ops
         for result_id in op.results
     }
+
+
+def _users_by_value_id(plan):
+    users = {}
+    for op in plan.ops:
+        for operand_id in op.operands:
+            users.setdefault(operand_id, []).append(op)
+    return users
+
+
+def _assume_tree_info(plan):
+    op_by_result = _op_by_result_id(plan)
+    users_by_value = _users_by_value_id(plan)
+    value_ids = set()
+    expanded = set()
+
+    def walk(value_id):
+        op = op_by_result.get(value_id)
+        if op is None or op.name not in _ASSUME_TREE_OPS:
+            return
+        value_ids.add(value_id)
+        if value_id in expanded:
+            return
+        expanded.add(value_id)
+        for operand_id in op.operands:
+            walk(operand_id)
+
+    for op in plan.ops:
+        if op.name == "llvm.intr.assume":
+            for operand_id in op.operands:
+                walk(operand_id)
+
+    assume_tree_values = frozenset(value_ids)
+    assume_only_values = set()
+    visiting = set()
+
+    def is_assume_only(value_id):
+        if value_id in assume_only_values:
+            return True
+        if value_id not in assume_tree_values or value_id in visiting:
+            return False
+        visiting.add(value_id)
+        try:
+            users = users_by_value.get(value_id, ())
+            if not users:
+                return False
+            for user in users:
+                if user.name == "llvm.intr.assume":
+                    continue
+                if user.name not in _ASSUME_TREE_OPS or not user.results:
+                    return False
+                if not all(is_assume_only(result_id) for result_id in user.results):
+                    return False
+            assume_only_values.add(value_id)
+            return True
+        finally:
+            visiting.remove(value_id)
+
+    for value_id in assume_tree_values:
+        is_assume_only(value_id)
+    return assume_tree_values, frozenset(assume_only_values)
 
 
 def _raw_op_plan(raw_op):
@@ -2143,6 +2214,159 @@ def _emit_addptr_op(builder, op, values, wave_values, w):
     )
 
 
+def _const_int_value(values, value_id):
+    value = values.get(value_id)
+    if value is None or _is_bool_value(value):
+        return None
+    const = value.const_value
+    return const if type(const) is int else None
+
+
+def _is_assumable_index_value(state, value_id):
+    value = state["values"].get(value_id)
+    if (
+        value is None
+        or value.type_kind != "scalar"
+        or not _is_integer_or_index_value(value)
+    ):
+        return False
+    lowered = state["wave_values"].get(value_id)
+    return (
+        isinstance(lowered, _WaveValue)
+        and lowered.kind == "index_expr"
+        and not _is_deferred_index(lowered.value)
+    )
+
+
+def _range_fact_from_value_const(state, value_id, predicate, const_value):
+    if not _is_assumable_index_value(state, value_id):
+        return None
+    if predicate == "sgt":
+        return _AssumeFact(value_id, "range", lower=const_value + 1)
+    if predicate == "sge":
+        return _AssumeFact(value_id, "range", lower=const_value)
+    if predicate == "slt":
+        return _AssumeFact(value_id, "range", upper=const_value - 1)
+    if predicate == "sle":
+        return _AssumeFact(value_id, "range", upper=const_value)
+    if predicate == "eq":
+        return _AssumeFact(value_id, "range", lower=const_value, upper=const_value)
+    return None
+
+
+def _invert_cmpi_predicate(predicate):
+    return {
+        "eq": "eq",
+        "ne": "ne",
+        "slt": "sgt",
+        "sle": "sge",
+        "sgt": "slt",
+        "sge": "sle",
+        "ult": "ugt",
+        "ule": "uge",
+        "ugt": "ult",
+        "uge": "ule",
+    }.get(predicate)
+
+
+def _divisibility_fact_from_remainder(state, rem_value_id):
+    rem_op = state["op_by_result"].get(rem_value_id)
+    if rem_op is None or rem_op.name != "arith.remsi":
+        return None
+    if len(rem_op.operands) != 2:
+        return None
+    value_id, divisor_id = rem_op.operands
+    divisor = _const_int_value(state["values"], divisor_id)
+    if divisor is None or divisor <= 0:
+        return None
+    if not _is_assumable_index_value(state, value_id):
+        return None
+    return _AssumeFact(value_id, "divisible", divisor=divisor)
+
+
+def _assume_fact_from_cmp(op, state):
+    if len(op.operands) != 2:
+        return None
+    predicate = _CMPI_PREDICATES.get(int(op.attrs.get("predicate")))
+    if predicate is None:
+        return None
+
+    lhs_id, rhs_id = op.operands
+    lhs_const = _const_int_value(state["values"], lhs_id)
+    rhs_const = _const_int_value(state["values"], rhs_id)
+    if predicate == "eq":
+        if rhs_const == 0:
+            fact = _divisibility_fact_from_remainder(state, lhs_id)
+            if fact is not None:
+                return fact
+        if lhs_const == 0:
+            fact = _divisibility_fact_from_remainder(state, rhs_id)
+            if fact is not None:
+                return fact
+    if rhs_const is not None:
+        return _range_fact_from_value_const(state, lhs_id, predicate, rhs_const)
+    if lhs_const is not None:
+        inverted = _invert_cmpi_predicate(predicate)
+        if inverted is not None:
+            return _range_fact_from_value_const(state, rhs_id, inverted, lhs_const)
+    return None
+
+
+def _assume_facts_for_value(state, value_id):
+    op = state["op_by_result"].get(value_id)
+    if op is None:
+        return ()
+    if op.name == "arith.andi":
+        facts = []
+        for operand_id in op.operands:
+            facts.extend(_assume_facts_for_value(state, operand_id))
+        return tuple(facts)
+    if op.name == "arith.cmpi":
+        fact = _assume_fact_from_cmp(op, state)
+        return (fact,) if fact is not None else ()
+    return ()
+
+
+def _emit_assume_fact(builder, state, fact, w):
+    lowered = state["wave_values"].get(fact.value_id)
+    if (
+        not isinstance(lowered, _WaveValue)
+        or lowered.kind != "index_expr"
+        or _is_deferred_index(lowered.value)
+    ):
+        return
+    value = _materialize_index_value(builder, lowered.value, {}, w)
+    if fact.kind == "range":
+        x = w.sym_ctx.sym("x")
+        assumptions = []
+        if fact.lower is not None:
+            assumptions.append(x >= fact.lower)
+        if fact.upper is not None:
+            assumptions.append(x <= fact.upper)
+        if not assumptions:
+            return
+        value = builder.assume(value, assumptions, name="x")
+    elif fact.kind == "divisible" and fact.divisor is not None:
+        value = builder.assume_divisible(value, fact.divisor)
+    else:
+        return
+    _set_wave_value(state["wave_values"], fact.value_id, "index_expr", value)
+
+
+def _emit_assume_op(builder, op, state, w):
+    for operand_id in op.operands:
+        for fact in _assume_facts_for_value(state, operand_id):
+            _emit_assume_fact(builder, state, fact, w)
+
+
+def _is_assume_tree_helper_op(state, op):
+    if not op.results:
+        return False
+    return op.name in _ASSUME_TREE_OPS and all(
+        result_id in state["assume_only_values"] for result_id in op.results
+    )
+
+
 def _product(values):
     result = 1
     for value in values:
@@ -2848,10 +3072,12 @@ def _committed_groups(state):
 
 def _initial_lowering_state(builder, plan, w):
     values = _values_by_id(plan)
+    _, assume_only_values = _assume_tree_info(plan)
     state = {
         "values": values,
         "memdescs": _memdescs_by_id(plan),
         "op_by_result": _op_by_result_id(plan),
+        "assume_only_values": assume_only_values,
         "wave_values": {},
         "program_id_bindings": {},
         "mem_state": _MemState(),
@@ -2863,6 +3089,8 @@ def _initial_lowering_state(builder, plan, w):
 def _emit_generic_value_op(builder, state, op, w):
     values = state["values"]
     wave_values = state["wave_values"]
+    if _is_assume_tree_helper_op(state, op):
+        return True
     if op.name == "arith.constant":
         _emit_constant_op(builder, op, values, wave_values, w)
     elif op.name == "tt.get_program_id":
@@ -4418,7 +4646,9 @@ def _emit_ordered_raw_op(
         )
     if _emit_generic_value_op(builder, state, op, w):
         return
-    if op.name == "scf.if":
+    if op.name == "llvm.intr.assume":
+        _emit_assume_op(builder, op, state, w)
+    elif op.name == "scf.if":
         _emit_scf_if_op(builder, kernel, raw_op, op, state, lds_layout, w, stats)
     elif op.name == "scf.for":
         _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats)

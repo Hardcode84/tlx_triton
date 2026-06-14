@@ -1366,6 +1366,113 @@ def test_tlx_wave_bridge_lowers_uniform_tensor_compare_mask(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_lowers_llvm_assume_range_and_divisibility(tmp_path):
+    assume_func = """
+  tt.func public @assume_range_div(%arg0: i32) attributes {noinline = false} {
+    %c16 = arith.constant 16 : i32
+    %c128 = arith.constant 128 : i32
+    %c0 = arith.constant 0 : i32
+    %lower = arith.cmpi sgt, %arg0, %c0 : i32
+    %upper = arith.cmpi sgt, %c128, %arg0 : i32
+    %range = arith.andi %lower, %upper : i1
+    llvm.intr.assume %range : i1
+    %rem = arith.remsi %arg0, %c16 : i32
+    %divisible = arith.cmpi eq, %rem, %c0 : i32
+    llvm.intr.assume %divisible : i1
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert wave.count("wave.assume") == 3
+    assert '#wave.pred<"-1 + x >= 0">' in wave
+    assert '#wave.pred<"-127 + x <= 0">' in wave
+    assert '#wave.pred<"Mod(x, 16) == 0">' in wave
+    assert "llvm.intr.assume" not in wave
+    assert "arith.remsi" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_lowers_shared_assume_condition_helpers(tmp_path):
+    assume_func = """
+  tt.func public @shared_assume_condition(%arg0: i32) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c0 = arith.constant 0 : i32
+    %sum = arith.addi %arg0, %c1 : i32
+    %positive = arith.cmpi sgt, %sum, %c0 : i32
+    llvm.intr.assume %positive : i1
+    scf.if %positive {
+      %one = arith.constant 1 : i32
+    }
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.assume" in wave
+    assert "arith.cmpi sgt" in wave
+    assert "scf.if" in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_drops_unsigned_llvm_assume_facts(tmp_path):
+    assume_func = """
+  tt.func public @drop_unsigned_assume(%arg0: i32) attributes {noinline = false} {
+    %c3 = arith.constant 3 : i32
+    %c0 = arith.constant 0 : i32
+    %nonnegative = arith.cmpi uge, %arg0, %c0 : i32
+    llvm.intr.assume %nonnegative : i1
+    %rem = arith.remui %arg0, %c3 : i32
+    %divisible = arith.cmpi eq, %rem, %c0 : i32
+    llvm.intr.assume %divisible : i1
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.assume" not in wave
+    assert "llvm.intr.assume" not in wave
+    assert "arith.remui" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_drops_unsupported_llvm_assume(tmp_path):
+    assume_func = """
+  tt.func public @drop_unsupported_assume(%arg0: i32) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c0 = arith.constant 0 : i32
+    %not_zero = arith.cmpi ne, %arg0, %c0 : i32
+    llvm.intr.assume %not_zero : i1
+    %diff = arith.subi %arg0, %c1 : i32
+    %positive_diff = arith.cmpi sgt, %diff, %c0 : i32
+    llvm.intr.assume %positive_diff : i1
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.assume" not in wave
+    assert "llvm.intr.assume" not in wave
+    assert "arith.subi" not in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_discovers_normal_build_wave_runtime(tmp_path, monkeypatch):
     build_dir = tmp_path / "cmake.test"
     python_package = build_dir / "python_packages" / "wave_mlir"

@@ -234,6 +234,7 @@ _ORDERED_BODY_EFFECT_OPS = {
 }
 
 _ORDERED_BODY_PLANNED_OPS = {
+    "llvm.intr.assume",
     "scf.for",
     "scf.if",
     "scf.yield",
@@ -255,6 +256,24 @@ _ORDERED_BODY_SUPPORTED_OPS = (
     | _ORDERED_BODY_EFFECT_OPS
     | _ORDERED_BODY_PLANNED_OPS
 )
+
+_ASSUME_TREE_OPS = {
+    "arith.addi",
+    "arith.andi",
+    "arith.cmpi",
+    "arith.divsi",
+    "arith.divui",
+    "arith.extsi",
+    "arith.extui",
+    "arith.index_cast",
+    "arith.muli",
+    "arith.ori",
+    "arith.remsi",
+    "arith.remui",
+    "arith.subi",
+    "arith.trunci",
+    "arith.xori",
+}
 
 
 @dataclass(frozen=True)
@@ -553,14 +572,117 @@ def _validate_straight_line_kernel_ops(ops):
             )
 
 
+def _raw_op_result_ids(op):
+    return tuple(
+        _value_id(op.get_result(index)) for index in range(op.get_num_results())
+    )
+
+
+def _raw_op_operand_ids(op):
+    return tuple(
+        _value_id(op.get_operand(index)) for index in range(op.get_num_operands())
+    )
+
+
+def _ordered_body_users_by_value_id(ops):
+    users = {}
+    for op in ops:
+        for operand_id in _raw_op_operand_ids(op):
+            users.setdefault(operand_id, []).append(op)
+    return users
+
+
+def _ordered_body_op_by_result_id(ops):
+    return {
+        result_id: op
+        for op in ops
+        for result_id in _raw_op_result_ids(op)
+    }
+
+
+def _ordered_body_assume_tree_info(ops):
+    op_by_result = _ordered_body_op_by_result_id(ops)
+    users_by_value = _ordered_body_users_by_value_id(ops)
+    value_ids = set()
+    expanded = set()
+
+    def walk(value_id):
+        op = op_by_result.get(value_id)
+        if op is None or op.get_name() not in _ASSUME_TREE_OPS:
+            return
+        value_ids.add(value_id)
+        if value_id in expanded:
+            return
+        expanded.add(value_id)
+        for operand_id in _raw_op_operand_ids(op):
+            walk(operand_id)
+
+    for op in ops:
+        if op.get_name() == "llvm.intr.assume":
+            for operand_id in _raw_op_operand_ids(op):
+                walk(operand_id)
+
+    assume_tree_values = frozenset(value_ids)
+    assume_only_values = set()
+    visiting = set()
+
+    def is_assume_only(value_id):
+        if value_id in assume_only_values:
+            return True
+        if value_id not in assume_tree_values or value_id in visiting:
+            return False
+        visiting.add(value_id)
+        try:
+            users = users_by_value.get(value_id, ())
+            if not users:
+                return False
+            for user in users:
+                if user.get_name() == "llvm.intr.assume":
+                    continue
+                if user.get_name() not in _ASSUME_TREE_OPS:
+                    return False
+                result_ids = _raw_op_result_ids(user)
+                if not result_ids:
+                    return False
+                if not all(is_assume_only(result_id) for result_id in result_ids):
+                    return False
+            assume_only_values.add(value_id)
+            return True
+        finally:
+            visiting.remove(value_id)
+
+    for value_id in assume_tree_values:
+        is_assume_only(value_id)
+    return assume_tree_values, frozenset(assume_only_values)
+
+
+def _is_assume_only_helper_op(
+    op,
+    assume_only_values,
+):
+    if op.get_name() not in _ASSUME_TREE_OPS:
+        return False
+    result_ids = _raw_op_result_ids(op)
+    if not result_ids:
+        return False
+    return all(result_id in assume_only_values for result_id in result_ids)
+
+
 def _validate_ordered_body_supported_ops(ops):
+    _, assume_only_values = _ordered_body_assume_tree_info(ops)
     for op in ops:
         name = op.get_name()
-        if name not in _ORDERED_BODY_SUPPORTED_OPS:
-            raise ValueError(
-                "tlx_wave bridge cannot lower unsupported TTGIR op in ordered "
-                f"body lowering: {name}"
-            )
+        if name in _ORDERED_BODY_SUPPORTED_OPS:
+            continue
+        if _is_assume_only_helper_op(
+            op,
+            assume_only_values,
+        ):
+            continue
+        raise ValueError(
+            "tlx_wave bridge cannot lower unsupported TTGIR op in ordered "
+            f"body lowering: {name}"
+        )
 
 
 def _op_results(op):
