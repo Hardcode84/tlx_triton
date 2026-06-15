@@ -918,6 +918,27 @@ def _linearized_tensor_packet_offset_expr(
     )
 
 
+def _linearized_tensor_dma_dword_offset_expr(
+    shape, dim_bindings, packet_elements, packet_bytes, w
+):
+    if packet_bytes % 4:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            f"without faithful DMA: {packet_bytes}-byte DMA packet is not "
+            "addressable as i32 LDS words"
+        )
+    packet_offset = _linearized_tensor_packet_offset_expr(
+        shape, dim_bindings, packet_elements, w
+    )
+    dwords_per_packet = packet_bytes // 4
+    if dwords_per_packet == 1:
+        return packet_offset
+    return _IndexExpr(
+        packet_offset.expr * int(dwords_per_packet),
+        dict(packet_offset.bindings),
+    )
+
+
 def _zero_index_expr(w):
     return _IndexExpr(w.sym_ctx.int_(0), {})
 
@@ -3024,18 +3045,6 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     return dim_bindings, frag.wave_size
 
 
-def _async_dim_bindings(builder, value_plan, w, component=0):
-    return _blocked_layout_dim_bindings(
-        builder,
-        value_plan,
-        w,
-        "ttg.async_copy_global_to_local source",
-        "tlx_async",
-        "async copy address lowering",
-        component=component,
-    )
-
-
 def _dot_operand_encoding_info(value, context):
     attr = value.encoding_attr
     if attr is None or not _attr_bool(attr, "is_dot_operand_encoding"):
@@ -3096,34 +3105,7 @@ def _require_physical_dot_operand_fragment(values, wave_values, value, context):
         context,
     )
 
-
-
-def _source_pointee_type(kernel, address):
-    if address.base_arg_index is None:
-        raise ValueError(
-            "tlx_wave bridge cannot lower async copy without a source pointer base"
-        )
-    if address.base_arg_index >= len(kernel.args):
-        raise ValueError(
-            f"tlx_wave bridge async copy references missing kernel arg {address.base_arg_index}"
-        )
-    pointee_type = kernel.args[address.base_arg_index].ttgir_type_obj.get_pointee_type()
-    if pointee_type is None:
-        raise ValueError(
-            f"tlx_wave bridge async copy source %{address.base_arg_name} is not a pointer"
-        )
-    return pointee_type
-
-
-def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
-    if address.element_byte_width is None:
-        return None
-    if address.element_byte_width in (1, 2, 4):
-        packet_bytes = 4
-    elif address.element_byte_width == 16:
-        packet_bytes = 16
-    else:
-        return None
+def _dma_packet_layout_supported(address, memdesc):
     try:
         shared = _swizzled_shared_encoding_info(
             memdesc.encoding_attr,
@@ -3131,32 +3113,50 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
             "ttg.async_copy_global_to_local destination",
         )
     except ValueError:
-        return None
-    if not (
-        _is_identity_shared_layout(memdesc, shared)
-        or (
-            memdesc.element_type == "f16"
-            and memdesc.shape == _GFX950_MMA_SHAPE
-            and address.shape == memdesc.shape
-            and shared == _GFX950_SHARED_LAYOUT
-        )
-    ):
-        return None
+        return False
+    return _is_identity_shared_layout(memdesc, shared) or (
+        memdesc.element_type == "f16"
+        and memdesc.shape == _GFX950_MMA_SHAPE
+        and address.shape == memdesc.shape
+        and shared == _GFX950_SHARED_LAYOUT
+    )
+
+
+def _dma_packet_byte_candidates(address, memdesc, memdescs, lds_layout):
+    if address.element_byte_width is None:
+        return ()
+    if address.element_byte_width == 2 and address.element_type in {"f16", "bf16"}:
+        raw_candidates = (16, 4)
+    elif address.element_byte_width in (1, 2, 4):
+        raw_candidates = (4,)
+    elif address.element_byte_width == 16:
+        raw_candidates = (16,)
+    else:
+        return ()
+    if not _dma_packet_layout_supported(address, memdesc):
+        return ()
     if not _memdesc_dma_can_use_base_pointer(
         memdesc,
         memdescs,
         "ttg.async_copy_global_to_local destination",
     ):
-        return None
-    if not _memdesc_base_is_aligned(
-        memdesc,
-        memdescs,
-        lds_layout,
-        4,
-        "ttg.async_copy_global_to_local destination",
-    ):
-        return None
-    return packet_bytes
+        return ()
+    candidates = []
+    for packet_bytes in raw_candidates:
+        if _memdesc_base_is_aligned(
+            memdesc,
+            memdescs,
+            lds_layout,
+            packet_bytes,
+            "ttg.async_copy_global_to_local destination",
+        ):
+            candidates.append(packet_bytes)
+    return tuple(candidates)
+
+
+def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
+    candidates = _dma_packet_byte_candidates(address, memdesc, memdescs, lds_layout)
+    return candidates[0] if candidates else None
 
 
 def _dma_packet_elements(address, packet_bytes):
@@ -3178,8 +3178,6 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
             f"{context}: source element width {address.element_byte_width} "
             f"does not divide DMA packet size {packet_bytes}"
         )
-    if packet_bytes != 4:
-        return None
     if address_plan.shape != memdesc.shape:
         raise ValueError(
             f"{context}: source tensor shape {address_plan.shape} does not "
@@ -3200,18 +3198,18 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
     return layout
 
 
-def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout):
+def _require_dma_packet_byte_candidates(address, memdesc, memdescs, lds_layout):
     context = (
         "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
         "without faithful DMA"
     )
-    packet_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
-    if packet_bytes is None:
+    candidates = _dma_packet_byte_candidates(address, memdesc, memdescs, lds_layout)
+    if not candidates:
         raise ValueError(
             f"{context}: unsupported source element width, destination shared "
             "layout, memdesc view, or LDS alignment for waveamd.dma_load_lds"
         )
-    return packet_bytes
+    return candidates
 
 
 def _dma_packet_component_count(value_plan, layout, packet_elements):
@@ -3260,14 +3258,26 @@ def _dma_packet_dim_bindings(
     coords = _delinearize_expr(w, element_linear, value_plan.shape, row_major_order)
 
     dim_bindings = {}
-    packet_index = builder.index_expr(packet_index_expr, {thread_sym: thread})
-    active = _wave_cmpi(
-        builder,
-        "ult",
-        packet_index,
-        builder.splat(builder.constant(w.index_type(), total_packets), width=width),
-        w,
-    )
+    component_packet_start = component * cta_threads
+    active = None
+    if component_packet_start + width > total_packets:
+        packet_index = thread
+        if component_packet_start:
+            packet_index = builder.binary(
+                w.BinaryKind.AddI,
+                packet_index,
+                builder.splat(
+                    builder.constant(w.i32(), component_packet_start),
+                    width=width,
+                ),
+            )
+        active = _wave_cmpi(
+            builder,
+            "ult",
+            packet_index,
+            builder.splat(builder.constant(w.i32(), total_packets), width=width),
+            w,
+        )
     for dim in range(len(value_plan.shape)):
         coord = builder.index_expr(coords[dim], {thread_sym: thread})
         dim_bindings[_dim_symbol(w, dim)] = coord
@@ -3888,10 +3898,11 @@ def _emit_dma_packet_ptrs(
         thread,
         w,
     )
-    destination_offset = _linearized_tensor_packet_offset_expr(
+    destination_offset = _linearized_tensor_dma_dword_offset_expr(
         memdesc.shape,
         uniform_bindings,
         packet_elements,
+        packet_bytes,
         w,
     )
     destination = builder.ptr_add(
@@ -3901,32 +3912,66 @@ def _emit_dma_packet_ptrs(
     return source, destination, dim_bindings, width, active
 
 
-def _emit_async_source_ptr(builder, state, kernel, address, w, component=0):
-    pointee_type = _source_pointee_type(kernel, address)
-    element_type = _binding_type(pointee_type, w)
-    if address.address_value_id is None:
-        raise ValueError(
-            "tlx_wave bridge cannot lower async copy without a source address value"
-        )
-    address_plan = state["values"][address.address_value_id]
-    dim_bindings, width, active = _async_dim_bindings(
-        builder, address_plan, w, component=component
+def _select_dma_packet_lowering(
+    state,
+    address,
+    address_plan,
+    memdesc,
+    memdescs,
+    lds_layout,
+    mask_value,
+    w,
+):
+    errors = []
+    pointer_source = _require_lowered_value(
+        state["wave_values"],
+        address.address_value_id,
+        "pointer_expr",
+        "ttg.async_copy_global_to_local source",
     )
-    # Async copy inputs are regular SSA values. They must have been produced by
-    # earlier ordered op lowering; this path must not recursively lower a use-def
-    # slice around the async op.
-    source = _materialize_pointer_value(
-        builder,
-        _require_lowered_value(
-            state["wave_values"],
-            address.address_value_id,
-            "pointer_expr",
-            "ttg.async_copy_global_to_local source",
-        ),
-        dim_bindings,
-        w,
+    for dma_bytes in _require_dma_packet_byte_candidates(
+        address, memdesc, memdescs, lds_layout
+    ):
+        try:
+            dma_packet_layout = _validate_dma_packet_layout(
+                address_plan, address, memdesc, dma_bytes
+            )
+            packet_elements = _dma_packet_elements(address, dma_bytes)
+            if packet_elements is None:
+                raise ValueError(
+                    "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                    "without faithful DMA: unknown DMA packet element count"
+                )
+            _require_dma_packet_mask_uniform(
+                state,
+                mask_value,
+                address_plan.shape,
+                packet_elements,
+                len(address_plan.shape) - 1,
+                w,
+            )
+            _require_dma_packet_source_contiguous_bytes(
+                state,
+                pointer_source,
+                address.element_byte_width,
+                dma_bytes,
+                address_plan.shape,
+                len(address_plan.shape) - 1,
+                w,
+            )
+            copy_component_count = _dma_packet_component_count(
+                address_plan, dma_packet_layout, packet_elements
+            )
+        except ValueError as exc:
+            errors.append(exc)
+            continue
+        return dma_bytes, dma_packet_layout, copy_component_count
+    if errors:
+        raise errors[-1]
+    raise ValueError(
+        "tlx_wave bridge cannot lower ttg.async_copy_global_to_local without "
+        "faithful DMA: no legal DMA packet size was found"
     )
-    return source, element_type, dim_bindings, width, active
 
 
 def _emit_async_copy(
@@ -3953,21 +3998,12 @@ def _emit_async_copy(
             "tlx_wave bridge cannot lower async copy without a source address value"
         )
     address_plan = state["values"][address.address_value_id]
-    component_count = _blocked_layout_component_count(
-        address_plan,
-        "ttg.async_copy_global_to_local source",
-        "async copy address lowering",
-    )
     if address.element_type != memdesc.element_type:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local: "
             f"source element type {address.element_type} does not match "
             f"destination memdesc element type {memdesc.element_type}"
         )
-    dma_bytes = _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout)
-    dma_packet_layout = _validate_dma_packet_layout(
-        address_plan, address, memdesc, dma_bytes
-    )
     mask_value = None
     if address.mask_value_id is not None:
         mask_value = _require_lowered_value(
@@ -3976,59 +4012,33 @@ def _emit_async_copy(
             "mask_expr",
             "ttg.async_copy_global_to_local mask",
         )
-    if dma_packet_layout is not None:
-        packet_elements = _dma_packet_elements(address, dma_bytes)
-        if packet_elements is None:
-            raise ValueError(
-                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-                "without faithful DMA: unknown DMA packet element count"
-            )
-        _require_dma_packet_mask_uniform(
-            state,
-            mask_value,
-            address_plan.shape,
-            packet_elements,
-            len(address_plan.shape) - 1,
-            w,
-        )
-        copy_component_count = _dma_packet_component_count(
-            address_plan, dma_packet_layout, packet_elements
-        )
-    else:
-        copy_component_count = component_count
+    dma_bytes, dma_packet_layout, copy_component_count = _select_dma_packet_lowering(
+        state,
+        address,
+        address_plan,
+        memdesc,
+        memdescs,
+        lds_layout,
+        mask_value,
+        w,
+    )
     stats.async_copies += 1
 
     token = after_token
     for component in range(copy_component_count):
-        if dma_packet_layout is not None:
-            source, destination, dim_bindings, width, active = _emit_dma_packet_ptrs(
-                builder,
-                state,
-                address,
-                address_plan,
-                memdesc,
-                memdescs,
-                lds_layout,
-                dma_bytes,
-                dma_packet_layout,
-                component,
-                w,
-            )
-        else:
-            source, _element_type, dim_bindings, width, active = _emit_async_source_ptr(
-                builder, state, kernel, address, w, component=component
-            )
-            destination = _emit_memdesc_base_ptr(
-                builder,
-                memdesc,
-                memdescs,
-                lds_layout,
-                state,
-                w.i32(),
-                4,
-                w,
-                "ttg.async_copy_global_to_local destination",
-            )
+        source, destination, dim_bindings, width, active = _emit_dma_packet_ptrs(
+            builder,
+            state,
+            address,
+            address_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            dma_bytes,
+            dma_packet_layout,
+            component,
+            w,
+        )
         mask = active
         if mask_value is not None:
             user_mask = _materialize_mask_value(
