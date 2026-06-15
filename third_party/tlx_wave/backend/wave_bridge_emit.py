@@ -1537,6 +1537,305 @@ def _require_dma_destination_whole_wave_contiguous(
             )
 
 
+def _shared_layout_kind(memdesc, context):
+    padded = _padded_shared_encoding_info(memdesc.encoding, context)
+    if padded is not None:
+        return "padded", padded
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr,
+            memdesc.encoding,
+            context,
+        )
+    except ValueError:
+        return "linear", None
+    if _is_identity_shared_layout(memdesc, shared):
+        return "linear", shared
+    return "swizzled", shared
+
+
+def _padded_physical_coords_expr(w, data_element_linear, shape, info, context):
+    rank = len(info.offset_vectors[0])
+    if len(shape) < rank:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: padded_shared rank {rank} "
+            f"exceeds memdesc shape {shape}"
+        )
+    prefix_rank = len(shape) - rank
+    prefix_shape = tuple(int(dim) for dim in shape[:prefix_rank])
+    tile_shape = tuple(int(dim) for dim in shape[prefix_rank:])
+    tile_elements = _product(tile_shape)
+    prefix_linear = w.floor(data_element_linear / tile_elements)
+    tile_linear = w.mod(data_element_linear, tile_elements)
+    row_major_prefix = tuple(reversed(range(prefix_rank)))
+    prefix_coords = (
+        _delinearize_expr(w, prefix_linear, prefix_shape, row_major_prefix)
+        if prefix_rank
+        else ()
+    )
+    tile_coords = [w.sym_ctx.int_(0) for _ in tile_shape]
+    for (layout_dim, logical_bit), physical_bit in _padded_layout_bit_mapping(
+        info, context
+    ).items():
+        bit = w.mod(w.floor(tile_linear / (1 << int(physical_bit))), 2)
+        tile_coords[int(layout_dim)] = (
+            tile_coords[int(layout_dim)] + bit * (1 << int(logical_bit))
+        )
+    return tuple(prefix_coords) + tuple(tile_coords)
+
+
+def _padded_physical_coords_static(data_element_linear, shape, info, context):
+    rank = len(info.offset_vectors[0])
+    if len(shape) < rank:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: padded_shared rank {rank} "
+            f"exceeds memdesc shape {shape}"
+        )
+    prefix_rank = len(shape) - rank
+    prefix_shape = tuple(int(dim) for dim in shape[:prefix_rank])
+    tile_shape = tuple(int(dim) for dim in shape[prefix_rank:])
+    tile_elements = _product(tile_shape)
+    prefix_linear = int(data_element_linear) // tile_elements
+    tile_linear = int(data_element_linear) % tile_elements
+    prefix_coords = (
+        _static_delinearize_row_major(prefix_linear, prefix_shape)
+        if prefix_rank
+        else ()
+    )
+    tile_coords = [0 for _ in tile_shape]
+    for (layout_dim, logical_bit), physical_bit in _padded_layout_bit_mapping(
+        info, context
+    ).items():
+        bit = (tile_linear // (1 << int(physical_bit))) % 2
+        tile_coords[int(layout_dim)] += bit * (1 << int(logical_bit))
+    coords = tuple(prefix_coords) + tuple(tile_coords)
+    for dim, coord in enumerate(coords):
+        if coord < 0 or coord >= int(shape[dim]):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: physical padded "
+                f"element {data_element_linear} maps to out-of-bounds coords "
+                f"{coords} for shape {shape}"
+            )
+    return coords
+
+
+def _swizzled_physical_coords_expr(w, physical_element_linear, shape, shared, context):
+    if len(shape) < 2 or shared.order != (1, 0):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unsupported swizzled "
+            f"shared layout shape={shape}, order={shared.order}; only rank-2 "
+            "order=[1, 0] swizzles are supported"
+        )
+    vec = int(shared.vec)
+    per_phase = int(shared.per_phase)
+    max_phase = int(shared.max_phase)
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: invalid swizzled shared "
+            f"parameters vec={vec}, perPhase={per_phase}, maxPhase={max_phase}"
+        )
+    coords = list(
+        _delinearize_expr(
+            w,
+            physical_element_linear,
+            shape,
+            tuple(reversed(range(len(shape)))),
+        )
+    )
+    prefix_rank = len(shape) - 2
+    row = coords[prefix_rank]
+    swizzled_col = coords[prefix_rank + 1]
+    phase = w.mod(w.floor(row / per_phase), max_phase)
+    col_group = w.xor(w.floor(swizzled_col / vec), phase)
+    coords[prefix_rank + 1] = col_group * vec + w.mod(swizzled_col, vec)
+    return tuple(coords)
+
+
+def _swizzled_physical_coords_static(physical_element_linear, shape, shared, context):
+    if len(shape) < 2 or shared.order != (1, 0):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unsupported swizzled "
+            f"shared layout shape={shape}, order={shared.order}; only rank-2 "
+            "order=[1, 0] swizzles are supported"
+        )
+    vec = int(shared.vec)
+    per_phase = int(shared.per_phase)
+    max_phase = int(shared.max_phase)
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: invalid swizzled shared "
+            f"parameters vec={vec}, perPhase={per_phase}, maxPhase={max_phase}"
+        )
+    coords = list(_static_delinearize_row_major(physical_element_linear, shape))
+    prefix_rank = len(shape) - 2
+    row = int(coords[prefix_rank])
+    swizzled_col = int(coords[prefix_rank + 1])
+    phase = (row // per_phase) % max_phase
+    col_group = (swizzled_col // vec) ^ phase
+    coords[prefix_rank + 1] = col_group * vec + (swizzled_col % vec)
+    coords = tuple(coords)
+    for dim, coord in enumerate(coords):
+        if coord < 0 or coord >= int(shape[dim]):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: physical swizzled "
+                f"element {physical_element_linear} maps to out-of-bounds coords "
+                f"{coords} for shape {shape}"
+            )
+    return coords
+
+
+def _dma_packet_start_coords_static(memdesc, packet_elements, packet_index, context):
+    physical_element_linear = int(packet_index) * int(packet_elements)
+    kind, info = _shared_layout_kind(memdesc, context)
+    if kind == "padded":
+        return _padded_physical_coords_static(
+            physical_element_linear,
+            memdesc.shape,
+            info,
+            context,
+        )
+    if kind == "swizzled":
+        return _swizzled_physical_coords_static(
+            physical_element_linear,
+            memdesc.shape,
+            info,
+            context,
+        )
+    return _static_delinearize_row_major(physical_element_linear, memdesc.shape)
+
+
+def _dma_packet_physical_coords_expr(
+    w,
+    physical_element_linear,
+    memdesc,
+    context,
+):
+    kind, info = _shared_layout_kind(memdesc, context)
+    if kind == "padded":
+        return _padded_physical_coords_expr(
+            w,
+            physical_element_linear,
+            memdesc.shape,
+            info,
+            context,
+        )
+    if kind == "swizzled":
+        return _swizzled_physical_coords_expr(
+            w,
+            physical_element_linear,
+            memdesc.shape,
+            info,
+            context,
+        )
+    return _delinearize_expr(
+        w,
+        physical_element_linear,
+        memdesc.shape,
+        tuple(reversed(range(len(memdesc.shape)))),
+    )
+
+
+def _require_physical_packet_contiguous_from_coords(
+    memdesc,
+    shape,
+    coords,
+    packet_elements,
+    packet_bytes,
+    context,
+):
+    first = None
+    inner_dim = len(shape) - 1
+    for element in range(int(packet_elements)):
+        packet_coords = list(coords)
+        packet_coords[inner_dim] += element
+        if packet_coords[inner_dim] >= int(shape[inner_dim]):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: DMA packet starting "
+                f"at {coords} crosses innermost dimension extent {shape[inner_dim]}"
+            )
+        byte_offset = _memdesc_static_byte_offset(
+            memdesc,
+            shape,
+            tuple(packet_coords),
+            context,
+        )
+        if first is None:
+            first = byte_offset
+            if first % 4:
+                raise ValueError(
+                    f"tlx_wave bridge cannot lower {context}: physical byte "
+                    f"offset {first} is not 4-byte aligned"
+                )
+            continue
+        expected = first + element * int(memdesc.element_byte_width)
+        if byte_offset != expected:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: DMA packet starting "
+                f"at {coords} is not physically contiguous in shared memory"
+            )
+    if int(packet_elements) * int(memdesc.element_byte_width) != int(packet_bytes):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: DMA packet has "
+            f"{packet_elements} elements but {packet_bytes} bytes for "
+            f"{memdesc.element_type}"
+        )
+    return first
+
+
+def _require_dma_destination_physical_packets(
+    memdesc,
+    packet_elements,
+    packet_bytes,
+    width,
+    context,
+):
+    total_elements = _product(memdesc.shape)
+    if total_elements % int(packet_elements):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: tensor element count "
+            f"{total_elements} is not divisible by {packet_elements} element "
+            "DMA packets"
+        )
+    total_packets = total_elements // int(packet_elements)
+    packet_offsets = []
+    for packet_index in range(total_packets):
+        coords = _dma_packet_start_coords_static(
+            memdesc,
+            packet_elements,
+            packet_index,
+            context,
+        )
+        packet_offsets.append(
+            _require_physical_packet_contiguous_from_coords(
+                memdesc,
+                memdesc.shape,
+                coords,
+                packet_elements,
+                packet_bytes,
+                context,
+            )
+        )
+
+    for chunk_start in range(0, total_packets, int(width)):
+        chunk_offsets = packet_offsets[chunk_start : chunk_start + int(width)]
+        if not chunk_offsets:
+            continue
+        first_offset = chunk_offsets[0]
+        if first_offset % 4:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: physical byte offset "
+                f"{first_offset} is not 4-byte aligned"
+            )
+        for lane, byte_offset in enumerate(chunk_offsets[1:], start=1):
+            expected = first_offset + lane * int(packet_bytes)
+            if byte_offset != expected:
+                raise _DmaDestinationNotWholeWaveContiguous(
+                    f"tlx_wave bridge cannot lower {context}: DMA destination "
+                    "packet starts are not whole-wave contiguous; lane "
+                    f"{lane} starts at byte {byte_offset}, expected {expected}"
+                )
+
+
 def _require_fragment_load_physical_contiguous(value, memdesc):
     element_count = _GFX950_MMA_REGS * (4 // int(memdesc.element_byte_width))
     for lane in range(_GFX950_MMA_WAVE):
@@ -3770,6 +4069,7 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
         "ttg.async_copy_global_to_local source",
         "async copy DMA packet lowering",
     )
+    width = _product(layout.threads_per_warp)
     rank = len(address_plan.shape)
     inner_dim = rank - 1
     if int(address_plan.shape[inner_dim]) % packet_elements:
@@ -3777,11 +4077,11 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
             f"{context}: innermost tensor extent {address_plan.shape[inner_dim]} "
             f"is not divisible by {packet_elements} element DMA packets"
         )
-    _require_dma_destination_physical_contiguous(
+    _require_dma_destination_physical_packets(
         memdesc,
-        memdesc.shape,
         packet_elements,
         packet_bytes,
+        width,
         context,
     )
     return layout
@@ -3822,6 +4122,7 @@ def _dma_packet_component_count(value_plan, layout, packet_elements):
 def _dma_packet_dim_bindings(
     builder,
     value_plan,
+    memdesc,
     layout,
     packet_elements,
     component,
@@ -3843,13 +4144,17 @@ def _dma_packet_dim_bindings(
     thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread")
     packet_index_expr = w.sym_ctx.int_(component * cta_threads) + thread_sym
     element_linear = packet_index_expr * int(packet_elements)
-    row_major_order = tuple(reversed(range(len(value_plan.shape))))
-    coords = _delinearize_expr(w, element_linear, value_plan.shape, row_major_order)
+    coords = _dma_packet_physical_coords_expr(
+        w,
+        element_linear,
+        memdesc,
+        "ttg.async_copy_global_to_local destination",
+    )
 
     dim_bindings = {}
     component_packet_start = component * cta_threads
     active = None
-    if component_packet_start + width > total_packets:
+    if component_packet_start + cta_threads > total_packets:
         packet_index = thread
         if component_packet_start:
             packet_index = builder.binary(
@@ -3876,6 +4181,7 @@ def _dma_packet_dim_bindings(
 def _dma_packet_uniform_dim_bindings(
     builder,
     value_plan,
+    memdesc,
     layout,
     packet_elements,
     component,
@@ -3888,8 +4194,12 @@ def _dma_packet_uniform_dim_bindings(
     thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread_first")
     packet_index_expr = w.sym_ctx.int_(component * cta_threads) + thread_sym
     element_linear = packet_index_expr * int(packet_elements)
-    row_major_order = tuple(reversed(range(len(value_plan.shape))))
-    coords = _delinearize_expr(w, element_linear, value_plan.shape, row_major_order)
+    coords = _dma_packet_physical_coords_expr(
+        w,
+        element_linear,
+        memdesc,
+        "ttg.async_copy_global_to_local destination",
+    )
 
     dim_bindings = {}
     for dim in range(len(value_plan.shape)):
@@ -4456,6 +4766,7 @@ def _emit_dma_packet_ptrs(
     dim_bindings, width, active, thread = _dma_packet_dim_bindings(
         builder,
         address_plan,
+        memdesc,
         layout,
         packet_elements,
         component,
@@ -4481,6 +4792,7 @@ def _emit_dma_packet_ptrs(
     uniform_bindings = _dma_packet_uniform_dim_bindings(
         builder,
         address_plan,
+        memdesc,
         layout,
         packet_elements,
         component,
@@ -4552,17 +4864,6 @@ def _select_dma_packet_lowering(
             copy_component_count = _dma_packet_component_count(
                 address_plan, dma_packet_layout, packet_elements
             )
-            for component in range(copy_component_count):
-                _require_dma_destination_whole_wave_contiguous(
-                    address_plan,
-                    dma_packet_layout,
-                    memdesc,
-                    packet_elements,
-                    dma_bytes,
-                    component,
-                    "tlx_wave bridge cannot lower "
-                    "ttg.async_copy_global_to_local without faithful DMA",
-                )
         except ValueError as exc:
             errors.append(exc)
             continue

@@ -91,13 +91,11 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
         wave = wave.decode()
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == compiled.metadata.tlx_wave_num_async_copies
     assert compiled.metadata.tlx_wave_num_async_waits >= 2
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "scf.for" in wave
-    assert "waveamd.dma_load_lds" not in wave
-    assert "wave.load" in wave
-    assert "wave.store" in wave
+    assert "waveamd.dma_load_lds" in wave
     assert "waveamd.mma" in wave
     assert "waveamdmachine.target" in wave
 
@@ -109,10 +107,8 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     if isinstance(wave, bytes):
         wave = wave.decode()
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
-    assert "waveamd.dma_load_lds" not in wave
-    assert "wave.load" in wave
-    assert "wave.store" in wave
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == compiled.metadata.tlx_wave_num_async_copies
+    assert "waveamd.dma_load_lds" in wave
     assert "ttg.async_copy_global_to_local" not in wave
 
 

@@ -1133,7 +1133,7 @@ def test_tlx_wave_lowers_generic_tensor_layout_with_repeated_components(tmp_path
     del ctx
 
 
-def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_without_dma():
+def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_as_dma():
     src = ASTSource(
         fn=_tlx_wave_gemm_cutoff_kernel,
         signature={
@@ -1161,10 +1161,8 @@ def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_without_dma():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
-    assert "waveamd.dma_load_lds" not in wave_artifact
-    assert "wave.load" in wave_artifact
-    assert "wave.store" in wave_artifact
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
+    assert wave_artifact.count("waveamd.dma_load_lds") == 4
     assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
@@ -1195,7 +1193,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 2
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 2
     assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
     assert compiled.metadata.tlx_wave_num_async_waits == 1
     assert compiled.metadata.tlx_wave_num_wave_barriers == 1
@@ -1208,9 +1206,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     assert "isTransposed = true" in ttgir
     assert ttgir.count("#ttg.padded_shared") == 2
     assert "parent = #mma, kWidth = 8" in ttgir
-    assert "waveamd.dma_load_lds" not in wave_artifact
-    assert "wave.load" in wave_artifact
-    assert "wave.store" in wave_artifact
+    assert wave_artifact.count("waveamd.dma_load_lds") == 2
     assert wave_artifact.count("wave.wait") == 1
     assert wave_artifact.count("wave.barrier") == 1
     assert "ttg.local_load" not in wave_artifact
@@ -1331,6 +1327,86 @@ def test_tlx_wave_async_copy_lowers_contiguous_f16_as_16_byte_dma(tmp_path):
     assert "bytes = 16" in wave_artifact
     assert "waveamdmachine.global_load_lds_b128" in machine
     assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_padded_chunk_crossing_pad_falls_back(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.padded_shared<[64:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [2, 0], [4, 0], [8, 0], [16, 0], [1, 0]], block = []}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_padded_crosses_pad(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
+    %row_stride = arith.constant dense<32> : tensor<32x1xi32, #blocked>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi32, #blocked>
+    %row_off = arith.muli %rows_2d, %row_stride : tensor<32x1xi32, #blocked>
+    %row_offs = tt.broadcast %row_off : tensor<32x1xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+    %col_offs = tt.broadcast %cols_2d : tensor<1x32xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %offs = arith.addi %row_offs, %col_offs : tensor<32x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f16>, #blocked>, tensor<32x32xi32, #blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<32x32x!tt.ptr<f16>, #blocked> -> <32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_lowers_swizzled_f16_as_dma(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_swizzled_dma(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
+    %row_stride = arith.constant dense<32> : tensor<32x1xi32, #blocked>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi32, #blocked>
+    %row_off = arith.muli %rows_2d, %row_stride : tensor<32x1xi32, #blocked>
+    %row_offs = tt.broadcast %row_off : tensor<32x1xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+    %col_offs = tt.broadcast %cols_2d : tensor<1x32xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %offs = arith.addi %row_offs, %col_offs : tensor<32x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f16>, #blocked>, tensor<32x32xi32, #blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<32x32x!tt.ptr<f16>, #blocked> -> <32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    assert wave_artifact.count("waveamd.dma_load_lds") == 1
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    assert "wave.load" not in wave_artifact
     del ctx
 
 
