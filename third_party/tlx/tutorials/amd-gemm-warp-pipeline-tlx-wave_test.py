@@ -13,9 +13,7 @@ def _load_gemm_wp_module():
     return module
 
 
-def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
-
+def _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=1, stride_bn=1):
     import triton
     from triton import knobs
     from triton.backends import backends
@@ -55,9 +53,9 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
             n,
             k,
             a.stride()[0],
-            a.stride()[1],
+            stride_ak,
             b.stride()[0],
-            b.stride()[1],
+            stride_bn,
             c.stride()[0],
             c.stride()[1],
             BLOCK_M=block_m,
@@ -73,6 +71,13 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
             matrix_instr_nonkdim=16,
             grid=grid,
         )
+    return compiled
+
+
+def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path)
 
     wave = compiled.asm["wave"]
     if isinstance(wave, bytes):
@@ -86,3 +91,10 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert "waveamd.dma_load_lds" in wave
     assert "waveamd.mma" in wave
     assert "waveamdmachine.target" in wave
+
+
+def test_gemm_wp_tlx_wave_rejects_noncontiguous_inner_stride(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+
+    with pytest.raises(ValueError, match="source pointer.*not provably contiguous"):
+        _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=2)

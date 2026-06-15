@@ -39,9 +39,9 @@ def gemm_wp(
     N,
     K,
     stride_am,
-    stride_ak,
+    stride_ak: tl.constexpr,
     stride_bk,
-    stride_bn,
+    stride_bn: tl.constexpr,
     stride_cm,
     stride_cn,
     BLOCK_M: tl.constexpr,
@@ -52,12 +52,10 @@ def gemm_wp(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
 ):
+    tl.static_assert(stride_ak > 0, "stride_ak must be positive")
+    tl.static_assert(stride_bn > 0, "stride_bn must be positive")
     tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
-    tl.assume(stride_ak == 1)
-    tl.assume(stride_bn == 1)
     tl.assume(M % BLOCK_M == 0)
     tl.assume(N % BLOCK_N == 0)
     tl.assume(K % BLOCK_K == 0)
@@ -159,8 +157,6 @@ NUM_XCDS = 8
 def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
     M, K = a.shape
     _, N = b.shape
-    if a.stride(1) != 1 or b.stride(1) != 1:
-        raise ValueError("gemm_wp requires unit inner strides for f16 dword DMA packets")
     if M % bm or N % bn:
         raise ValueError("gemm_wp requires M/N to be divisible by BLOCK_M/BLOCK_N")
     if K % bk:
