@@ -59,6 +59,22 @@ class _IndexExpr:
 
 
 @dataclass(frozen=True)
+class _IndexBinary:
+    kind: object
+    lhs: object
+    rhs: object
+
+
+@dataclass(frozen=True)
+class _IndexSelectCompare:
+    predicate: str
+    lhs: object
+    rhs: object
+    true_value: object
+    false_value: object
+
+
+@dataclass(frozen=True)
 class _DimBinding:
     dim: int
 
@@ -125,6 +141,15 @@ def _is_deferred_index(source):
         return True
     if isinstance(source, _IndexExpr):
         return any(_is_deferred_index(value) for value in source.bindings.values())
+    if isinstance(source, _IndexBinary):
+        return _is_deferred_index(source.lhs) or _is_deferred_index(source.rhs)
+    if isinstance(source, _IndexSelectCompare):
+        return (
+            _is_deferred_index(source.lhs)
+            or _is_deferred_index(source.rhs)
+            or _is_deferred_index(source.true_value)
+            or _is_deferred_index(source.false_value)
+        )
     return False
 
 
@@ -534,11 +559,63 @@ def _materialize_index_value(builder, source, dim_bindings, w, force_width=None)
         }
         value = builder.index_expr(source.expr, bindings)
         return _maybe_splat(builder, value, force_width, w)
+    if isinstance(source, _IndexBinary):
+        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
+        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
+        return _maybe_splat(builder, builder.binary(source.kind, lhs, rhs), force_width, w)
+    if isinstance(source, _IndexSelectCompare):
+        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
+        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
+        true_value = _materialize_index_value(
+            builder, source.true_value, dim_bindings, w
+        )
+        false_value = _materialize_index_value(
+            builder, source.false_value, dim_bindings, w
+        )
+        return _maybe_splat(
+            builder,
+            _index_select_compare_value(
+                builder,
+                source.predicate,
+                lhs,
+                rhs,
+                true_value,
+                false_value,
+                w,
+            ),
+            force_width,
+            w,
+        )
     if isinstance(source, _DimBinding):
         return _maybe_splat(
             builder, _dim_binding_value(dim_bindings, source, w), force_width, w
         )
     return _maybe_splat(builder, source, force_width, w)
+
+
+def _index_select_compare_value(
+    builder,
+    predicate,
+    lhs,
+    rhs,
+    true_value,
+    false_value,
+    w,
+):
+    width = None
+    for value in (lhs, rhs):
+        if w.SimdType.isinstance(value.type):
+            width = w.SimdType(value.type).width
+            break
+    if width is None:
+        condition = _arith_cmpi(builder, predicate, lhs, rhs, w)
+    else:
+        lhs = _maybe_splat(builder, lhs, width, w)
+        rhs = _maybe_splat(builder, rhs, width, w)
+        true_value = _maybe_splat(builder, true_value, width, w)
+        false_value = _maybe_splat(builder, false_value, width, w)
+        condition = _wave_cmpi(builder, predicate, lhs, rhs, w)
+    return builder.select(condition, true_value, false_value)
 
 
 def _false_mask(builder, w, width):
@@ -1662,6 +1739,20 @@ def _shift_index_dims(source, axis):
                 for symbol, binding in source.bindings.items()
             },
         )
+    if isinstance(source, _IndexBinary):
+        return _IndexBinary(
+            source.kind,
+            _shift_index_dims(source.lhs, axis),
+            _shift_index_dims(source.rhs, axis),
+        )
+    if isinstance(source, _IndexSelectCompare):
+        return _IndexSelectCompare(
+            source.predicate,
+            _shift_index_dims(source.lhs, axis),
+            _shift_index_dims(source.rhs, axis),
+            _shift_index_dims(source.true_value, axis),
+            _shift_index_dims(source.false_value, axis),
+        )
     return source
 
 
@@ -1864,7 +1955,59 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
     result = values[op.results[0]]
     lhs_symbol = w.sym(f"tlx_v{result.value_id}_lhs")
     rhs_symbol = w.sym(f"tlx_v{result.value_id}_rhs")
-    expr = lhs_symbol + rhs_symbol if op.name == "arith.addi" else lhs_symbol * rhs_symbol
+    expr = None
+    if op.name == "arith.addi":
+        expr = lhs_symbol + rhs_symbol
+    elif op.name == "arith.muli":
+        expr = lhs_symbol * rhs_symbol
+    elif op.name == "arith.subi":
+        expr = lhs_symbol - rhs_symbol
+    if expr is not None:
+        if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
+            lowered_lhs = _materialize_index_value(builder, lhs, {}, w)
+            lowered_rhs = _materialize_index_value(builder, rhs, {}, w)
+            _set_wave_value(
+                wave_values,
+                result.value_id,
+                "index_expr",
+                builder.index_expr(
+                    expr, {lhs_symbol: lowered_lhs, rhs_symbol: lowered_rhs}
+                ),
+            )
+            return
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "index_expr",
+            _IndexExpr(expr, {lhs_symbol: lhs, rhs_symbol: rhs}),
+        )
+        return
+
+    binary_kind = _wave_binary_kind_for_op(op.name, w)
+    if binary_kind is not None:
+        if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
+            _set_wave_value(
+                wave_values,
+                result.value_id,
+                "index_expr",
+                builder.binary(
+                    binary_kind,
+                    _materialize_index_value(builder, lhs, {}, w),
+                    _materialize_index_value(builder, rhs, {}, w),
+                ),
+            )
+            return
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "index_expr",
+            _IndexBinary(binary_kind, lhs, rhs),
+        )
+        return
+
+    minmax_predicate = _minmax_select_predicate(op.name)
+    if minmax_predicate is None:
+        raise ValueError(f"tlx_wave bridge cannot lower scalar/index {op.name}")
     if not _is_deferred_index(lhs) and not _is_deferred_index(rhs):
         lowered_lhs = _materialize_index_value(builder, lhs, {}, w)
         lowered_rhs = _materialize_index_value(builder, rhs, {}, w)
@@ -1872,8 +2015,14 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
             wave_values,
             result.value_id,
             "index_expr",
-            builder.index_expr(
-                expr, {lhs_symbol: lowered_lhs, rhs_symbol: lowered_rhs}
+            _index_select_compare_value(
+                builder,
+                minmax_predicate,
+                lowered_lhs,
+                lowered_rhs,
+                lowered_lhs,
+                lowered_rhs,
+                w,
             ),
         )
         return
@@ -1881,8 +2030,41 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
         wave_values,
         result.value_id,
         "index_expr",
-        _IndexExpr(expr, {lhs_symbol: lhs, rhs_symbol: rhs}),
+        _IndexSelectCompare(minmax_predicate, lhs, rhs, lhs, rhs),
     )
+
+
+def _wave_binary_kind_for_op(op_name, w):
+    return {
+        "arith.divsi": w.BinaryKind.DivSI,
+        "arith.divui": w.BinaryKind.DivUI,
+        "arith.remsi": w.BinaryKind.RemSI,
+        "arith.remui": w.BinaryKind.RemUI,
+    }.get(op_name)
+
+
+def _simd_binary_kind_for_op(op_name, w):
+    return {
+        "arith.addi": w.BinaryKind.AddI,
+        "arith.muli": w.BinaryKind.MulI,
+        "arith.subi": w.BinaryKind.SubI,
+        "arith.divsi": w.BinaryKind.DivSI,
+        "arith.divui": w.BinaryKind.DivUI,
+        "arith.remsi": w.BinaryKind.RemSI,
+        "arith.remui": w.BinaryKind.RemUI,
+        "arith.andi": w.BinaryKind.AndI,
+        "arith.ori": w.BinaryKind.OrI,
+        "arith.xori": w.BinaryKind.XOrI,
+    }.get(op_name)
+
+
+def _minmax_select_predicate(op_name):
+    return {
+        "arith.minsi": "sle",
+        "arith.minui": "ule",
+        "arith.maxsi": "sge",
+        "arith.maxui": "uge",
+    }.get(op_name)
 
 
 def _validate_simd_operand_layout(operand_plan, result_plan, op_name):
@@ -1988,6 +2170,38 @@ def _emit_simd_binary_op(builder, op, values, wave_values, w, kind):
     wave_values[result.value_id] = _result_wave_value_from_components(components)
 
 
+def _emit_simd_minmax_op(builder, op, values, wave_values, w, predicate):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError(f"tlx_wave bridge expected {op.name} with two operands")
+    result = values[op.results[0]]
+    if result.type_kind != "tensor" or not _is_integer_or_index_value(result):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op.name} as SIMD data: expected "
+            f"integer tensor result, got {result.type}"
+        )
+    lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
+    rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
+    component_count = _blocked_layout_component_count(
+        result, f"{op.name} result", "SIMD data min/max"
+    )
+    width = _tensor_lane_width(result, f"{op.name} result")
+    lhs_components = _simd_arith_operand_components(
+        builder, values, lhs, op.operands[0], result, component_count, width, w, op.name
+    )
+    rhs_components = _simd_arith_operand_components(
+        builder, values, rhs, op.operands[1], result, component_count, width, w, op.name
+    )
+    components = tuple(
+        builder.select(
+            _wave_cmpi(builder, predicate, lhs_component, rhs_component, w),
+            lhs_component,
+            rhs_component,
+        )
+        for lhs_component, rhs_component in zip(lhs_components, rhs_components)
+    )
+    wave_values[result.value_id] = _result_wave_value_from_components(components)
+
+
 def _emit_arith_binary_op(builder, op, values, wave_values, w):
     lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
     rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
@@ -1996,9 +2210,16 @@ def _emit_arith_binary_op(builder, op, values, wave_values, w):
         return
     data_kinds = {"simd", "simd_tuple", "index_expr"}
     if lhs.kind in data_kinds and rhs.kind in data_kinds:
-        binary_kind = w.BinaryKind.AddI if op.name == "arith.addi" else w.BinaryKind.MulI
-        _emit_simd_binary_op(builder, op, values, wave_values, w, binary_kind)
-        return
+        binary_kind = _simd_binary_kind_for_op(op.name, w)
+        if binary_kind is not None:
+            _emit_simd_binary_op(builder, op, values, wave_values, w, binary_kind)
+            return
+        minmax_predicate = _minmax_select_predicate(op.name)
+        if minmax_predicate is not None:
+            _emit_simd_minmax_op(
+                builder, op, values, wave_values, w, minmax_predicate
+            )
+            return
     _arith_mixed_error(op.name, lhs, rhs)
 
 
@@ -3101,7 +3322,19 @@ def _emit_generic_value_op(builder, state, op, w):
         _emit_splat_or_broadcast_op(builder, op, values, wave_values, w)
     elif op.name == "tt.expand_dims":
         _forward_lowered_value(op, values, wave_values)
-    elif op.name in {"arith.addi", "arith.muli"}:
+    elif op.name in {
+        "arith.addi",
+        "arith.divsi",
+        "arith.divui",
+        "arith.maxsi",
+        "arith.maxui",
+        "arith.minsi",
+        "arith.minui",
+        "arith.muli",
+        "arith.remsi",
+        "arith.remui",
+        "arith.subi",
+    }:
         _emit_arith_binary_op(builder, op, values, wave_values, w)
     elif op.name == "arith.cmpi":
         _emit_typed_cmp_op(builder, op, values, wave_values, w)
