@@ -519,6 +519,18 @@ def _is_wave_simd_index_type(typ, w):
     return "simd<index" in compact or "xindex>" in compact
 
 
+def _is_wave_simd_pointer_type(typ, w):
+    if typ is None:
+        return False
+    simd_type = getattr(w, "SimdType", None)
+    if simd_type is not None:
+        try:
+            return simd_type.isinstance(typ) and "ptr" in str(typ)
+        except (AttributeError, TypeError):
+            pass
+    return "simd<" in str(typ) and "ptr" in str(typ)
+
+
 def _wave_cmpi_operand(builder, value, w):
     typ = getattr(value, "type", None)
     if _is_wave_simd_index_type(typ, w):
@@ -891,6 +903,18 @@ def _linearized_tensor_offset_expr(shape, dim_bindings, w):
         offset = offset + _dim_symbol(w, dim) * stride
         stride *= int(shape[dim])
     return _IndexExpr(offset, dict(dim_bindings))
+
+
+def _linearized_tensor_packet_offset_expr(
+    shape, dim_bindings, packet_elements, w
+):
+    offset = _linearized_tensor_offset_expr(shape, dim_bindings, w)
+    if packet_elements == 1:
+        return offset
+    return _IndexExpr(
+        w.floor(offset.expr / int(packet_elements)),
+        dict(offset.bindings),
+    )
 
 
 def _zero_index_expr(w):
@@ -1885,7 +1909,7 @@ def _emit_constant_op(builder, op, values, wave_values, w):
             wave_values,
             value.value_id,
             "index_expr",
-            builder.index_expr(w.sym_ctx.int_(const)),
+            _IndexExpr(w.sym_ctx.int_(const), {}),
         )
     elif _scalar_data_type(value) is not None and isinstance(const, (int, float)):
         _set_wave_value(
@@ -2987,12 +3011,78 @@ def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     return packet_bytes
 
 
+def _dma_packet_elements(address, packet_bytes):
+    if address.element_byte_width is None:
+        return None
+    if packet_bytes % address.element_byte_width:
+        return None
+    return packet_bytes // address.element_byte_width
+
+
+def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
+    context = (
+        "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+        "without faithful DMA"
+    )
+    packet_elements = _dma_packet_elements(address, packet_bytes)
+    if packet_elements is None or packet_elements < 1:
+        raise ValueError(
+            f"{context}: source element width {address.element_byte_width} "
+            f"does not divide DMA packet size {packet_bytes}"
+        )
+    if packet_bytes != 4:
+        return None
+    if address.element_byte_width not in (2, 4):
+        return None
+    if address_plan.shape != memdesc.shape:
+        raise ValueError(
+            f"{context}: source tensor shape {address_plan.shape} does not "
+            f"match destination memdesc shape {memdesc.shape}"
+        )
+    layout = _blocked_tensor_layout_info(
+        address_plan,
+        "ttg.async_copy_global_to_local source",
+        "async copy DMA packet lowering",
+    )
+    rank = len(address_plan.shape)
+    row_major_order = tuple(reversed(range(rank)))
+    if layout.order != row_major_order:
+        raise ValueError(
+            f"{context}: source blocked layout order {layout.order} is not "
+            f"row-major order {row_major_order} for DMA packet lowering"
+        )
+    if any(int(value) != 1 for value in layout.size_per_thread):
+        raise ValueError(
+            f"{context}: source blocked layout sizePerThread "
+            f"{layout.size_per_thread} is not supported for DMA packet lowering"
+        )
+    inner_dim = rank - 1
+    if int(address_plan.shape[inner_dim]) % packet_elements:
+        raise ValueError(
+            f"{context}: innermost tensor extent {address_plan.shape[inner_dim]} "
+            f"is not divisible by {packet_elements} element DMA packets"
+        )
+    if int(layout.threads_per_warp[inner_dim]) % packet_elements:
+        raise ValueError(
+            f"{context}: innermost threadsPerWarp "
+            f"{layout.threads_per_warp[inner_dim]} is not divisible by "
+            f"{packet_elements} element DMA packets"
+        )
+    per_wave_elements = _product(layout.threads_per_warp)
+    if per_wave_elements % packet_elements:
+        raise ValueError(
+            f"{context}: per-wave source coverage {per_wave_elements} is not "
+            f"divisible by {packet_elements} element DMA packets"
+        )
+    return layout
+
+
 def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout, component_count):
     context = (
         "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
         "without faithful DMA"
     )
-    if component_count != 1:
+    if component_count != 1 and address.element_byte_width not in (2, 4):
         raise ValueError(
             f"{context}: source blocked layout maps to {component_count} "
             "components; repeated or multicomponent DMA lowering is not implemented"
@@ -3004,6 +3094,466 @@ def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout, component_
             "layout, memdesc view, or LDS alignment for waveamd.dma_load_lds"
         )
     return packet_bytes
+
+
+def _dma_packet_dim_bindings(
+    builder,
+    value_plan,
+    layout,
+    packet_elements,
+    component,
+    w,
+):
+    component_shape = _blocked_layout_component_shape(
+        value_plan.shape,
+        layout,
+        "ttg.async_copy_global_to_local source",
+        "async copy DMA packet lowering",
+    )
+    component_count = _product(component_shape)
+    if component < 0 or component >= component_count:
+        raise ValueError(
+            "tlx_wave bridge async copy DMA packet component "
+            f"{component} is out of range for componentShape={component_shape}"
+        )
+    width = _product(layout.threads_per_warp)
+    lanes_per_packet = width // int(packet_elements)
+    thread = builder.workitem_id(axis=0, width=width)
+    thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread")
+    lane_expr = w.mod(thread_sym, width)
+    packet_linear = lane_expr * int(packet_elements)
+    lane_coords = _delinearize_expr(
+        w,
+        packet_linear,
+        layout.threads_per_warp,
+        layout.order,
+    )
+    warp_coords = _delinearize_expr(
+        w,
+        w.floor(thread_sym / width),
+        layout.warps_per_cta,
+        layout.order,
+    )
+    component_coords = (
+        _delinearize_expr(w, w.sym_ctx.int_(component), component_shape, layout.order)
+        if component_count != 1
+        else None
+    )
+
+    dim_bindings = {}
+    active_lane = builder.index_expr(lane_expr, {thread_sym: thread})
+    active = _wave_cmpi(
+        builder,
+        "ult",
+        active_lane,
+        builder.splat(builder.constant(w.index_type(), lanes_per_packet), width=width),
+        w,
+    )
+    for dim in range(len(value_plan.shape)):
+        expanded_component = (
+            component_coords[dim]
+            if component_coords is not None
+            else w.sym_ctx.int_(0)
+        )
+        covered = _blocked_layout_dim_coverage(
+            layout,
+            dim,
+            "ttg.async_copy_global_to_local source",
+            "async copy DMA packet lowering",
+        )
+        coord_expr = (
+            lane_coords[dim]
+            + layout.threads_per_warp[dim] * warp_coords[dim]
+            + covered * expanded_component
+        )
+        coord = builder.index_expr(coord_expr, {thread_sym: thread})
+        dim_bindings[_dim_symbol(w, dim)] = coord
+        extent = builder.splat(
+            builder.constant(w.index_type(), value_plan.shape[dim]),
+            width=width,
+        )
+        in_bounds = _wave_cmpi(builder, "ult", coord, extent, w)
+        active = _wave_mask_and(builder, active, in_bounds, w, width)
+    return dim_bindings, width, active, thread
+
+
+def _dma_packet_uniform_dim_bindings(
+    builder,
+    value_plan,
+    layout,
+    component,
+    thread,
+    w,
+):
+    component_shape = _blocked_layout_component_shape(
+        value_plan.shape,
+        layout,
+        "ttg.async_copy_global_to_local source",
+        "async copy DMA packet lowering",
+    )
+    component_count = _product(component_shape)
+    width = _product(layout.threads_per_warp)
+    thread_first = builder.read_first(thread)
+    thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread_first")
+    lane_coords = _delinearize_expr(
+        w,
+        w.sym_ctx.int_(0),
+        layout.threads_per_warp,
+        layout.order,
+    )
+    warp_coords = _delinearize_expr(
+        w,
+        w.floor(thread_sym / width),
+        layout.warps_per_cta,
+        layout.order,
+    )
+    component_coords = (
+        _delinearize_expr(w, w.sym_ctx.int_(component), component_shape, layout.order)
+        if component_count != 1
+        else None
+    )
+
+    dim_bindings = {}
+    for dim in range(len(value_plan.shape)):
+        expanded_component = (
+            component_coords[dim]
+            if component_coords is not None
+            else w.sym_ctx.int_(0)
+        )
+        covered = _blocked_layout_dim_coverage(
+            layout,
+            dim,
+            "ttg.async_copy_global_to_local source",
+            "async copy DMA packet lowering",
+        )
+        coord_expr = (
+            lane_coords[dim]
+            + layout.threads_per_warp[dim] * warp_coords[dim]
+            + covered * expanded_component
+        )
+        dim_bindings[_dim_symbol(w, dim)] = builder.index_expr(
+            coord_expr,
+            {thread_sym: thread_first},
+        )
+    return dim_bindings
+
+
+def _offset_packet_dim_bindings(builder, dim_bindings, inner_dim, offset, w):
+    if offset == 0:
+        return dim_bindings
+    adjusted = dict(dim_bindings)
+    symbol = _dim_symbol(w, inner_dim)
+    source = adjusted[symbol]
+    offset_sym = w.sym(f"tlx_dma_packet_elem_{inner_dim}_{offset}")
+    adjusted[symbol] = builder.index_expr(
+        offset_sym + int(offset),
+        {offset_sym: source},
+    )
+    return adjusted
+
+
+def _ixsimpl_module():
+    import ixsimpl
+
+    return ixsimpl
+
+
+def _ixsimpl_simplify(expr, assumptions, w):
+    values = [expr]
+    w.sym_ctx.simplify_batch(values, assumptions=list(assumptions))
+    return values[0]
+
+
+def _ixsimpl_is_true(expr):
+    return str(expr) == "True"
+
+
+def _ixsimpl_is_false(expr):
+    return str(expr) == "False"
+
+
+def _ixsimpl_proves(expr, assumptions, w):
+    simplified = _ixsimpl_simplify(expr, assumptions, w)
+    if _ixsimpl_is_true(simplified):
+        return True
+    if _ixsimpl_is_false(simplified):
+        return False
+    return w.sym_ctx.check(simplified, assumptions=list(assumptions)) is True
+
+
+def _ixsimpl_expr_equal(lhs, rhs, assumptions, w):
+    ixs = _ixsimpl_module()
+    lhs = _ixsimpl_simplify(lhs, assumptions, w)
+    rhs = _ixsimpl_simplify(rhs, assumptions, w)
+    if ixs.same_node(lhs, rhs):
+        return True
+    return _ixsimpl_proves(w.sym_ctx.eq(lhs, rhs), assumptions, w)
+
+
+def _ixsimpl_predicate_equivalent(lhs, rhs, assumptions, w):
+    ixs = _ixsimpl_module()
+    lhs = _ixsimpl_simplify(lhs, assumptions, w)
+    rhs = _ixsimpl_simplify(rhs, assumptions, w)
+    if ixs.same_node(lhs, rhs):
+        return True
+    if _ixsimpl_is_true(lhs):
+        return _ixsimpl_proves(rhs, assumptions, w)
+    if _ixsimpl_is_false(lhs):
+        return _ixsimpl_proves(ixs.not_(rhs), assumptions, w)
+    if _ixsimpl_is_true(rhs):
+        return _ixsimpl_proves(lhs, assumptions, w)
+    if _ixsimpl_is_false(rhs):
+        return _ixsimpl_proves(ixs.not_(lhs), assumptions, w)
+    if _ixsimpl_proves(lhs, assumptions, w) and _ixsimpl_proves(rhs, assumptions, w):
+        return True
+    if _ixsimpl_proves(ixs.not_(lhs), assumptions, w) and _ixsimpl_proves(
+        ixs.not_(rhs), assumptions, w
+    ):
+        return True
+    return False
+
+
+def _ixsimpl_unknown_expr(source, unknowns, w):
+    key = id(source)
+    expr = unknowns.get(key)
+    if expr is None:
+        expr = w.sym(f"tlx_dma_unknown_{len(unknowns)}")
+        unknowns[key] = expr
+    return expr
+
+
+def _ixsimpl_index_expr(source, w, unknowns):
+    if isinstance(source, bool):
+        return None
+    if isinstance(source, int):
+        return w.sym_ctx.int_(source)
+    if isinstance(source, _DimBinding):
+        return _dim_symbol(w, source.dim)
+    if isinstance(source, _IndexExpr):
+        expr = source.expr
+        for symbol, binding in source.bindings.items():
+            replacement = _ixsimpl_index_expr(binding, w, unknowns)
+            if replacement is None:
+                return None
+            expr = expr.subs(symbol, replacement)
+        return expr
+    if isinstance(source, (_IndexBinary, _IndexSelectCompare)):
+        return None
+    typ = getattr(source, "type", None)
+    if typ is None:
+        return None
+    if _is_wave_simd_index_type(typ, w):
+        return None
+    return _ixsimpl_unknown_expr(source, unknowns, w)
+
+
+def _ixsimpl_pointer_offset_expr(source, w, unknowns):
+    if isinstance(source, _PointerBase):
+        return w.sym_ctx.int_(0)
+    if isinstance(source, _PointerAdd):
+        base = _ixsimpl_pointer_offset_expr(source.base, w, unknowns)
+        offset = _ixsimpl_index_expr(source.offset, w, unknowns)
+        if base is None or offset is None:
+            return None
+        return base + offset
+    typ = getattr(source, "type", None)
+    if typ is not None and _is_wave_simd_pointer_type(typ, w):
+        return None
+    return w.sym_ctx.int_(0)
+
+
+def _ixsimpl_shift_dim(expr, dim, offset, w):
+    if offset == 0:
+        return expr
+    symbol = _dim_symbol(w, dim)
+    return expr.subs(symbol, symbol + int(offset))
+
+
+def _ixsimpl_mask_compare_expr(predicate, lhs, rhs, w):
+    if predicate == "eq":
+        return w.sym_ctx.eq(lhs, rhs)
+    if predicate == "ne":
+        return w.sym_ctx.ne(lhs, rhs)
+    if predicate == "slt":
+        return lhs < rhs
+    if predicate == "sle":
+        return lhs <= rhs
+    if predicate == "sgt":
+        return lhs > rhs
+    if predicate == "sge":
+        return lhs >= rhs
+    return None
+
+
+def _ixsimpl_mask_expr(source, w, unknowns):
+    ixs = _ixsimpl_module()
+    if isinstance(source, _MaskConst):
+        return w.sym_ctx.true_() if source.value else w.sym_ctx.false_()
+    if isinstance(source, _MaskAnd):
+        lhs = _ixsimpl_mask_expr(source.lhs, w, unknowns)
+        rhs = _ixsimpl_mask_expr(source.rhs, w, unknowns)
+        if lhs is None or rhs is None:
+            return None
+        return ixs.and_(lhs, rhs)
+    if isinstance(source, _MaskCompare):
+        lhs = _ixsimpl_index_expr(source.lhs, w, unknowns)
+        rhs = _ixsimpl_index_expr(source.rhs, w, unknowns)
+        if lhs is None or rhs is None:
+            return None
+        return _ixsimpl_mask_compare_expr(source.predicate, lhs, rhs, w)
+    return None
+
+
+def _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w):
+    assumptions = []
+    for dim, extent in enumerate(shape):
+        symbol = _dim_symbol(w, dim)
+        assumptions.append(symbol >= 0)
+        upper = int(extent) - 1
+        if dim == inner_dim:
+            upper = int(extent) - int(packet_elements)
+        assumptions.append(symbol <= upper)
+    if packet_elements > 1:
+        symbol = _dim_symbol(w, inner_dim)
+        assumptions.append(
+            w.sym_ctx.eq(
+                w.mod(symbol, int(packet_elements)),
+                w.sym_ctx.int_(0),
+            )
+        )
+    return tuple(assumptions)
+
+
+def _require_dma_packet_source_contiguous(
+    pointer_source,
+    packet_elements,
+    inner_dim,
+    w,
+):
+    if packet_elements <= 1:
+        return
+    unknowns = {}
+    offset = _ixsimpl_pointer_offset_expr(pointer_source, w, unknowns)
+    if offset is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: f16/bf16 DMA packet source pointer is not "
+            "provably contiguous across packet elements"
+        )
+    for packet_element in range(1, packet_elements):
+        shifted = _ixsimpl_shift_dim(offset, inner_dim, packet_element, w)
+        expected = offset + int(packet_element)
+        if not _ixsimpl_expr_equal(shifted, expected, (), w):
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "without faithful DMA: f16/bf16 DMA packet source pointer is "
+                "not provably contiguous across packet elements"
+            )
+
+
+def _require_dma_packet_mask_uniform(
+    mask_source,
+    shape,
+    packet_elements,
+    inner_dim,
+    w,
+):
+    if mask_source is None or packet_elements <= 1:
+        return
+    unknowns = {}
+    mask = _ixsimpl_mask_expr(mask_source, w, unknowns)
+    if mask is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: f16/bf16 DMA packet mask is not provably "
+            "uniform across packet elements"
+        )
+    assumptions = _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w)
+    for packet_element in range(1, packet_elements):
+        shifted = _ixsimpl_shift_dim(mask, inner_dim, packet_element, w)
+        if not _ixsimpl_predicate_equivalent(mask, shifted, assumptions, w):
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "without faithful DMA: f16/bf16 DMA packet mask is not "
+                "provably uniform across packet elements"
+            )
+
+
+def _emit_dma_packet_ptrs(
+    builder,
+    state,
+    address,
+    address_plan,
+    memdesc,
+    memdescs,
+    lds_layout,
+    packet_bytes,
+    layout,
+    component,
+    w,
+):
+    packet_elements = _dma_packet_elements(address, packet_bytes)
+    if packet_elements is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: unknown DMA packet element count"
+        )
+    pointer_source = _require_lowered_value(
+        state["wave_values"],
+        address.address_value_id,
+        "pointer_expr",
+        "ttg.async_copy_global_to_local source",
+    )
+    _require_dma_packet_source_contiguous(
+        pointer_source,
+        packet_elements,
+        len(address_plan.shape) - 1,
+        w,
+    )
+    dim_bindings, width, active, thread = _dma_packet_dim_bindings(
+        builder,
+        address_plan,
+        layout,
+        packet_elements,
+        component,
+        w,
+    )
+    source = _materialize_pointer_value(
+        builder,
+        pointer_source,
+        dim_bindings,
+        w,
+    )
+    destination_base = _emit_memdesc_base_ptr(
+        builder,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        w.i32(),
+        4,
+        w,
+        "ttg.async_copy_global_to_local destination",
+    )
+    uniform_bindings = _dma_packet_uniform_dim_bindings(
+        builder,
+        address_plan,
+        layout,
+        component,
+        thread,
+        w,
+    )
+    destination_offset = _linearized_tensor_packet_offset_expr(
+        memdesc.shape,
+        uniform_bindings,
+        packet_elements,
+        w,
+    )
+    destination = builder.ptr_add(
+        destination_base,
+        _materialize_index_value(builder, destination_offset, {}, w),
+    )
+    return source, destination, dim_bindings, width, active
 
 
 def _emit_async_source_ptr(builder, state, kernel, address, w, component=0):
@@ -3072,31 +3622,53 @@ def _emit_async_copy(
     dma_bytes = _require_dma_packet_bytes(
         address, memdesc, memdescs, lds_layout, component_count
     )
+    dma_packet_layout = _validate_dma_packet_layout(
+        address_plan, address, memdesc, dma_bytes
+    )
+    mask_value = None
+    if address.mask_value_id is not None:
+        mask_value = _require_lowered_value(
+            state["wave_values"],
+            address.mask_value_id,
+            "mask_expr",
+            "ttg.async_copy_global_to_local mask",
+        )
+    if dma_packet_layout is not None:
+        packet_elements = _dma_packet_elements(address, dma_bytes)
+        if packet_elements is None:
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "without faithful DMA: unknown DMA packet element count"
+            )
+        _require_dma_packet_mask_uniform(
+            mask_value,
+            address_plan.shape,
+            packet_elements,
+            len(address_plan.shape) - 1,
+            w,
+        )
     stats.async_copies += 1
-    stats.dma_load_lds += 1
 
     token = after_token
     for component in range(component_count):
-        source, _element_type, dim_bindings, width, active = _emit_async_source_ptr(
-            builder, state, kernel, address, w, component=component
-        )
-        mask = active
-        if address.mask_value_id is not None:
-            user_mask = _materialize_mask_value(
+        if dma_packet_layout is not None:
+            source, destination, dim_bindings, width, active = _emit_dma_packet_ptrs(
                 builder,
-                _require_lowered_value(
-                    state["wave_values"],
-                    address.mask_value_id,
-                    "mask_expr",
-                    "ttg.async_copy_global_to_local mask",
-                ),
-                dim_bindings,
+                state,
+                address,
+                address_plan,
+                memdesc,
+                memdescs,
+                lds_layout,
+                dma_bytes,
+                dma_packet_layout,
+                component,
                 w,
-                width,
             )
-            mask = _wave_mask_and(builder, mask, user_mask, w, width)
-
-        def emit_copy(copy_after):
+        else:
+            source, _element_type, dim_bindings, width, active = _emit_async_source_ptr(
+                builder, state, kernel, address, w, component=component
+            )
             destination = _emit_memdesc_base_ptr(
                 builder,
                 memdesc,
@@ -3108,6 +3680,19 @@ def _emit_async_copy(
                 w,
                 "ttg.async_copy_global_to_local destination",
             )
+        mask = active
+        if mask_value is not None:
+            user_mask = _materialize_mask_value(
+                builder,
+                mask_value,
+                dim_bindings,
+                w,
+                width,
+            )
+            mask = _wave_mask_and(builder, mask, user_mask, w, width)
+
+        def emit_copy(copy_after):
+            stats.dma_load_lds += 1
             return builder.dma_load_lds(
                 source, destination, after=copy_after, bytes=dma_bytes
             )
