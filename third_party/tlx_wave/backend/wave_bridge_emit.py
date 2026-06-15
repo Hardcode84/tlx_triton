@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from .wave_bridge_plan import (
     _ASSUME_TREE_OPS,
+    _AMDMfmaEncodingInfo,
     _GFX950_DOT_PARENT_LAYOUT,
     _GFX950_F16_MMA_KIND,
     _GFX950_MMA_M,
@@ -14,16 +15,21 @@ from .wave_bridge_plan import (
     _GFX950_MMA_REGS,
     _GFX950_MMA_SHAPE,
     _GFX950_MMA_WAVE,
-    _GFX950_SHARED_LAYOUT,
     _BlockedEncodingInfo,
     _DotOperandEncodingInfo,
     _SwizzledSharedEncodingInfo,
     _WaveAsyncStats,
+    _amd_mfma_encoding_info,
     _async_address_by_token,
     _bridge_stage,
     _compute_lds_layout,
     _local_load_address_by_result,
     _memdescs_by_id,
+    _memdesc_size_bytes,
+    _padded_layout_bit_mapping,
+    _padded_shared_encoding_info,
+    _padded_shared_tile_storage_bytes,
+    _padded_static_byte_offset,
     _target_triple,
     _value_id,
     _values_by_id,
@@ -37,6 +43,20 @@ _WAVE_TOOL_NAMES = (
     "wave-symbols-test",
     "wave-translate",
     "wavec",
+)
+
+
+_GFX950_PROPAGATED_STORE_LAYOUT = _BlockedEncodingInfo(
+    size_per_thread=(1, 1),
+    threads_per_warp=(2, 32),
+    warps_per_cta=(4, 1),
+    order=(1, 0),
+)
+_GFX950_PIPELINED_STORE_LAYOUT = _BlockedEncodingInfo(
+    size_per_thread=(1, 4),
+    threads_per_warp=(8, 8),
+    warps_per_cta=(4, 1),
+    order=(1, 0),
 )
 
 
@@ -223,6 +243,37 @@ def _blocked_encoding_info(attr, raw_encoding, context):
     )
 
 
+def _dot_parent_encoding_info(attr, raw_encoding, context):
+    if attr is not None and _attr_bool(attr, "is_blocked_encoding"):
+        return _blocked_encoding_info(attr, raw_encoding, context)
+    parent_raw = None if attr is None else str(attr)
+    try:
+        mfma = _amd_mfma_encoding_info(parent_raw, context)
+    except ValueError as exc:
+        raise ValueError(f"tlx_wave bridge cannot lower {context}: {exc}") from exc
+    if mfma is not None:
+        return mfma
+    raise ValueError(
+        f"tlx_wave bridge expected blocked or #ttg.amd_mfma TTGIR encoding "
+        f"for {context}, got {parent_raw or raw_encoding}"
+    )
+
+
+def _dot_result_layout_info(attr, raw_encoding, context):
+    if attr is not None and _attr_bool(attr, "is_blocked_encoding"):
+        return _blocked_encoding_info(attr, raw_encoding, context)
+    try:
+        mfma = _amd_mfma_encoding_info(raw_encoding, context)
+    except ValueError as exc:
+        raise ValueError(f"tlx_wave bridge cannot lower {context}: {exc}") from exc
+    if mfma is not None:
+        return mfma
+    raise ValueError(
+        f"tlx_wave bridge expected blocked or #ttg.amd_mfma TTGIR encoding "
+        f"for {context}, got {raw_encoding}"
+    )
+
+
 def _swizzled_shared_encoding_info(attr, raw_encoding, context):
     if attr is None or not _attr_bool(attr, "is_swizzled_shared_encoding"):
         raise ValueError(
@@ -246,7 +297,29 @@ def _same_blocked_encoding(lhs, rhs):
     )
 
 
+def _same_amd_mfma_encoding(lhs, rhs):
+    return (
+        lhs.version == rhs.version
+        and lhs.warps_per_cta == rhs.warps_per_cta
+        and lhs.instr_shape == rhs.instr_shape
+        and lhs.is_transposed == rhs.is_transposed
+        and lhs.tiles_per_warp == rhs.tiles_per_warp
+        and lhs.element_bit_width == rhs.element_bit_width
+        and lhs.cga_layout == rhs.cga_layout
+    )
+
+
+def _same_dot_parent_encoding(lhs, rhs):
+    if isinstance(lhs, _BlockedEncodingInfo) and isinstance(rhs, _BlockedEncodingInfo):
+        return _same_blocked_encoding(lhs, rhs)
+    if isinstance(lhs, _AMDMfmaEncodingInfo) and isinstance(rhs, _AMDMfmaEncodingInfo):
+        return _same_amd_mfma_encoding(lhs, rhs)
+    return False
+
+
 def _same_layout_encoding(lhs, rhs):
+    if lhs.encoding is not None and lhs.encoding == rhs.encoding:
+        return True
     if lhs.encoding_attr is None or rhs.encoding_attr is None:
         return lhs.encoding_attr is None and rhs.encoding_attr is None
     if _attr_bool(lhs.encoding_attr, "is_blocked_encoding") and _attr_bool(
@@ -939,6 +1012,225 @@ def _linearized_tensor_dma_dword_offset_expr(
     )
 
 
+def _apply_symbolic_padding(byte_offset, element_byte_width, info, w, context):
+    padded = byte_offset
+    for interval, padding in zip(info.intervals, info.paddings):
+        interval_bytes = int(interval) * int(element_byte_width)
+        padding_bytes = int(padding) * int(element_byte_width)
+        if interval_bytes <= 0 or padding_bytes <= 0:
+            raise ValueError(f"tlx_wave bridge cannot lower {context}: invalid padded_shared interval")
+        padded = padded + w.floor(byte_offset / interval_bytes) * padding_bytes
+    return padded
+
+
+def _padded_shared_byte_offset_expr(
+    shape,
+    dim_bindings,
+    element_byte_width,
+    raw_encoding,
+    w,
+    context,
+):
+    info = _padded_shared_encoding_info(raw_encoding, context)
+    if info is None:
+        return None
+    if element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown element byte width "
+            "for padded shared-memory address"
+        )
+    rank = len(info.offset_vectors[0])
+    if len(shape) < rank:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: padded_shared rank {rank} "
+            f"exceeds shape {shape}"
+        )
+    prefix_rank = len(shape) - rank
+    bindings = dict(dim_bindings)
+    byte_offset = w.sym_ctx.int_(0)
+    if prefix_rank:
+        prefix_shape = shape[:prefix_rank]
+        prefix = _linearized_tensor_offset_expr(prefix_shape, dim_bindings, w)
+        tile_bytes = _padded_shared_tile_storage_bytes(
+            shape[prefix_rank:],
+            element_byte_width,
+            info,
+            context,
+        )
+        byte_offset = byte_offset + prefix.expr * int(tile_bytes)
+        bindings.update(prefix.bindings)
+
+    mapping = _padded_layout_bit_mapping(info, context)
+    tile_element_offset = w.sym_ctx.int_(0)
+    for (layout_dim, logical_bit), physical_bit in mapping.items():
+        dim = prefix_rank + int(layout_dim)
+        symbol = _dim_symbol(w, dim)
+        bit = w.mod(w.floor(symbol / (1 << int(logical_bit))), 2)
+        tile_element_offset = tile_element_offset + bit * (1 << int(physical_bit))
+    tile_byte_offset = tile_element_offset * int(element_byte_width)
+    byte_offset = byte_offset + _apply_symbolic_padding(
+        tile_byte_offset,
+        element_byte_width,
+        info,
+        w,
+        context,
+    )
+    return _IndexExpr(byte_offset, bindings)
+
+
+def _swizzled_shared_byte_offset_expr(
+    memdesc,
+    shape,
+    dim_bindings,
+    w,
+    context,
+):
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr, memdesc.encoding, context
+        )
+    except ValueError:
+        return None
+    if _is_identity_shared_layout(memdesc, shared):
+        return None
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown element byte width "
+            "for swizzled shared-memory address"
+        )
+    if len(shape) < 2 or shared.order != (1, 0):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unsupported swizzled "
+            f"shared layout shape={shape}, order={shared.order}; only rank-2 "
+            "order=[1, 0] swizzles are supported"
+        )
+    vec = int(shared.vec)
+    per_phase = int(shared.per_phase)
+    max_phase = int(shared.max_phase)
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: invalid swizzled shared "
+            f"parameters vec={vec}, perPhase={per_phase}, maxPhase={max_phase}"
+        )
+    prefix_rank = len(shape) - 2
+    rows = int(shape[prefix_rank])
+    cols = int(shape[prefix_rank + 1])
+    if cols % vec:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: swizzled shared columns "
+            f"{cols} are not divisible by vec={vec}"
+        )
+    bindings = dict(dim_bindings)
+    byte_offset = w.sym_ctx.int_(0)
+    if prefix_rank:
+        prefix = _linearized_tensor_offset_expr(shape[:prefix_rank], dim_bindings, w)
+        byte_offset = (
+            byte_offset
+            + prefix.expr * rows * cols * int(memdesc.element_byte_width)
+        )
+        bindings.update(prefix.bindings)
+
+    row = _dim_symbol(w, prefix_rank)
+    col = _dim_symbol(w, prefix_rank + 1)
+    phase = w.mod(w.floor(row / per_phase), max_phase)
+    col_group = w.floor(col / vec)
+    swizzled_col = w.xor(col_group, phase) * vec + w.mod(col, vec)
+    element_offset = row * cols + swizzled_col
+    byte_offset = byte_offset + element_offset * int(memdesc.element_byte_width)
+    return _IndexExpr(byte_offset, bindings)
+
+
+def _memdesc_pointer_offset_expr(
+    memdesc,
+    shape,
+    dim_bindings,
+    pointer_element_bytes,
+    w,
+    context,
+):
+    if pointer_element_bytes is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown pointer element "
+            "byte width for LDS address"
+        )
+    offset = _padded_shared_byte_offset_expr(
+        shape,
+        dim_bindings,
+        memdesc.element_byte_width,
+        memdesc.encoding,
+        w,
+        context,
+    )
+    if offset is None:
+        offset = _swizzled_shared_byte_offset_expr(
+            memdesc,
+            shape,
+            dim_bindings,
+            w,
+            context,
+        )
+    if offset is None:
+        offset = _linearized_tensor_scaled_offset_expr(
+            shape,
+            dim_bindings,
+            memdesc.element_byte_width,
+            pointer_element_bytes,
+            w,
+            context,
+        )
+        return offset
+    if pointer_element_bytes == 1:
+        return offset
+    return _IndexExpr(
+        w.floor(offset.expr / int(pointer_element_bytes)),
+        dict(offset.bindings),
+    )
+
+
+def _memdesc_dma_dword_offset_expr(
+    memdesc,
+    shape,
+    dim_bindings,
+    packet_elements,
+    packet_bytes,
+    w,
+):
+    if packet_bytes % 4:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            f"without faithful DMA: {packet_bytes}-byte DMA packet is not "
+            "addressable as i32 LDS words"
+        )
+    if _padded_shared_encoding_info(
+        memdesc.encoding,
+        "ttg.async_copy_global_to_local destination",
+    ) is None:
+        try:
+            shared = _swizzled_shared_encoding_info(
+                memdesc.encoding_attr,
+                memdesc.encoding,
+                "ttg.async_copy_global_to_local destination",
+            )
+        except ValueError:
+            shared = None
+        if shared is None or _is_identity_shared_layout(memdesc, shared):
+            return _linearized_tensor_dma_dword_offset_expr(
+                shape,
+                dim_bindings,
+                packet_elements,
+                packet_bytes,
+                w,
+            )
+    return _memdesc_pointer_offset_expr(
+        memdesc,
+        shape,
+        dim_bindings,
+        4,
+        w,
+        "ttg.async_copy_global_to_local destination",
+    )
+
+
 def _zero_index_expr(w):
     return _IndexExpr(w.sym_ctx.int_(0), {})
 
@@ -1034,7 +1326,211 @@ def _is_identity_shared_layout(memdesc, shared):
     )
 
 
+def _is_supported_swizzled_shared_layout(memdesc, shared):
+    if _is_identity_shared_layout(memdesc, shared):
+        return True
+    return (
+        len(memdesc.shape) >= 2
+        and shared.order == (1, 0)
+        and int(shared.vec) > 0
+        and int(shared.per_phase) > 0
+        and int(shared.max_phase) > 0
+        and int(memdesc.shape[-1]) % int(shared.vec) == 0
+    )
+
+
+def _static_delinearize_row_major(linear, shape):
+    coords = [0] * len(shape)
+    remainder = int(linear)
+    for dim in reversed(range(len(shape))):
+        extent = int(shape[dim])
+        coords[dim] = remainder % extent
+        remainder //= extent
+    if remainder:
+        raise ValueError(
+            f"tlx_wave bridge internal error: linear index {linear} exceeds "
+            f"shape {shape}"
+        )
+    return tuple(coords)
+
+
+def _swizzled_static_byte_offset(memdesc, shape, coords, shared, context):
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown element byte width "
+            "for swizzled shared-memory address"
+        )
+    if len(shape) < 2 or shared.order != (1, 0):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unsupported swizzled "
+            f"shared layout shape={shape}, order={shared.order}; only rank-2 "
+            "order=[1, 0] swizzles are supported"
+        )
+    vec = int(shared.vec)
+    per_phase = int(shared.per_phase)
+    max_phase = int(shared.max_phase)
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: invalid swizzled shared "
+            f"parameters vec={vec}, perPhase={per_phase}, maxPhase={max_phase}"
+        )
+    prefix_rank = len(shape) - 2
+    rows = int(shape[prefix_rank])
+    cols = int(shape[prefix_rank + 1])
+    if cols % vec:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: swizzled shared columns "
+            f"{cols} are not divisible by vec={vec}"
+        )
+    prefix_shape = shape[:prefix_rank]
+    prefix_coords = coords[:prefix_rank]
+    prefix_index = _static_linear_offset(prefix_shape, prefix_coords) if prefix_shape else 0
+    row = int(coords[prefix_rank])
+    col = int(coords[prefix_rank + 1])
+    phase = (row // per_phase) % max_phase
+    swizzled_col = ((col // vec) ^ phase) * vec + (col % vec)
+    if swizzled_col >= cols:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: swizzled column "
+            f"{swizzled_col} exceeds extent {cols}"
+        )
+    return (
+        (prefix_index * rows * cols + row * cols + swizzled_col)
+        * int(memdesc.element_byte_width)
+    )
+
+
+def _memdesc_static_byte_offset(memdesc, shape, coords, context):
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown element byte width "
+            "for shared-memory address"
+        )
+    padded_offset = _padded_static_byte_offset(
+        shape,
+        coords,
+        memdesc.element_byte_width,
+        memdesc.encoding,
+        context,
+    )
+    if padded_offset is not None:
+        return padded_offset
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr, memdesc.encoding, context
+        )
+    except ValueError:
+        return _static_linear_offset(shape, coords) * int(memdesc.element_byte_width)
+    if _is_identity_shared_layout(memdesc, shared):
+        return _static_linear_offset(shape, coords) * int(memdesc.element_byte_width)
+    return _swizzled_static_byte_offset(memdesc, shape, coords, shared, context)
+
+
+def _require_contiguous_physical_window(
+    memdesc,
+    shape,
+    start_linear,
+    element_count,
+    alignment_bytes,
+    context,
+):
+    total_elements = _product(shape)
+    if start_linear < 0 or start_linear + element_count > total_elements:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: physical window "
+            f"{start_linear}:{start_linear + element_count} exceeds shape {shape}"
+        )
+    first = None
+    for element in range(int(element_count)):
+        coords = _static_delinearize_row_major(start_linear + element, shape)
+        byte_offset = _memdesc_static_byte_offset(memdesc, shape, coords, context)
+        if first is None:
+            first = byte_offset
+            if first % int(alignment_bytes):
+                raise ValueError(
+                    f"tlx_wave bridge cannot lower {context}: physical byte "
+                    f"offset {first} is not {alignment_bytes}-byte aligned"
+                )
+            continue
+        expected = first + element * int(memdesc.element_byte_width)
+        if byte_offset != expected:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: logical elements "
+                f"{start_linear}:{start_linear + element_count} are not "
+                "physically contiguous in shared memory"
+            )
+
+
+def _require_dma_destination_physical_contiguous(
+    memdesc,
+    shape,
+    packet_elements,
+    packet_bytes,
+    context,
+):
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"{context}: unknown destination element byte width for DMA packet"
+        )
+    if packet_elements * int(memdesc.element_byte_width) != packet_bytes:
+        raise ValueError(
+            f"{context}: DMA packet has {packet_elements} elements but "
+            f"{packet_bytes} bytes for {memdesc.element_type}"
+        )
+    for start in range(0, _product(shape), int(packet_elements)):
+        _require_contiguous_physical_window(
+            memdesc,
+            shape,
+            start,
+            packet_elements,
+            4,
+            "ttg.async_copy_global_to_local destination",
+        )
+
+
+def _require_fragment_load_physical_contiguous(value, memdesc):
+    element_count = _GFX950_MMA_REGS * (4 // int(memdesc.element_byte_width))
+    for lane in range(_GFX950_MMA_WAVE):
+        _require_contiguous_physical_window(
+            memdesc,
+            memdesc.shape,
+            lane * element_count,
+            element_count,
+            4,
+            "ttg.local_load fragment source",
+        )
+
+
+def _padded_shared_layout_info(memdesc, context):
+    try:
+        return _padded_shared_encoding_info(memdesc.encoding, context)
+    except ValueError as exc:
+        raise ValueError(f"tlx_wave bridge cannot lower {context}: {exc}") from exc
+
+
+def _validate_padded_shared_layout(memdesc, context):
+    info = _padded_shared_layout_info(memdesc, context)
+    if info is None:
+        return None
+    rank = len(info.offset_vectors[0])
+    if len(memdesc.shape) < rank:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: padded_shared rank {rank} "
+            f"exceeds memdesc shape {memdesc.shape}"
+        )
+    _padded_shared_tile_storage_bytes(
+        memdesc.shape[len(memdesc.shape) - rank :],
+        memdesc.element_byte_width,
+        info,
+        context,
+    )
+    return info
+
+
 def _validate_generic_shared_layout(memdesc, context):
+    padded = _validate_padded_shared_layout(memdesc, context)
+    if padded is not None:
+        return
     try:
         shared = _swizzled_shared_encoding_info(
             memdesc.encoding_attr, memdesc.encoding, context
@@ -1043,14 +1539,12 @@ def _validate_generic_shared_layout(memdesc, context):
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: {exc}"
         ) from exc
-    if _is_identity_shared_layout(memdesc, shared):
+    if _is_supported_swizzled_shared_layout(memdesc, shared):
         return
     raise ValueError(
         f"tlx_wave bridge cannot lower {context}: unsupported shared-memory "
         "encoding for generic LDS addressing; expected contiguous unswizzled "
-        "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
-        "order = [rank-1, ..., 0]}> until shared-layout transforms are "
-        "implemented; "
+        "#ttg.swizzled_shared or rank-2 order=[1, 0] swizzled_shared; "
         f"got shape={memdesc.shape}, vec={shared.vec}, "
         f"perPhase={shared.per_phase}, maxPhase={shared.max_phase}, "
         f"order={shared.order}, encoding={memdesc.encoding}"
@@ -1070,7 +1564,7 @@ def _emit_memdesc_index_offset(
             f"tlx_wave bridge cannot lower {context}: memdesc_index view has "
             f"unknown element byte width for {memdesc.element_type}"
         )
-    view_bytes = _memdesc_logical_size_bytes(memdesc)
+    view_bytes = _memdesc_size_bytes(memdesc)
     if memdesc.static_index is not None:
         byte_offset = memdesc.static_index * view_bytes
         if byte_offset % pointer_element_bytes:
@@ -1352,6 +1846,15 @@ def _memdesc_static_subslice_offset_bytes(memdesc, parent, context):
             f"has unknown element byte width for {parent.element_type}"
         )
     shape = parent.alloc_shape or parent.shape
+    padded_offset = _padded_static_byte_offset(
+        shape,
+        _memdesc_subslice_offsets(memdesc, context),
+        parent.element_byte_width,
+        parent.encoding,
+        context,
+    )
+    if padded_offset is not None:
+        return padded_offset
     return (
         _static_linear_offset(shape, _memdesc_subslice_offsets(memdesc, context))
         * parent.element_byte_width
@@ -1447,7 +1950,7 @@ def _memdesc_base_is_aligned(
         return False
 
     if memdesc.view_op == "ttg.memdesc_index":
-        view_bytes = _memdesc_logical_size_bytes(memdesc)
+        view_bytes = _memdesc_size_bytes(memdesc)
         if memdesc.static_index is not None:
             return (memdesc.static_index * view_bytes) % pointer_element_bytes == 0
         return view_bytes % pointer_element_bytes == 0
@@ -1533,10 +2036,10 @@ def _emit_memdesc_ptr_for_type(
             w,
             context,
         )
-        offset = _linearized_tensor_scaled_offset_expr(
+        offset = _memdesc_pointer_offset_expr(
+            memdesc,
             memdesc.shape,
             dim_bindings,
-            memdesc.element_byte_width,
             pointer_element_bytes,
             w,
             context,
@@ -1590,10 +2093,10 @@ def _emit_memdesc_ptr_for_type(
             if memdesc.view_op == "ttg.memdesc_subslice"
             else memdesc.shape
         )
-        offset = _linearized_tensor_scaled_offset_expr(
+        offset = _memdesc_pointer_offset_expr(
+            memdesc,
             offset_shape,
             dim_bindings,
-            memdesc.element_byte_width,
             pointer_element_bytes,
             w,
             context,
@@ -1643,10 +2146,10 @@ def _emit_memdesc_ptr_for_type(
         pointer_element_type,
         offset=lds_layout.offsets[memdesc.value_id],
     )
-    offset = _linearized_tensor_scaled_offset_expr(
+    offset = _memdesc_pointer_offset_expr(
+        memdesc,
         memdesc.shape,
         dim_bindings,
-        memdesc.element_byte_width,
         pointer_element_bytes,
         w,
         context,
@@ -2986,6 +3489,14 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
         value_plan.encoding,
         "fragment store physical value",
     )
+    if (
+        _product(layout.size_per_thread) != frag.registers
+        and value_plan.element_type == "f32"
+        and value_plan.shape == _GFX950_MMA_SHAPE
+        and frag.registers == _product(_GFX950_DOT_PARENT_LAYOUT.size_per_thread)
+        and _same_blocked_encoding(layout, _GFX950_PROPAGATED_STORE_LAYOUT)
+    ):
+        layout = _GFX950_DOT_PARENT_LAYOUT
     rank = len(value_plan.shape)
     if (
         len(layout.size_per_thread) != rank
@@ -3045,6 +3556,17 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     return dim_bindings, frag.wave_size
 
 
+def _is_supported_fragment_store_layout(layout):
+    return any(
+        _same_blocked_encoding(layout, supported)
+        for supported in (
+            _GFX950_DOT_PARENT_LAYOUT,
+            _GFX950_PROPAGATED_STORE_LAYOUT,
+            _GFX950_PIPELINED_STORE_LAYOUT,
+        )
+    )
+
+
 def _dot_operand_encoding_info(value, context):
     attr = value.encoding_attr
     if attr is None or not _attr_bool(attr, "is_dot_operand_encoding"):
@@ -3056,7 +3578,7 @@ def _dot_operand_encoding_info(value, context):
     return _DotOperandEncodingInfo(
         int(_attr_value(attr, "get_dot_operand_op_idx")),
         int(_attr_value(attr, "get_dot_operand_k_width")),
-        _blocked_encoding_info(parent_attr, value.encoding, f"{context} parent"),
+        _dot_parent_encoding_info(parent_attr, value.encoding, f"{context} parent"),
     )
 
 
@@ -3064,7 +3586,7 @@ def _same_dot_operand_encoding(lhs, rhs):
     return (
         lhs.op_idx == rhs.op_idx
         and lhs.k_width == rhs.k_width
-        and _same_blocked_encoding(lhs.parent, rhs.parent)
+        and _same_dot_parent_encoding(lhs.parent, rhs.parent)
     )
 
 
@@ -3106,6 +3628,16 @@ def _require_physical_dot_operand_fragment(values, wave_values, value, context):
     )
 
 def _dma_packet_layout_supported(address, memdesc):
+    padded = _validate_padded_shared_layout(
+        memdesc,
+        "ttg.async_copy_global_to_local destination",
+    )
+    if padded is not None:
+        return (
+            memdesc.element_type == "f16"
+            and memdesc.shape == _GFX950_MMA_SHAPE
+            and address.shape == memdesc.shape
+        )
     try:
         shared = _swizzled_shared_encoding_info(
             memdesc.encoding_attr,
@@ -3114,11 +3646,12 @@ def _dma_packet_layout_supported(address, memdesc):
         )
     except ValueError:
         return False
-    return _is_identity_shared_layout(memdesc, shared) or (
+    if _is_identity_shared_layout(memdesc, shared):
+        return True
+    return _is_supported_swizzled_shared_layout(memdesc, shared) and (
         memdesc.element_type == "f16"
         and memdesc.shape == _GFX950_MMA_SHAPE
         and address.shape == memdesc.shape
-        and shared == _GFX950_SHARED_LAYOUT
     )
 
 
@@ -3195,6 +3728,13 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
             f"{context}: innermost tensor extent {address_plan.shape[inner_dim]} "
             f"is not divisible by {packet_elements} element DMA packets"
         )
+    _require_dma_destination_physical_contiguous(
+        memdesc,
+        memdesc.shape,
+        packet_elements,
+        packet_bytes,
+        context,
+    )
     return layout
 
 
@@ -3898,7 +4438,8 @@ def _emit_dma_packet_ptrs(
         thread,
         w,
     )
-    destination_offset = _linearized_tensor_dma_dword_offset_expr(
+    destination_offset = _memdesc_dma_dword_offset_expr(
+        memdesc,
         memdesc.shape,
         uniform_bindings,
         packet_elements,
@@ -5008,15 +5549,40 @@ def _unsupported_fragment_local_load(value, reason, memdesc=None):
 
 
 def _validate_supported_dot_local_load_layout(value, memdesc, info):
-    if not _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
+    if isinstance(info.parent, _BlockedEncodingInfo):
+        if not _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
+            _unsupported_fragment_local_load(
+                value,
+                "current flat gfx950 fragment loader supports only dot operand "
+                "parent layout sizePerThread=(2, 2), threadsPerWarp=(4, 16), "
+                "warpsPerCTA=(4, 1), order=(1, 0); "
+                f"got sizePerThread={info.parent.size_per_thread}, "
+                f"threadsPerWarp={info.parent.threads_per_warp}, "
+                f"warpsPerCTA={info.parent.warps_per_cta}, order={info.parent.order}",
+                memdesc,
+            )
+    elif isinstance(info.parent, _AMDMfmaEncodingInfo):
+        if not (
+            info.parent.version == 4
+            and info.parent.warps_per_cta == (2, 2)
+            and info.parent.instr_shape == (16, 16, 32)
+            and info.parent.is_transposed
+        ):
+            _unsupported_fragment_local_load(
+                value,
+                "current flat gfx950 fragment loader supports only "
+                "#ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], "
+                "instrShape = [16, 16, 32], isTransposed = true}>; "
+                f"got version={info.parent.version}, "
+                f"warpsPerCTA={info.parent.warps_per_cta}, "
+                f"instrShape={info.parent.instr_shape}, "
+                f"isTransposed={info.parent.is_transposed}",
+                memdesc,
+            )
+    else:
         _unsupported_fragment_local_load(
             value,
-            "current flat gfx950 fragment loader supports only dot operand "
-            "parent layout sizePerThread=(2, 2), threadsPerWarp=(4, 16), "
-            "warpsPerCTA=(4, 1), order=(1, 0); "
-            f"got sizePerThread={info.parent.size_per_thread}, "
-            f"threadsPerWarp={info.parent.threads_per_warp}, "
-            f"warpsPerCTA={info.parent.warps_per_cta}, order={info.parent.order}",
+            f"unsupported dot operand parent layout {info.parent}",
             memdesc,
         )
     try:
@@ -5024,13 +5590,17 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
             memdesc.encoding_attr, memdesc.encoding, "ttg.local_load memdesc"
         )
     except ValueError as exc:
+        padded = _validate_padded_shared_layout(memdesc, "ttg.local_load memdesc")
+        if padded is not None:
+            return
         _unsupported_fragment_local_load(value, str(exc), memdesc)
-    if shared != _GFX950_SHARED_LAYOUT:
+    if not _is_supported_swizzled_shared_layout(memdesc, shared):
         _unsupported_fragment_local_load(
             value,
             "current flat gfx950 fragment loader supports only "
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
-            "order = [1, 0]}> for f16 32x32 dot operands; "
+            "order = [1, 0]}> or a supported #ttg.padded_shared layout "
+            "for f16 32x32 dot operands; "
             f"got vec={shared.vec}, perPhase={shared.per_phase}, "
             f"maxPhase={shared.max_phase}, order={shared.order}",
             memdesc,
@@ -5050,10 +5620,10 @@ def _validate_dot_operand_fragment_load(value, memdesc, info):
         _unsupported_fragment_local_load(
             value, f"expected opIdx 0/1, got {info.op_idx}", memdesc
         )
-    if info.k_width not in (0, 4, 32):
+    if info.k_width not in (0, 4, 8, 32):
         _unsupported_fragment_local_load(
             value,
-            f"expected kWidth 0, 4, or 32 for gfx950 f16 MFMA, got {info.k_width}",
+            f"expected kWidth 0, 4, 8, or 32 for gfx950 f16 MFMA, got {info.k_width}",
             memdesc,
         )
     if memdesc.element_type != "f16" or memdesc.element_byte_width != 2:
@@ -5069,6 +5639,7 @@ def _validate_dot_operand_fragment_load(value, memdesc, info):
             memdesc,
         )
     _validate_supported_dot_local_load_layout(value, memdesc, info)
+    _require_fragment_load_physical_contiguous(value, memdesc)
 
 
 def _physical_local_load_fragment_capability(value, memdesc):
@@ -5107,17 +5678,23 @@ def _physical_local_load_fragment_regs_capability(value, memdesc):
             memdesc.encoding_attr, memdesc.encoding, "ttg.local_load memdesc"
         )
     except ValueError as exc:
+        padded = _validate_padded_shared_layout(memdesc, "ttg.local_load memdesc")
+        if padded is not None:
+            _require_fragment_load_physical_contiguous(value, memdesc)
+            return True
         _unsupported_fragment_local_load(value, str(exc), memdesc)
-    if shared != _GFX950_SHARED_LAYOUT:
+    if not _is_supported_swizzled_shared_layout(memdesc, shared):
         _unsupported_fragment_local_load(
             value,
             "current flat gfx950 fragment register loader supports only "
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
-            "order = [1, 0]}> for f16 32x32 dot operands; "
+            "order = [1, 0]}> or a supported #ttg.padded_shared layout "
+            "for f16 32x32 dot operands; "
             f"got vec={shared.vec}, perPhase={shared.per_phase}, "
             f"maxPhase={shared.max_phase}, order={shared.order}",
             memdesc,
         )
+    _require_fragment_load_physical_contiguous(value, memdesc)
     return True
 
 
@@ -5138,6 +5715,69 @@ def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, 
         _unsupported_fragment_local_load(value, str(exc), memdesc)
 
 
+def _fragment_lane_dim_bindings(builder, value, memdesc, w):
+    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
+    lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane")
+    elements_per_lane = _GFX950_MMA_REGS * (4 // int(memdesc.element_byte_width))
+    element_linear = lane_sym * int(elements_per_lane)
+    row_major_order = tuple(reversed(range(len(memdesc.shape))))
+    coords = _delinearize_expr(w, element_linear, memdesc.shape, row_major_order)
+    return {
+        _dim_symbol(w, dim): builder.index_expr(coords[dim], {lane_sym: lane})
+        for dim in range(len(memdesc.shape))
+    }
+
+
+def _memdesc_needs_encoded_fragment_offset(memdesc):
+    if _padded_shared_encoding_info(
+        memdesc.encoding,
+        "ttg.local_load fragment source",
+    ) is not None:
+        return True
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr,
+            memdesc.encoding,
+            "ttg.local_load fragment source",
+        )
+    except ValueError:
+        return False
+    return not _is_identity_shared_layout(memdesc, shared)
+
+
+def _fragment_dense_i32_offset(builder, value, w):
+    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
+    lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane_dense")
+    return builder.index_expr(
+        lane_sym * _GFX950_MMA_REGS,
+        {lane_sym: lane},
+    )
+
+
+def _emit_fragment_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, w):
+    base = _emit_memdesc_i32_ptr(
+        builder, value, memdesc, memdescs, lds_layout, state, w
+    )
+    if _memdesc_needs_encoded_fragment_offset(memdesc):
+        dim_bindings = _fragment_lane_dim_bindings(builder, value, memdesc, w)
+        offset = _memdesc_pointer_offset_expr(
+            memdesc,
+            memdesc.shape,
+            dim_bindings,
+            4,
+            w,
+            "ttg.local_load fragment source",
+        )
+        offset = _materialize_index_value(builder, offset, {}, w)
+    else:
+        offset = _fragment_dense_i32_offset(builder, value, w)
+    return builder.ptr_add(
+        base,
+        offset,
+        w.simd_ptr_type(w.i32(), w.shared_address_space(), _GFX950_MMA_WAVE),
+    )
+
+
 def _emit_dot_operand_fragment_load(
     builder,
     address,
@@ -5151,19 +5791,14 @@ def _emit_dot_operand_fragment_load(
     w,
     stats,
 ):
-    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
-    lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane")
-    lane_offset = builder.index_expr(
-        lane_sym * _GFX950_MMA_REGS,
-        {lane_sym: lane},
-    )
-    base = _emit_memdesc_i32_ptr(
-        builder, value, memdesc, memdescs, lds_layout, state, w
-    )
-    ptr = builder.ptr_add(
-        base,
-        lane_offset,
-        w.simd_ptr_type(w.i32(), w.shared_address_space(), _GFX950_MMA_WAVE),
+    ptr = _emit_fragment_i32_ptr(
+        builder,
+        value,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        w,
     )
     fragment, token = builder.fragment_load(
         ptr, _fragment_type_for_dot_operand(capability.info, w), after=after_token
@@ -5184,19 +5819,14 @@ def _emit_dot_operand_register_load(
     w,
     stats,
 ):
-    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
-    lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane")
-    lane_offset = builder.index_expr(
-        lane_sym * _GFX950_MMA_REGS,
-        {lane_sym: lane},
-    )
-    base = _emit_memdesc_i32_ptr(
-        builder, value, memdesc, memdescs, lds_layout, state, w
-    )
-    ptr = builder.ptr_add(
-        base,
-        lane_offset,
-        w.simd_ptr_type(w.i32(), w.shared_address_space(), _GFX950_MMA_WAVE),
+    ptr = _emit_fragment_i32_ptr(
+        builder,
+        value,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        w,
     )
     load_type = w.simd_type(
         w.vector_type(_GFX950_MMA_REGS, w.i32()),
@@ -5281,17 +5911,17 @@ def _validate_dot_op(operands, acc, result):
             "tlx_wave bridge supports only static 32x32 tt.dot operands; "
             f"shapes={shapes}; operand encodings: {encodings}"
         )
-    if not _same_blocked_encoding(role_infos[0].parent, role_infos[1].parent):
+    if not _same_dot_parent_encoding(role_infos[0].parent, role_infos[1].parent):
         raise ValueError(
             "tlx_wave bridge expected matching tt.dot operand parent layouts; "
             f"role0 encoding: {role_values[0].encoding}; "
             f"role1 encoding: {role_values[1].encoding}"
         )
 
-    result_layout = _blocked_encoding_info(
+    result_layout = _dot_result_layout_info(
         result.encoding_attr, result.encoding, "tt.dot result"
     )
-    if not _same_blocked_encoding(role_infos[0].parent, result_layout):
+    if not _same_dot_parent_encoding(role_infos[0].parent, result_layout):
         raise ValueError(
             "tlx_wave bridge expected tt.dot result layout to match dot operand parent; "
             f"result encoding: {result.encoding}; "
@@ -5303,10 +5933,10 @@ def _validate_dot_op(operands, acc, result):
             f"got type={result.type}, encoding={result.encoding}"
         )
     if acc.type_kind == "tensor":
-        acc_layout = _blocked_encoding_info(
+        acc_layout = _dot_result_layout_info(
             acc.encoding_attr, acc.encoding, "tt.dot accumulator"
         )
-        if not _same_blocked_encoding(result_layout, acc_layout):
+        if not _same_dot_parent_encoding(result_layout, acc_layout):
             raise ValueError(
                 "tlx_wave bridge expected tt.dot accumulator layout to match result; "
                 f"accumulator encoding: {acc.encoding}; result encoding: {result.encoding}"
@@ -5640,11 +6270,55 @@ def _validate_fragment_store_value(value_plan, physical_plan):
             "that changes element type or shape: "
             f"physical type={physical_plan.type}, store type={value_plan.type}"
         )
-    _blocked_encoding_info(
-        physical_plan.encoding_attr,
-        physical_plan.encoding,
-        "fragment store physical value",
+    physical_layout = None
+    try:
+        physical_layout = _blocked_encoding_info(
+            physical_plan.encoding_attr,
+            physical_plan.encoding,
+            "fragment store physical value",
+        )
+    except ValueError:
+        pass
+    if physical_layout is not None:
+        if not _is_supported_fragment_store_layout(physical_layout):
+            raise ValueError(
+                "tlx_wave bridge cannot lower fragment store: unsupported "
+                "blocked fragment layout; expected the gfx950 dot-parent "
+                "layout or a known propagated store layout, got "
+                f"sizePerThread={physical_layout.size_per_thread}, "
+                f"threadsPerWarp={physical_layout.threads_per_warp}, "
+                f"warpsPerCTA={physical_layout.warps_per_cta}, "
+                f"order={physical_layout.order}"
+            )
+        return physical_plan
+    try:
+        mfma = _amd_mfma_encoding_info(
+            physical_plan.encoding,
+            "fragment store physical value",
+        )
+    except ValueError as exc:
+        raise ValueError(f"tlx_wave bridge cannot lower fragment store: {exc}") from exc
+    if mfma is None:
+        raise ValueError(
+            "tlx_wave bridge expected blocked or #ttg.amd_mfma encoding for "
+            f"fragment store physical value, got {physical_plan.encoding}"
+        )
+    value_layout = _blocked_encoding_info(
+        value_plan.encoding_attr,
+        value_plan.encoding,
+        "fragment store value",
     )
+    if not _is_supported_fragment_store_layout(value_layout):
+        raise ValueError(
+            "tlx_wave bridge cannot lower fragment store through #ttg.amd_mfma "
+            "using unsupported blocked store layout; expected the gfx950 "
+            "dot-parent layout or a known propagated store layout, got "
+            f"sizePerThread={value_layout.size_per_thread}, "
+            f"threadsPerWarp={value_layout.threads_per_warp}, "
+            f"warpsPerCTA={value_layout.warps_per_cta}, "
+            f"order={value_layout.order}"
+        )
+    return value_plan
 
 
 def _extract_fragment_component(regs, component, width, w):
@@ -5672,7 +6346,7 @@ def _emit_fragment_store(
     builder,
     state,
     lowered,
-    physical_plan,
+    store_plan,
     ptr_id,
     mask_id,
     after_token,
@@ -5684,7 +6358,7 @@ def _emit_fragment_store(
     token = after_token
     for component in range(frag.registers):
         dim_bindings, width = _store_dim_bindings(
-            builder, physical_plan, lowered, w, component=component
+            builder, store_plan, lowered, w, component=component
         )
         ptr = _materialize_pointer_value(
             builder,
@@ -6056,12 +6730,12 @@ def _emit_store_op(builder, op, state, w):
 
     if lowered.kind == "fragment":
         physical_plan = _physical_value_plan(values, lowered, value_id)
-        _validate_fragment_store_value(value_plan, physical_plan)
+        store_plan = _validate_fragment_store_value(value_plan, physical_plan)
         token = _emit_fragment_store(
             builder,
             state,
             lowered,
-            physical_plan,
+            store_plan,
             ptr_id,
             mask_id,
             _mem_root(state),

@@ -34,11 +34,20 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     def parse_options(self, opts) -> Any:
         opts = dict(opts)
         opts["backend_name"] = "tlx_wave"
+        # The current Wave machine path lowers gfx950
+        # mfma.f32.16x16x32.f16; select the matching Triton MFMA shape
+        # unless the caller explicitly asks for something else.
+        opts.setdefault("matrix_instr_nonkdim", 16)
         options = super().parse_options(opts)
         if options.arch != "gfx950":
             raise ValueError(f"tlx_wave stage-1 scaffold only supports gfx950, got {options.arch}")
         if options.warp_size != 64:
             raise ValueError(f"tlx_wave gfx950 expects wave64, got warp_size={options.warp_size}")
+        if options.matrix_instr_nonkdim != 16:
+            raise ValueError(
+                "tlx_wave gfx950 currently supports only matrix_instr_nonkdim=16 "
+                f"for Wave mfma.f32.16x16x32 lowering, got {options.matrix_instr_nonkdim}"
+            )
         return options
 
     @staticmethod
@@ -81,6 +90,14 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         passes.ttgpuir.add_f32_dot_tc(pm, False)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+        # Keep the HIP/TLX dot layout contract intact for the Wave bridge:
+        # accelerated dot metadata drives require_layout insertion, propagation
+        # retags the local_alloc/local_load chain, and the final cleanup removes
+        # layout conversions left behind by the propagation step.
+        amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
+        tlx.tlx_passes.add_tlx_insert_require_layout(pm)
+        tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
@@ -90,6 +107,9 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_canonicalizer(pm)
+        tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir_post_cf_lift")

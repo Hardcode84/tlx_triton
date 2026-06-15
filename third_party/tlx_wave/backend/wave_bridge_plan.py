@@ -1,3 +1,5 @@
+import ast
+import re
 from dataclasses import dataclass
 
 
@@ -312,10 +314,28 @@ class _SwizzledSharedEncodingInfo:
 
 
 @dataclass(frozen=True)
+class _PaddedSharedEncodingInfo:
+    intervals: tuple[int, ...]
+    paddings: tuple[int, ...]
+    offset_vectors: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _AMDMfmaEncodingInfo:
+    version: int
+    warps_per_cta: tuple[int, ...]
+    instr_shape: tuple[int, ...]
+    is_transposed: bool
+    tiles_per_warp: tuple[int, ...] | None = None
+    element_bit_width: int | None = None
+    cga_layout: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
 class _DotOperandEncodingInfo:
     op_idx: int
     k_width: int
-    parent: _BlockedEncodingInfo
+    parent: _BlockedEncodingInfo | _AMDMfmaEncodingInfo
 
 
 _GFX950_DOT_PARENT_LAYOUT = _BlockedEncodingInfo(
@@ -367,6 +387,268 @@ def _align_to(value, alignment):
 
 def _attr_str(attr):
     return None if attr is None else str(attr)
+
+
+def _is_power_of_two(value):
+    return value > 0 and value & (value - 1) == 0
+
+
+def _log2_power_of_two(value, context):
+    if not _is_power_of_two(value):
+        raise ValueError(f"{context}: expected a positive power of two, got {value}")
+    return value.bit_length() - 1
+
+
+def _static_linear_offset(shape, coords):
+    if len(shape) != len(coords):
+        raise ValueError(
+            "tlx_wave bridge internal error: static offset rank mismatch "
+            f"for shape={shape}, coords={coords}"
+        )
+    offset = 0
+    stride = 1
+    for dim in reversed(range(len(shape))):
+        offset += int(coords[dim]) * stride
+        stride *= int(shape[dim])
+    return offset
+
+
+def _extract_bracket_literal(text, key, context):
+    key_pos = text.find(key)
+    if key_pos < 0:
+        return None
+    start = text.find("[", key_pos)
+    if start < 0:
+        raise ValueError(f"{context}: malformed {key} list in {text}")
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise ValueError(f"{context}: unterminated {key} list in {text}")
+
+
+def _int_list_literal(text, key, context):
+    literal = _extract_bracket_literal(text, key, context)
+    if literal is None:
+        return None
+    try:
+        values = ast.literal_eval(literal)
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(f"{context}: cannot parse {key} list {literal}") from exc
+    return tuple(int(value) for value in values)
+
+
+def _offset_vectors_from_order_shape(order, shape, context):
+    vectors = []
+    rank = len(shape)
+    seen = sorted(int(dim) for dim in order)
+    if seen != list(range(rank)):
+        raise ValueError(
+            f"{context}: padded_shared order {order} is not a permutation of rank {rank}"
+        )
+    for dim in order:
+        extent = int(shape[dim])
+        bits = _log2_power_of_two(extent, context)
+        for bit in range(bits):
+            vector = [0] * rank
+            vector[int(dim)] = 1 << bit
+            vectors.append(tuple(vector))
+    return tuple(vectors)
+
+
+_PADDED_SHARED_RE = re.compile(
+    r"^#ttg\.padded_shared<\[(?P<pairs>[^\]]*)\]\s*\{(?P<body>.*)\}>$"
+)
+_PADDED_PAIR_RE = re.compile(r"(\d+)\s*:\+\s*(\d+)")
+_AMD_MFMA_RE = re.compile(r"^#ttg\.amd_mfma<\{(?P<body>.*)\}>$")
+
+
+def _padded_shared_encoding_info(raw_encoding, context="padded shared encoding"):
+    if raw_encoding is None:
+        return None
+    match = _PADDED_SHARED_RE.match(raw_encoding)
+    if match is None:
+        return None
+    pairs = tuple(
+        (int(interval), int(padding))
+        for interval, padding in _PADDED_PAIR_RE.findall(match.group("pairs"))
+    )
+    if not pairs:
+        raise ValueError(f"{context}: padded_shared has no interval/padding pairs")
+    for interval, padding in pairs:
+        _log2_power_of_two(interval, context)
+        _log2_power_of_two(padding, context)
+
+    body = match.group("body")
+    block = _int_list_literal(body, "block", context)
+    if block not in (None, ()):
+        raise ValueError(
+            f"{context}: padded_shared block layout {block} is not supported"
+        )
+    offset_literal = _extract_bracket_literal(body, "offset", context)
+    if offset_literal is not None:
+        try:
+            offset_vectors = tuple(
+                tuple(int(component) for component in vector)
+                for vector in ast.literal_eval(offset_literal)
+            )
+        except (SyntaxError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"{context}: cannot parse padded_shared offset list {offset_literal}"
+            ) from exc
+    else:
+        order = _int_list_literal(body, "order", context)
+        shape = _int_list_literal(body, "shape", context)
+        if order is None or shape is None:
+            raise ValueError(
+                f"{context}: padded_shared requires either offset vectors or order/shape"
+            )
+        offset_vectors = _offset_vectors_from_order_shape(order, shape, context)
+
+    if not offset_vectors:
+        raise ValueError(f"{context}: padded_shared has no offset vectors")
+    rank = len(offset_vectors[0])
+    if rank == 0 or any(len(vector) != rank for vector in offset_vectors):
+        raise ValueError(f"{context}: padded_shared offset vectors have inconsistent rank")
+    return _PaddedSharedEncodingInfo(
+        tuple(interval for interval, _ in pairs),
+        tuple(padding for _, padding in pairs),
+        offset_vectors,
+    )
+
+
+def _amd_mfma_encoding_info(raw_encoding, context="AMD MFMA encoding"):
+    if raw_encoding is None:
+        return None
+    match = _AMD_MFMA_RE.match(raw_encoding)
+    if match is None:
+        return None
+    body = match.group("body")
+    version_match = re.search(r"\bversion\s*=\s*(\d+)", body)
+    transposed_match = re.search(r"\bisTransposed\s*=\s*(true|false)", body)
+    warps_per_cta = _int_list_literal(body, "warpsPerCTA", context)
+    instr_shape = _int_list_literal(body, "instrShape", context)
+    tiles_per_warp = _int_list_literal(body, "tilesPerWarp", context)
+    cga_layout = _int_list_literal(body, "CGALayout", context)
+    element_bit_width_match = re.search(r"\belementBitWidth\s*=\s*(\d+)", body)
+    if (
+        version_match is None
+        or transposed_match is None
+        or warps_per_cta is None
+        or instr_shape is None
+    ):
+        raise ValueError(f"{context}: malformed #ttg.amd_mfma encoding {raw_encoding}")
+    return _AMDMfmaEncodingInfo(
+        int(version_match.group(1)),
+        warps_per_cta,
+        instr_shape,
+        transposed_match.group(1) == "true",
+        tiles_per_warp,
+        int(element_bit_width_match.group(1)) if element_bit_width_match else None,
+        cga_layout,
+    )
+
+
+def _padded_layout_bit_mapping(info, context):
+    mapping = {}
+    for physical_bit, vector in enumerate(info.offset_vectors):
+        nonzero = [
+            (dim, value)
+            for dim, value in enumerate(vector)
+            if int(value) != 0
+        ]
+        if len(nonzero) != 1:
+            raise ValueError(
+                f"{context}: only one-hot padded_shared offset vectors are supported"
+            )
+        dim, value = nonzero[0]
+        logical_bit = _log2_power_of_two(int(value), context)
+        key = (dim, logical_bit)
+        if key in mapping:
+            raise ValueError(
+                f"{context}: duplicate padded_shared basis for dim {dim} bit {logical_bit}"
+            )
+        mapping[key] = physical_bit
+    return mapping
+
+
+def _padded_logical_offset_elements(coords, info, context):
+    mapping = _padded_layout_bit_mapping(info, context)
+    offset = 0
+    for dim, coord in enumerate(coords):
+        coord = int(coord)
+        bit = 0
+        while (1 << bit) <= coord:
+            if coord & (1 << bit):
+                key = (dim, bit)
+                if key not in mapping:
+                    raise ValueError(
+                        f"{context}: padded_shared has no basis for dim {dim} bit {bit}"
+                    )
+                offset += 1 << mapping[key]
+            bit += 1
+    return offset
+
+
+def _apply_static_padding(byte_offset, element_byte_width, info, context):
+    result = int(byte_offset)
+    for interval, padding in zip(info.intervals, info.paddings):
+        interval_bytes = int(interval) * int(element_byte_width)
+        padding_bytes = int(padding) * int(element_byte_width)
+        _log2_power_of_two(interval_bytes, context)
+        _log2_power_of_two(padding_bytes, context)
+        result += (int(byte_offset) // interval_bytes) * padding_bytes
+    return result
+
+
+def _padded_shared_tile_storage_bytes(tile_shape, element_byte_width, info, context):
+    if element_byte_width is None:
+        raise ValueError(f"{context}: unknown element byte width for padded_shared")
+    if len(tile_shape) != len(info.offset_vectors[0]):
+        raise ValueError(
+            f"{context}: padded_shared rank {len(info.offset_vectors[0])} "
+            f"does not match tile shape {tile_shape}"
+        )
+    if any(int(extent) <= 0 for extent in tile_shape):
+        raise ValueError(f"{context}: padded_shared tile shape must be positive")
+    max_coords = tuple(int(extent) - 1 for extent in tile_shape)
+    max_offset_elements = _padded_logical_offset_elements(max_coords, info, context)
+    max_offset_bytes = max_offset_elements * int(element_byte_width)
+    return (
+        _apply_static_padding(max_offset_bytes, element_byte_width, info, context)
+        + int(element_byte_width)
+    )
+
+
+def _padded_static_byte_offset(shape, coords, element_byte_width, raw_encoding, context):
+    info = _padded_shared_encoding_info(raw_encoding, context)
+    if info is None:
+        return None
+    rank = len(info.offset_vectors[0])
+    if len(shape) < rank or len(coords) != len(shape):
+        raise ValueError(
+            f"{context}: padded_shared rank {rank} is incompatible with "
+            f"shape={shape}, coords={coords}"
+        )
+    prefix_rank = len(shape) - rank
+    prefix_shape = tuple(int(dim) for dim in shape[:prefix_rank])
+    tile_shape = tuple(int(dim) for dim in shape[prefix_rank:])
+    prefix_coords = tuple(int(coord) for coord in coords[:prefix_rank])
+    tile_coords = tuple(int(coord) for coord in coords[prefix_rank:])
+    tile_bytes = _padded_shared_tile_storage_bytes(
+        tile_shape, element_byte_width, info, context
+    )
+    prefix_index = _static_linear_offset(prefix_shape, prefix_coords) if prefix_shape else 0
+    tile_offset = _padded_logical_offset_elements(tile_coords, info, context)
+    tile_offset_bytes = _apply_static_padding(
+        tile_offset * int(element_byte_width), element_byte_width, info, context
+    )
+    return prefix_index * tile_bytes + tile_offset_bytes
 
 
 def _type_str(type_obj):
@@ -1631,6 +1913,25 @@ def _memdesc_size_bytes(memdesc):
             f"with element type {memdesc.element_type}"
         )
     shape = memdesc.alloc_shape or memdesc.shape
+    padded = _padded_shared_encoding_info(
+        memdesc.encoding,
+        f"tlx_wave bridge cannot size LDS memdesc {memdesc.name or memdesc.source}",
+    )
+    if padded is not None:
+        rank = len(padded.offset_vectors[0])
+        if len(shape) < rank:
+            raise ValueError(
+                f"tlx_wave bridge cannot size LDS memdesc {memdesc.name or memdesc.source}: "
+                f"padded_shared rank {rank} exceeds alloc shape {shape}"
+            )
+        prefix_shape = shape[: len(shape) - rank]
+        tile_shape = shape[len(shape) - rank :]
+        return _product(prefix_shape) * _padded_shared_tile_storage_bytes(
+            tile_shape,
+            memdesc.element_byte_width,
+            padded,
+            f"tlx_wave bridge cannot size LDS memdesc {memdesc.name or memdesc.source}",
+        )
     return _product(shape) * memdesc.element_byte_width
 
 

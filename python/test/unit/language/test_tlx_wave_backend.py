@@ -1188,6 +1188,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     )
 
     compiled = triton_compile(src, target=GFX950_WAVE)
+    ttgir = _asm_text(compiled, "ttgir")
     wave_artifact = _asm_text(compiled, "wave")
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
@@ -1198,6 +1199,13 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     assert compiled.metadata.tlx_wave_num_wave_barriers == 1
     assert compiled.metadata.tlx_wave_num_wave_local_loads == 2
     assert compiled.metadata.tlx_wave_num_mmas == 1
+    assert "#ttg.amd_mfma" in ttgir
+    assert "version = 4" in ttgir
+    assert "warpsPerCTA = [2, 2]" in ttgir
+    assert "instrShape = [16, 16, 32]" in ttgir
+    assert "isTransposed = true" in ttgir
+    assert ttgir.count("#ttg.padded_shared") == 2
+    assert "parent = #mma, kWidth = 8" in ttgir
     assert wave_artifact.count("waveamd.dma_load_lds") == 2
     assert wave_artifact.count("wave.wait") == 1
     assert wave_artifact.count("wave.barrier") == 1
@@ -3149,6 +3157,27 @@ def test_tlx_wave_bridge_rejects_unsupported_shared_local_load_layout(tmp_path):
     assert "order" in message
     assert "memdesc encoding" in message
     assert "#ttg.dot_op" in message
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_noncontiguous_swizzled_fragment_load(tmp_path):
+    dot_func = """
+  tt.func public @dot_kernel(%c: !tt.ptr<f32>) attributes {noinline = false} {
+    %slot = arith.constant 0 : i32
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<1x32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<1x32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %a_view = ttg.memdesc_index %a_alloc[%slot] : !ttg.memdesc<1x32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %b_view = ttg.memdesc_index %b_alloc[%slot] : !ttg.memdesc<1x32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %lhs = ttg.local_load %a_view : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = ttg.local_load %b_view : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+    with pytest.raises(ValueError, match="physically contiguous|byte offset"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
 
