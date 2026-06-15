@@ -60,6 +60,10 @@ _GFX950_PIPELINED_STORE_LAYOUT = _BlockedEncodingInfo(
 )
 
 
+class _DmaDestinationNotWholeWaveContiguous(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class _WaveValue:
     kind: str
@@ -1486,6 +1490,51 @@ def _require_dma_destination_physical_contiguous(
             4,
             "ttg.async_copy_global_to_local destination",
         )
+
+
+def _require_dma_destination_whole_wave_contiguous(
+    value_plan,
+    layout,
+    memdesc,
+    packet_elements,
+    packet_bytes,
+    component,
+    context,
+):
+    width = _product(layout.threads_per_warp)
+    cta_threads = width * _product(layout.warps_per_cta)
+    total_packets = _product(value_plan.shape) // int(packet_elements)
+    component_packet_start = int(component) * cta_threads
+    active_lanes = max(0, min(width, total_packets - component_packet_start))
+    if active_lanes <= 1:
+        return
+
+    first_offset = None
+    for lane in range(active_lanes):
+        packet_index = component_packet_start + lane
+        packet_start = packet_index * int(packet_elements)
+        coords = _static_delinearize_row_major(packet_start, memdesc.shape)
+        byte_offset = _memdesc_static_byte_offset(
+            memdesc,
+            memdesc.shape,
+            coords,
+            "ttg.async_copy_global_to_local destination",
+        )
+        if first_offset is None:
+            first_offset = byte_offset
+            if first_offset % 4:
+                raise _DmaDestinationNotWholeWaveContiguous(
+                    f"{context}: DMA destination byte offset {first_offset} "
+                    "is not 4-byte aligned"
+                )
+            continue
+        expected = first_offset + lane * int(packet_bytes)
+        if byte_offset != expected:
+            raise _DmaDestinationNotWholeWaveContiguous(
+                f"{context}: DMA destination packet starts are not "
+                "whole-wave contiguous; lane "
+                f"{lane} starts at byte {byte_offset}, expected {expected}"
+            )
 
 
 def _require_fragment_load_physical_contiguous(value, memdesc):
@@ -4503,6 +4552,17 @@ def _select_dma_packet_lowering(
             copy_component_count = _dma_packet_component_count(
                 address_plan, dma_packet_layout, packet_elements
             )
+            for component in range(copy_component_count):
+                _require_dma_destination_whole_wave_contiguous(
+                    address_plan,
+                    dma_packet_layout,
+                    memdesc,
+                    packet_elements,
+                    dma_bytes,
+                    component,
+                    "tlx_wave bridge cannot lower "
+                    "ttg.async_copy_global_to_local without faithful DMA",
+                )
         except ValueError as exc:
             errors.append(exc)
             continue
@@ -4513,6 +4573,121 @@ def _select_dma_packet_lowering(
         "tlx_wave bridge cannot lower ttg.async_copy_global_to_local without "
         "faithful DMA: no legal DMA packet size was found"
     )
+
+
+def _zero_simd_for_element(builder, element_type, width, w, context):
+    return _splat_constant_value(
+        builder,
+        element_type,
+        0.0 if element_type in {"f16", "bf16", "f32"} else 0,
+        width,
+        w,
+        context,
+    )
+
+
+def _emit_async_copy_via_load_store(
+    builder,
+    state,
+    address,
+    address_plan,
+    memdesc,
+    memdescs,
+    lds_layout,
+    mask_value,
+    after_token,
+    w,
+    stats,
+):
+    if address_plan.shape != memdesc.shape:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: source tensor shape "
+            f"{address_plan.shape} does not match destination memdesc shape "
+            f"{memdesc.shape}"
+        )
+    pointer_source = _require_lowered_value(
+        state["wave_values"],
+        address.address_value_id,
+        "pointer_expr",
+        "ttg.async_copy_global_to_local source",
+    )
+    component_count = _blocked_layout_component_count(
+        address_plan,
+        "ttg.async_copy_global_to_local source",
+        "generic async copy lowering",
+    )
+    token = after_token
+    for component in range(component_count):
+        dim_bindings, width, active = _blocked_tensor_dim_bindings(
+            builder,
+            address_plan,
+            w,
+            "ttg.async_copy_global_to_local source",
+            component=component,
+        )
+        source = _materialize_pointer_value(
+            builder,
+            pointer_source,
+            dim_bindings,
+            w,
+        )
+        mask = active
+        if mask_value is not None:
+            user_mask = _materialize_mask_value(
+                builder,
+                mask_value,
+                dim_bindings,
+                w,
+                width,
+            )
+            mask = _wave_mask_and(builder, mask, user_mask, w, width)
+
+        result_type = w.simd_type(
+            _wave_element_type(
+                address.element_type,
+                w,
+                "ttg.async_copy_global_to_local source",
+            ),
+            width,
+        )
+        fallback = _zero_simd_for_element(
+            builder,
+            address.element_type,
+            width,
+            w,
+            "ttg.async_copy_global_to_local inactive lanes",
+        )
+        loaded, token = _emit_masked_load(
+            builder,
+            source,
+            result_type,
+            mask,
+            fallback,
+            token,
+            w,
+        )
+        destination = _emit_memdesc_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            dim_bindings,
+            width,
+            w,
+            "ttg.async_copy_global_to_local destination",
+        )
+        token = _emit_component_store(
+            builder,
+            loaded,
+            destination,
+            mask,
+            token,
+            w,
+        )
+    stats.async_copies += 1
+    return token
 
 
 def _emit_async_copy(
@@ -4553,16 +4728,31 @@ def _emit_async_copy(
             "mask_expr",
             "ttg.async_copy_global_to_local mask",
         )
-    dma_bytes, dma_packet_layout, copy_component_count = _select_dma_packet_lowering(
-        state,
-        address,
-        address_plan,
-        memdesc,
-        memdescs,
-        lds_layout,
-        mask_value,
-        w,
-    )
+    try:
+        dma_bytes, dma_packet_layout, copy_component_count = _select_dma_packet_lowering(
+            state,
+            address,
+            address_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            mask_value,
+            w,
+        )
+    except _DmaDestinationNotWholeWaveContiguous:
+        return _emit_async_copy_via_load_store(
+            builder,
+            state,
+            address,
+            address_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            mask_value,
+            after_token,
+            w,
+            stats,
+        )
     stats.async_copies += 1
 
     token = after_token

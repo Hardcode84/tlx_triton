@@ -1133,7 +1133,7 @@ def test_tlx_wave_lowers_generic_tensor_layout_with_repeated_components(tmp_path
     del ctx
 
 
-def test_tlx_wave_gemm_cutoff_lowers_async_dma():
+def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_without_dma():
     src = ASTSource(
         fn=_tlx_wave_gemm_cutoff_kernel,
         signature={
@@ -1161,8 +1161,10 @@ def test_tlx_wave_gemm_cutoff_lowers_async_dma():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
-    assert wave_artifact.count("waveamd.dma_load_lds") == 4
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
     assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
@@ -1193,7 +1195,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 2
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 2
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
     assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
     assert compiled.metadata.tlx_wave_num_async_waits == 1
     assert compiled.metadata.tlx_wave_num_wave_barriers == 1
@@ -1206,7 +1208,9 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     assert "isTransposed = true" in ttgir
     assert ttgir.count("#ttg.padded_shared") == 2
     assert "parent = #mma, kWidth = 8" in ttgir
-    assert wave_artifact.count("waveamd.dma_load_lds") == 2
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
     assert wave_artifact.count("wave.wait") == 1
     assert wave_artifact.count("wave.barrier") == 1
     assert "ttg.local_load" not in wave_artifact
