@@ -5649,6 +5649,7 @@ def _wave_build_dirs():
         yield build_dir
         yield build_dir / "third_party" / "tlx_wave" / "wave"
         yield build_dir / "third_party" / "wave"
+    yield _repo_root() / "third_party" / "wave" / "build" / "wave-build"
     yield _repo_root() / "third_party" / "wave" / "build"
 
 
@@ -5705,8 +5706,11 @@ def _load_wave_dsl():
         candidates = "\n  ".join(str(path) for path in _candidate_wave_python_paths())
         raise RuntimeError(
             "tlx_wave requires Wave MLIR Python bindings from the third_party/wave submodule build. "
-            "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave and WAVE_ENABLE_PYTHON_BINDINGS=ON; "
-            "the underlying MLIR install must have MLIR_ENABLE_BINDINGS_PYTHON=ON. "
+            "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run "
+            "`python third_party/wave/build_tools/build_llvm.py --python-bindings` followed by "
+            "`cmake -S third_party/wave -B third_party/wave/build/wave-build "
+            "-G Ninja -DWAVE_ENABLE_PYTHON_BINDINGS=ON` and "
+            "`cmake --build third_party/wave/build/wave-build`. "
             f"Unable to import mlir.dialects.wave_dsl: {type(exc).__name__}: {exc}. "
             f"Checked Wave Python package candidates:\n  {candidates}"
         ) from exc
@@ -5723,7 +5727,8 @@ def _wave_tool(tool_name, override_env=None):
     )
     raise RuntimeError(
         f"tlx_wave requires {tool_name} from the third_party/wave submodule build. "
-        "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave so the Wave tools are built. "
+        "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run the standalone "
+        "third_party/wave build documented in third_party/wave/README.md. "
         f"Checked {tool_name} candidates:\n  {candidates}"
     )
 

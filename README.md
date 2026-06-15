@@ -112,6 +112,12 @@ says:
          LLVM_SYSPATH=$LLVM_BUILD_DIR \
          pip install -e .
 
+   When enabling the `tlx_wave` backend, keep Wave's LLVM separate from
+   Triton's LLVM. The Wave submodule builds against the commit pinned in
+   `third_party/wave/llvm-commit.txt` using
+   `python third_party/wave/build_tools/build_llvm.py --python-bindings`;
+   do not point Wave at `LLVM_SYSPATH`.
+
 </details>
 
 # Tips for building
