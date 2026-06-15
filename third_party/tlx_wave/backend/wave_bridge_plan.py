@@ -211,6 +211,7 @@ _ORDERED_BODY_VALUE_OPS = {
     "arith.constant",
     "arith.divsi",
     "arith.divui",
+    "arith.extf",
     "arith.maxsi",
     "arith.maxui",
     "arith.minsi",
@@ -219,6 +220,7 @@ _ORDERED_BODY_VALUE_OPS = {
     "arith.remsi",
     "arith.remui",
     "arith.subi",
+    "arith.truncf",
     "tt.addptr",
     "tt.broadcast",
     "tt.expand_dims",
@@ -244,6 +246,9 @@ _ORDERED_BODY_EFFECT_OPS = {
 
 _ORDERED_BODY_PLANNED_OPS = {
     "llvm.intr.assume",
+    "rocdl.sched.barrier",
+    "rocdl.sched.group.barrier",
+    "rocdl.setprio",
     "scf.for",
     "scf.if",
     "scf.yield",
@@ -901,7 +906,13 @@ def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
             operand_plans[0] if operand_plans else None, op.get_int_attr("axis") or 0
         )
         kind = "expand_dims"
-    elif op_name in {"tt.broadcast", "tt.splat", "ttg.convert_layout"}:
+    elif op_name in {
+        "arith.extf",
+        "arith.truncf",
+        "tt.broadcast",
+        "tt.splat",
+        "ttg.convert_layout",
+    }:
         varying_dims = (
             operand_plans[0].varying_dims if operand_plans and operand_plans[0] else ()
         )

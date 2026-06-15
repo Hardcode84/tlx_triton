@@ -586,6 +586,37 @@ def test_tlx_wave_lowers_multicomponent_blocked_local_roundtrip(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_f16_32x32_blocked_local_roundtrip_as_tensor_data(tmp_path):
+    local_func = """
+  tt.func public @f16_32x32_roundtrip(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>) attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %in_base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %in_ptr = tt.addptr %in_base, %zero : tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %loaded = tt.load %in_ptr : tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    ttg.local_store %loaded, %alloc : tensor<32x32xf16, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>> -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %out = ttg.local_load %alloc : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %out_base = tt.splat %arg1 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %out_ptr = tt.addptr %out_base, %zero : tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>, tensor<32x32xi32, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.store %out_ptr, %out : tensor<32x32x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 1
+    assert "waveamd.fragment_pack" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_lowers_simd_convert_layout_component_permutation(tmp_path):
     source_encoding = (
         "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
@@ -1280,6 +1311,41 @@ def test_tlx_wave_async_copy_rejects_strided_f16_packet_source(tmp_path):
     %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
     %two = arith.constant dense<2> : tensor<1x64xi32, #blocked>
     %offsets = arith.muli %cols_2d, %two : tensor<1x64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1x64x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offsets : tensor<1x64x!tt.ptr<f16>, #blocked>, tensor<1x64xi32, #blocked>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<1x64x!tt.ptr<f16>, #blocked> -> <1x64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(ValueError, match="source pointer"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_branch_local_assume_does_not_prove_later_dma_source(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_branch_assume(%arg0: !tt.ptr<f16>, %stride: i32, %flag: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cond = arith.cmpi eq, %flag, %c0 : i32
+    scf.if %cond {
+      %unit_stride = arith.cmpi eq, %stride, %c1 : i32
+      llvm.intr.assume %unit_stride : i1
+    }
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64xf16, #shared, #smem, mutable>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<1x64xi32, #blocked>
+    %offsets = arith.muli %cols_2d, %stride_splat : tensor<1x64xi32, #blocked>
     %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1x64x!tt.ptr<f16>, #blocked>
     %ptr = tt.addptr %base, %offsets : tensor<1x64x!tt.ptr<f16>, #blocked>, tensor<1x64xi32, #blocked>
     %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<1x64x!tt.ptr<f16>, #blocked> -> <1x64xf16, #shared, #smem, mutable>

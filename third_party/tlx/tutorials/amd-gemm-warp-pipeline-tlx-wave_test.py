@@ -1,0 +1,88 @@
+import importlib.util
+from pathlib import Path
+
+import pytest
+import torch
+
+
+def _load_gemm_wp_module():
+    path = Path(__file__).with_name("amd-gemm-warp-pipeline_test.py")
+    spec = importlib.util.spec_from_file_location("tlx_wave_gemm_wp_tutorial", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+
+    import triton
+    from triton import knobs
+    from triton.backends import backends
+    from triton.runtime.jit import MockTensor
+
+    if "tlx_wave" not in backends:
+        pytest.skip("tlx_wave backend is not installed")
+
+    with knobs.cache.scope(), knobs.runtime.scope():
+        knobs.cache.dir = str(tmp_path / "triton-cache")
+        knobs.runtime.override_arch = "gfx950"
+        triton.runtime.driver._default = None
+        triton.runtime.driver._active = None
+        try:
+            target = triton.runtime.driver.active.get_current_target()
+        except RuntimeError as exc:
+            pytest.skip(f"tlx_wave backend is not active: {exc}")
+        if target.backend != "tlx_wave" or target.arch != "gfx950":
+            pytest.skip(f"requires tlx_wave:gfx950, got {target}")
+
+        tutorial = _load_gemm_wp_module()
+
+        m = n = 32
+        k = 128
+        block_m = block_n = 32
+        block_k = 32
+        grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
+
+        a = MockTensor(torch.float16, [m, k])
+        b = MockTensor(torch.float16, [k, n])
+        c = MockTensor(torch.float32, [m, n])
+        compiled = tutorial.gemm_wp.warmup(
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            a.stride()[0],
+            a.stride()[1],
+            b.stride()[0],
+            b.stride()[1],
+            c.stride()[0],
+            c.stride()[1],
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_M=16,
+            NUM_BUFFERS=2,
+            NUM_XCDS=tutorial.NUM_XCDS,
+            XCD_CHUNK=4,
+            num_warps=4,
+            num_stages=1,
+            waves_per_eu=0,
+            matrix_instr_nonkdim=16,
+            grid=grid,
+        )
+
+    wave = compiled.asm["wave"]
+    if isinstance(wave, bytes):
+        wave = wave.decode()
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_async_copies >= 4
+    assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+    assert compiled.metadata.tlx_wave_num_async_waits >= 2
+    assert compiled.metadata.tlx_wave_num_mmas > 1
+    assert "scf.for" in wave
+    assert "waveamd.dma_load_lds" in wave
+    assert "waveamd.mma" in wave
+    assert "waveamdmachine.target" in wave
