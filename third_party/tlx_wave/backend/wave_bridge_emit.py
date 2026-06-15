@@ -1,7 +1,7 @@
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -948,7 +948,9 @@ def _blocked_layout_dim_bindings(
             builder.constant(w.index_type(), value_plan.shape[dim]),
             width=width,
         )
-        in_bounds = _wave_cmpi(builder, "ult", coord, extent, w)
+        in_bounds = _wave_cmpi(
+            builder, "ult", _maybe_splat(builder, coord, width, w), extent, w
+        )
         active = _wave_mask_and(builder, active, in_bounds, w, width)
     return dim_bindings, width, active
 
@@ -4887,6 +4889,15 @@ def _zero_simd_for_element(builder, element_type, width, w, context):
     )
 
 
+def _async_copy_other_value_plan(address_plan, address):
+    return replace(
+        address_plan,
+        element_type=address.element_type,
+        element_byte_width=address.element_byte_width,
+        pointee_type=None,
+    )
+
+
 def _emit_async_copy_via_load_store(
     builder,
     state,
@@ -4952,12 +4963,25 @@ def _emit_async_copy_via_load_store(
             ),
             width,
         )
-        fallback = _zero_simd_for_element(
-            builder,
-            address.element_type,
-            width,
-            w,
-            "ttg.async_copy_global_to_local inactive lanes",
+        fallback = (
+            _load_other_value(
+                builder,
+                state,
+                address.other_value_id,
+                _async_copy_other_value_plan(address_plan, address),
+                width,
+                w,
+                "ttg.async_copy_global_to_local other",
+                component=component,
+            )
+            if address.other_value_id is not None
+            else _zero_simd_for_element(
+                builder,
+                address.element_type,
+                width,
+                w,
+                "ttg.async_copy_global_to_local inactive lanes",
+            )
         )
         loaded, token = _emit_masked_load(
             builder,
@@ -4979,11 +5003,12 @@ def _emit_async_copy_via_load_store(
             w,
             "ttg.async_copy_global_to_local destination",
         )
+        store_mask = active if address.other_value_id is not None else mask
         token = _emit_component_store(
             builder,
             loaded,
             destination,
-            mask,
+            store_mask,
             token,
             w,
         )
@@ -5001,12 +5026,6 @@ def _emit_async_copy(
         raise ValueError(
             "tlx_wave bridge cannot lower async copy: unknown LDS memdesc "
             f"{address.memdesc_value_id}"
-        )
-    if address.other_value_id is not None:
-        raise ValueError(
-            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local with "
-            "`other` values yet; emitting a masked copy would leave inactive "
-            "LDS lanes undefined"
         )
 
     memdesc = memdescs[address.memdesc_value_id]
@@ -5029,6 +5048,20 @@ def _emit_async_copy(
             "mask_expr",
             "ttg.async_copy_global_to_local mask",
         )
+    if address.other_value_id is not None:
+        return _emit_async_copy_via_load_store(
+            builder,
+            state,
+            address,
+            address_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            mask_value,
+            after_token,
+            w,
+            stats,
+        )
     try:
         dma_bytes, dma_packet_layout, copy_component_count = _select_dma_packet_lowering(
             state,
@@ -5040,7 +5073,7 @@ def _emit_async_copy(
             mask_value,
             w,
         )
-    except _DmaDestinationNotWholeWaveContiguous:
+    except ValueError:
         return _emit_async_copy_via_load_store(
             builder,
             state,

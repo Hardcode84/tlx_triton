@@ -1788,18 +1788,6 @@ def _build_address_plans(ops, values, owners):
     return tuple(addresses)
 
 
-def _validate_address_feature_support(addresses):
-    for address in addresses:
-        if (
-            address.op == "ttg.async_copy_global_to_local"
-            and address.other_value_id is not None
-        ):
-            raise ValueError(
-                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-                "with `other` fill values yet"
-            )
-
-
 def _build_token_plans(ops, values):
     tokens = []
     for op in ops:
@@ -1867,7 +1855,6 @@ def _build_bridge_plan(mod, kernel):
     storage_aliases = _build_storage_alias_plans(ops, values_by_id)
     memdescs_by_id = _build_memdesc_plans(ops, values_by_id)
     address_plans = _build_address_plans(ops, values_by_id, owners)
-    _validate_address_feature_support(address_plans)
     return _BridgePlan(
         "ttgir_graph",
         op_counts,

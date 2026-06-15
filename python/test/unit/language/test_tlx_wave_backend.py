@@ -910,7 +910,7 @@ def test_tlx_wave_lowers_memdesc_subslice_as_staged_transform(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_strided_subslice_rejects_without_dma(tmp_path):
+def test_tlx_wave_async_copy_strided_subslice_falls_back_without_dma(tmp_path):
     local_func = """
   tt.func public @async_subslice(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x64xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
@@ -940,8 +940,18 @@ def test_tlx_wave_async_copy_strided_subslice_rejects_without_dma(tmp_path):
         wave_bridge_emit._dma_packet_bytes(address, memdesc, memdescs, lds_layout)
         is None
     )
-    with pytest.raises(ValueError, match="without faithful DMA"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
@@ -1471,7 +1481,7 @@ def test_tlx_wave_async_copy_f16_source_falls_back_to_4_byte_dma(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_partial_f16_packet_mask(tmp_path):
+def test_tlx_wave_async_copy_partial_f16_packet_mask_falls_back(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -1494,8 +1504,18 @@ def test_tlx_wave_async_copy_rejects_partial_f16_packet_mask(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(ValueError, match="packet mask"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
@@ -1548,7 +1568,7 @@ def test_tlx_wave_async_copy_proves_arg_aligned_inner_packet_mask(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_strided_f16_packet_source(tmp_path):
+def test_tlx_wave_async_copy_strided_f16_packet_source_falls_back(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -1571,12 +1591,22 @@ def test_tlx_wave_async_copy_rejects_strided_f16_packet_source(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(ValueError, match="source pointer"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
-def test_tlx_wave_branch_local_assume_does_not_prove_later_dma_source(tmp_path):
+def test_tlx_wave_branch_local_assume_source_uses_async_copy_fallback(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -1606,8 +1636,18 @@ def test_tlx_wave_branch_local_assume_does_not_prove_later_dma_source(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(ValueError, match="source pointer"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
@@ -1639,7 +1679,7 @@ def test_tlx_wave_async_copy_lowers_i8_as_dma(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_strided_i8_packet_source(tmp_path):
+def test_tlx_wave_async_copy_strided_i8_packet_source_falls_back(tmp_path):
     async_i8_func = """
   tt.func public @async_i8_strided(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
@@ -1656,8 +1696,18 @@ def test_tlx_wave_async_copy_rejects_strided_i8_packet_source(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
 
-    with pytest.raises(ValueError, match="source pointer logical bytes"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
@@ -1771,7 +1821,7 @@ def test_tlx_wave_async_copy_lowers_i8_multicomponent_layout_as_dma(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_unaligned_f16_view_without_dma(tmp_path):
+def test_tlx_wave_async_copy_unaligned_f16_view_falls_back_without_dma(tmp_path):
     async_f16_view_func = """
   tt.func public @async_f16_view(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
     %slot = arith.constant 1 : i32
@@ -1791,12 +1841,22 @@ def test_tlx_wave_async_copy_rejects_unaligned_f16_view_without_dma(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, async_f16_view_func)
 
-    with pytest.raises(ValueError, match="without faithful DMA"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_noncontiguous_2d_i8_packet_source(
+def test_tlx_wave_async_copy_noncontiguous_2d_i8_packet_source_falls_back(
     tmp_path,
 ):
     async_i8_2d_func = """
@@ -1811,20 +1871,38 @@ def test_tlx_wave_async_copy_rejects_noncontiguous_2d_i8_packet_source(
 """
     mod, ctx = _parse_ttgir(tmp_path, async_i8_2d_func)
 
-    with pytest.raises(ValueError, match="source pointer logical bytes"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_async_copy_other():
+def test_tlx_wave_bridge_lowers_async_copy_other_with_load_store_fallback():
     src = ASTSource(
         fn=_tlx_wave_async_other_kernel,
         signature={"in_ptr": "*fp32", "out_ptr": "*fp32", "n_elements": "i32"},
         constexprs={"BLOCK_SIZE": 64},
     )
 
-    with pytest.raises(ValueError, match="async_copy_global_to_local.*`other`"):
-        triton_compile(src, target=GFX950_WAVE)
+    compiled = triton_compile(src, target=GFX950_WAVE)
+    wave_artifact = _asm_text(compiled, "wave")
+
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_async_copies == 1
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
 def test_tlx_wave_bridge_lowers_async_copy_constant_i1_mask(tmp_path):
@@ -2890,9 +2968,93 @@ def test_tlx_wave_bridge_uses_async_copy_operand_segments_for_other(tmp_path):
     assert len(async_addresses) == 1
     assert async_addresses[0].mask_value_id is None
     assert async_addresses[0].other_value_id is not None
-    with pytest.raises(ValueError, match="async_copy_global_to_local.*`other`"):
-        wave_bridge_plan._validate_address_feature_support(addresses)
+    plan = wave_bridge._build_bridge_plan(mod, kernel)
+    assert len(
+        [
+            address
+            for address in plan.addresses
+            if address.op == "ttg.async_copy_global_to_local"
+        ]
+    ) == 1
     del ctx
+
+
+def test_tlx_wave_async_copy_other_bool_constant_uses_copied_element_type():
+    class FakeValue:
+        def __init__(self, typ, value=None):
+            self.type = typ
+            self.value = value
+
+    class FakeBuilder:
+        def __init__(self):
+            self.constants = []
+            self.splats = []
+
+        def constant(self, typ, value):
+            result = FakeValue(typ, value)
+            self.constants.append((typ, value, result))
+            return result
+
+        def splat(self, value, element_type=None, width=None):
+            result = FakeValue(f"simd<{element_type},{width}>", value)
+            self.splats.append((value, element_type, width, result))
+            return result
+
+    class FakeW:
+        def i1(self):
+            return "i1"
+
+    address_plan = wave_bridge_plan._ValuePlan(
+        0,
+        "value",
+        "tt.addptr",
+        0,
+        "tensor<16x16x!tt.ptr<i1>>",
+        "tensor",
+        (16, 16),
+        "!tt.ptr<i1>",
+        1,
+        "i1",
+        "#blocked",
+        None,
+        None,
+        None,
+        None,
+        None,
+        (),
+        "varying",
+    )
+    address = SimpleNamespace(element_type="i1", element_byte_width=1)
+    other_plan = wave_bridge_emit._async_copy_other_value_plan(address_plan, address)
+    state = {
+        "values": {
+            1: SimpleNamespace(
+                producer="arith.constant",
+                const_value=False,
+                type="tensor<16x16xi1>",
+            )
+        },
+        "wave_values": {
+            1: wave_bridge_emit._WaveValue(
+                "mask_expr", wave_bridge_emit._MaskConst(False)
+            )
+        },
+    }
+    builder = FakeBuilder()
+
+    value = wave_bridge_emit._load_other_value(
+        builder,
+        state,
+        1,
+        other_plan,
+        64,
+        FakeW(),
+        "ttg.async_copy_global_to_local other",
+    )
+
+    assert other_plan.element_type == "i1"
+    assert builder.constants[0][:2] == ("i1", 0)
+    assert builder.splats[0][1:] == ("i1", 64, value)
 
 
 def test_tlx_wave_bridge_reports_unsupported_ttgir_skeleton_inputs(tmp_path):

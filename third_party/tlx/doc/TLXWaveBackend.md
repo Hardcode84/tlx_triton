@@ -343,6 +343,12 @@ inputs.
     WaveAMD DMA; or
   - a conservative `wave.load` from global plus `wave.store` to shared as the
     fallback.
+- Treat DMA as a fast path, not as the correctness requirement. If source
+  contiguity, mask uniformity, destination packet contiguity, alignment, or
+  layout checks cannot prove a faithful `waveamd.dma_load_lds`, lower the copy
+  through the load/store fallback when generic LDS addressing supports the
+  destination. Copies with `other` fill values also use this fallback so inactive
+  masked lanes are written with the requested fill value.
 - Produce a `!wave.mem.token` for every side-effecting copy/store.
 - Convert `ttg.async_commit_group` into a bridge token group, likely emitted as
   `wave.join` over the copy tokens.
