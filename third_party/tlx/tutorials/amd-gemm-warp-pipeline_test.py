@@ -13,8 +13,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 @triton.jit
 def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk_size: tl.constexpr):
@@ -151,9 +149,19 @@ def gemm_wp(
 NUM_XCDS = 8
 
 
+def _validate_dma_packet_shape(a, b, n, k, bn, bk):
+    if a.stride(1) != 1 or b.stride(1) != 1:
+        raise ValueError("gemm_wp requires unit inner strides for f16 dword DMA packets")
+    if bn % 2 or bk % 2:
+        raise ValueError("gemm_wp requires BLOCK_N/BLOCK_K to be divisible by 2 for f16 dword DMA packets")
+    if n % 16 or k % 16:
+        raise ValueError("gemm_wp requires N/K to be divisible by 16 for the current TLX Wave DMA proof")
+
+
 def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
     M, K = a.shape
     _, N = b.shape
+    _validate_dma_packet_shape(a, b, N, K, bn, bk)
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
     gemm_wp[grid](
         a,
@@ -184,6 +192,7 @@ def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
 
 
 if __name__ == "__main__":
+    DEVICE = triton.runtime.driver.active.get_active_torch_device()
     tflops = lambda ms, M, N, K: 2 * M * N * K * 1e-12 / (ms * 1e-3)
 
     # (label, BM, BN, BK, nb, nw, gm, wpeu, nonk, xcd)

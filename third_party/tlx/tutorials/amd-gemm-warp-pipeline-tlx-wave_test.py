@@ -13,6 +13,15 @@ def _load_gemm_wp_module():
     return module
 
 
+class _FakeTensor:
+    def __init__(self, shape, strides):
+        self.shape = shape
+        self._strides = strides
+
+    def stride(self, dim):
+        return self._strides[dim]
+
+
 def _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=32, n=32, k=128):
     import triton
     from triton import knobs
@@ -101,3 +110,33 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
     assert "waveamd.dma_load_lds" in wave
     assert "ttg.async_copy_global_to_local" not in wave
+
+
+def test_gemm_wp_run_rejects_non_unit_inner_strides():
+    tutorial = _load_gemm_wp_module()
+    a = _FakeTensor((32, 80), (160, 2))
+    b = _FakeTensor((80, 48), (48, 1))
+    c = _FakeTensor((32, 48), (48, 1))
+
+    with pytest.raises(ValueError, match="unit inner strides"):
+        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
+
+
+@pytest.mark.parametrize("shape", [(32, 33, 80), (32, 48, 81)])
+def test_gemm_wp_run_rejects_unaligned_dma_packet_edges(shape):
+    tutorial = _load_gemm_wp_module()
+    m, n, k = shape
+    a = _FakeTensor((m, k), (k, 1))
+    b = _FakeTensor((k, n), (n, 1))
+    c = _FakeTensor((m, n), (n, 1))
+
+    with pytest.raises(ValueError, match="N/K.*divisible by 16"):
+        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
+
+
+def test_gemm_wp_run_allows_packet_aligned_edge_shape():
+    tutorial = _load_gemm_wp_module()
+    a = _FakeTensor((48, 80), (80, 1))
+    b = _FakeTensor((80, 48), (48, 1))
+
+    tutorial._validate_dma_packet_shape(a, b, 48, 80, 32, 32)
