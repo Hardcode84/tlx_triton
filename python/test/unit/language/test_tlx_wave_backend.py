@@ -1361,7 +1361,7 @@ def test_tlx_wave_branch_local_assume_does_not_prove_later_dma_source(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_i8_without_dma(tmp_path):
+def test_tlx_wave_async_copy_lowers_i8_as_dma(tmp_path):
     async_i8_func = """
   tt.func public @async_i8(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
@@ -1374,9 +1374,39 @@ def test_tlx_wave_async_copy_rejects_i8_without_dma(tmp_path):
     tt.return
   }
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
 
-    with pytest.raises(ValueError, match="without faithful DMA"):
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    assert wave_artifact.count("waveamd.dma_load_lds") == 1
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_rejects_strided_i8_packet_source(tmp_path):
+    async_i8_func = """
+  tt.func public @async_i8_strided(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %two = arith.constant dense<2> : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %offsets = arith.muli %range, %two : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %offsets : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<64x!tt.ptr<i8>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>> -> <64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
+
+    with pytest.raises(ValueError, match="source pointer logical bytes"):
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 
@@ -1463,7 +1493,7 @@ def test_tlx_wave_async_copy_multiple_in_flight_explicit_commit_wait(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_multicomponent_layout_without_dma(tmp_path):
+def test_tlx_wave_async_copy_lowers_i8_multicomponent_layout_as_dma(tmp_path):
     async_i8_func = """
   tt.func public @async_i8_multicomponent(%arg0: !tt.ptr<i8>) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
@@ -1476,10 +1506,18 @@ def test_tlx_wave_async_copy_rejects_multicomponent_layout_without_dma(tmp_path)
     tt.return
   }
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, async_i8_func)
 
-    with pytest.raises(ValueError, match="source blocked layout maps to 2 components"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    assert wave_artifact.count("waveamd.dma_load_lds") == 1
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
@@ -1508,7 +1546,7 @@ def test_tlx_wave_async_copy_rejects_unaligned_f16_view_without_dma(tmp_path):
     del ctx
 
 
-def test_tlx_wave_async_copy_rejects_2d_i8_without_dma(
+def test_tlx_wave_async_copy_rejects_noncontiguous_2d_i8_packet_source(
     tmp_path,
 ):
     async_i8_2d_func = """
@@ -1523,7 +1561,7 @@ def test_tlx_wave_async_copy_rejects_2d_i8_without_dma(
 """
     mod, ctx = _parse_ttgir(tmp_path, async_i8_2d_func)
 
-    with pytest.raises(ValueError, match="without faithful DMA"):
+    with pytest.raises(ValueError, match="source pointer logical bytes"):
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
     del ctx
 

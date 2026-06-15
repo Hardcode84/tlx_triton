@@ -3108,7 +3108,7 @@ def _source_pointee_type(kernel, address):
 def _dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     if address.element_byte_width is None:
         return None
-    if address.element_byte_width in (2, 4):
+    if address.element_byte_width in (1, 2, 4):
         packet_bytes = 4
     elif address.element_byte_width == 16:
         packet_bytes = 16
@@ -3170,8 +3170,6 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
         )
     if packet_bytes != 4:
         return None
-    if address.element_byte_width not in (2, 4):
-        return None
     if address_plan.shape != memdesc.shape:
         raise ValueError(
             f"{context}: source tensor shape {address_plan.shape} does not "
@@ -3192,16 +3190,11 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
     return layout
 
 
-def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout, component_count):
+def _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout):
     context = (
         "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
         "without faithful DMA"
     )
-    if component_count != 1 and address.element_byte_width not in (2, 4):
-        raise ValueError(
-            f"{context}: source blocked layout maps to {component_count} "
-            "components; repeated or multicomponent DMA lowering is not implemented"
-        )
     packet_bytes = _dma_packet_bytes(address, memdesc, memdescs, lds_layout)
     if packet_bytes is None:
         raise ValueError(
@@ -3448,6 +3441,17 @@ def _ixsimpl_pointer_offset_expr(source, w, unknowns, opaque_dim=None):
     return w.sym_ctx.int_(0)
 
 
+def _ixsimpl_pointer_byte_offset_expr(
+    source, source_element_byte_width, w, unknowns, opaque_dim=None
+):
+    if source_element_byte_width is None or source_element_byte_width <= 0:
+        return None
+    offset = _ixsimpl_pointer_offset_expr(source, w, unknowns, opaque_dim)
+    if offset is None:
+        return None
+    return offset * int(source_element_byte_width)
+
+
 def _ixsimpl_shift_dim(expr, dim, offset, w):
     if offset == 0:
         return expr
@@ -3534,32 +3538,50 @@ def _ixsimpl_assume_fact_exprs(state, unknowns, w):
     return tuple(assumptions)
 
 
-def _require_dma_packet_source_contiguous(
+def _require_dma_packet_source_contiguous_bytes(
     state,
     pointer_source,
-    packet_elements,
+    source_element_byte_width,
+    packet_bytes,
+    shape,
     inner_dim,
     w,
 ):
+    if (
+        source_element_byte_width is None
+        or source_element_byte_width <= 0
+        or packet_bytes % source_element_byte_width
+    ):
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: source element byte width does not divide "
+            f"{packet_bytes}-byte DMA packet"
+        )
+    packet_elements = int(packet_bytes) // int(source_element_byte_width)
     if packet_elements <= 1:
         return
     unknowns = {}
-    offset = _ixsimpl_pointer_offset_expr(pointer_source, w, unknowns, inner_dim)
+    offset = _ixsimpl_pointer_byte_offset_expr(
+        pointer_source, source_element_byte_width, w, unknowns, inner_dim
+    )
     if offset is None:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-            "without faithful DMA: f16/bf16 DMA packet source pointer is not "
-            "provably contiguous across packet elements"
+            "without faithful DMA: DMA packet source pointer logical bytes are "
+            f"not provably contiguous across {packet_bytes}-byte packets"
         )
-    assumptions = _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    assumptions = (
+        _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w)
+        + _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    )
     for packet_element in range(1, packet_elements):
         shifted = _ixsimpl_shift_dim(offset, inner_dim, packet_element, w)
-        expected = offset + int(packet_element)
+        expected = offset + int(packet_element * source_element_byte_width)
         if not _ixsimpl_expr_equal(shifted, expected, assumptions, w):
             raise ValueError(
                 "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-                "without faithful DMA: f16/bf16 DMA packet source pointer is "
-                "not provably contiguous across packet elements"
+                "without faithful DMA: DMA packet source pointer logical bytes "
+                f"are not provably contiguous across {packet_bytes}-byte packets"
             )
 
 
@@ -3578,8 +3600,8 @@ def _require_dma_packet_mask_uniform(
     if mask is None:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-            "without faithful DMA: f16/bf16 DMA packet mask is not provably "
-            "uniform across packet elements"
+            "without faithful DMA: DMA packet mask is not provably uniform "
+            "across packet elements"
         )
     assumptions = (
         _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w)
@@ -3594,8 +3616,8 @@ def _require_dma_packet_mask_uniform(
                 continue
             raise ValueError(
                 "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
-                "without faithful DMA: f16/bf16 DMA packet mask is not "
-                "provably uniform across packet elements"
+                "without faithful DMA: DMA packet mask is not provably uniform "
+                "across packet elements"
             )
 
 
@@ -3682,10 +3704,12 @@ def _emit_dma_packet_ptrs(
         "pointer_expr",
         "ttg.async_copy_global_to_local source",
     )
-    _require_dma_packet_source_contiguous(
+    _require_dma_packet_source_contiguous_bytes(
         state,
         pointer_source,
-        packet_elements,
+        address.element_byte_width,
+        packet_bytes,
+        address_plan.shape,
         len(address_plan.shape) - 1,
         w,
     )
@@ -3799,9 +3823,7 @@ def _emit_async_copy(
             f"source element type {address.element_type} does not match "
             f"destination memdesc element type {memdesc.element_type}"
         )
-    dma_bytes = _require_dma_packet_bytes(
-        address, memdesc, memdescs, lds_layout, component_count
-    )
+    dma_bytes = _require_dma_packet_bytes(address, memdesc, memdescs, lds_layout)
     dma_packet_layout = _validate_dma_packet_layout(
         address_plan, address, memdesc, dma_bytes
     )
