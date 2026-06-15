@@ -98,6 +98,11 @@ endif()
 set(WAVE_ENABLE_PYTHON_BINDINGS ON CACHE BOOL
   "Build the Wave/WaveAMD MLIR Python bindings for tlx_wave." FORCE)
 
+if(TRITON_BUILD_PYTHON_MODULE)
+  add_triton_plugin(TritonTLXWave ${CMAKE_CURRENT_SOURCE_DIR}/triton_tlx_wave.cc)
+  target_link_libraries(TritonTLXWave PRIVATE Python3::Module pybind11::headers)
+endif()
+
 add_subdirectory("${TLX_WAVE_SOURCE_DIR}" "${TLX_WAVE_BINARY_DIR}")
 
 set(TLX_WAVE_RUNTIME_TARGETS

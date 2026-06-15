@@ -442,6 +442,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRNVVMToLLVMIRTranslation
     MLIRGPUToNVVMTransforms
     MLIRIR
+    MLIRControlFlowToSCF
     MLIRControlFlowToLLVM
     MLIRPass
     MLIRTransforms
@@ -458,13 +459,20 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
     # LLVM
     LLVMPasses
-    LLVMNVPTXCodeGen
     LLVMAMDGPUCodeGen
     LLVMAMDGPUAsmParser
 
     Python3::Module
     nanobind-static
   )
+  if("nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
+    if(NOT "NVPTX" IN_LIST LLVM_TARGETS_TO_BUILD)
+      message(FATAL_ERROR
+        "The Nvidia backend requires LLVM to be built with the NVPTX target. "
+        "Rebuild LLVM with NVPTX or configure without the nvidia backend.")
+    endif()
+    list(APPEND TRITON_LIBRARIES LLVMNVPTXCodeGen)
+  endif()
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
      CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64

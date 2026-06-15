@@ -85,6 +85,14 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir")
+
+        passes.convert.triton_lift_cf_to_scf(mod)
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+        pm.run(mod, "tlx_wave.make_ttgir_post_cf_lift")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 

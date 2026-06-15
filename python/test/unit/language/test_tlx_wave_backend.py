@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 import triton
-from triton._C.libtriton import ir
+from triton._C.libtriton import ir, passes
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.backends import backends
@@ -2636,6 +2636,43 @@ def test_tlx_wave_bridge_lowers_scalar_compare_if_condition(tmp_path):
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert "arith.cmpi slt" in wave
+    assert "scf.if" in wave
+    del ctx
+
+
+def test_tlx_wave_lifts_cf_diamond_before_bridge(tmp_path):
+    cf_func = """
+  tt.func public @cf_diamond(%arg0: i32, %flag: i1) attributes {noinline = false} {
+    cf.cond_br %flag, ^bb1(%arg0 : i32), ^bb2(%arg0 : i32)
+  ^bb1(%x: i32):
+    %one = arith.constant 1 : i32
+    %then = arith.addi %x, %one : i32
+    cf.br ^bb3(%then : i32)
+  ^bb2(%y: i32):
+    %two = arith.constant 2 : i32
+    %else = arith.addi %y, %two : i32
+    cf.br ^bb3(%else : i32)
+  ^bb3(%result: i32):
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, cf_func)
+    changed = passes.convert.triton_lift_cf_to_scf(mod)
+    ttgir = str(mod)
+
+    assert changed
+    assert "cf.cond_br" not in ttgir
+    assert "cf.br" not in ttgir
+    assert "scf.if" in ttgir
+
+    wave = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "cf.cond_br" not in wave
+    assert "cf.br" not in wave
     assert "scf.if" in wave
     del ctx
 
