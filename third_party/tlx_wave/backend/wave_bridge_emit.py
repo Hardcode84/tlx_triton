@@ -81,6 +81,7 @@ class _DotOperandFragmentLoad:
 class _IndexExpr:
     expr: object
     bindings: dict
+    materialized: object | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,8 @@ class _IndexBinary:
     kind: object
     lhs: object
     rhs: object
+    nsw: bool = False
+    nuw: bool = False
 
 
 @dataclass(frozen=True)
@@ -643,6 +646,11 @@ def _dim_binding_value(dim_bindings, binding, w):
 
 def _materialize_index_value(builder, source, dim_bindings, w, force_width=None):
     if isinstance(source, _IndexExpr):
+        if source.materialized is not None:
+            value = _materialize_index_value(
+                builder, source.materialized, dim_bindings, w
+            )
+            return _maybe_splat(builder, value, force_width, w)
         bindings = {
             symbol: _materialize_index_value(builder, value, dim_bindings, w)
             for symbol, value in source.bindings.items()
@@ -652,7 +660,10 @@ def _materialize_index_value(builder, source, dim_bindings, w, force_width=None)
     if isinstance(source, _IndexBinary):
         lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
         rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
-        return _maybe_splat(builder, builder.binary(source.kind, lhs, rhs), force_width, w)
+        value = builder.binary(
+            source.kind, lhs, rhs, nsw=source.nsw, nuw=source.nuw
+        )
+        return _maybe_splat(builder, value, force_width, w)
     if isinstance(source, _IndexSelectCompare):
         lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
         rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
@@ -2637,12 +2648,19 @@ def _shift_index_dims(source, axis):
                 symbol: _shift_index_dims(binding, axis)
                 for symbol, binding in source.bindings.items()
             },
+            (
+                None
+                if source.materialized is None
+                else _shift_index_dims(source.materialized, axis)
+            ),
         )
     if isinstance(source, _IndexBinary):
         return _IndexBinary(
             source.kind,
             _shift_index_dims(source.lhs, axis),
             _shift_index_dims(source.rhs, axis),
+            nsw=source.nsw,
+            nuw=source.nuw,
         )
     if isinstance(source, _IndexSelectCompare):
         return _IndexSelectCompare(
@@ -2954,11 +2972,38 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
     elif op.name == "arith.subi":
         expr = lhs_symbol - rhs_symbol
     if expr is not None:
+        if getattr(w, "BinaryKind", None) is None:
+            _set_wave_value(
+                wave_values,
+                result.value_id,
+                "index_expr",
+                builder.index_expr(
+                    expr,
+                    {
+                        lhs_symbol: _materialize_index_value(builder, lhs, {}, w),
+                        rhs_symbol: _materialize_index_value(builder, rhs, {}, w),
+                    },
+                ),
+            )
+            return
+
+        materialized = None
+        nsw, nuw = _index_overflow_flags(op, lhs, rhs)
+        if nsw or nuw:
+            binary_kind = _wave_binary_kind_for_op(op.name, w)
+            if binary_kind is not None:
+                materialized = _IndexBinary(
+                    binary_kind, lhs, rhs, nsw=nsw, nuw=nuw
+                )
         _set_wave_value(
             wave_values,
             result.value_id,
             "index_expr",
-            _IndexExpr(expr, {lhs_symbol: lhs, rhs_symbol: rhs}),
+            _IndexExpr(
+                expr,
+                {lhs_symbol: lhs, rhs_symbol: rhs},
+                materialized=materialized,
+            ),
         )
         return
 
@@ -2984,12 +3029,40 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
 
 
 def _wave_binary_kind_for_op(op_name, w):
+    binary_kind = getattr(w, "BinaryKind", None)
+    if binary_kind is None:
+        return None
     return {
-        "arith.divsi": w.BinaryKind.DivSI,
-        "arith.divui": w.BinaryKind.DivUI,
-        "arith.remsi": w.BinaryKind.RemSI,
-        "arith.remui": w.BinaryKind.RemUI,
+        "arith.addi": binary_kind.AddI,
+        "arith.muli": binary_kind.MulI,
+        "arith.subi": binary_kind.SubI,
+        "arith.divsi": binary_kind.DivSI,
+        "arith.divui": binary_kind.DivUI,
+        "arith.remsi": binary_kind.RemSI,
+        "arith.remui": binary_kind.RemUI,
     }.get(op_name)
+
+
+def _arith_overflow_flags(op):
+    if op.name not in {"arith.addi", "arith.muli", "arith.subi"}:
+        return False, False
+    attr = getattr(op, "attrs", {}).get("overflowFlags")
+    if attr is None:
+        return False, False
+    text = str(attr)
+    return "nsw" in text, "nuw" in text
+
+
+def _index_overflow_flags(op, lhs, rhs):
+    if _is_deferred_index(lhs) or _is_deferred_index(rhs):
+        return False, False
+    nsw, nuw = _arith_overflow_flags(op)
+    if op.name == "arith.muli":
+        # The bridge already treats scalar index expressions as mathematical
+        # offsets. Emit the matching no-signed-wrap contract so Wave range
+        # analysis can reason about products before division/rem.
+        nsw = True
+    return nsw, nuw
 
 
 def _simd_binary_kind_for_op(op_name, w):
@@ -3112,8 +3185,9 @@ def _emit_simd_binary_op(builder, op, values, wave_values, w, kind):
     rhs_components = _simd_arith_operand_components(
         builder, values, rhs, op.operands[1], result, component_count, width, w, op.name
     )
+    nsw, nuw = _arith_overflow_flags(op)
     components = tuple(
-        builder.binary(kind, lhs_component, rhs_component)
+        builder.binary(kind, lhs_component, rhs_component, nsw=nsw, nuw=nuw)
         for lhs_component, rhs_component in zip(lhs_components, rhs_components)
     )
     wave_values[result.value_id] = _result_wave_value_from_components(components)
@@ -4330,6 +4404,17 @@ def _mask_source_depends_on_dim(source, dim):
     return False
 
 
+def _ixsimpl_apply_index_binary(kind, lhs, rhs):
+    kind = str(kind)
+    if kind == "addi":
+        return lhs + rhs
+    if kind == "muli":
+        return lhs * rhs
+    if kind == "subi":
+        return lhs - rhs
+    return None
+
+
 def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
     if isinstance(source, bool):
         return None
@@ -4345,7 +4430,17 @@ def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
                 return None
             expr = expr.subs(symbol, replacement)
         return expr
-    if isinstance(source, (_IndexBinary, _IndexSelectCompare)):
+    if isinstance(source, _IndexBinary):
+        if opaque_dim is not None and not _index_source_depends_on_dim(
+            source, opaque_dim
+        ):
+            return _ixsimpl_unknown_expr(source, unknowns, w)
+        lhs = _ixsimpl_index_expr(source.lhs, w, unknowns, opaque_dim)
+        rhs = _ixsimpl_index_expr(source.rhs, w, unknowns, opaque_dim)
+        if lhs is not None and rhs is not None:
+            return _ixsimpl_apply_index_binary(source.kind, lhs, rhs)
+        return None
+    if isinstance(source, _IndexSelectCompare):
         if opaque_dim is not None and not _index_source_depends_on_dim(
             source, opaque_dim
         ):
@@ -4381,16 +4476,20 @@ def _ixsimpl_index_packet_expr(
     if isinstance(source, _IndexBinary):
         if not _index_source_depends_on_dim(source, inner_dim):
             return _ixsimpl_unknown_expr(source, unknowns, w)
-        if str(source.kind) not in {"remsi", "remui"}:
-            return None
-        if _index_source_depends_on_dim(source.rhs, inner_dim):
-            return None
         lhs = _ixsimpl_index_packet_expr(
             source.lhs, w, unknowns, inner_dim, packet_elements, assumptions
         )
         rhs = _ixsimpl_index_packet_expr(
             source.rhs, w, unknowns, inner_dim, packet_elements, assumptions
         )
+        if lhs is not None and rhs is not None:
+            expr = _ixsimpl_apply_index_binary(source.kind, lhs, rhs)
+            if expr is not None:
+                return expr
+        if str(source.kind) not in {"remsi", "remui"}:
+            return None
+        if _index_source_depends_on_dim(source.rhs, inner_dim):
+            return None
         if lhs is None or rhs is None:
             return None
         if not _ixsimpl_expr_equal(

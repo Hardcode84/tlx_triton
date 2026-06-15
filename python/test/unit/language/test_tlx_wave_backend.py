@@ -2123,6 +2123,39 @@ def test_tlx_wave_bridge_lowers_scalar_index_arithmetic(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_emits_nsw_for_scalar_index_product(tmp_path):
+    arith_func = """
+  tt.func public @scalar_index_product(%arg0: !tt.ptr<i32>) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c32 = arith.constant 32 : i32
+    %pid0 = tt.get_program_id x : i32
+    %pid1 = tt.get_program_id y : i32
+    %q0 = arith.divsi %pid0, %c32 : i32
+    %q1 = arith.divsi %pid1, %c32 : i32
+    %product = arith.muli %q0, %q1 : i32
+    %value_scalar = arith.divsi %product, %c32 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %offset_base = tt.splat %value_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %offsets = arith.addi %offset_base, %range : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %offsets : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %data_scalar = arith.addi %c1, %c1 : i32
+    %data = tt.splat %data_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %data : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary muli" in wave
+    assert "overflow<nsw> : index, index -> index" in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_lowers_unsigned_index_div_rem(tmp_path):
     arith_func = """
   tt.func public @unsigned_index_arith(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
