@@ -13,11 +13,13 @@ def _load_gemm_wp_module():
     return module
 
 
-def _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=1, stride_bn=1):
+def _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=32, n=32, k=128):
     import triton
     from triton import knobs
     from triton.backends import backends
     from triton.runtime.jit import MockTensor
+
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
 
     if "tlx_wave" not in backends:
         pytest.skip("tlx_wave backend is not installed")
@@ -36,8 +38,6 @@ def _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=1, stride_bn=1):
 
         tutorial = _load_gemm_wp_module()
 
-        m = n = 32
-        k = 128
         block_m = block_n = 32
         block_k = 32
         grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
@@ -53,9 +53,9 @@ def _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=1, stride_bn=1):
             n,
             k,
             a.stride()[0],
-            stride_ak,
+            a.stride()[1],
             b.stride()[0],
-            stride_bn,
+            b.stride()[1],
             c.stride()[0],
             c.stride()[1],
             BLOCK_M=block_m,
@@ -75,9 +75,7 @@ def _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=1, stride_bn=1):
 
 
 def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
-
-    compiled = _warmup_gemm_wp_tlx_wave(tmp_path)
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
 
     wave = compiled.asm["wave"]
     if isinstance(wave, bytes):
@@ -93,8 +91,13 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert "waveamdmachine.target" in wave
 
 
-def test_gemm_wp_tlx_wave_rejects_noncontiguous_inner_stride(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=48, n=48, k=80)
 
-    with pytest.raises(ValueError, match="source pointer.*not provably contiguous"):
-        _warmup_gemm_wp_tlx_wave(tmp_path, stride_ak=2)
+    wave = compiled.asm["wave"]
+    if isinstance(wave, bytes):
+        wave = wave.decode()
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+    assert "waveamd.dma_load_lds" in wave
+    assert "ttg.async_copy_global_to_local" not in wave

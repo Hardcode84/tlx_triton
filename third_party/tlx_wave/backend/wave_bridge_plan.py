@@ -10,6 +10,7 @@ class _KernelArg:
     type_kind: str
     wave_type: str
     kind: str
+    divisibility: int | None
 
 
 @dataclass(frozen=True)
@@ -1814,6 +1815,22 @@ def _tt_func_ops(mod):
     return tuple(funcs)
 
 
+def _arg_int_attr(arg_attrs, name):
+    if arg_attrs is None:
+        return None
+    prefix = f"{name} = "
+    for part in str(arg_attrs).strip("{}").split(","):
+        part = part.strip()
+        if not part.startswith(prefix):
+            continue
+        raw_value = part[len(prefix) :].split(":", 1)[0].strip()
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+    return None
+
+
 def _kernel_from_module(mod):
     funcs = _public_tt_func_ops(mod)
     if len(funcs) != 1:
@@ -1826,6 +1843,7 @@ def _kernel_from_module(mod):
         )
 
     op = funcs[0]
+    arg_attrs = dict(op.get_attrs()).get("arg_attrs") or ()
     name = op.get_str_attr("sym_name") or _entry_name(mod)
     helper_funcs = [
         func
@@ -1857,6 +1875,10 @@ def _kernel_from_module(mod):
                 _type_kind(ttgir_type_obj),
                 wave_type,
                 kind,
+                _arg_int_attr(
+                    arg_attrs[index] if index < len(arg_attrs) else None,
+                    "tt.divisibility",
+                ),
             )
         )
     return _Kernel(name, tuple(args), op.get_bool_attr("noinline"))

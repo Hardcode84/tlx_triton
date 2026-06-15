@@ -1888,7 +1888,8 @@ def _arith_mixed_error(op_name, lhs, rhs):
     )
 
 
-def _init_argument_wave_values(builder, values, wave_values, w):
+def _init_argument_wave_values(builder, kernel, values, state, w):
+    wave_values = state["wave_values"]
     for value in values.values():
         if value.kind != "argument" or value.base_arg_index is None:
             continue
@@ -1915,6 +1916,15 @@ def _init_argument_wave_values(builder, values, wave_values, w):
                 "index_expr",
                 _IndexExpr(symbol, {symbol: arg}),
             )
+            arg_info = kernel.args[value.base_arg_index]
+            if arg_info.divisibility is not None and arg_info.divisibility > 1:
+                state["assume_facts"].append(
+                    _AssumeFact(
+                        value.value_id,
+                        "divisible",
+                        divisor=arg_info.divisibility,
+                    )
+                )
         elif value.type_kind == "scalar" and _scalar_data_type(value) is not None:
             _set_wave_value(
                 wave_values,
@@ -3397,6 +3407,18 @@ def _index_source_depends_on_dim(source, dim):
     return False
 
 
+def _mask_source_depends_on_dim(source, dim):
+    if isinstance(source, _MaskAnd):
+        return _mask_source_depends_on_dim(
+            source.lhs, dim
+        ) or _mask_source_depends_on_dim(source.rhs, dim)
+    if isinstance(source, _MaskCompare):
+        return _index_source_depends_on_dim(
+            source.lhs, dim
+        ) or _index_source_depends_on_dim(source.rhs, dim)
+    return False
+
+
 def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
     if isinstance(source, bool):
         return None
@@ -3426,6 +3448,64 @@ def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
     return _ixsimpl_unknown_expr(source, unknowns, w)
 
 
+def _ixsimpl_index_packet_expr(
+    source, w, unknowns, inner_dim, packet_elements, assumptions
+):
+    if isinstance(source, bool):
+        return None
+    if isinstance(source, int):
+        return w.sym_ctx.int_(source)
+    if isinstance(source, _DimBinding):
+        return _dim_symbol(w, source.dim)
+    if isinstance(source, _IndexExpr):
+        expr = source.expr
+        for symbol, binding in source.bindings.items():
+            replacement = _ixsimpl_index_packet_expr(
+                binding, w, unknowns, inner_dim, packet_elements, assumptions
+            )
+            if replacement is None:
+                return None
+            expr = expr.subs(symbol, replacement)
+        return expr
+    if isinstance(source, _IndexBinary):
+        if not _index_source_depends_on_dim(source, inner_dim):
+            return _ixsimpl_unknown_expr(source, unknowns, w)
+        if str(source.kind) not in {"remsi", "remui"}:
+            return None
+        if _index_source_depends_on_dim(source.rhs, inner_dim):
+            return None
+        lhs = _ixsimpl_index_packet_expr(
+            source.lhs, w, unknowns, inner_dim, packet_elements, assumptions
+        )
+        rhs = _ixsimpl_index_packet_expr(
+            source.rhs, w, unknowns, inner_dim, packet_elements, assumptions
+        )
+        if lhs is None or rhs is None:
+            return None
+        if not _ixsimpl_expr_equal(
+            _ixsimpl_shift_dim(lhs, inner_dim, 1, w),
+            _ixsimpl_add_const(lhs, 1, w),
+            assumptions,
+            w,
+        ):
+            return None
+        if not _ixsimpl_mod_zero(lhs, packet_elements, assumptions, w):
+            return None
+        if not _ixsimpl_mod_zero(rhs, packet_elements, assumptions, w):
+            return None
+        return _ixsimpl_unknown_expr(source, unknowns, w) + _dim_symbol(w, inner_dim)
+    if isinstance(source, _IndexSelectCompare):
+        if not _index_source_depends_on_dim(source, inner_dim):
+            return _ixsimpl_unknown_expr(source, unknowns, w)
+        return None
+    typ = getattr(source, "type", None)
+    if typ is None:
+        return None
+    if _is_wave_simd_index_type(typ, w):
+        return None
+    return _ixsimpl_unknown_expr(source, unknowns, w)
+
+
 def _ixsimpl_pointer_offset_expr(source, w, unknowns, opaque_dim=None):
     if isinstance(source, _PointerBase):
         return w.sym_ctx.int_(0)
@@ -3441,12 +3521,52 @@ def _ixsimpl_pointer_offset_expr(source, w, unknowns, opaque_dim=None):
     return w.sym_ctx.int_(0)
 
 
+def _ixsimpl_pointer_packet_offset_expr(
+    source, w, unknowns, inner_dim, packet_elements, assumptions
+):
+    if isinstance(source, _PointerBase):
+        return w.sym_ctx.int_(0)
+    if isinstance(source, _PointerAdd):
+        base = _ixsimpl_pointer_packet_offset_expr(
+            source.base, w, unknowns, inner_dim, packet_elements, assumptions
+        )
+        offset = _ixsimpl_index_packet_expr(
+            source.offset, w, unknowns, inner_dim, packet_elements, assumptions
+        )
+        if base is None or offset is None:
+            return None
+        return base + offset
+    typ = getattr(source, "type", None)
+    if typ is not None and _is_wave_simd_pointer_type(typ, w):
+        return None
+    return w.sym_ctx.int_(0)
+
+
 def _ixsimpl_pointer_byte_offset_expr(
     source, source_element_byte_width, w, unknowns, opaque_dim=None
 ):
     if source_element_byte_width is None or source_element_byte_width <= 0:
         return None
     offset = _ixsimpl_pointer_offset_expr(source, w, unknowns, opaque_dim)
+    if offset is None:
+        return None
+    return offset * int(source_element_byte_width)
+
+
+def _ixsimpl_pointer_packet_byte_offset_expr(
+    source,
+    source_element_byte_width,
+    w,
+    unknowns,
+    inner_dim,
+    packet_elements,
+    assumptions,
+):
+    if source_element_byte_width is None or source_element_byte_width <= 0:
+        return None
+    offset = _ixsimpl_pointer_packet_offset_expr(
+        source, w, unknowns, inner_dim, packet_elements, assumptions
+    )
     if offset is None:
         return None
     return offset * int(source_element_byte_width)
@@ -3475,19 +3595,19 @@ def _ixsimpl_mask_compare_expr(predicate, lhs, rhs, w):
     return None
 
 
-def _ixsimpl_mask_expr(source, w, unknowns):
+def _ixsimpl_mask_expr(source, w, unknowns, opaque_dim=None):
     ixs = _ixsimpl_module()
     if isinstance(source, _MaskConst):
         return w.sym_ctx.true_() if source.value else w.sym_ctx.false_()
     if isinstance(source, _MaskAnd):
-        lhs = _ixsimpl_mask_expr(source.lhs, w, unknowns)
-        rhs = _ixsimpl_mask_expr(source.rhs, w, unknowns)
+        lhs = _ixsimpl_mask_expr(source.lhs, w, unknowns, opaque_dim)
+        rhs = _ixsimpl_mask_expr(source.rhs, w, unknowns, opaque_dim)
         if lhs is None or rhs is None:
             return None
         return ixs.and_(lhs, rhs)
     if isinstance(source, _MaskCompare):
-        lhs = _ixsimpl_index_expr(source.lhs, w, unknowns)
-        rhs = _ixsimpl_index_expr(source.rhs, w, unknowns)
+        lhs = _ixsimpl_index_expr(source.lhs, w, unknowns, opaque_dim)
+        rhs = _ixsimpl_index_expr(source.rhs, w, unknowns, opaque_dim)
         if lhs is None or rhs is None:
             return None
         return _ixsimpl_mask_compare_expr(source.predicate, lhs, rhs, w)
@@ -3529,12 +3649,21 @@ def _ixsimpl_assume_fact_exprs(state, unknowns, w):
             if fact.upper is not None:
                 assumptions.append(value <= fact.upper)
         elif fact.kind == "divisible" and fact.divisor is not None:
-            assumptions.append(
-                w.sym_ctx.eq(
-                    w.mod(value, int(fact.divisor)),
-                    w.sym_ctx.int_(0),
+            divisor = int(fact.divisor)
+            divisors = {divisor}
+            candidate = 2
+            while candidate * candidate <= divisor:
+                if divisor % candidate == 0:
+                    divisors.add(candidate)
+                    divisors.add(divisor // candidate)
+                candidate += 1
+            for implied_divisor in sorted(divisors):
+                assumptions.append(
+                    w.sym_ctx.eq(
+                        w.mod(value, implied_divisor),
+                        w.sym_ctx.int_(0),
+                    )
                 )
-            )
     return tuple(assumptions)
 
 
@@ -3561,19 +3690,29 @@ def _require_dma_packet_source_contiguous_bytes(
     if packet_elements <= 1:
         return
     unknowns = {}
+    assumptions = (
+        _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w)
+        + _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    )
     offset = _ixsimpl_pointer_byte_offset_expr(
         pointer_source, source_element_byte_width, w, unknowns, inner_dim
     )
+    if offset is None:
+        offset = _ixsimpl_pointer_packet_byte_offset_expr(
+            pointer_source,
+            source_element_byte_width,
+            w,
+            unknowns,
+            inner_dim,
+            packet_elements,
+            assumptions,
+        )
     if offset is None:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
             "without faithful DMA: DMA packet source pointer logical bytes are "
             f"not provably contiguous across {packet_bytes}-byte packets"
         )
-    assumptions = (
-        _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w)
-        + _ixsimpl_assume_fact_exprs(state, unknowns, w)
-    )
     for packet_element in range(1, packet_elements):
         shifted = _ixsimpl_shift_dim(offset, inner_dim, packet_element, w)
         expected = offset + int(packet_element * source_element_byte_width)
@@ -3596,7 +3735,7 @@ def _require_dma_packet_mask_uniform(
     if mask_source is None or packet_elements <= 1:
         return
     unknowns = {}
-    mask = _ixsimpl_mask_expr(mask_source, w, unknowns)
+    mask = _ixsimpl_mask_expr(mask_source, w, unknowns, inner_dim)
     if mask is None:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
@@ -3654,6 +3793,8 @@ def _ixsimpl_packet_mask_uniform(
 ):
     if source is None or packet_elements <= 1:
         return True
+    if not _mask_source_depends_on_dim(source, inner_dim):
+        return True
     if isinstance(source, _MaskConst):
         return True
     if isinstance(source, _MaskAnd):
@@ -3664,8 +3805,8 @@ def _ixsimpl_packet_mask_uniform(
         )
     if not isinstance(source, _MaskCompare):
         return False
-    lhs = _ixsimpl_index_expr(source.lhs, w, unknowns)
-    rhs = _ixsimpl_index_expr(source.rhs, w, unknowns)
+    lhs = _ixsimpl_index_expr(source.lhs, w, unknowns, inner_dim)
+    rhs = _ixsimpl_index_expr(source.rhs, w, unknowns, inner_dim)
     if lhs is None or rhs is None:
         return False
     if source.predicate in {"slt", "ult"}:
@@ -4084,7 +4225,7 @@ def _committed_groups(state):
     return _mem_state(state).committed_groups
 
 
-def _initial_lowering_state(builder, plan, w):
+def _initial_lowering_state(builder, kernel, plan, w):
     values = _values_by_id(plan)
     _, assume_only_values = _assume_tree_info(plan)
     state = {
@@ -4097,7 +4238,7 @@ def _initial_lowering_state(builder, plan, w):
         "mem_state": _MemState(),
         "assume_facts": [],
     }
-    _init_argument_wave_values(builder, values, state["wave_values"], w)
+    _init_argument_wave_values(builder, kernel, values, state, w)
     return state
 
 
@@ -6157,7 +6298,7 @@ def _emit_raw_block(
 
 
 def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
-    state = _initial_lowering_state(builder, plan, w)
+    state = _initial_lowering_state(builder, kernel, plan, w)
     state["stats"] = stats
     state["address_by_token"] = _async_address_by_token(plan)
     state["local_loads"] = _local_load_address_by_result(plan)

@@ -39,9 +39,9 @@ def gemm_wp(
     N,
     K,
     stride_am,
-    stride_ak: tl.constexpr,
+    stride_ak,
     stride_bk,
-    stride_bn: tl.constexpr,
+    stride_bn,
     stride_cm,
     stride_cn,
     BLOCK_M: tl.constexpr,
@@ -52,13 +52,10 @@ def gemm_wp(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
 ):
-    tl.static_assert(stride_ak > 0, "stride_ak must be positive")
-    tl.static_assert(stride_bn > 0, "stride_bn must be positive")
     tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
-    tl.assume(M % BLOCK_M == 0)
-    tl.assume(N % BLOCK_N == 0)
-    tl.assume(K % BLOCK_K == 0)
 
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -74,8 +71,8 @@ def gemm_wp(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # Precompute row/col offsets (these are per-thread, not carried in loop)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offs_k = tl.arange(0, BLOCK_K)
 
     # Base offsets — recompute full pointer from tile_id * BLOCK_K
@@ -157,10 +154,6 @@ NUM_XCDS = 8
 def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
     M, K = a.shape
     _, N = b.shape
-    if M % bm or N % bn:
-        raise ValueError("gemm_wp requires M/N to be divisible by BLOCK_M/BLOCK_N")
-    if K % bk:
-        raise ValueError("gemm_wp requires K to be divisible by BLOCK_K")
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
     gemm_wp[grid](
         a,

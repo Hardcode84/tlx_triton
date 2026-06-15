@@ -1136,6 +1136,10 @@ def test_tlx_wave_gemm_cutoff_lowers_async_dma():
             "K_ITERS": 2,
             "NUM_BUFFERS": 2,
         },
+        attrs={
+            (3,): [["tt.divisibility", 16]],
+            (4,): [["tt.divisibility", 16]],
+        },
     )
 
     compiled = triton_compile(src, target=GFX950_WAVE)
@@ -1143,8 +1147,8 @@ def test_tlx_wave_gemm_cutoff_lowers_async_dma():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
-    assert wave_artifact.count("waveamd.dma_load_lds") == 16
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 8
+    assert wave_artifact.count("waveamd.dma_load_lds") == 8
     assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
@@ -1163,6 +1167,10 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
             "BLOCK_N": 32,
             "BLOCK_K": 32,
         },
+        attrs={
+            (3,): [["tt.divisibility", 16]],
+            (4,): [["tt.divisibility", 16]],
+        },
     )
 
     compiled = triton_compile(src, target=GFX950_WAVE)
@@ -1170,13 +1178,13 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 2
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 8
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
     assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
     assert compiled.metadata.tlx_wave_num_async_waits == 1
     assert compiled.metadata.tlx_wave_num_wave_barriers == 1
     assert compiled.metadata.tlx_wave_num_wave_local_loads == 2
     assert compiled.metadata.tlx_wave_num_mmas == 1
-    assert wave_artifact.count("waveamd.dma_load_lds") == 8
+    assert wave_artifact.count("waveamd.dma_load_lds") == 4
     assert wave_artifact.count("wave.wait") == 1
     assert wave_artifact.count("wave.barrier") == 1
     assert "ttg.local_load" not in wave_artifact
@@ -1262,9 +1270,9 @@ def test_tlx_wave_lowers_gemm_f16_async_tiles_as_dma(tmp_path):
     ] == [16, 16]
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_async_copies"] == 2
-    assert metadata["tlx_wave_num_dma_load_lds"] == 32
-    assert wave_artifact.count("waveamd.dma_load_lds") == 32
-    assert wave_artifact.count("wave.where") == 32
+    assert metadata["tlx_wave_num_dma_load_lds"] == 16
+    assert wave_artifact.count("waveamd.dma_load_lds") == 16
+    assert wave_artifact.count("wave.where") == 16
     assert "ttg.memdesc_index" not in wave_artifact
     assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
@@ -1295,6 +1303,55 @@ def test_tlx_wave_async_copy_rejects_partial_f16_packet_mask(tmp_path):
 
     with pytest.raises(ValueError, match="packet mask"):
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_async_copy_proves_arg_aligned_inner_packet_mask(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_aligned_packet_mask(%arg0: !tt.ptr<f16>, %m: i32, %n: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x32xf16, #shared, #smem, mutable>
+    %rows = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<8xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<8x1xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+    %row_stride = arith.constant dense<32> : tensor<8x1xi32, #blocked>
+    %row_offsets = arith.muli %rows_2d, %row_stride : tensor<8x1xi32, #blocked>
+    %row_offsets_b = tt.broadcast %row_offsets : tensor<8x1xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %n_splat_offsets = tt.splat %n : i32 -> tensor<1x32xi32, #blocked>
+    %col_offsets_mod = arith.remsi %cols_2d, %n_splat_offsets : tensor<1x32xi32, #blocked>
+    %col_offsets_b = tt.broadcast %col_offsets_mod : tensor<1x32xi32, #blocked> -> tensor<8x32xi32, #blocked>
+    %offsets = arith.addi %row_offsets_b, %col_offsets_b : tensor<8x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<8x32x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offsets : tensor<8x32x!tt.ptr<f16>, #blocked>, tensor<8x32xi32, #blocked>
+    %m_splat = tt.splat %m : i32 -> tensor<8x1xi32, #blocked>
+    %row_mask = arith.cmpi slt, %rows_2d, %m_splat : tensor<8x1xi32, #blocked>
+    %row_mask_b = tt.broadcast %row_mask : tensor<8x1xi1, #blocked> -> tensor<8x32xi1, #blocked>
+    %n_splat = tt.splat %n : i32 -> tensor<1x32xi32, #blocked>
+    %col_mask = arith.cmpi slt, %cols_2d, %n_splat : tensor<1x32xi32, #blocked>
+    %col_mask_b = tt.broadcast %col_mask : tensor<1x32xi1, #blocked> -> tensor<8x32xi1, #blocked>
+    %mask = arith.andi %row_mask_b, %col_mask_b : tensor<8x32xi1, #blocked>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc mask %mask : tensor<8x32x!tt.ptr<f16>, #blocked> -> <8x32xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=4, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_dma_load_lds"] > 0
+    assert "waveamd.dma_load_lds" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
     del ctx
 
 
