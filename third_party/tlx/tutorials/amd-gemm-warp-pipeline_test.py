@@ -50,14 +50,23 @@ def gemm_wp(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
+    tl.assume(K > 0)
+    m_cdiv_num = M + BLOCK_M - 1
+    n_cdiv_num = N + BLOCK_N - 1
+    k_cdiv_num = K + BLOCK_K - 1
+    tl.assume(m_cdiv_num >= 0)
+    tl.assume(n_cdiv_num >= 0)
+    tl.assume(k_cdiv_num >= 0)
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
 
     pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_m = m_cdiv_num // BLOCK_M
+    num_pid_n = n_cdiv_num // BLOCK_N
     grid_mn = num_pid_m * num_pid_n
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
 
@@ -77,7 +86,7 @@ def gemm_wp(
     a_base_off = offs_m[:, None] * stride_am
     b_base_off = offs_n[None, :] * stride_bn
 
-    K_ITERS = tl.cdiv(K, BLOCK_K)
+    K_ITERS = k_cdiv_num // BLOCK_K
 
     smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
     smemB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
