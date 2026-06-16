@@ -32,6 +32,8 @@ def _warmup_gemm_wp_tlx_wave(
     block_n=32,
     block_k=32,
     num_warps=4,
+    group_m=16,
+    num_buffers=2,
     a_strides=None,
     b_strides=None,
     c_strides=None,
@@ -89,8 +91,8 @@ def _warmup_gemm_wp_tlx_wave(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
-            GROUP_M=16,
-            NUM_BUFFERS=2,
+            GROUP_M=group_m,
+            NUM_BUFFERS=num_buffers,
             NUM_XCDS=tutorial.NUM_XCDS,
             XCD_CHUNK=4,
             num_warps=num_warps,
@@ -102,12 +104,17 @@ def _warmup_gemm_wp_tlx_wave(
     return compiled
 
 
-def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
-    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
-
+def _wave_text(compiled):
     wave = compiled.asm["wave"]
     if isinstance(wave, bytes):
         wave = wave.decode()
+    return wave
+
+
+def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
+
+    wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
     assert (
@@ -125,9 +132,7 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
 def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=48, n=48, k=80)
 
-    wave = compiled.asm["wave"]
-    if isinstance(wave, bytes):
-        wave = wave.decode()
+    wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert (
         compiled.metadata.tlx_wave_num_dma_load_lds
@@ -153,9 +158,7 @@ def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(
         num_warps=8,
     )
 
-    wave = compiled.asm["wave"]
-    if isinstance(wave, bytes):
-        wave = wave.decode()
+    wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas >= 32
     assert compiled.metadata.tlx_wave_num_fragment_fills >= 32
@@ -175,9 +178,7 @@ def test_gemm_wp_tlx_wave_warmup_lowers_8_warp_32x32_layout(monkeypatch, tmp_pat
         num_warps=8,
     )
 
-    wave = compiled.asm["wave"]
-    if isinstance(wave, bytes):
-        wave = wave.decode()
+    wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "waveamd.mma" in wave
@@ -203,9 +204,7 @@ def test_gemm_wp_tlx_wave_warmup_falls_back_for_non_unit_inner_stride(
 ):
     compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, **stride_override)
 
-    wave = compiled.asm["wave"]
-    if isinstance(wave, bytes):
-        wave = wave.decode()
+    wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
     assert (
@@ -218,43 +217,67 @@ def test_gemm_wp_tlx_wave_warmup_falls_back_for_non_unit_inner_stride(
 
 
 @pytest.mark.parametrize("shape", [(32, 33, 80), (32, 48, 81)])
-def test_gemm_wp_run_rejects_unaligned_dma_packet_edges(shape):
-    tutorial = _load_gemm_wp_module()
+def test_gemm_wp_tlx_wave_warmup_falls_back_for_unaligned_packet_edges(
+    monkeypatch, tmp_path, shape
+):
     m, n, k = shape
-    a = _FakeTensor((m, k), (k, 1))
-    b = _FakeTensor((k, n), (n, 1))
-    c = _FakeTensor((m, n), (n, 1))
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=m, n=n, k=k)
 
-    with pytest.raises(ValueError, match="N/K.*divisible by 16"):
-        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
+    wave = _wave_text(compiled)
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_async_copies >= 4
+    assert (
+        compiled.metadata.tlx_wave_num_dma_load_lds
+        < compiled.metadata.tlx_wave_num_async_copies
+    )
+    assert "wave.load" in wave
+    assert "wave.store" in wave
+    assert "ttg.async_copy_global_to_local" not in wave
 
 
-def test_gemm_wp_run_rejects_non_power_of_two_group_divisor():
+def test_gemm_wp_tlx_wave_warmup_lowers_non_power_of_two_group_divisors(
+    monkeypatch, tmp_path
+):
+    compiled = _warmup_gemm_wp_tlx_wave(
+        tmp_path,
+        monkeypatch,
+        m=224,
+        n=80,
+        k=80,
+        group_m=4,
+    )
+
+    wave = _wave_text(compiled)
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert "waveamd.mma" in wave
+    assert "(x & -1 + x) == 0" not in wave
+
+
+def test_gemm_wp_validation_rejects_too_few_k_tiles():
     tutorial = _load_gemm_wp_module()
-    a = _FakeTensor((32, 80), (80, 1))
-    b = _FakeTensor((80, 80), (80, 1))
-    c = _FakeTensor((32, 80), (80, 1))
+    a = _FakeTensor((32, 32), (32, 1))
+    b = _FakeTensor((32, 32), (32, 1))
 
-    with pytest.raises(ValueError, match="GROUP_M.*positive power of two"):
-        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
-
-
-def test_gemm_wp_run_rejects_non_power_of_two_tail_group_size():
-    tutorial = _load_gemm_wp_module()
-    a = _FakeTensor((2816, 80), (80, 1))
-    b = _FakeTensor((80, 64), (64, 1))
-    c = _FakeTensor((2816, 64), (64, 1))
-
-    with pytest.raises(ValueError, match="final M-group size"):
-        tutorial.run(a, b, c, 256, 32, 32, 2, 4, 8)
+    with pytest.raises(ValueError, match="ceil\\(K / BLOCK_K\\).*NUM_BUFFERS"):
+        tutorial._validate_dma_packet_shape(a, b, 32, 32, 32, 32, 32, 2, 16)
 
 
-def test_gemm_wp_run_allows_full_non_power_of_two_m_groups():
-    tutorial = _load_gemm_wp_module()
-    a = _FakeTensor((6144, 80), (80, 1))
-    b = _FakeTensor((80, 64), (64, 1))
+def test_gemm_wp_tlx_wave_warmup_lowers_non_power_of_two_tail_group_size(
+    monkeypatch, tmp_path
+):
+    compiled = _warmup_gemm_wp_tlx_wave(
+        tmp_path,
+        monkeypatch,
+        m=224,
+        n=64,
+        k=80,
+        group_m=4,
+    )
 
-    tutorial._validate_dma_packet_shape(a, b, 64, 80, 256, 32, 32, 2, 8)
+    wave = _wave_text(compiled)
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert "waveamd.mma" in wave
+    assert "(x & -1 + x) == 0" not in wave
 
 
 def test_gemm_wp_run_allows_packet_aligned_edge_shape():
