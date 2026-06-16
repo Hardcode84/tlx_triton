@@ -137,15 +137,18 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     assert "ttg.async_copy_global_to_local" not in wave
 
 
-def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(monkeypatch, tmp_path):
+@pytest.mark.parametrize("block_m,block_n", [(128, 256), (256, 128), (256, 256)])
+def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(
+    monkeypatch, tmp_path, block_m, block_n
+):
     compiled = _warmup_gemm_wp_tlx_wave(
         tmp_path,
         monkeypatch,
         m=4096,
         n=4096,
         k=4096,
-        block_m=128,
-        block_n=256,
+        block_m=block_m,
+        block_n=block_n,
         block_k=32,
         num_warps=8,
     )

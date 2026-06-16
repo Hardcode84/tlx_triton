@@ -216,6 +216,14 @@ def _wave_bridge_options(arch="gfx950", warp_size=64):
     return SimpleNamespace(arch=arch, warp_size=warp_size)
 
 
+def test_tlx_wave_backend_defaults_and_rejects_mfma_nonkdim():
+    backend = make_backend(GFX950_WAVE)
+
+    assert backend.parse_options({}).matrix_instr_nonkdim == 16
+    with pytest.raises(ValueError, match="matrix_instr_nonkdim=16"):
+        backend.parse_options({"matrix_instr_nonkdim": 32})
+
+
 def _parse_ttgir(
     tmp_path,
     public_funcs,
@@ -563,6 +571,41 @@ def test_tlx_wave_lowers_dot_local_load_fragment_without_async_gemm(tmp_path):
     assert wave_artifact.count("waveamd.fragment_pack") == 2
     assert wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA_KIND}"') == 1
     assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+@pytest.mark.parametrize("k_width", [4, 8, 32])
+def test_tlx_wave_lowers_amd_mfma_dot_local_load_k_width_variants(tmp_path, k_width):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @dot_local_load_mfma_kwidth() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma__K_WIDTH_ATTR__}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma__K_WIDTH_ATTR__}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma__K_WIDTH_ATTR__}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma__K_WIDTH_ATTR__}>> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+""".replace("__K_WIDTH_ATTR__", f", kWidth = {k_width}")
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 2
+    assert metadata["tlx_wave_num_fragment_packs"] == 2
+    assert metadata["tlx_wave_num_fragment_fills"] == 1
+    assert metadata["tlx_wave_num_mmas"] == 1
+    assert wave_artifact.count("waveamd.fragment_pack") == 2
+    assert wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA_KIND}"') == 1
     del ctx
 
 
@@ -3898,6 +3941,28 @@ def test_tlx_wave_bridge_rejects_non_f16_dot_with_encoding_diagnostic(tmp_path):
     assert "f16 x f16" in message
     assert "#ttg.dot_op" in message
     assert "opIdx = 0" in message
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_bf16_dot_local_load_with_diagnostic(tmp_path):
+    dot_func = """
+  tt.func public @bf16_dot_local_load() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xbf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xbf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xbf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xbf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xbf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xbf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "ttg.local_load" in message
+    assert "expected f16 dot operand, got bf16" in message
+    assert "#ttg.dot_op" in message
     del ctx
 
 
