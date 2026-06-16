@@ -71,11 +71,21 @@ def gemm_wp(
     pid = chiplet_transform_chunked(pid, grid_mn, NUM_XCDS, XCD_CHUNK)
 
     num_pid_in_group = GROUP_M * num_pid_n
+    tl.assume(num_pid_in_group > 0)
+    tl.assume(num_pid_in_group <= 2147483647)
+    tl.assume((num_pid_in_group & (num_pid_in_group - 1)) == 0)
     group_id = pid // num_pid_in_group
+    pid_in_group = pid - group_id * num_pid_in_group
+    tl.assume(pid_in_group >= 0)
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    tl.assume(group_size_m > 0)
+    tl.assume(group_size_m <= 2147483647)
+    tl.assume((group_size_m & (group_size_m - 1)) == 0)
+    pid_n = pid_in_group // group_size_m
+    pid_m = first_pid_m + (pid_in_group - pid_n * group_size_m)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Precompute row/col offsets (these are per-thread, not carried in loop)
     offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
@@ -87,6 +97,8 @@ def gemm_wp(
     b_base_off = offs_n[None, :] * stride_bn
 
     K_ITERS = k_cdiv_num // BLOCK_K
+    tl.assume(K_ITERS > 0)
+    tl.assume(K_ITERS >= NUM_BUFFERS)
 
     smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
     smemB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NUM_BUFFERS)
@@ -158,19 +170,50 @@ def gemm_wp(
 NUM_XCDS = 8
 
 
-def _validate_dma_packet_shape(a, b, n, k, bn, bk):
+def _is_power_of_two(value):
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _has_power_of_two_group_size_divisors(num_pid_m, gm):
+    if num_pid_m <= 0 or not _is_power_of_two(gm):
+        return False
+    tail_group_size = num_pid_m % gm
+    return tail_group_size == 0 or _is_power_of_two(tail_group_size)
+
+
+def _validate_dma_packet_shape(a, b, n, k, bm, bn, bk, nb, gm):
     if a.stride(1) != 1 or b.stride(1) != 1:
         raise ValueError("gemm_wp requires unit inner strides for f16 dword DMA packets")
     if bn % 2 or bk % 2:
         raise ValueError("gemm_wp requires BLOCK_N/BLOCK_K to be divisible by 2 for f16 dword DMA packets")
     if n % 16 or k % 16:
         raise ValueError("gemm_wp requires N/K to be divisible by 16 for the current TLX Wave DMA proof")
+    k_iters = (k + bk - 1) // bk
+    if k_iters < nb:
+        raise ValueError("gemm_wp requires ceil(K / BLOCK_K) to be at least NUM_BUFFERS")
+    num_pid_m = (a.shape[0] + bm - 1) // bm
+    if not _has_power_of_two_group_size_divisors(num_pid_m, gm):
+        raise ValueError(
+            "gemm_wp requires GROUP_M and the final M-group size to be powers "
+            "of two for the current TLX Wave integer division proof"
+        )
+    num_pid_in_group = gm * ((n + bn - 1) // bn)
+    if not _is_power_of_two(num_pid_in_group):
+        raise ValueError(
+            "gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to be a positive power of two "
+            "for the current TLX Wave integer division proof"
+        )
+    if num_pid_in_group > 2147483647:
+        raise ValueError(
+            "gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to fit in signed 32 bits "
+            "for the current TLX Wave integer division proof"
+        )
 
 
 def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):
     M, K = a.shape
     _, N = b.shape
-    _validate_dma_packet_shape(a, b, N, K, bn, bk)
+    _validate_dma_packet_shape(a, b, N, K, bm, bn, bk, nb, gm)
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), )
     gemm_wp[grid](
         a,

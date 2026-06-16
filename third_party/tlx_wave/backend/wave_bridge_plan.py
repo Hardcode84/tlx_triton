@@ -1200,7 +1200,13 @@ def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
             operand_plans[0].varying_dims if operand_plans and operand_plans[0] else ()
         )
         kind = op_name.split(".")[-1]
-    elif op_name in {"arith.addi", "arith.muli", "arith.andi", "arith.cmpi"}:
+    elif op_name in {
+        "arith.addi",
+        "arith.andi",
+        "arith.cmpi",
+        "arith.muli",
+        "arith.subi",
+    }:
         varying_dims = _merge_varying_dims(*operand_plans)
         kind = op_name.split(".")[-1]
     elif op_name == "tt.addptr":

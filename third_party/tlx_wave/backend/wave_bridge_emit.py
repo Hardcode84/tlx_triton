@@ -395,6 +395,154 @@ def _users_by_value_id(plan):
     return users
 
 
+def _plan_minus_one_base_value(values, op_by_result, value_id):
+    op = op_by_result.get(value_id)
+    if op is None or len(op.operands) != 2:
+        return None
+    lhs_id, rhs_id = op.operands
+    if op.name == "arith.subi" and _const_int_value(values, rhs_id) == 1:
+        return lhs_id
+    if op.name == "arith.addi":
+        if _const_int_value(values, rhs_id) == -1:
+            return lhs_id
+        if _const_int_value(values, lhs_id) == -1:
+            return rhs_id
+    return None
+
+
+def _plan_power_of_two_or_zero_value(values, op_by_result, value_id):
+    op = op_by_result.get(value_id)
+    if op is None or op.name != "arith.andi" or len(op.operands) != 2:
+        return None
+    lhs_id, rhs_id = op.operands
+    if _plan_minus_one_base_value(values, op_by_result, rhs_id) == lhs_id:
+        return lhs_id
+    if _plan_minus_one_base_value(values, op_by_result, lhs_id) == rhs_id:
+        return rhs_id
+    return None
+
+
+def _range_bounds_from_value_const(predicate, const_value):
+    if predicate == "sgt":
+        return const_value + 1, None
+    if predicate == "sge":
+        return const_value, None
+    if predicate == "slt":
+        return None, const_value - 1
+    if predicate == "sle":
+        return None, const_value
+    if predicate == "eq":
+        return const_value, const_value
+    return None
+
+
+def _plan_is_assumable_index_value(values, value_id):
+    value = values.get(value_id)
+    return (
+        value is not None
+        and value.type_kind == "scalar"
+        and not _is_bool_value(value)
+        and _is_integer_or_index_value(value)
+    )
+
+
+def _plan_range_fact_from_value_const(values, value_id, predicate, const_value):
+    if not _plan_is_assumable_index_value(values, value_id):
+        return None
+    bounds = _range_bounds_from_value_const(predicate, const_value)
+    if bounds is None:
+        return None
+    lower, upper = bounds
+    return _AssumeFact(value_id, "range", lower=lower, upper=upper)
+
+
+def _plan_assume_fact_from_cmp(values, op_by_result, op):
+    if len(op.operands) != 2:
+        return None
+    predicate = _CMPI_PREDICATES.get(int(op.attrs.get("predicate")))
+    if predicate is None:
+        return None
+
+    lhs_id, rhs_id = op.operands
+    lhs_const = _const_int_value(values, lhs_id)
+    rhs_const = _const_int_value(values, rhs_id)
+    if predicate == "eq":
+        if rhs_const == 0:
+            pow2_value = _plan_power_of_two_or_zero_value(
+                values, op_by_result, lhs_id
+            )
+            if pow2_value is not None and _plan_is_assumable_index_value(
+                values, pow2_value
+            ):
+                return _AssumeFact(pow2_value, "power_of_two_or_zero")
+        if lhs_const == 0:
+            pow2_value = _plan_power_of_two_or_zero_value(
+                values, op_by_result, rhs_id
+            )
+            if pow2_value is not None and _plan_is_assumable_index_value(
+                values, pow2_value
+            ):
+                return _AssumeFact(pow2_value, "power_of_two_or_zero")
+    if rhs_const is not None:
+        return _plan_range_fact_from_value_const(
+            values, lhs_id, predicate, rhs_const
+        )
+    if lhs_const is not None:
+        inverted = _invert_cmpi_predicate(predicate)
+        if inverted is not None:
+            return _plan_range_fact_from_value_const(
+                values, rhs_id, inverted, lhs_const
+            )
+    return None
+
+
+def _plan_assume_facts_for_value(values, op_by_result, value_id):
+    op = op_by_result.get(value_id)
+    if op is None:
+        return ()
+    if op.name == "arith.andi":
+        facts = []
+        for operand_id in op.operands:
+            facts.extend(_plan_assume_facts_for_value(values, op_by_result, operand_id))
+        return tuple(facts)
+    if op.name == "arith.cmpi":
+        fact = _plan_assume_fact_from_cmp(values, op_by_result, op)
+        return (fact,) if fact is not None else ()
+    return ()
+
+
+def _facts_prove_nonnegative_value(facts, value_id):
+    for fact in facts:
+        if (
+            fact.value_id == value_id
+            and fact.kind == "range"
+            and fact.lower is not None
+            and fact.lower >= 0
+        ):
+            return True
+    return False
+
+
+def _pow2_assumed_value_ids(plan):
+    values = _values_by_id(plan)
+    op_by_result = _op_by_result_id(plan)
+    facts = []
+
+    for op in plan.ops:
+        if op.name == "llvm.intr.assume":
+            for operand_id in op.operands:
+                facts.extend(
+                    _plan_assume_facts_for_value(values, op_by_result, operand_id)
+                )
+
+    return frozenset(
+        fact.value_id
+        for fact in facts
+        if fact.kind == "power_of_two_or_zero"
+        and _facts_prove_nonnegative_value(facts, fact.value_id)
+    )
+
+
 def _assume_tree_info(plan):
     op_by_result = _op_by_result_id(plan)
     users_by_value = _users_by_value_id(plan)
@@ -3068,7 +3216,7 @@ def _emit_make_range_op(op, values, wave_values, w):
     )
 
 
-def _emit_index_binary_op(builder, op, values, wave_values, w):
+def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
     if len(op.operands) != 2 or len(op.results) != 1:
         raise ValueError(f"tlx_wave bridge expected {op.name} with two operands")
     lhs = _require_lowered_value(wave_values, op.operands[0], "index_expr", op.name)
@@ -3101,7 +3249,13 @@ def _emit_index_binary_op(builder, op, values, wave_values, w):
 
         materialized = None
         nsw, nuw = _index_overflow_flags(op, lhs, rhs)
-        if nsw or nuw:
+        keep_symbolic = (
+            op.name == "arith.muli"
+            and bool(op.results)
+            and state is not None
+            and op.results[0] in state.get("pow2_assumed_values", ())
+        )
+        if (nsw or nuw) and not keep_symbolic:
             binary_kind = _wave_binary_kind_for_op(op.name, w)
             if binary_kind is not None:
                 materialized = _IndexBinary(binary_kind, lhs, rhs, nsw=nsw, nuw=nuw)
@@ -3338,11 +3492,11 @@ def _emit_simd_minmax_op(builder, op, values, wave_values, w, predicate):
     wave_values[result.value_id] = _result_wave_value_from_components(components)
 
 
-def _emit_arith_binary_op(builder, op, values, wave_values, w):
+def _emit_arith_binary_op(builder, op, values, wave_values, w, state=None):
     lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
     rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
     if lhs.kind == "index_expr" and rhs.kind == "index_expr":
-        _emit_index_binary_op(builder, op, values, wave_values, w)
+        _emit_index_binary_op(builder, op, values, wave_values, w, state)
         return
     data_kinds = {"simd", "simd_tuple", "index_expr"}
     if lhs.kind in data_kinds and rhs.kind in data_kinds:
@@ -3688,17 +3842,11 @@ def _is_assumable_index_value(state, value_id):
 def _range_fact_from_value_const(state, value_id, predicate, const_value):
     if not _is_assumable_index_value(state, value_id):
         return None
-    if predicate == "sgt":
-        return _AssumeFact(value_id, "range", lower=const_value + 1)
-    if predicate == "sge":
-        return _AssumeFact(value_id, "range", lower=const_value)
-    if predicate == "slt":
-        return _AssumeFact(value_id, "range", upper=const_value - 1)
-    if predicate == "sle":
-        return _AssumeFact(value_id, "range", upper=const_value)
-    if predicate == "eq":
-        return _AssumeFact(value_id, "range", lower=const_value, upper=const_value)
-    return None
+    bounds = _range_bounds_from_value_const(predicate, const_value)
+    if bounds is None:
+        return None
+    lower, upper = bounds
+    return _AssumeFact(value_id, "range", lower=lower, upper=upper)
 
 
 def _invert_cmpi_predicate(predicate):
@@ -3731,6 +3879,37 @@ def _divisibility_fact_from_remainder(state, rem_value_id):
     return _AssumeFact(value_id, "divisible", divisor=divisor)
 
 
+def _minus_one_base_value(state, value_id):
+    op = state["op_by_result"].get(value_id)
+    if op is None or len(op.operands) != 2:
+        return None
+    lhs_id, rhs_id = op.operands
+    if op.name == "arith.subi" and _const_int_value(state["values"], rhs_id) == 1:
+        return lhs_id
+    if op.name == "arith.addi":
+        if _const_int_value(state["values"], rhs_id) == -1:
+            return lhs_id
+        if _const_int_value(state["values"], lhs_id) == -1:
+            return rhs_id
+    return None
+
+
+def _power_of_two_or_zero_fact_from_and(state, and_value_id):
+    and_op = state["op_by_result"].get(and_value_id)
+    if and_op is None or and_op.name != "arith.andi" or len(and_op.operands) != 2:
+        return None
+    lhs_id, rhs_id = and_op.operands
+    if _minus_one_base_value(state, rhs_id) == lhs_id:
+        value_id = lhs_id
+    elif _minus_one_base_value(state, lhs_id) == rhs_id:
+        value_id = rhs_id
+    else:
+        return None
+    if not _is_assumable_index_value(state, value_id):
+        return None
+    return _AssumeFact(value_id, "power_of_two_or_zero")
+
+
 def _assume_fact_from_cmp(op, state):
     if len(op.operands) != 2:
         return None
@@ -3746,8 +3925,14 @@ def _assume_fact_from_cmp(op, state):
             fact = _divisibility_fact_from_remainder(state, lhs_id)
             if fact is not None:
                 return fact
+            fact = _power_of_two_or_zero_fact_from_and(state, lhs_id)
+            if fact is not None:
+                return fact
         if lhs_const == 0:
             fact = _divisibility_fact_from_remainder(state, rhs_id)
+            if fact is not None:
+                return fact
+            fact = _power_of_two_or_zero_fact_from_and(state, rhs_id)
             if fact is not None:
                 return fact
     if rhs_const is not None:
@@ -3795,14 +3980,25 @@ def _emit_assume_fact(builder, state, fact, w):
         value = builder.assume(value, assumptions, name="x")
     elif fact.kind == "divisible" and fact.divisor is not None:
         value = builder.assume_divisible(value, fact.divisor)
+    elif fact.kind == "power_of_two_or_zero":
+        x = w.sym_ctx.sym("x")
+        value = builder.assume(value, [w.sym_ctx.eq(x & (x - 1), 0)], name="x")
     else:
         return
     _set_wave_value(state["wave_values"], fact.value_id, "index_expr", value)
 
 
+def _is_safe_assume_fact(state, fact):
+    if fact.kind != "power_of_two_or_zero":
+        return True
+    return fact.value_id in state.get("pow2_assumed_values", ())
+
+
 def _emit_assume_op(builder, op, state, w):
     for operand_id in op.operands:
         for fact in _assume_facts_for_value(state, operand_id):
+            if not _is_safe_assume_fact(state, fact):
+                continue
             state["assume_facts"].append(fact)
             _emit_assume_fact(builder, state, fact, w)
 
@@ -5596,6 +5792,7 @@ def _initial_lowering_state(builder, kernel, plan, w):
         "program_id_bindings": {},
         "mem_state": _MemState(),
         "assume_facts": [],
+        "pow2_assumed_values": _pow2_assumed_value_ids(plan),
     }
     _init_argument_wave_values(builder, kernel, values, state, w)
     return state
@@ -5629,7 +5826,7 @@ def _emit_generic_value_op(builder, state, op, w):
         "arith.remui",
         "arith.subi",
     }:
-        _emit_arith_binary_op(builder, op, values, wave_values, w)
+        _emit_arith_binary_op(builder, op, values, wave_values, w, state)
     elif op.name in {"arith.extf", "arith.truncf"}:
         _emit_float_cast_op(builder, op, values, wave_values, w)
     elif op.name == "arith.cmpi":

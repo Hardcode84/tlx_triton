@@ -196,9 +196,37 @@ def test_gemm_wp_run_rejects_unaligned_dma_packet_edges(shape):
         tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
 
 
+def test_gemm_wp_run_rejects_non_power_of_two_group_divisor():
+    tutorial = _load_gemm_wp_module()
+    a = _FakeTensor((32, 80), (80, 1))
+    b = _FakeTensor((80, 80), (80, 1))
+    c = _FakeTensor((32, 80), (80, 1))
+
+    with pytest.raises(ValueError, match="GROUP_M.*positive power of two"):
+        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
+
+
+def test_gemm_wp_run_rejects_non_power_of_two_tail_group_size():
+    tutorial = _load_gemm_wp_module()
+    a = _FakeTensor((2816, 80), (80, 1))
+    b = _FakeTensor((80, 64), (64, 1))
+    c = _FakeTensor((2816, 64), (64, 1))
+
+    with pytest.raises(ValueError, match="final M-group size"):
+        tutorial.run(a, b, c, 256, 32, 32, 2, 4, 8)
+
+
+def test_gemm_wp_run_allows_full_non_power_of_two_m_groups():
+    tutorial = _load_gemm_wp_module()
+    a = _FakeTensor((6144, 80), (80, 1))
+    b = _FakeTensor((80, 64), (64, 1))
+
+    tutorial._validate_dma_packet_shape(a, b, 64, 80, 256, 32, 32, 2, 8)
+
+
 def test_gemm_wp_run_allows_packet_aligned_edge_shape():
     tutorial = _load_gemm_wp_module()
     a = _FakeTensor((48, 80), (80, 1))
     b = _FakeTensor((80, 48), (48, 1))
 
-    tutorial._validate_dma_packet_shape(a, b, 48, 80, 32, 32)
+    tutorial._validate_dma_packet_shape(a, b, 48, 80, 32, 32, 32, 2, 16)

@@ -2110,6 +2110,99 @@ def test_tlx_wave_bridge_lowers_llvm_assume_range_and_divisibility(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_lowers_llvm_assume_power_of_two(tmp_path):
+    assume_func = """
+  tt.func public @assume_power_of_two(%arg0: i32) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c0 = arith.constant 0 : i32
+    %minus_one = arith.subi %arg0, %c1 : i32
+    %pow2_bits = arith.andi %arg0, %minus_one : i32
+    %pow2 = arith.cmpi eq, %pow2_bits, %c0 : i32
+    %positive = arith.cmpi sgt, %arg0, %c0 : i32
+    %assumption = arith.andi %positive, %pow2 : i1
+    llvm.intr.assume %assumption : i1
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert wave.count("wave.assume") == 2
+    assert '#wave.pred<"-1 + x >= 0">' in wave
+    assert "x &" in wave
+    assert "== 0" in wave
+    assert "llvm.intr.assume" not in wave
+    assert "arith.andi" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_drops_standalone_fixed_width_power_of_two_assume(tmp_path):
+    assume_func = """
+  tt.func public @assume_power_of_two(%arg0: i32) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c0 = arith.constant 0 : i32
+    %minus_one = arith.subi %arg0, %c1 : i32
+    %pow2_bits = arith.andi %arg0, %minus_one : i32
+    %pow2 = arith.cmpi eq, %pow2_bits, %c0 : i32
+    llvm.intr.assume %pow2 : i1
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.assume" not in wave
+    assert "x &" not in wave
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_keeps_pow2_assumed_product_symbolic(tmp_path):
+    assume_func = """
+  tt.func public @assume_power_of_two_product(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %c16 = arith.constant 16 : i32
+    %c1 = arith.constant 1 : i32
+    %c0 = arith.constant 0 : i32
+    %c_i32_max = arith.constant 2147483647 : i32
+    %divisor = arith.muli %arg1, %c16 : i32
+    %positive = arith.cmpi sgt, %divisor, %c0 : i32
+    %bounded = arith.cmpi sle, %divisor, %c_i32_max : i32
+    %minus_one = arith.subi %divisor, %c1 : i32
+    %pow2_bits = arith.andi %divisor, %minus_one : i32
+    %pow2 = arith.cmpi eq, %pow2_bits, %c0 : i32
+    %bounds = arith.andi %positive, %bounded : i1
+    %assumption = arith.andi %bounds, %pow2 : i1
+    llvm.intr.assume %assumption : i1
+    %pid = tt.get_program_id x : i32
+    %group = arith.divsi %pid, %divisor : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %group : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, assume_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary muli" not in wave
+    assert "wave.binary divsi" in wave
+    assert "x &" in wave
+    assert "-2147483647 + x <= 0" in wave
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_lowers_shared_assume_condition_helpers(tmp_path):
     assume_func = """
   tt.func public @shared_assume_condition(%arg0: i32) attributes {noinline = false} {
