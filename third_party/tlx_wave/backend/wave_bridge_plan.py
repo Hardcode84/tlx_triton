@@ -237,6 +237,7 @@ _ORDERED_BODY_VALUE_OPS = {
 }
 
 _ORDERED_BODY_EFFECT_OPS = {
+    "amdg.buffer_load_to_local",
     "tt.dot",
     "tt.load",
     "tt.store",
@@ -1065,6 +1066,71 @@ def _async_copy_operands(op):
     return address_value, memdesc_value, mask_value, other_value
 
 
+def _require_default_cache_modifier(op, context):
+    cache = dict(op.get_attrs()).get("cache")
+    if cache is None or cache == 1 or str(cache) == "1":
+        return
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context} with cacheModifier={cache}; "
+        "Wave lowering does not support cache modifiers yet"
+    )
+
+
+def _buffer_load_to_local_operands(op):
+    _require_default_cache_modifier(op, "amdg.buffer_load_to_local")
+    operands = _op_operands(op)
+    segments = _op_int_array_attr(op, "operandSegmentSizes")
+    if segments is None:
+        raise ValueError(
+            "tlx_wave bridge expected amdg.buffer_load_to_local "
+            "operandSegmentSizes attribute"
+        )
+    if len(segments) != 6:
+        raise ValueError(
+            "tlx_wave bridge expected amdg.buffer_load_to_local "
+            f"operandSegmentSizes with six entries, got {segments}"
+        )
+    if sum(segments) != len(operands):
+        raise ValueError(
+            "tlx_wave bridge found inconsistent amdg.buffer_load_to_local "
+            f"operandSegmentSizes={segments} for {len(operands)} operands"
+        )
+    if segments[0] != 1 or segments[1] != 1 or segments[2] != 1:
+        raise ValueError(
+            "tlx_wave bridge expected amdg.buffer_load_to_local destination, "
+            f"base pointer, and offsets operands, got operandSegmentSizes={segments}"
+        )
+    if segments[3] not in (0, 1) or segments[4] not in (0, 1):
+        raise ValueError(
+            "tlx_wave bridge expected optional single mask/other operands for "
+            f"amdg.buffer_load_to_local, got operandSegmentSizes={segments}"
+        )
+    if segments[5] not in (0, 1):
+        raise ValueError(
+            "tlx_wave bridge expected optional single stride operand for "
+            f"amdg.buffer_load_to_local, got operandSegmentSizes={segments}"
+        )
+
+    index = 0
+    memdesc_value = operands[index]
+    index += segments[0]
+    ptr_value = operands[index]
+    index += segments[1]
+    offsets_value = operands[index]
+    index += segments[2]
+    mask_value = operands[index] if segments[3] else None
+    index += segments[3]
+    other_value = operands[index] if segments[4] else None
+    index += segments[4]
+    stride_value = operands[index] if segments[5] else None
+    if stride_value is not None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower amdg.buffer_load_to_local with "
+            "a stride operand yet"
+        )
+    return ptr_value, offsets_value, memdesc_value, mask_value, other_value
+
+
 def _result_owner_map(ops):
     owners = {}
     for op in ops:
@@ -1719,10 +1785,17 @@ def _address_plan(op, values, owners):
     operands = _op_operands(op)
     results = _op_results(op)
     address_value = memdesc_value = value_value = mask_value = other_value = None
+    offset_value = None
     result_value_id = token_value_id = None
 
     if name == "ttg.async_copy_global_to_local":
         address_value, memdesc_value, mask_value, other_value = _async_copy_operands(op)
+        token_value_id = _value_id(results[0]) if results else None
+        result_value_id = token_value_id
+    elif name == "amdg.buffer_load_to_local":
+        address_value, offset_value, memdesc_value, mask_value, other_value = (
+            _buffer_load_to_local_operands(op)
+        )
         token_value_id = _value_id(results[0]) if results else None
         result_value_id = token_value_id
     elif name == "tt.store":
@@ -1743,12 +1816,23 @@ def _address_plan(op, values, owners):
     else:
         return None
 
-    source_value = address_value or memdesc_value
+    source_value = (
+        offset_value
+        if name == "amdg.buffer_load_to_local"
+        else (address_value or memdesc_value)
+    )
     source_plan = (
         values.get(_value_id(source_value)) if source_value is not None else None
     )
+    base_plan = (
+        values.get(_value_id(address_value))
+        if address_value is not None
+        else source_plan
+    )
     offset_value_id = None
-    if address_value is not None:
+    if offset_value is not None:
+        offset_value_id = _value_id(offset_value)
+    elif address_value is not None:
         owner = owners.get(_value_id(address_value))
         if (
             owner is not None
@@ -1774,8 +1858,16 @@ def _address_plan(op, values, owners):
             else (source_plan.element_byte_width if source_plan is not None else None)
         ),
         source_plan.shape if source_plan is not None else (),
-        source_plan.base_arg_index if source_plan is not None else None,
-        source_plan.base_arg_name if source_plan is not None else None,
+        (
+            base_plan.base_arg_index
+            if base_plan is not None and base_plan.base_arg_index is not None
+            else (source_plan.base_arg_index if source_plan is not None else None)
+        ),
+        (
+            base_plan.base_arg_name
+            if base_plan is not None and base_plan.base_arg_name is not None
+            else (source_plan.base_arg_name if source_plan is not None else None)
+        ),
         offset_value_id,
         _value_id(mask_value) if mask_value is not None else None,
         _value_id(other_value) if other_value is not None else None,
@@ -1804,6 +1896,10 @@ def _build_token_plans(ops, values):
         if name == "ttg.async_copy_global_to_local":
             async_source_value, async_memdesc_value, async_mask_value, _ = (
                 _async_copy_operands(op)
+            )
+        elif name == "amdg.buffer_load_to_local":
+            async_source_value, _, async_memdesc_value, async_mask_value, _ = (
+                _buffer_load_to_local_operands(op)
             )
         result_token_id = (
             _value_id(results[0])
@@ -2006,7 +2102,7 @@ def _async_address_by_token(plan):
     return {
         address.token_value_id: address
         for address in plan.addresses
-        if address.op == "ttg.async_copy_global_to_local"
+        if address.op in {"ttg.async_copy_global_to_local", "amdg.buffer_load_to_local"}
         and address.token_value_id is not None
     }
 

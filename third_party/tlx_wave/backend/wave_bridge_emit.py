@@ -5228,10 +5228,9 @@ def _emit_dma_packet_ptrs(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
             "without faithful DMA: unknown DMA packet element count"
         )
-    pointer_source = _require_lowered_value(
-        state["wave_values"],
-        address.address_value_id,
-        "pointer_expr",
+    pointer_source = _async_copy_pointer_source(
+        state,
+        address,
         "ttg.async_copy_global_to_local source",
     )
     _require_dma_packet_source_contiguous_bytes(
@@ -5305,10 +5304,9 @@ def _select_dma_packet_lowering(
     w,
 ):
     errors = []
-    pointer_source = _require_lowered_value(
-        state["wave_values"],
-        address.address_value_id,
-        "pointer_expr",
+    pointer_source = _async_copy_pointer_source(
+        state,
+        address,
         "ttg.async_copy_global_to_local source",
     )
     for dma_bytes in _require_dma_packet_byte_candidates(
@@ -5376,6 +5374,39 @@ def _async_copy_other_value_plan(address_plan, address):
     )
 
 
+def _async_copy_source_plan(address, values):
+    if address.op == "amdg.buffer_load_to_local":
+        if address.offset_value_id is None:
+            raise ValueError(
+                "tlx_wave bridge cannot lower amdg.buffer_load_to_local "
+                "without offsets"
+            )
+        return _async_copy_other_value_plan(values[address.offset_value_id], address)
+    return values[address.address_value_id]
+
+
+def _async_copy_pointer_source(state, address, context):
+    base = _require_lowered_value(
+        state["wave_values"],
+        address.address_value_id,
+        "pointer_expr",
+        context,
+    )
+    if address.op != "amdg.buffer_load_to_local":
+        return base
+    if address.offset_value_id is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower amdg.buffer_load_to_local without offsets"
+        )
+    offset = _require_lowered_value(
+        state["wave_values"],
+        address.offset_value_id,
+        "index_expr",
+        "amdg.buffer_load_to_local offsets",
+    )
+    return _PointerAdd(base, offset)
+
+
 def _emit_async_copy_via_load_store(
     builder,
     state,
@@ -5396,10 +5427,9 @@ def _emit_async_copy_via_load_store(
             f"{address_plan.shape} does not match destination memdesc shape "
             f"{memdesc.shape}"
         )
-    pointer_source = _require_lowered_value(
-        state["wave_values"],
-        address.address_value_id,
-        "pointer_expr",
+    pointer_source = _async_copy_pointer_source(
+        state,
+        address,
         "ttg.async_copy_global_to_local source",
     )
     component_count = _blocked_layout_component_count(
@@ -5511,7 +5541,7 @@ def _emit_async_copy(
         raise ValueError(
             "tlx_wave bridge cannot lower async copy without a source address value"
         )
-    address_plan = state["values"][address.address_value_id]
+    address_plan = _async_copy_source_plan(address, state["values"])
     if address.element_type != memdesc.element_type:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local: "
@@ -5866,6 +5896,7 @@ _PLANNING_ONLY_OPS = {
 
 
 _CONTROL_REGION_EFFECT_OPS = {
+    "amdg.buffer_load_to_local",
     "tt.dot",
     "tt.load",
     "tt.store",
@@ -8327,7 +8358,7 @@ def _emit_ordered_raw_op(
         _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats)
     elif op.name == "tt.load":
         _emit_global_load_op(builder, op, state, w)
-    elif op.name == "ttg.async_copy_global_to_local":
+    elif op.name in {"ttg.async_copy_global_to_local", "amdg.buffer_load_to_local"}:
         token_id = op.results[0] if op.results else None
         address = state["address_by_token"].get(token_id)
         if address is None:
@@ -8628,6 +8659,12 @@ def _binding_i32_attr(w, value):
     return w.IntegerAttr.get(w.i32(), int(value))
 
 
+def _planned_async_copy_count(plan):
+    return plan.op_counts.get("ttg.async_copy_global_to_local", 0) + plan.op_counts.get(
+        "amdg.buffer_load_to_local", 0
+    )
+
+
 def _binding_bool_attr(w, value):
     return w.IntegerAttr.get(w.i1(), int(bool(value)))
 
@@ -8662,9 +8699,7 @@ def _emit_wave_skeleton_with_bindings(kernel, attrs, plan):
                 "scalar_count": scalar_count,
                 "wave_size": attrs.threads_per_warp,
                 "num_warps": attrs.num_warps,
-                "async_copy_count": plan.op_counts.get(
-                    "ttg.async_copy_global_to_local", 0
-                ),
+                "async_copy_count": _planned_async_copy_count(plan),
                 "async_wait_count": plan.op_counts.get("ttg.async_wait", 0),
             },
         )
