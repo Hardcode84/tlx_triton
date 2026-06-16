@@ -4313,11 +4313,13 @@ def _ixsimpl_simplify(expr, assumptions, w):
 
 
 def _ixsimpl_is_true(expr):
-    return str(expr) == "True"
+    ixs = _ixsimpl_module()
+    return ixs.same_node(expr, expr._ctx.true_())
 
 
 def _ixsimpl_is_false(expr):
-    return str(expr) == "False"
+    ixs = _ixsimpl_module()
+    return ixs.same_node(expr, expr._ctx.false_())
 
 
 def _ixsimpl_proves(expr, assumptions, w):

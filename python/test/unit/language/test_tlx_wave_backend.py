@@ -258,6 +258,26 @@ def _run_waveamd_to_machine(wave_artifact):
     return result.stdout
 
 
+def test_tlx_wave_bridge_recognizes_structural_ixsimpl_bool_literals():
+    import ixsimpl
+
+    ctx = ixsimpl.Context()
+    x = ctx.sym("x")
+    aligned = ctx.eq(ixsimpl.mod(x, 8), ctx.int_(0))
+    not_aligned = ctx.ne(ixsimpl.mod(x, 8), ctx.int_(0))
+    w = SimpleNamespace(sym_ctx=ctx)
+
+    simplified_true = [aligned]
+    simplified_false = [not_aligned]
+    ctx.simplify_batch(simplified_true, assumptions=[aligned])
+    ctx.simplify_batch(simplified_false, assumptions=[aligned])
+
+    assert wave_bridge_emit._ixsimpl_is_true(simplified_true[0])
+    assert wave_bridge_emit._ixsimpl_is_false(simplified_false[0])
+    assert wave_bridge_emit._ixsimpl_proves(aligned, [aligned], w) is True
+    assert wave_bridge_emit._ixsimpl_proves(not_aligned, [aligned], w) is False
+
+
 def test_tlx_wave_lowers_non_dot_local_memory_roundtrip(tmp_path):
     local_func = """
   tt.func public @local_roundtrip(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) attributes {noinline = false} {
