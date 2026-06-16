@@ -182,8 +182,6 @@ def _has_power_of_two_group_size_divisors(num_pid_m, gm):
 
 
 def _validate_dma_packet_shape(a, b, n, k, bm, bn, bk, nb, gm):
-    if a.stride(1) != 1 or b.stride(1) != 1:
-        raise ValueError("gemm_wp requires unit inner strides for f16 dword DMA packets")
     if bn % 2 or bk % 2:
         raise ValueError("gemm_wp requires BLOCK_N/BLOCK_K to be divisible by 2 for f16 dword DMA packets")
     if n % 16 or k % 16:

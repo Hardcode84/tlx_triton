@@ -32,6 +32,9 @@ def _warmup_gemm_wp_tlx_wave(
     block_n=32,
     block_k=32,
     num_warps=4,
+    a_strides=None,
+    b_strides=None,
+    c_strides=None,
 ):
     import triton
     from triton import knobs
@@ -67,6 +70,9 @@ def _warmup_gemm_wp_tlx_wave(
         a = MockTensor(torch.float16, [m, k])
         b = MockTensor(torch.float16, [k, n])
         c = MockTensor(torch.float32, [m, n])
+        a_strides = a.stride() if a_strides is None else a_strides
+        b_strides = b.stride() if b_strides is None else b_strides
+        c_strides = c.stride() if c_strides is None else c_strides
         compiled = tutorial.gemm_wp.warmup(
             a,
             b,
@@ -74,12 +80,12 @@ def _warmup_gemm_wp_tlx_wave(
             m,
             n,
             k,
-            a.stride()[0],
-            a.stride()[1],
-            b.stride()[0],
-            b.stride()[1],
-            c.stride()[0],
-            c.stride()[1],
+            a_strides[0],
+            a_strides[1],
+            b_strides[0],
+            b_strides[1],
+            c_strides[0],
+            c_strides[1],
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
@@ -174,14 +180,38 @@ def test_gemm_wp_tlx_wave_warmup_lowers_8_warp_32x32_layout(monkeypatch, tmp_pat
     assert "waveamd.mma" in wave
 
 
-def test_gemm_wp_run_rejects_non_unit_inner_strides():
+def test_gemm_wp_validation_allows_non_unit_inner_strides():
     tutorial = _load_gemm_wp_module()
     a = _FakeTensor((32, 80), (160, 2))
     b = _FakeTensor((80, 48), (48, 1))
-    c = _FakeTensor((32, 48), (48, 1))
 
-    with pytest.raises(ValueError, match="unit inner strides"):
-        tutorial.run(a, b, c, 32, 32, 32, 2, 4, 16)
+    tutorial._validate_dma_packet_shape(a, b, 48, 80, 32, 32, 32, 2, 16)
+
+
+@pytest.mark.parametrize(
+    "stride_override",
+    [
+        {"a_strides": (256, 2)},
+        {"b_strides": (64, 2)},
+    ],
+)
+def test_gemm_wp_tlx_wave_warmup_falls_back_for_non_unit_inner_stride(
+    monkeypatch, tmp_path, stride_override
+):
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, **stride_override)
+
+    wave = compiled.asm["wave"]
+    if isinstance(wave, bytes):
+        wave = wave.decode()
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_async_copies >= 4
+    assert (
+        compiled.metadata.tlx_wave_num_dma_load_lds
+        < compiled.metadata.tlx_wave_num_async_copies
+    )
+    assert "wave.load" in wave
+    assert "wave.store" in wave
+    assert "ttg.async_copy_global_to_local" not in wave
 
 
 @pytest.mark.parametrize("shape", [(32, 33, 80), (32, 48, 81)])
