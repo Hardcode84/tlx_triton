@@ -22,13 +22,28 @@ class _FakeTensor:
         return self._strides[dim]
 
 
-def _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=32, n=32, k=128):
+def _warmup_gemm_wp_tlx_wave(
+    tmp_path,
+    monkeypatch,
+    m=32,
+    n=32,
+    k=128,
+    block_m=32,
+    block_n=32,
+    block_k=32,
+    num_warps=4,
+):
     import triton
     from triton import knobs
     from triton.backends import backends
     from triton.runtime.jit import MockTensor
 
     monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+    wave_opt = (
+        Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
+    )
+    if wave_opt.exists():
+        monkeypatch.setenv("TRITON_WAVE_OPT", str(wave_opt))
 
     if "tlx_wave" not in backends:
         pytest.skip("tlx_wave backend is not installed")
@@ -47,8 +62,6 @@ def _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=32, n=32, k=128):
 
         tutorial = _load_gemm_wp_module()
 
-        block_m = block_n = 32
-        block_k = 32
         grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
 
         a = MockTensor(torch.float16, [m, k])
@@ -74,7 +87,7 @@ def _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, m=32, n=32, k=128):
             NUM_BUFFERS=2,
             NUM_XCDS=tutorial.NUM_XCDS,
             XCD_CHUNK=4,
-            num_warps=4,
+            num_warps=num_warps,
             num_stages=1,
             waves_per_eu=0,
             matrix_instr_nonkdim=16,
@@ -91,7 +104,10 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
         wave = wave.decode()
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == compiled.metadata.tlx_wave_num_async_copies
+    assert (
+        compiled.metadata.tlx_wave_num_dma_load_lds
+        == compiled.metadata.tlx_wave_num_async_copies
+    )
     assert compiled.metadata.tlx_wave_num_async_waits >= 2
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "scf.for" in wave
@@ -107,9 +123,55 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     if isinstance(wave, bytes):
         wave = wave.decode()
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == compiled.metadata.tlx_wave_num_async_copies
+    assert (
+        compiled.metadata.tlx_wave_num_dma_load_lds
+        == compiled.metadata.tlx_wave_num_async_copies
+    )
     assert "waveamd.dma_load_lds" in wave
     assert "ttg.async_copy_global_to_local" not in wave
+
+
+def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(monkeypatch, tmp_path):
+    compiled = _warmup_gemm_wp_tlx_wave(
+        tmp_path,
+        monkeypatch,
+        m=4096,
+        n=4096,
+        k=4096,
+        block_m=128,
+        block_n=256,
+        block_k=32,
+        num_warps=8,
+    )
+
+    wave = compiled.asm["wave"]
+    if isinstance(wave, bytes):
+        wave = wave.decode()
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_mmas >= 32
+    assert compiled.metadata.tlx_wave_num_fragment_fills >= 32
+    assert "waveamd.mma" in wave
+
+
+def test_gemm_wp_tlx_wave_warmup_lowers_8_warp_32x32_layout(monkeypatch, tmp_path):
+    compiled = _warmup_gemm_wp_tlx_wave(
+        tmp_path,
+        monkeypatch,
+        m=32,
+        n=32,
+        k=128,
+        block_m=32,
+        block_n=32,
+        block_k=32,
+        num_warps=8,
+    )
+
+    wave = compiled.asm["wave"]
+    if isinstance(wave, bytes):
+        wave = wave.decode()
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_mmas > 1
+    assert "waveamd.mma" in wave
 
 
 def test_gemm_wp_run_rejects_non_unit_inner_strides():
