@@ -107,16 +107,21 @@ def _warmup_gemm_wp_tlx_wave(
     return compiled
 
 
+def _asm_text(compiled, artifact):
+    text = compiled.asm[artifact]
+    if isinstance(text, bytes):
+        text = text.decode()
+    return text
+
+
 def _wave_text(compiled):
-    wave = compiled.asm["wave"]
-    if isinstance(wave, bytes):
-        wave = wave.decode()
-    return wave
+    return _asm_text(compiled, "wave")
 
 
 def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
 
+    ttgir = _asm_text(compiled, "ttgir")
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
@@ -130,6 +135,14 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert "waveamd.dma_load_lds" in wave
     assert 'kind = "mfma.f32.32x32x16.f16"' in wave
     assert "waveamdmachine.target" in wave
+    assert (
+        "#ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>"
+        in ttgir
+    )
+    assert (
+        "#ttg.padded_shared<[512:+32] {order = [1, 0], shape = [32, 32]}"
+        in ttgir
+    )
 
 
 def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(

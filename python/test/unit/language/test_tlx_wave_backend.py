@@ -4266,6 +4266,36 @@ def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_lowers_gfx950_mfma32_swizzled_fragment_load(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @local_load_mfma32_swizzled() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 2
+    assert metadata["tlx_wave_num_fragment_packs"] == 2
+    assert metadata["tlx_wave_num_fragment_fills"] == 0
+    assert metadata["tlx_wave_num_mmas"] == 0
+    assert wave_artifact.count("waveamd.fragment_pack") == 2
+    assert "waveamd.mma" not in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_bridge_lowers_gfx950_32x32x16_mfma_layout(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
