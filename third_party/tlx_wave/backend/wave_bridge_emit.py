@@ -8484,6 +8484,14 @@ def _store_component_pointer_offset_expr(pointer_offset, value_plan, component, 
     return expr
 
 
+def _store_component_expr(expr, value_plan, component, w):
+    for symbol, replacement in _mfma32_component_dim_exprs(
+        value_plan, component, w
+    ).items():
+        expr = expr.subs(symbol, replacement)
+    return expr
+
+
 def _mfma32_store_pointer_components_contiguous(
     pointer_source, value_plan, component, count, w
 ):
@@ -8506,16 +8514,120 @@ def _mfma32_store_pointer_components_contiguous(
     return True
 
 
-def _mfma_fragment_store_vector_width_for_store(
-    pointer_source, value_plan, frag, component, mask_id, w
+def _store_component_index_expr(source, value_plan, component, w, unknowns):
+    expr = _ixsimpl_index_expr(source, w, unknowns)
+    if expr is None:
+        return None
+    return _store_component_expr(expr, value_plan, component, w)
+
+
+def _mfma32_store_component_slt_uniform(
+    first_lhs,
+    first_rhs,
+    lhs,
+    rhs,
+    index,
+    count,
+    assumptions,
+    w,
 ):
-    if mask_id is not None:
-        return 1
+    if not _ixsimpl_expr_equal(lhs, first_lhs + int(index), assumptions, w):
+        return False
+    if not _ixsimpl_expr_equal(rhs, first_rhs, assumptions, w):
+        return False
+    return _ixsimpl_mod_zero(first_lhs, count, assumptions, w) and _ixsimpl_mod_zero(
+        first_rhs, count, assumptions, w
+    )
+
+
+def _mfma32_store_mask_compare_components_uniform(
+    source,
+    value_plan,
+    component,
+    count,
+    assumptions,
+    w,
+    unknowns,
+):
+    first_lhs = _store_component_index_expr(
+        source.lhs, value_plan, component, w, unknowns
+    )
+    first_rhs = _store_component_index_expr(
+        source.rhs, value_plan, component, w, unknowns
+    )
+    if first_lhs is None or first_rhs is None:
+        return False
+    first = _ixsimpl_mask_compare_expr(source.predicate, first_lhs, first_rhs, w)
+    if first is None:
+        return False
+    for index in range(1, count):
+        lhs = _store_component_index_expr(
+            source.lhs, value_plan, component + index, w, unknowns
+        )
+        rhs = _store_component_index_expr(
+            source.rhs, value_plan, component + index, w, unknowns
+        )
+        if lhs is None or rhs is None:
+            return False
+        candidate = _ixsimpl_mask_compare_expr(source.predicate, lhs, rhs, w)
+        if candidate is None:
+            return False
+        if _ixsimpl_predicate_equivalent(first, candidate, assumptions, w):
+            continue
+        if source.predicate == "slt" and _mfma32_store_component_slt_uniform(
+            first_lhs, first_rhs, lhs, rhs, index, count, assumptions, w
+        ):
+            continue
+        if source.predicate == "sgt" and _mfma32_store_component_slt_uniform(
+            first_rhs, first_lhs, rhs, lhs, index, count, assumptions, w
+        ):
+            continue
+        return False
+    return True
+
+
+def _mfma32_store_mask_components_uniform(
+    state, mask_source, value_plan, component, count, w
+):
+    if mask_source is None or count <= 1:
+        return True
+    if isinstance(mask_source, _MaskConst):
+        return True
+    unknowns = {}
+    assumptions = _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    if isinstance(mask_source, _MaskAnd):
+        return _mfma32_store_mask_components_uniform(
+            state, mask_source.lhs, value_plan, component, count, w
+        ) and _mfma32_store_mask_components_uniform(
+            state, mask_source.rhs, value_plan, component, count, w
+        )
+    if isinstance(mask_source, _MaskCompare):
+        return _mfma32_store_mask_compare_components_uniform(
+            mask_source, value_plan, component, count, assumptions, w, unknowns
+        )
+    mask = _ixsimpl_mask_expr(mask_source, w, unknowns)
+    if mask is None:
+        return False
+    first = _store_component_expr(mask, value_plan, component, w)
+    for index in range(1, count):
+        candidate = _store_component_expr(mask, value_plan, component + index, w)
+        if not _ixsimpl_predicate_equivalent(first, candidate, assumptions, w):
+            return False
+    return True
+
+
+def _mfma_fragment_store_vector_width_for_store(
+    state, pointer_source, mask_source, value_plan, frag, component, w
+):
     vector_width = _mfma_fragment_store_vector_width(value_plan, frag)
     if component % vector_width or component + vector_width > frag.registers:
         return 1
     if not _mfma32_store_pointer_components_contiguous(
         pointer_source, value_plan, component, vector_width, w
+    ):
+        return 1
+    if not _mfma32_store_mask_components_uniform(
+        state, mask_source, value_plan, component, vector_width, w
     ):
         return 1
     return vector_width
@@ -8569,10 +8681,20 @@ def _emit_fragment_store(
         "pointer_expr",
         "tt.store pointer",
     )
+    mask_source = (
+        _require_lowered_value(
+            state["wave_values"],
+            mask_id,
+            "mask_expr",
+            "tt.store mask",
+        )
+        if mask_id is not None
+        else None
+    )
     component = 0
     while component < frag.registers:
         vector_width = _mfma_fragment_store_vector_width_for_store(
-            pointer_source, store_plan, frag, component, mask_id, w
+            state, pointer_source, mask_source, store_plan, frag, component, w
         )
         dim_bindings, width = _store_dim_bindings(
             builder, store_plan, lowered, w, component=component
@@ -8593,12 +8715,7 @@ def _emit_fragment_store(
         mask = (
             _materialize_mask_value(
                 builder,
-                _require_lowered_value(
-                    state["wave_values"],
-                    mask_id,
-                    "mask_expr",
-                    "tt.store mask",
-                ),
+                mask_source,
                 dim_bindings,
                 w,
                 width,
