@@ -253,6 +253,36 @@ template <typename T> std::vector<int64_t> toInt64Vector(ArrayRef<T> values) {
   return result;
 }
 
+template <typename Range>
+std::vector<std::vector<int64_t>> toNestedInt64Vector(Range &&values) {
+  std::vector<std::vector<int64_t>> result;
+  result.reserve(values.size());
+  for (const auto &basis : values) {
+    std::vector<int64_t> converted;
+    converted.reserve(basis.size());
+    for (auto value : basis)
+      converted.push_back(static_cast<int64_t>(value));
+    result.push_back(std::move(converted));
+  }
+  return result;
+}
+
+template <typename Range> std::vector<std::string> toStringVector(Range values) {
+  std::vector<std::string> result;
+  for (StringAttr value : values)
+    result.push_back(value.str());
+  return result;
+}
+
+py::object getLinearEncodingBases(Attribute attr, StringRef name) {
+  if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(attr)) {
+    auto dim = StringAttr::get(attr.getContext(), name);
+    return py::cast(
+        toNestedInt64Vector(linear.getLinearLayout().getBases().lookup(dim)));
+  }
+  return py::none();
+}
+
 py::object printAttribute(Attribute attr) {
   if (!attr)
     return py::none();
@@ -735,6 +765,50 @@ void init_triton_ir(py::module_ &m) {
            [](Attribute &self) -> py::object {
              if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
                return py::cast(toInt64Vector(blocked.getOrder()));
+             return py::none();
+           })
+      .def("is_linear_encoding",
+           [](Attribute &self) { return isa<ttg::LinearEncodingTrait>(self); })
+      .def("get_linear_register_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "register");
+           })
+      .def("get_linear_lane_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "lane");
+           })
+      .def("get_linear_warp_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "warp");
+           })
+      .def("get_linear_block_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "block");
+           })
+      .def("get_linear_in_dim_names",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::cast(
+                   toStringVector(linear.getLinearLayout().getInDimNames()));
+             return py::none();
+           })
+      .def("get_linear_out_dim_names",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::cast(
+                   toStringVector(linear.getLinearLayout().getOutDimNames()));
+             return py::none();
+           })
+      .def("get_linear_num_in_dims",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::int_(linear.getLinearLayout().getNumInDims());
+             return py::none();
+           })
+      .def("get_linear_num_out_dims",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::int_(linear.getLinearLayout().getNumOutDims());
              return py::none();
            })
       .def("is_swizzled_shared_encoding",

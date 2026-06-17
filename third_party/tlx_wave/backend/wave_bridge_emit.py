@@ -1,4 +1,3 @@
-import ast
 import math
 import os
 import subprocess
@@ -302,6 +301,12 @@ def _int_tuple(values):
     return tuple(int(value) for value in values)
 
 
+def _nested_int_tuple(values):
+    if values is None:
+        raise ValueError("missing typed TTGIR encoding field")
+    return tuple(tuple(int(value) for value in basis) for basis in values)
+
+
 def _blocked_encoding_info(attr, raw_encoding, context):
     if attr is None or not _attr_bool(attr, "is_blocked_encoding"):
         raise ValueError(
@@ -316,71 +321,31 @@ def _blocked_encoding_info(attr, raw_encoding, context):
     )
 
 
-def _extract_linear_basis_list(raw_encoding, name, context):
-    raw = str(raw_encoding)
-    marker = f"{name} ="
-    marker_index = raw.find(marker)
-    if marker_index < 0:
-        raise ValueError(
-            f"tlx_wave bridge expected #ttg.linear basis '{name}' for {context}, "
-            f"got {raw_encoding}"
-        )
-    start = raw.find("[", marker_index + len(marker))
-    if start < 0:
-        raise ValueError(
-            f"tlx_wave bridge expected #ttg.linear basis list for {context}, "
-            f"got {raw_encoding}"
-        )
-    depth = 0
-    end = None
-    for index in range(start, len(raw)):
-        char = raw[index]
-        if char == "[":
-            depth += 1
-        elif char == "]":
-            depth -= 1
-            if depth == 0:
-                end = index + 1
-                break
-    if end is None:
-        raise ValueError(
-            f"tlx_wave bridge found unterminated #ttg.linear basis list for "
-            f"{context}: {raw_encoding}"
-        )
-    try:
-        values = ast.literal_eval(raw[start:end])
-    except (SyntaxError, ValueError) as exc:
-        raise ValueError(
-            f"tlx_wave bridge could not parse #ttg.linear basis '{name}' for "
-            f"{context}: {raw_encoding}"
-        ) from exc
-    if not isinstance(values, list):
-        raise ValueError(
-            f"tlx_wave bridge expected #ttg.linear basis '{name}' to be a list "
-            f"for {context}, got {raw_encoding}"
-        )
-    bases = []
-    for basis in values:
-        if not isinstance(basis, list):
-            raise ValueError(
-                f"tlx_wave bridge expected #ttg.linear basis '{name}' entries "
-                f"to be lists for {context}, got {raw_encoding}"
-            )
-        bases.append(tuple(int(value) for value in basis))
-    return tuple(bases)
-
-
 def _linear_encoding_info(attr, raw_encoding, context, rank):
-    raw = str(attr) if attr is not None else str(raw_encoding)
-    if not raw.startswith("#ttg.linear<"):
+    if attr is None or not _attr_bool(attr, "is_linear_encoding"):
         raise ValueError(
-            f"tlx_wave bridge expected #ttg.linear encoding for {context}, "
-            f"got {raw_encoding}"
+            "tlx_wave bridge expected #ttg.linear or #ttg.generic_linear "
+            f"encoding for {context}, got {raw_encoding}"
         )
-    register_bases = _extract_linear_basis_list(raw, "register", context)
-    lane_bases = _extract_linear_basis_list(raw, "lane", context)
-    warp_bases = _extract_linear_basis_list(raw, "warp", context)
-    block_bases = _extract_linear_basis_list(raw, "block", context)
+    in_dim_names = tuple(
+        str(name) for name in _attr_value(attr, "get_linear_in_dim_names")
+    )
+    for name in ("register", "lane", "warp", "block"):
+        if name not in in_dim_names:
+            raise ValueError(
+                f"tlx_wave bridge expected #ttg.linear input dim '{name}' for "
+                f"{context}, got {raw_encoding}"
+            )
+    num_out_dims = int(_attr_value(attr, "get_linear_num_out_dims"))
+    if num_out_dims != rank:
+        raise ValueError(
+            f"tlx_wave bridge #ttg.linear rank does not match {context}: "
+            f"rank={rank}, layout_rank={num_out_dims}, encoding={raw_encoding}"
+        )
+    register_bases = _nested_int_tuple(_attr_value(attr, "get_linear_register_bases"))
+    lane_bases = _nested_int_tuple(_attr_value(attr, "get_linear_lane_bases"))
+    warp_bases = _nested_int_tuple(_attr_value(attr, "get_linear_warp_bases"))
+    block_bases = _nested_int_tuple(_attr_value(attr, "get_linear_block_bases"))
     if block_bases:
         raise ValueError(
             f"tlx_wave bridge cannot lower #ttg.linear encoding with block "
@@ -461,6 +426,16 @@ def _same_blocked_encoding(lhs, rhs):
     )
 
 
+def _same_linear_encoding(lhs, rhs):
+    return (
+        lhs.register_bases == rhs.register_bases
+        and lhs.lane_bases == rhs.lane_bases
+        and lhs.warp_bases == rhs.warp_bases
+        and lhs.threads_per_warp == rhs.threads_per_warp
+        and lhs.warps_per_cta == rhs.warps_per_cta
+    )
+
+
 def _same_amd_mfma_encoding(lhs, rhs):
     return (
         lhs.version == rhs.version
@@ -516,6 +491,22 @@ def _same_layout_encoding(lhs, rhs):
             rhs.encoding_attr, rhs.encoding, "layout equality result"
         )
         return _same_blocked_encoding(lhs_info, rhs_info)
+    if _attr_bool(lhs.encoding_attr, "is_linear_encoding") and _attr_bool(
+        rhs.encoding_attr, "is_linear_encoding"
+    ):
+        lhs_info = _linear_encoding_info(
+            lhs.encoding_attr,
+            lhs.encoding,
+            "layout equality source",
+            len(lhs.shape),
+        )
+        rhs_info = _linear_encoding_info(
+            rhs.encoding_attr,
+            rhs.encoding,
+            "layout equality result",
+            len(rhs.shape),
+        )
+        return _same_linear_encoding(lhs_info, rhs_info)
     return False
 
 
@@ -860,22 +851,12 @@ def _is_data_tensor(value):
 def _tensor_lane_width(value_plan, context):
     if getattr(value_plan, "type_kind", None) != "tensor":
         return None
-    layout = _blocked_encoding_info(
-        value_plan.encoding_attr,
-        value_plan.encoding,
+    layout = _tensor_layout_info(
+        value_plan,
         context,
+        "SIMD tensor width",
     )
-    rank = len(value_plan.shape)
-    if (
-        len(layout.size_per_thread) != rank
-        or len(layout.threads_per_warp) != rank
-        or len(layout.warps_per_cta) != rank
-    ):
-        raise ValueError(
-            f"tlx_wave bridge blocked layout rank does not match {context}: "
-            f"shape={value_plan.shape}, encoding={value_plan.encoding}"
-        )
-    return _product(layout.threads_per_warp)
+    return _layout_lane_width(layout)
 
 
 def _maybe_splat(builder, value, force_width, w):
@@ -1096,6 +1077,38 @@ def _materialize_mask_value(builder, source, dim_bindings, w, width):
         )
         return _wave_cmpi(builder, source.predicate, lhs, rhs, w)
     return source
+
+
+def _materialize_component_mask_value(
+    builder, lowered, dim_bindings, w, width, context, component=0
+):
+    if isinstance(lowered, _WaveValue):
+        if lowered.kind == "mask_expr":
+            return _materialize_mask_value(
+                builder,
+                lowered.value,
+                dim_bindings,
+                w,
+                width,
+            )
+        if lowered.kind == "mask_tuple":
+            if component < 0 or component >= len(lowered.value):
+                raise ValueError(
+                    f"tlx_wave bridge cannot lower {context}: mask component "
+                    f"{component} is out of range for {len(lowered.value)} masks"
+                )
+            return _materialize_mask_value(
+                builder,
+                lowered.value[component],
+                dim_bindings,
+                w,
+                width,
+            )
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected mask value, "
+            f"got {lowered.kind}"
+        )
+    return _materialize_mask_value(builder, lowered, dim_bindings, w, width)
 
 
 def _materialize_pointer_value(builder, source, dim_bindings, w):
@@ -1388,7 +1401,7 @@ def _blocked_tensor_layout_info(value_plan, context, lowering_name):
     return layout
 
 
-def _dma_source_tensor_layout_info(value_plan, context, lowering_name):
+def _tensor_layout_info(value_plan, context, lowering_name):
     if value_plan.type_kind != "tensor" or not value_plan.shape:
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: expected ranked tensor, "
@@ -1403,12 +1416,23 @@ def _dma_source_tensor_layout_info(value_plan, context, lowering_name):
         value_plan.encoding_attr, "is_blocked_encoding"
     ):
         return _blocked_tensor_layout_info(value_plan, context, lowering_name)
-    return _linear_encoding_info(
-        value_plan.encoding_attr,
-        value_plan.encoding,
-        context,
-        len(value_plan.shape),
+    if value_plan.encoding_attr is not None and _attr_bool(
+        value_plan.encoding_attr, "is_linear_encoding"
+    ):
+        return _linear_encoding_info(
+            value_plan.encoding_attr,
+            value_plan.encoding,
+            context,
+            len(value_plan.shape),
+        )
+    raise ValueError(
+        f"tlx_wave bridge {lowering_name} expected blocked or linear tensor "
+        f"encoding for {context}, got {value_plan.encoding}"
     )
+
+
+def _dma_source_tensor_layout_info(value_plan, context, lowering_name):
+    return _tensor_layout_info(value_plan, context, lowering_name)
 
 
 def _blocked_layout_component_count(value_plan, context, lowering_name):
@@ -1427,16 +1451,37 @@ def _linear_layout_component_count(layout):
     return 1 << len(layout.register_bases)
 
 
-def _async_copy_source_layout_component_count(
-    value_plan, layout, context, lowering_name
-):
+def _tensor_layout_component_count(value_plan, context, lowering_name, layout=None):
+    layout = (
+        _tensor_layout_info(value_plan, context, lowering_name)
+        if layout is None
+        else layout
+    )
     if isinstance(layout, _BlockedEncodingInfo):
-        return _blocked_layout_component_count(value_plan, context, lowering_name)
+        return _product(
+            _blocked_layout_component_shape(
+                value_plan.shape,
+                layout,
+                context,
+                lowering_name,
+            )
+        )
     if isinstance(layout, _LinearEncodingInfo):
         return _linear_layout_component_count(layout)
     raise ValueError(
-        f"tlx_wave bridge cannot lower {context}: unsupported async copy "
-        f"source layout {value_plan.encoding}"
+        f"tlx_wave bridge cannot lower {context}: unsupported tensor layout "
+        f"{value_plan.encoding}"
+    )
+
+
+def _async_copy_source_layout_component_count(
+    value_plan, layout, context, lowering_name
+):
+    return _tensor_layout_component_count(
+        value_plan,
+        context,
+        lowering_name,
+        layout=layout,
     )
 
 
@@ -1600,15 +1645,24 @@ def _linear_layout_dim_bindings(
     return dim_bindings, width, active
 
 
-def _async_copy_source_dim_bindings(
-    builder, value_plan, layout, w, context, component=0
+def _tensor_layout_dim_bindings(
+    builder,
+    value_plan,
+    layout,
+    w,
+    context,
+    symbol_prefix,
+    lowering_name,
+    component=0,
 ):
     if isinstance(layout, _BlockedEncodingInfo):
-        return _blocked_tensor_dim_bindings(
+        return _blocked_layout_dim_bindings(
             builder,
             value_plan,
             w,
             context,
+            symbol_prefix,
+            lowering_name,
             component=component,
         )
     if isinstance(layout, _LinearEncodingInfo):
@@ -1618,13 +1672,28 @@ def _async_copy_source_dim_bindings(
             layout,
             w,
             context,
-            "tlx_async_copy",
-            "generic async copy lowering",
+            symbol_prefix,
+            lowering_name,
             component=component,
         )
     raise ValueError(
-        f"tlx_wave bridge cannot lower {context}: unsupported async copy "
-        f"source layout {value_plan.encoding}"
+        f"tlx_wave bridge cannot lower {context}: unsupported tensor layout "
+        f"{value_plan.encoding}"
+    )
+
+
+def _async_copy_source_dim_bindings(
+    builder, value_plan, layout, w, context, component=0
+):
+    return _tensor_layout_dim_bindings(
+        builder,
+        value_plan,
+        layout,
+        w,
+        context,
+        "tlx_async_copy",
+        "generic async copy lowering",
+        component=component,
     )
 
 
@@ -3683,7 +3752,7 @@ def _emit_constant_op(builder, op, values, wave_values, w, stats=None):
         if stats is not None:
             stats.fragment_fills += len(fragments)
     elif _is_data_tensor(value) and isinstance(const, (int, float)):
-        component_count = _blocked_layout_component_count(
+        component_count = _tensor_layout_component_count(
             value, "arith.constant result", "SIMD tensor constant"
         )
         width = _tensor_lane_width(value, "arith.constant result")
@@ -3960,7 +4029,7 @@ def _simd_arith_operand_components(
         )
     if lowered.kind == "index_expr":
         component = _simd_splat_index_operand(
-            builder, lowered.value, result_plan, width, w, context
+            builder, lowered.value, operand_plan, width, w, context
         )
         return tuple(component for _ in range(component_count))
     raise ValueError(
@@ -3986,7 +4055,7 @@ def _emit_simd_binary_op(builder, op, values, wave_values, w, kind):
         )
     lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
     rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
-    component_count = _blocked_layout_component_count(
+    component_count = _tensor_layout_component_count(
         result, f"{op.name} result", "SIMD data arithmetic"
     )
     width = _tensor_lane_width(result, f"{op.name} result")
@@ -4015,7 +4084,7 @@ def _emit_simd_minmax_op(builder, op, values, wave_values, w, predicate):
         )
     lhs = _require_typed_wave_value(wave_values, op.operands[0], op.name)
     rhs = _require_typed_wave_value(wave_values, op.operands[1], op.name)
-    component_count = _blocked_layout_component_count(
+    component_count = _tensor_layout_component_count(
         result, f"{op.name} result", "SIMD data min/max"
     )
     width = _tensor_lane_width(result, f"{op.name} result")
@@ -4128,7 +4197,7 @@ def _emit_float_cast_op(builder, op, values, wave_values, w):
         return
 
     if source.kind in {"simd", "simd_tuple"}:
-        component_count = _blocked_layout_component_count(
+        component_count = _tensor_layout_component_count(
             result_plan, f"{op.name} result", "SIMD tensor fpconvert"
         )
         source_components = _simd_components_for_layout(
@@ -4213,14 +4282,9 @@ def _emit_simd_cmp_op(builder, op, values, wave_values, w, predicate):
             f"tlx_wave bridge cannot lower arith.cmpi as SIMD data: expected "
             f"i1 tensor result, got {result.type}"
         )
-    component_count = _blocked_layout_component_count(
+    component_count = _tensor_layout_component_count(
         result, "arith.cmpi result", "SIMD data compare"
     )
-    if component_count != 1:
-        raise ValueError(
-            "tlx_wave bridge cannot lower arith.cmpi as SIMD data for "
-            f"multi-component tensor layouts yet; encoding={result.encoding}"
-        )
     width = _tensor_lane_width(result, "arith.cmpi result")
     lhs = _require_typed_wave_value(wave_values, op.operands[0], "arith.cmpi")
     rhs = _require_typed_wave_value(wave_values, op.operands[1], "arith.cmpi")
@@ -4248,12 +4312,14 @@ def _emit_simd_cmp_op(builder, op, values, wave_values, w, predicate):
         "arith.cmpi",
         require_same_element=False,
     )
-    _set_wave_value(
-        wave_values,
-        result.value_id,
-        "mask_expr",
-        _wave_cmpi(builder, predicate, lhs_components[0], rhs_components[0], w),
+    components = tuple(
+        _wave_cmpi(builder, predicate, lhs_component, rhs_component, w)
+        for lhs_component, rhs_component in zip(lhs_components, rhs_components)
     )
+    if component_count == 1:
+        _set_wave_value(wave_values, result.value_id, "mask_expr", components[0])
+    else:
+        _set_wave_value(wave_values, result.value_id, "mask_tuple", components)
 
 
 def _emit_typed_cmp_op(builder, op, values, wave_values, w):
@@ -4277,12 +4343,7 @@ def _emit_typed_cmp_op(builder, op, values, wave_values, w):
     _arith_mixed_error("arith.cmpi", lhs, rhs)
 
 
-def _emit_mask_and_op(builder, op, values, wave_values, w):
-    if len(op.operands) != 2 or len(op.results) != 1:
-        raise ValueError("tlx_wave bridge expected arith.andi with two operands")
-    lhs = _require_lowered_value(wave_values, op.operands[0], "mask_expr", "arith.andi")
-    rhs = _require_lowered_value(wave_values, op.operands[1], "mask_expr", "arith.andi")
-    result = values[op.results[0]]
+def _mask_and_component(builder, lhs, rhs, result, w):
     if not _is_deferred_mask(lhs) and not _is_deferred_mask(rhs):
         width = None
         for source in (lhs, rhs):
@@ -4290,29 +4351,80 @@ def _emit_mask_and_op(builder, op, values, wave_values, w):
                 width = w.MaskType(source.type).width
                 break
         if width is None:
-            layout = _blocked_encoding_info(
-                result.encoding_attr,
-                result.encoding,
+            width = _tensor_lane_width(
+                result,
                 "arith.andi result",
             )
-            width = _product(layout.threads_per_warp)
         if isinstance(lhs, _MaskConst):
             lhs = _materialize_mask_value(builder, lhs, {}, w, width)
         if isinstance(rhs, _MaskConst):
             rhs = _materialize_mask_value(builder, rhs, {}, w, width)
-        _set_wave_value(
-            wave_values,
-            result.value_id,
-            "mask_expr",
-            builder.select(lhs, rhs, _false_mask(builder, w, width)),
-        )
-        return
-    _set_wave_value(
-        wave_values,
-        result.value_id,
-        "mask_expr",
-        _MaskAnd(lhs, rhs),
+        return builder.select(lhs, rhs, _false_mask(builder, w, width))
+    return _MaskAnd(lhs, rhs)
+
+
+def _mask_components_for_and(lowered, count, context):
+    if lowered.kind == "mask_expr":
+        return tuple(lowered.value for _ in range(count))
+    if lowered.kind == "mask_tuple":
+        if len(lowered.value) != count:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: mask tuple has "
+                f"{len(lowered.value)} components, expected {count}"
+            )
+        return tuple(lowered.value)
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: expected mask value, "
+        f"got {lowered.kind}"
     )
+
+
+def _emit_mask_and_op(builder, op, values, wave_values, w, lhs=None, rhs=None):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        raise ValueError("tlx_wave bridge expected arith.andi with two operands")
+    lhs = (
+        _require_typed_wave_value(wave_values, op.operands[0], "arith.andi")
+        if lhs is None
+        else lhs
+    )
+    rhs = (
+        _require_typed_wave_value(wave_values, op.operands[1], "arith.andi")
+        if rhs is None
+        else rhs
+    )
+    result = values[op.results[0]]
+    if lhs.kind not in {"mask_expr", "mask_tuple"} or rhs.kind not in {
+        "mask_expr",
+        "mask_tuple",
+    }:
+        _arith_mixed_error("arith.andi", lhs, rhs)
+    tuple_count = max(
+        len(lhs.value) if lhs.kind == "mask_tuple" else 1,
+        len(rhs.value) if rhs.kind == "mask_tuple" else 1,
+    )
+    if tuple_count == 1:
+        component = _mask_and_component(builder, lhs.value, rhs.value, result, w)
+        _set_wave_value(wave_values, result.value_id, "mask_expr", component)
+        return
+
+    expected_count = _tensor_layout_component_count(
+        result,
+        "arith.andi result",
+        "SIMD mask conjunction",
+    )
+    if tuple_count != expected_count:
+        raise ValueError(
+            "tlx_wave bridge cannot lower arith.andi for mask tuple with "
+            f"{tuple_count} components; result layout expects {expected_count}; "
+            f"encoding={result.encoding}"
+        )
+    lhs_components = _mask_components_for_and(lhs, tuple_count, "arith.andi lhs")
+    rhs_components = _mask_components_for_and(rhs, tuple_count, "arith.andi rhs")
+    components = tuple(
+        _mask_and_component(builder, lhs_component, rhs_component, result, w)
+        for lhs_component, rhs_component in zip(lhs_components, rhs_components)
+    )
+    _set_wave_value(wave_values, result.value_id, "mask_tuple", components)
 
 
 def _emit_typed_and_op(builder, op, values, wave_values, w):
@@ -4320,8 +4432,11 @@ def _emit_typed_and_op(builder, op, values, wave_values, w):
         raise ValueError("tlx_wave bridge expected arith.andi with two operands")
     lhs = _require_typed_wave_value(wave_values, op.operands[0], "arith.andi")
     rhs = _require_typed_wave_value(wave_values, op.operands[1], "arith.andi")
-    if lhs.kind == "mask_expr" and rhs.kind == "mask_expr":
-        _emit_mask_and_op(builder, op, values, wave_values, w)
+    if lhs.kind in {"mask_expr", "mask_tuple"} and rhs.kind in {
+        "mask_expr",
+        "mask_tuple",
+    }:
+        _emit_mask_and_op(builder, op, values, wave_values, w, lhs=lhs, rhs=rhs)
         return
     data_kinds = {"simd", "simd_tuple", "index_expr"}
     if lhs.kind in data_kinds and rhs.kind in data_kinds:
@@ -4659,8 +4774,27 @@ def _blocked_layout_static_coord(layout, shape, thread, component):
     return tuple(coords)
 
 
+def _layout_lane_width(layout):
+    return _product(layout.threads_per_warp)
+
+
 def _layout_thread_count(layout):
-    return _product(layout.threads_per_warp) * _product(layout.warps_per_cta)
+    return _layout_lane_width(layout) * _product(layout.warps_per_cta)
+
+
+def _tensor_layout_static_coord(layout, shape, thread, component):
+    if isinstance(layout, _BlockedEncodingInfo):
+        return _blocked_layout_static_coord(layout, shape, thread, component)
+    if isinstance(layout, _LinearEncodingInfo):
+        width = _layout_lane_width(layout)
+        return _linear_layout_static_coords(
+            layout,
+            len(shape),
+            component,
+            thread % width,
+            thread // width,
+        )
+    raise ValueError(f"unsupported tensor layout {layout}")
 
 
 def _blocked_layout_component_all_lanes_active(
@@ -4696,7 +4830,7 @@ def _linear_layout_component_all_lanes_active(value_plan, layout, component=0):
     return True
 
 
-def _async_copy_source_component_all_lanes_active(
+def _tensor_layout_component_all_lanes_active(
     value_plan, layout, context, lowering_name, component=0
 ):
     if isinstance(layout, _BlockedEncodingInfo):
@@ -4713,6 +4847,18 @@ def _async_copy_source_component_all_lanes_active(
             component=component,
         )
     return False
+
+
+def _async_copy_source_component_all_lanes_active(
+    value_plan, layout, context, lowering_name, component=0
+):
+    return _tensor_layout_component_all_lanes_active(
+        value_plan,
+        layout,
+        context,
+        lowering_name,
+        component=component,
+    )
 
 
 def _simd_convert_error(reason, source_plan, result_plan):
@@ -4746,19 +4892,42 @@ def _simd_components_for_layout(source, source_plan, component_count, context):
     )
 
 
-def _blocked_layout_component_permutation(source_plan, result_plan):
-    source_layout = _blocked_tensor_layout_info(
+def _mask_components_for_layout(source, source_plan, component_count, context):
+    if source.kind == "mask_expr":
+        if component_count != 1:
+            raise ValueError(
+                f"tlx_wave bridge internal error while lowering {context}: "
+                f"single mask value for {component_count} layout components; "
+                f"encoding={source_plan.encoding}"
+            )
+        return (source.value,)
+    if source.kind == "mask_tuple":
+        if len(source.value) != component_count:
+            raise ValueError(
+                f"tlx_wave bridge internal error while lowering {context}: "
+                f"mask tuple has {len(source.value)} components, expected "
+                f"{component_count}; encoding={source_plan.encoding}"
+            )
+        return tuple(source.value)
+    raise ValueError(
+        f"tlx_wave bridge internal error while lowering {context}: "
+        f"expected mask value, got {source.kind}"
+    )
+
+
+def _tensor_layout_component_permutation(source_plan, result_plan):
+    source_layout = _tensor_layout_info(
         source_plan,
         "ttg.convert_layout source",
         "SIMD layout conversion",
     )
-    result_layout = _blocked_tensor_layout_info(
+    result_layout = _tensor_layout_info(
         result_plan,
         "ttg.convert_layout result",
         "SIMD layout conversion",
     )
-    source_width = _product(source_layout.threads_per_warp)
-    result_width = _product(result_layout.threads_per_warp)
+    source_width = _layout_lane_width(source_layout)
+    result_width = _layout_lane_width(result_layout)
     if source_width != result_width:
         _simd_convert_error(
             f"SIMD widths differ ({source_width} -> {result_width})",
@@ -4774,23 +4943,43 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
             result_plan,
         )
 
-    source_components = _blocked_layout_component_count(
+    source_components = _tensor_layout_component_count(
         source_plan,
         "ttg.convert_layout source",
         "SIMD layout conversion",
+        layout=source_layout,
     )
-    result_components = _blocked_layout_component_count(
+    result_components = _tensor_layout_component_count(
         result_plan,
         "ttg.convert_layout result",
         "SIMD layout conversion",
+        layout=result_layout,
     )
+    source_locations_by_coord = {}
+    for source_component in range(source_components):
+        for thread in range(source_threads):
+            coord = _tensor_layout_static_coord(
+                source_layout,
+                source_plan.shape,
+                thread,
+                source_component,
+            )
+            if any(
+                coord[dim] >= source_plan.shape[dim]
+                for dim in range(len(source_plan.shape))
+            ):
+                continue
+            source_locations_by_coord.setdefault(coord, set()).add(
+                (thread, source_component)
+            )
+
     permutation = []
     for result_component in range(result_components):
         source_component = None
         for candidate in range(source_components):
             matches = True
             for thread in range(result_threads):
-                result_coord = _blocked_layout_static_coord(
+                result_coord = _tensor_layout_static_coord(
                     result_layout, result_plan.shape, thread, result_component
                 )
                 if any(
@@ -4798,7 +4987,7 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
                     for dim in range(len(result_plan.shape))
                 ):
                     continue
-                source_coord = _blocked_layout_static_coord(
+                source_coord = _tensor_layout_static_coord(
                     source_layout, source_plan.shape, thread, candidate
                 )
                 if source_coord != result_coord:
@@ -4808,14 +4997,42 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
                 source_component = candidate
                 break
         if source_component is None:
+            needs_cross_lane = False
+            for thread in range(result_threads):
+                result_coord = _tensor_layout_static_coord(
+                    result_layout, result_plan.shape, thread, result_component
+                )
+                if any(
+                    result_coord[dim] >= result_plan.shape[dim]
+                    for dim in range(len(result_plan.shape))
+                ):
+                    continue
+                for source_thread, _ in source_locations_by_coord.get(
+                    result_coord, ()
+                ):
+                    if source_thread != thread:
+                        needs_cross_lane = True
+                        break
+                if needs_cross_lane:
+                    break
+            reason = (
+                "conversion requires a cross-lane remap, which is not "
+                "representable by the current Wave SIMD tuple value model"
+                if needs_cross_lane
+                else "conversion is not representable as a same-lane "
+                "component permutation"
+            )
             _simd_convert_error(
-                "conversion requires a lane-dependent remap, which is not "
-                "representable by the current Wave SIMD tuple value model",
+                reason,
                 source_plan,
                 result_plan,
             )
         permutation.append(source_component)
     return tuple(permutation)
+
+
+def _blocked_layout_component_permutation(source_plan, result_plan):
+    return _tensor_layout_component_permutation(source_plan, result_plan)
 
 
 def _mfma32_accumulator_dim_exprs(thread_sym, component, w):
@@ -6367,12 +6584,14 @@ def _emit_async_copy_via_load_store(
         )
         mask = active
         if mask_value is not None:
-            user_mask = _materialize_mask_value(
+            user_mask = _materialize_component_mask_value(
                 builder,
                 mask_value,
                 dim_bindings,
                 w,
                 width,
+                "ttg.async_copy_global_to_local mask",
+                component=component,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -6463,12 +6682,18 @@ def _emit_async_copy(
         )
     mask_value = None
     if address.mask_value_id is not None:
-        mask_value = _require_lowered_value(
+        mask_value = _require_typed_wave_value(
             state["wave_values"],
             address.mask_value_id,
-            "mask_expr",
             "ttg.async_copy_global_to_local mask",
         )
+        if mask_value.kind not in {"mask_expr", "mask_tuple"}:
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                f"mask lowered as {mask_value.kind}"
+            )
+        if mask_value.kind == "mask_expr":
+            mask_value = mask_value.value
     if address.other_value_id is not None:
         return _emit_async_copy_via_load_store(
             builder,
@@ -6529,12 +6754,14 @@ def _emit_async_copy(
         )
         mask = active
         if mask_value is not None:
-            user_mask = _materialize_mask_value(
+            user_mask = _materialize_component_mask_value(
                 builder,
                 mask_value,
                 dim_bindings,
                 w,
                 width,
+                "ttg.async_copy_global_to_local mask",
+                component=component,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -8425,12 +8652,12 @@ def _shift_forwarded_value(source, axis):
 
 
 def _convert_simd_layout(source, source_plan, result_plan):
-    source_count = _blocked_layout_component_count(
+    source_count = _tensor_layout_component_count(
         source_plan,
         "ttg.convert_layout source",
         "SIMD layout conversion",
     )
-    result_count = _blocked_layout_component_count(
+    result_count = _tensor_layout_component_count(
         result_plan,
         "ttg.convert_layout result",
         "SIMD layout conversion",
@@ -8438,7 +8665,7 @@ def _convert_simd_layout(source, source_plan, result_plan):
     source_components = _simd_components_for_layout(
         source, source_plan, source_count, "ttg.convert_layout"
     )
-    permutation = _blocked_layout_component_permutation(source_plan, result_plan)
+    permutation = _tensor_layout_component_permutation(source_plan, result_plan)
     if len(permutation) != result_count:
         raise ValueError(
             "tlx_wave bridge internal error: convert_layout permutation length "
@@ -8450,13 +8677,39 @@ def _convert_simd_layout(source, source_plan, result_plan):
     return _WaveValue("simd_tuple", result_components)
 
 
+def _convert_mask_layout(source, source_plan, result_plan):
+    source_count = _tensor_layout_component_count(
+        source_plan,
+        "ttg.convert_layout source",
+        "SIMD mask layout conversion",
+    )
+    result_count = _tensor_layout_component_count(
+        result_plan,
+        "ttg.convert_layout result",
+        "SIMD mask layout conversion",
+    )
+    source_components = _mask_components_for_layout(
+        source, source_plan, source_count, "ttg.convert_layout"
+    )
+    permutation = _tensor_layout_component_permutation(source_plan, result_plan)
+    if len(permutation) != result_count:
+        raise ValueError(
+            "tlx_wave bridge internal error: convert_layout permutation length "
+            f"{len(permutation)} does not match result components {result_count}"
+        )
+    result_components = tuple(source_components[index] for index in permutation)
+    if result_count == 1:
+        return _WaveValue("mask_expr", result_components[0])
+    return _WaveValue("mask_tuple", result_components)
+
+
 def _simd_splat_from_scalar(builder, scalar, result_plan, w, context):
     if not _is_data_tensor(result_plan):
         raise ValueError(
             f"tlx_wave bridge cannot lower {context} as tensor data: "
             f"unsupported result type {result_plan.type}"
         )
-    component_count = _blocked_layout_component_count(
+    component_count = _tensor_layout_component_count(
         result_plan,
         f"{context} result",
         "SIMD tensor splat",
@@ -8498,12 +8751,12 @@ def _broadcast_uniform_simd_data(source, source_plan, result_plan, context):
             f"tlx_wave bridge cannot lower {context} as SIMD tensor data: "
             f"unsupported result type {result_plan.type}"
         )
-    source_count = _blocked_layout_component_count(
+    source_count = _tensor_layout_component_count(
         source_plan,
         f"{context} source",
         "SIMD tensor broadcast",
     )
-    result_count = _blocked_layout_component_count(
+    result_count = _tensor_layout_component_count(
         result_plan,
         f"{context} result",
         "SIMD tensor broadcast",
@@ -8606,6 +8859,13 @@ def _forward_lowered_value(op, values, wave_values):
             source_plan, result_plan
         ):
             wave_values[result_id] = _convert_simd_layout(
+                source, source_plan, result_plan
+            )
+            return
+        if source.kind == "mask_tuple" and not _same_layout_encoding(
+            source_plan, result_plan
+        ):
+            wave_values[result_id] = _convert_mask_layout(
                 source, source_plan, result_plan
             )
             return
@@ -9530,14 +9790,29 @@ def _emit_global_load_op(builder, op, state, w):
 
     result_id = op.results[0]
     result_plan = values[result_id]
-    component_count = _blocked_layout_component_count(
-        result_plan, "tt.load result", "generic tensor lowering"
+    layout = _tensor_layout_info(
+        result_plan,
+        "tt.load result",
+        "generic tensor lowering",
+    )
+    component_count = _tensor_layout_component_count(
+        result_plan,
+        "tt.load result",
+        "generic tensor lowering",
+        layout=layout,
     )
     components = []
     token = _mem_root(state)
     for component in range(component_count):
-        dim_bindings, width, active = _blocked_tensor_dim_bindings(
-            builder, result_plan, w, "tt.load result", component=component
+        dim_bindings, width, active = _tensor_layout_dim_bindings(
+            builder,
+            result_plan,
+            layout,
+            w,
+            "tt.load result",
+            "tlx_tensor",
+            "generic tensor lowering",
+            component=component,
         )
         ptr = _materialize_bounded_pointer_value(
             builder,
@@ -9554,8 +9829,9 @@ def _emit_global_load_op(builder, op, state, w):
             result_plan.shape,
             w,
             assume_pointer_range=len(op.operands) == 1
-            and _blocked_layout_component_all_lanes_active(
+            and _tensor_layout_component_all_lanes_active(
                 result_plan,
+                layout,
                 "tt.load result",
                 "generic tensor lowering",
                 component=component,
@@ -9563,17 +9839,18 @@ def _emit_global_load_op(builder, op, state, w):
         )
         mask = active
         if len(op.operands) > 1:
-            user_mask = _materialize_mask_value(
+            user_mask = _materialize_component_mask_value(
                 builder,
-                _require_lowered_value(
+                _require_typed_wave_value(
                     wave_values,
                     op.operands[1],
-                    "mask_expr",
                     "tt.load mask",
                 ),
                 dim_bindings,
                 w,
                 width,
+                "tt.load mask",
+                component=component,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -9719,13 +9996,28 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
         stats.barriers += 1
         return
 
-    component_count = _blocked_layout_component_count(
-        value_plan, "ttg.local_store value", "generic tensor lowering"
+    layout = _tensor_layout_info(
+        value_plan,
+        "ttg.local_store value",
+        "generic tensor lowering",
+    )
+    component_count = _tensor_layout_component_count(
+        value_plan,
+        "ttg.local_store value",
+        "generic tensor lowering",
+        layout=layout,
     )
     token = _mem_root(state)
     for component in range(component_count):
-        dim_bindings, width, active = _blocked_tensor_dim_bindings(
-            builder, value_plan, w, "ttg.local_store value", component=component
+        dim_bindings, width, active = _tensor_layout_dim_bindings(
+            builder,
+            value_plan,
+            layout,
+            w,
+            "ttg.local_store value",
+            "tlx_tensor",
+            "generic tensor lowering",
+            component=component,
         )
         ptr = _emit_memdesc_ptr(
             builder,
@@ -9772,14 +10064,29 @@ def _emit_generic_local_load(
     stats,
 ):
     _validate_generic_local_tensor(value, memdesc, "ttg.local_load")
-    component_count = _blocked_layout_component_count(
-        value, "ttg.local_load result", "generic tensor lowering"
+    layout = _tensor_layout_info(
+        value,
+        "ttg.local_load result",
+        "generic tensor lowering",
+    )
+    component_count = _tensor_layout_component_count(
+        value,
+        "ttg.local_load result",
+        "generic tensor lowering",
+        layout=layout,
     )
     components = []
     token = after_token
     for component in range(component_count):
-        dim_bindings, width, active = _blocked_tensor_dim_bindings(
-            builder, value, w, "ttg.local_load result", component=component
+        dim_bindings, width, active = _tensor_layout_dim_bindings(
+            builder,
+            value,
+            layout,
+            w,
+            "ttg.local_load result",
+            "tlx_tensor",
+            "generic tensor lowering",
+            component=component,
         )
         ptr = _emit_memdesc_ptr(
             builder,
@@ -10027,13 +10334,28 @@ def _emit_store_op(builder, op, state, w):
         return
 
     if lowered.kind in {"simd", "simd_tuple", "index_expr"}:
-        component_count = _blocked_layout_component_count(
-            value_plan, "tt.store value", "generic tensor lowering"
+        layout = _tensor_layout_info(
+            value_plan,
+            "tt.store value",
+            "generic tensor lowering",
+        )
+        component_count = _tensor_layout_component_count(
+            value_plan,
+            "tt.store value",
+            "generic tensor lowering",
+            layout=layout,
         )
         token = _mem_root(state)
         for component in range(component_count):
-            dim_bindings, width, active = _blocked_tensor_dim_bindings(
-                builder, value_plan, w, "tt.store value", component=component
+            dim_bindings, width, active = _tensor_layout_dim_bindings(
+                builder,
+                value_plan,
+                layout,
+                w,
+                "tt.store value",
+                "tlx_tensor",
+                "generic tensor lowering",
+                component=component,
             )
             ptr = _materialize_bounded_pointer_value(
                 builder,
@@ -10050,8 +10372,9 @@ def _emit_store_op(builder, op, state, w):
                 value_plan.shape,
                 w,
                 assume_pointer_range=mask_id is None
-                and _blocked_layout_component_all_lanes_active(
+                and _tensor_layout_component_all_lanes_active(
                     value_plan,
+                    layout,
                     "tt.store value",
                     "generic tensor lowering",
                     component=component,
@@ -10059,17 +10382,18 @@ def _emit_store_op(builder, op, state, w):
             )
             mask = active
             if mask_id is not None:
-                user_mask = _materialize_mask_value(
+                user_mask = _materialize_component_mask_value(
                     builder,
-                    _require_lowered_value(
+                    _require_typed_wave_value(
                         wave_values,
                         mask_id,
-                        "mask_expr",
                         "tt.store mask",
                     ),
                     dim_bindings,
                     w,
                     width,
+                    "tt.store mask",
+                    component=component,
                 )
                 mask = _wave_mask_and(builder, mask, user_mask, w, width)
             value = _materialize_tensor_data(

@@ -1152,6 +1152,42 @@ def test_tlx_wave_lowers_simd_convert_layout_component_permutation(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converts_mask_tuple_layout_component_permutation(tmp_path):
+    source_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
+        "warpsPerCTA = [4, 1], order = [0, 1]}>"
+    )
+    result_encoding = (
+        "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
+        "warpsPerCTA = [4, 1], order = [1, 0]}>"
+    )
+    convert_func = f"""
+  tt.func public @mask_convert_component_permutation() attributes {{noinline = false}} {{
+    %zero = arith.constant dense<0> : tensor<8x8xi32, {source_encoding}>
+    %one = arith.constant dense<1> : tensor<8x8xi32, {source_encoding}>
+    %mask = arith.cmpi slt, %zero, %one : tensor<8x8xi32, {source_encoding}>
+    %converted = ttg.convert_layout %mask : tensor<8x8xi1, {source_encoding}> -> tensor<8x8xi1, {result_encoding}>
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(tmp_path, convert_func)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    source_plan = next(value for value in plan.values if value.producer == "arith.cmpi")
+    result_plan = next(
+        value for value in plan.values if value.producer == "ttg.convert_layout"
+    )
+
+    converted = wave_bridge_emit._convert_mask_layout(
+        wave_bridge_emit._WaveValue("mask_tuple", tuple(range(4))),
+        source_plan,
+        result_plan,
+    )
+
+    assert converted.kind == "mask_tuple"
+    assert converted.value == (0, 2, 1, 3)
+    del ctx
+
+
 def test_tlx_wave_rejects_incompatible_simd_convert_layout(tmp_path):
     source_encoding = (
         "#ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], "
@@ -2076,6 +2112,49 @@ def test_tlx_wave_async_copy_lowers_swizzled_f16_as_dma(tmp_path):
     del ctx
 
 
+def test_tlx_wave_linear_encoding_attribute_helpers(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [[0, 1], [16, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = []}>
+"""
+    linear_func = """
+  tt.func public @linear_helpers() attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, linear_func, preamble=preamble)
+    plan = wave_bridge._build_bridge_plan(mod, wave_bridge._kernel_from_module(mod))
+    value = next(
+        value
+        for value in plan.values
+        if value.producer == "arith.constant" and value.shape == (32, 32)
+    )
+    attr = value.encoding_attr
+
+    assert attr.is_linear_encoding()
+    assert attr.get_linear_register_bases() == [[0, 1], [16, 0]]
+    assert attr.get_linear_lane_bases() == [
+        [0, 2],
+        [0, 4],
+        [0, 8],
+        [0, 16],
+        [1, 0],
+        [2, 0],
+    ]
+    assert attr.get_linear_warp_bases() == [[4, 0], [8, 0]]
+    assert attr.get_linear_block_bases() == []
+    assert set(attr.get_linear_in_dim_names()) == {
+        "register",
+        "lane",
+        "warp",
+        "block",
+    }
+    assert len(attr.get_linear_out_dim_names()) == 2
+    assert attr.get_linear_num_in_dims() == 4
+    assert attr.get_linear_num_out_dims() == 2
+    del ctx
+
+
 def test_tlx_wave_async_copy_linear_source_falls_back_without_dma(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [[0, 1], [16, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = []}>
@@ -2106,6 +2185,135 @@ def test_tlx_wave_async_copy_linear_source_falls_back_without_dma(tmp_path):
     assert "wave.load" in wave_artifact
     assert "wave.store" in wave_artifact
     assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_generic_linear_tensor_ops_and_local_roundtrip(tmp_path):
+    preamble = """
+#generic = #ttg.generic_linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    generic_func = """
+  tt.func public @generic_linear_ops(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) attributes {noinline = false} {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #generic>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #generic>
+    %ptr = tt.addptr %base, %offs : tensor<128x!tt.ptr<i32>, #generic>, tensor<128xi32, #generic>
+    %loaded = tt.load %ptr : tensor<128x!tt.ptr<i32>, #generic>
+    %one = arith.constant dense<1> : tensor<128xi32, #generic>
+    %sum = arith.addi %loaded, %one : tensor<128xi32, #generic>
+    %limit = arith.constant dense<64> : tensor<128xi32, #generic>
+    %mask = arith.cmpi slt, %sum, %limit : tensor<128xi32, #generic>
+    %bound = arith.constant dense<96> : tensor<128xi32, #generic>
+    %bounds_mask = arith.cmpi slt, %offs, %bound : tensor<128xi32, #generic>
+    %combined_mask = arith.andi %mask, %bounds_mask : tensor<128xi1, #generic>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+    ttg.local_store %sum, %alloc : tensor<128xi32, #generic> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+    %roundtrip = ttg.local_load %alloc : !ttg.memdesc<128xi32, #shared, #smem, mutable> -> tensor<128xi32, #generic>
+    %out_base = tt.splat %arg1 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #generic>
+    %out_ptr = tt.addptr %out_base, %offs : tensor<128x!tt.ptr<i32>, #generic>, tensor<128xi32, #generic>
+    tt.store %out_ptr, %roundtrip, %combined_mask : tensor<128x!tt.ptr<i32>, #generic>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, generic_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "ttg.generic_linear" not in wave_artifact
+    assert wave_artifact.count("wave.load") >= 2
+    assert wave_artifact.count("wave.store") >= 4
+    del ctx
+
+
+def test_tlx_wave_generic_linear_to_blocked_same_lane_convert(tmp_path):
+    preamble = """
+#generic = #ttg.generic_linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    convert_func = """
+  tt.func public @generic_linear_same_lane_convert(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) attributes {noinline = false} {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #generic>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #generic>
+    %ptr = tt.addptr %base, %offs : tensor<128x!tt.ptr<i32>, #generic>, tensor<128xi32, #generic>
+    %loaded = tt.load %ptr : tensor<128x!tt.ptr<i32>, #generic>
+    %converted = ttg.convert_layout %loaded : tensor<128xi32, #generic> -> tensor<128xi32, #blocked>
+    %limit = arith.constant dense<96> : tensor<128xi32, #generic>
+    %mask = arith.cmpi slt, %loaded, %limit : tensor<128xi32, #generic>
+    %out_mask = ttg.convert_layout %mask : tensor<128xi1, #generic> -> tensor<128xi1, #blocked>
+    %out_offs = ttg.convert_layout %offs : tensor<128xi32, #generic> -> tensor<128xi32, #blocked>
+    %out_base = tt.splat %arg1 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %out_ptr = tt.addptr %out_base, %out_offs : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %out_ptr, %converted, %out_mask : tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, convert_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "ttg.convert_layout" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_cross_lane_generic_linear_mask_convert(tmp_path):
+    preamble = """
+#generic = #ttg.generic_linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    convert_func = """
+  tt.func public @generic_linear_cross_lane_mask_convert(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) attributes {noinline = false} {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #generic>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #generic>
+    %ptr = tt.addptr %base, %offs : tensor<128x!tt.ptr<i32>, #generic>, tensor<128xi32, #generic>
+    %loaded = tt.load %ptr : tensor<128x!tt.ptr<i32>, #generic>
+    %limit = arith.constant dense<96> : tensor<128xi32, #generic>
+    %mask = arith.cmpi slt, %loaded, %limit : tensor<128xi32, #generic>
+    %out_mask = ttg.convert_layout %mask : tensor<128xi1, #generic> -> tensor<128xi1, #blocked>
+    %zero = arith.constant dense<0> : tensor<128xi32, #blocked>
+    %value = arith.constant dense<1> : tensor<128xi32, #blocked>
+    %out_base = tt.splat %arg1 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #blocked>
+    %out_ptr = tt.addptr %out_base, %zero : tensor<128x!tt.ptr<i32>, #blocked>, tensor<128xi32, #blocked>
+    tt.store %out_ptr, %value, %out_mask : tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, convert_func, preamble=preamble, num_warps=1)
+
+    with pytest.raises(ValueError, match="cross-lane remap"):
+        wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_rejects_cross_lane_generic_linear_convert(tmp_path):
+    preamble = """
+#generic = #ttg.generic_linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    convert_func = """
+  tt.func public @generic_linear_cross_lane_convert(%arg0: !tt.ptr<i32>) attributes {noinline = false} {
+    %offs = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #generic>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<128x!tt.ptr<i32>, #generic>
+    %ptr = tt.addptr %base, %offs : tensor<128x!tt.ptr<i32>, #generic>, tensor<128xi32, #generic>
+    %loaded = tt.load %ptr : tensor<128x!tt.ptr<i32>, #generic>
+    %converted = ttg.convert_layout %loaded : tensor<128xi32, #generic> -> tensor<128xi32, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, convert_func, preamble=preamble, num_warps=1)
+
+    with pytest.raises(ValueError, match="cross-lane remap"):
+        wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
     del ctx
 
 
