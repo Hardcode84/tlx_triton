@@ -34,19 +34,18 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     def parse_options(self, opts) -> Any:
         opts = dict(opts)
         opts["backend_name"] = "tlx_wave"
-        # The current Wave machine path lowers gfx950
-        # mfma.f32.16x16x32.f16; select the matching Triton MFMA shape
-        # unless the caller explicitly asks for something else.
+        # Select the gfx950-friendly MFMA shape by default, while allowing
+        # callers to request other AMD MFMA layouts. The bridge validates the
+        # concrete TTGIR layout before emitting Wave IR.
         opts.setdefault("matrix_instr_nonkdim", 16)
         options = super().parse_options(opts)
-        if options.arch != "gfx950":
-            raise ValueError(f"tlx_wave stage-1 scaffold only supports gfx950, got {options.arch}")
-        if options.warp_size != 64:
-            raise ValueError(f"tlx_wave gfx950 expects wave64, got warp_size={options.warp_size}")
-        if options.matrix_instr_nonkdim != 16:
+        if options.arch not in {"gfx942", "gfx950"}:
             raise ValueError(
-                "tlx_wave gfx950 currently supports only matrix_instr_nonkdim=16 "
-                f"for Wave mfma.f32.16x16x32 lowering, got {options.matrix_instr_nonkdim}"
+                f"tlx_wave stage-1 scaffold only supports gfx942/gfx950, got {options.arch}"
+            )
+        if options.warp_size != 64:
+            raise ValueError(
+                f"tlx_wave {options.arch} expects wave64, got warp_size={options.warp_size}"
             )
         return options
 
@@ -57,7 +56,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         tlx.tlx_passes.add_triton_tlx_fixup(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
                                             options.num_ctas, list((1, 1, 1)))
         passes.common.add_inliner(pm)
-        # gfx950 has no TDM path in this design; keep tensor descriptors on the
+        # gfx942/gfx950 have no TDM path in this design; keep tensor descriptors on the
         # ordinary pointer path for the future Wave bridge.
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)

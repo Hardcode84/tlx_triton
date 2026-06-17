@@ -40,6 +40,8 @@ class TLXWaveDriver(amd_driver.HIPDriver):
         device_properties = self.utils.get_device_properties(device)
         arch = knobs.runtime.override_arch or device_properties["arch"]
         arch = arch.split(":")[0]
-        if arch != "gfx950":
-            raise RuntimeError(f"tlx_wave stage-1 scaffold only supports gfx950, got {arch}")
+        if arch not in {"gfx942", "gfx950"}:
+            raise RuntimeError(
+                f"tlx_wave stage-1 scaffold only supports gfx942/gfx950, got {arch}"
+            )
         return GPUTarget("tlx_wave", arch, 64)

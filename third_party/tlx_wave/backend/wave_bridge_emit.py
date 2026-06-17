@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from .wave_bridge_plan import (
     _ASSUME_TREE_OPS,
     _AMDMfmaEncodingInfo,
+    _GFX950_BF16_MMA_KIND,
     _GFX950_DOT_PARENT_LAYOUT,
     _GFX950_F16_MMA_KIND,
     _GFX950_MMA_M,
@@ -4441,7 +4442,7 @@ def _dma_packet_layout_supported(address, memdesc):
     )
     if padded is not None:
         return (
-            memdesc.element_type == "f16"
+            memdesc.element_type in {"f16", "bf16"}
             and memdesc.shape == _GFX950_MMA_SHAPE
             and address.shape == memdesc.shape
         )
@@ -4456,7 +4457,7 @@ def _dma_packet_layout_supported(address, memdesc):
     if _is_identity_shared_layout(memdesc, shared):
         return True
     return _is_supported_swizzled_shared_layout(memdesc, shared) and (
-        memdesc.element_type == "f16"
+        memdesc.element_type in {"f16", "bf16"}
         and memdesc.shape == _GFX950_MMA_SHAPE
         and address.shape == memdesc.shape
     )
@@ -5810,11 +5811,12 @@ def _committed_groups(state):
     return _mem_state(state).committed_groups
 
 
-def _initial_lowering_state(builder, kernel, plan, w):
+def _initial_lowering_state(builder, kernel, attrs, plan, w):
     values = _values_by_id(plan)
     _, assume_only_values = _assume_tree_info(plan)
     state = {
         "values": values,
+        "attrs": attrs,
         "memdescs": _memdescs_by_id(plan),
         "op_by_result": _op_by_result_id(plan),
         "assume_only_values": assume_only_values,
@@ -6556,14 +6558,78 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
             )
 
 
-def _fragment_type_for_dot_operand(info, w):
+def _gfx950_mma_kind_for_element_type(element_type):
+    if element_type == "f16":
+        return _GFX950_F16_MMA_KIND
+    if element_type == "bf16":
+        return _GFX950_BF16_MMA_KIND
+    return None
+
+
+def _dot_operand_mma_kind(info, element_type, context, attrs=None):
+    kind = _gfx950_mma_kind_for_element_type(element_type)
+    if kind is None:
+        raise ValueError(
+            "tlx_wave bridge supports only f16/bf16 tt.dot operands for "
+            "Wave MFMA lowering; "
+            f"got {element_type} while lowering {context}"
+        )
+    if isinstance(info.parent, _BlockedEncodingInfo):
+        if attrs is not None and attrs.target != "hip:gfx950":
+            raise ValueError(
+                "tlx_wave bridge cannot lower blocked-parent tt.dot to gfx950 "
+                f"Wave MFMA kind {kind} for TTGIR target {attrs.target}"
+            )
+        if _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
+            return kind
+        raise ValueError(
+            "tlx_wave bridge supports blocked dot operand parents only for the "
+            "gfx950 dot-parent layout; "
+            f"got sizePerThread={info.parent.size_per_thread}, "
+            f"threadsPerWarp={info.parent.threads_per_warp}, "
+            f"warpsPerCTA={info.parent.warps_per_cta}, order={info.parent.order}"
+        )
+    if not isinstance(info.parent, _AMDMfmaEncodingInfo):
+        raise ValueError(
+            f"tlx_wave bridge expected blocked or #ttg.amd_mfma parent layout "
+            f"for {context}, got {info.parent}"
+        )
+    if (
+        info.parent.version == 4
+        and info.parent.instr_shape == (16, 16, 32)
+        and info.parent.is_transposed
+    ):
+        if attrs is not None and attrs.target != "hip:gfx950":
+            raise ValueError(
+                "tlx_wave bridge cannot lower gfx950 #ttg.amd_mfma parent to "
+                f"Wave MFMA kind {kind} for TTGIR target {attrs.target}"
+            )
+        return kind
+    if info.parent.version == 3 and info.parent.instr_shape == (16, 16, 16):
+        raise ValueError(
+            "tlx_wave bridge cannot lower gfx942/CDNA3 MFMA through high-level "
+            "WaveAMD yet: Wave models mfma.f32.16x16x16 fragments as wave32, "
+            "but the gfx942 WaveAMDMachine target requires wave64"
+        )
+    raise ValueError(
+        "tlx_wave bridge supports only gfx950 #ttg.amd_mfma<{version = 4, "
+        "instrShape = [16, 16, 32], isTransposed = true}> for Wave MFMA "
+        f"lowering; got version={info.parent.version}, "
+        f"warpsPerCTA={info.parent.warps_per_cta}, "
+        f"instrShape={info.parent.instr_shape}, "
+        f"isTransposed={info.parent.is_transposed}"
+    )
+
+
+def _fragment_type_for_dot_operand(info, element_type, w):
     if info.op_idx not in (0, 1):
         raise ValueError(
             f"tlx_wave bridge supports #ttg.dot_op opIdx 0/1, got {info.op_idx}"
         )
+    _dot_operand_mma_kind(info, element_type, "ttg.local_load result")
     return w.fragment_type(
         info.op_idx,
-        w.f16(),
+        _wave_element_type(element_type, w, "ttg.local_load fragment"),
         rows=_GFX950_MMA_M,
         columns=_GFX950_MMA_N,
         wave_size=_GFX950_MMA_WAVE,
@@ -6593,39 +6659,12 @@ def _unsupported_fragment_local_load(value, reason, memdesc=None):
 
 
 def _validate_supported_dot_local_load_layout(value, memdesc, info):
-    if isinstance(info.parent, _BlockedEncodingInfo):
-        if not _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
-            _unsupported_fragment_local_load(
-                value,
-                "current flat gfx950 fragment loader supports only dot operand "
-                "parent layout sizePerThread=(2, 2), threadsPerWarp=(4, 16), "
-                "warpsPerCTA=(4, 1), order=(1, 0); "
-                f"got sizePerThread={info.parent.size_per_thread}, "
-                f"threadsPerWarp={info.parent.threads_per_warp}, "
-                f"warpsPerCTA={info.parent.warps_per_cta}, order={info.parent.order}",
-                memdesc,
-            )
-    elif isinstance(info.parent, _AMDMfmaEncodingInfo):
-        if not (
-            info.parent.version == 4
-            and info.parent.instr_shape == (16, 16, 32)
-            and info.parent.is_transposed
-        ):
-            _unsupported_fragment_local_load(
-                value,
-                "current gfx950 fragment loader supports only "
-                "#ttg.amd_mfma<{version = 4, "
-                "instrShape = [16, 16, 32], isTransposed = true}>; "
-                f"got version={info.parent.version}, "
-                f"warpsPerCTA={info.parent.warps_per_cta}, "
-                f"instrShape={info.parent.instr_shape}, "
-                f"isTransposed={info.parent.is_transposed}",
-                memdesc,
-            )
-    else:
+    try:
+        _dot_operand_mma_kind(info, value.element_type, "ttg.local_load result")
+    except ValueError as exc:
         _unsupported_fragment_local_load(
             value,
-            f"unsupported dot operand parent layout {info.parent}",
+            str(exc),
             memdesc,
         )
     try:
@@ -6643,7 +6682,7 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
             "current flat gfx950 fragment loader supports only "
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
             "order = [1, 0]}> or a supported #ttg.padded_shared layout "
-            "for f16 32x32 dot operands; "
+            "for f16/bf16 32x32 dot operands; "
             f"got vec={shared.vec}, perPhase={shared.per_phase}, "
             f"maxPhase={shared.max_phase}, order={shared.order}",
             memdesc,
@@ -6651,9 +6690,9 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
 
 
 def _validate_dot_operand_fragment_load(value, memdesc, info):
-    if value.element_type != "f16" or value.element_byte_width != 2:
+    if value.element_type not in {"f16", "bf16"} or value.element_byte_width != 2:
         _unsupported_fragment_local_load(
-            value, f"expected f16 dot operand, got {value.element_type}", memdesc
+            value, f"expected f16/bf16 dot operand, got {value.element_type}", memdesc
         )
     if value.shape != _GFX950_MMA_SHAPE:
         _unsupported_fragment_local_load(
@@ -6666,13 +6705,16 @@ def _validate_dot_operand_fragment_load(value, memdesc, info):
     if info.k_width not in (0, 4, 8, 32):
         _unsupported_fragment_local_load(
             value,
-            f"expected kWidth 0, 4, 8, or 32 for gfx950 f16 MFMA, got {info.k_width}",
+            f"expected kWidth 0, 4, 8, or 32 for gfx950 f16/bf16 MFMA, got {info.k_width}",
             memdesc,
         )
-    if memdesc.element_type != "f16" or memdesc.element_byte_width != 2:
+    if (
+        memdesc.element_type != value.element_type
+        or memdesc.element_byte_width != value.element_byte_width
+    ):
         _unsupported_fragment_local_load(
             value,
-            f"expected f16 shared memdesc source, got {memdesc.element_type}",
+            f"expected {value.element_type} shared memdesc source, got {memdesc.element_type}",
             memdesc,
         )
     if memdesc.shape != _GFX950_MMA_SHAPE:
@@ -6725,20 +6767,23 @@ def _dot_operand_fragment_tile_shape(value, info, context):
 
 
 def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
-    if value.element_type != "f16" or value.element_byte_width != 2:
+    if value.element_type not in {"f16", "bf16"} or value.element_byte_width != 2:
         _unsupported_fragment_local_load(
-            value, f"expected f16 dot operand, got {value.element_type}", memdesc
+            value, f"expected f16/bf16 dot operand, got {value.element_type}", memdesc
         )
     if info.k_width not in (0, 4, 8, 32):
         _unsupported_fragment_local_load(
             value,
-            f"expected kWidth 0, 4, 8, or 32 for gfx950 f16 MFMA, got {info.k_width}",
+            f"expected kWidth 0, 4, 8, or 32 for gfx950 f16/bf16 MFMA, got {info.k_width}",
             memdesc,
         )
-    if memdesc.element_type != "f16" or memdesc.element_byte_width != 2:
+    if (
+        memdesc.element_type != value.element_type
+        or memdesc.element_byte_width != value.element_byte_width
+    ):
         _unsupported_fragment_local_load(
             value,
-            f"expected f16 shared memdesc source, got {memdesc.element_type}",
+            f"expected {value.element_type} shared memdesc source, got {memdesc.element_type}",
             memdesc,
         )
     if memdesc.shape != value.shape:
@@ -6777,14 +6822,17 @@ def _physical_local_load_fragment_regs_capability(value, memdesc):
         value.encoding_attr, "is_blocked_encoding"
     ):
         return None
-    if value.element_type != "f16" or value.element_byte_width != 2:
+    if value.element_type not in {"f16", "bf16"} or value.element_byte_width != 2:
         return None
     if value.shape != _GFX950_MMA_SHAPE:
         return None
-    if memdesc.element_type != "f16" or memdesc.element_byte_width != 2:
+    if (
+        memdesc.element_type != value.element_type
+        or memdesc.element_byte_width != value.element_byte_width
+    ):
         _unsupported_fragment_local_load(
             value,
-            f"expected f16 shared memdesc source, got {memdesc.element_type}",
+            f"expected {value.element_type} shared memdesc source, got {memdesc.element_type}",
             memdesc,
         )
     if memdesc.shape != _GFX950_MMA_SHAPE:
@@ -6809,7 +6857,7 @@ def _physical_local_load_fragment_regs_capability(value, memdesc):
             "current flat gfx950 fragment register loader supports only "
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, "
             "order = [1, 0]}> or a supported #ttg.padded_shared layout "
-            "for f16 32x32 dot operands; "
+            "for f16/bf16 32x32 dot operands; "
             f"got vec={shared.vec}, perPhase={shared.per_phase}, "
             f"maxPhase={shared.max_phase}, order={shared.order}",
             memdesc,
@@ -6965,7 +7013,9 @@ def _emit_dot_operand_fragment_load(
         tile_offsets=tile_offsets,
     )
     fragment, token = builder.fragment_load(
-        ptr, _fragment_type_for_dot_operand(capability.info, w), after=after_token
+        ptr,
+        _fragment_type_for_dot_operand(capability.info, value.element_type, w),
+        after=after_token,
     )
     stats.local_loads += 1
     stats.fragment_packs += 1
@@ -7112,7 +7162,7 @@ def _emit_accumulator_fragment(builder, value, wave_values, w, stats, values=Non
     )
 
 
-def _validate_dot_op(operands, acc, result):
+def _validate_dot_op(operands, acc, result, attrs):
     role_values = {}
     role_infos = {}
     for value in operands:
@@ -7136,12 +7186,16 @@ def _validate_dot_op(operands, acc, result):
             f"0 and 1; operand encodings: {encodings}"
         )
 
-    if any(value.element_type != "f16" for value in role_values.values()):
+    element_types = {value.element_type for value in role_values.values()}
+    if len(element_types) != 1 or not element_types <= {"f16", "bf16"}:
         encodings = ", ".join(value.encoding or "<none>" for value in operands)
         raise ValueError(
-            "tlx_wave bridge supports only f16 x f16 tt.dot operands for "
-            f"{_GFX950_F16_MMA_KIND}; operand encodings: {encodings}"
+            "tlx_wave bridge supports only matching f16 x f16 or bf16 x bf16 "
+            "tt.dot operands for Wave MFMA lowering; "
+            f"operand element types={sorted(element_types)}; "
+            f"operand encodings: {encodings}"
         )
+    element_type = next(iter(element_types))
     lhs_shape = role_values[0].shape
     rhs_shape = role_values[1].shape
     if (
@@ -7156,7 +7210,7 @@ def _validate_dot_op(operands, acc, result):
         encodings = ", ".join(value.encoding or "<none>" for value in operands)
         raise ValueError(
             "tlx_wave bridge supports tt.dot operands only as Mx32 and 32xN "
-            "static f16 MFMA tiles with M/N multiples of 32; "
+            "static f16/bf16 MFMA tiles with M/N multiples of 32; "
             f"shapes={shapes}; operand encodings: {encodings}"
         )
     if not _same_dot_parent_encoding(role_infos[0].parent, role_infos[1].parent):
@@ -7165,6 +7219,9 @@ def _validate_dot_op(operands, acc, result):
             f"role0 encoding: {role_values[0].encoding}; "
             f"role1 encoding: {role_values[1].encoding}"
         )
+    mma_kind = _dot_operand_mma_kind(
+        role_infos[0], element_type, "tt.dot operand", attrs=attrs
+    )
 
     result_layout = _dot_result_layout_info(
         result.encoding_attr, result.encoding, "tt.dot result"
@@ -7191,16 +7248,20 @@ def _validate_dot_op(operands, acc, result):
                 "tlx_wave bridge expected tt.dot accumulator layout to match result; "
                 f"accumulator encoding: {acc.encoding}; result encoding: {result.encoding}"
             )
-    return role_values
+    return role_values, mma_kind
 
 
-def _emit_dot_op(builder, op, values, wave_values, w, stats):
+def _emit_dot_op(builder, op, state, w, stats):
     if len(op.operands) < 3 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected tt.dot with 3 operands and 1 result")
+    values = state["values"]
+    wave_values = state["wave_values"]
     operands = tuple(values[operand] for operand in op.operands[:2])
     acc = values[op.operands[2]]
     result = values[op.results[0]]
-    role_values = _validate_dot_op(operands, acc, result)
+    role_values, mma_kind = _validate_dot_op(
+        operands, acc, result, state["attrs"]
+    )
     if (
         role_values[0].value_id not in wave_values
         or role_values[1].value_id not in wave_values
@@ -7243,7 +7304,7 @@ def _emit_dot_op(builder, op, values, wave_values, w, stats):
             acc_tile = acc_fragments[_fragment_tuple_index(result_tile_shape, row, col)]
             dots.append(
                 builder.mma(
-                    _GFX950_F16_MMA_KIND,
+                    mma_kind,
                     lhs_fragment,
                     rhs_fragment,
                     acc_tile,
@@ -7495,7 +7556,7 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
         info = _dot_operand_encoding_info(result, "ttg.convert_layout result")
         fragment = builder.fragment_pack(
             source.value,
-            _fragment_type_for_dot_operand(info, w),
+            _fragment_type_for_dot_operand(info, result.element_type, w),
         )
         stats.fragment_packs += 1
         _set_wave_value(state["wave_values"], result_id, "fragment", fragment)
@@ -7505,7 +7566,7 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
         info = _dot_operand_encoding_info(result, "ttg.convert_layout result")
         fragment = builder.fragment_pack(
             fragment_regs,
-            _fragment_type_for_dot_operand(info, w),
+            _fragment_type_for_dot_operand(info, result.element_type, w),
         )
         stats.fragment_packs += 1
         _set_wave_value(state["wave_values"], result_id, "fragment", fragment)
@@ -8446,7 +8507,7 @@ def _emit_ordered_raw_op(
             control_context=control_context,
         )
     elif op.name == "tt.dot":
-        _emit_dot_op(builder, op, values, wave_values, w, stats)
+        _emit_dot_op(builder, op, state, w, stats)
     elif op.name == "tt.store":
         _emit_store_op(builder, op, state, w)
     elif op.name in _PLANNING_ONLY_OPS:
@@ -8499,7 +8560,7 @@ def _emit_raw_block(
 
 
 def _emit_ordered_wave_body(builder, kernel, attrs, plan, lds_layout, w, stats):
-    state = _initial_lowering_state(builder, kernel, plan, w)
+    state = _initial_lowering_state(builder, kernel, attrs, plan, w)
     state["stats"] = stats
     state["address_by_token"] = _async_address_by_token(plan)
     state["local_loads"] = _local_load_address_by_result(plan)

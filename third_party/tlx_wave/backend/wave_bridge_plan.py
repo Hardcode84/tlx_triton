@@ -352,6 +352,7 @@ _GFX950_SHARED_LAYOUT = _SwizzledSharedEncodingInfo(
     order=(1, 0),
 )
 _GFX950_F16_MMA_KIND = "mfma.f32.16x16x32.f16"
+_GFX950_BF16_MMA_KIND = "mfma.f32.16x16x32.bf16"
 _GFX950_MMA_M = 16
 _GFX950_MMA_N = 16
 _GFX950_MMA_WAVE = 64
@@ -2275,17 +2276,18 @@ def _kernel_from_module(mod):
 
 
 def _validate_target(options, attrs):
-    if options.arch != "gfx950":
+    if options.arch not in {"gfx942", "gfx950"}:
         raise ValueError(
-            f"tlx_wave bridge only supports gfx950 Wave skeletons, got {options.arch}"
+            f"tlx_wave bridge only supports gfx942/gfx950 Wave skeletons, got {options.arch}"
         )
     if options.warp_size != 64:
         raise ValueError(
             f"tlx_wave bridge only supports wave64 inputs, got warp_size={options.warp_size}"
         )
-    if attrs.target != "hip:gfx950":
+    expected_target = f"hip:{options.arch}"
+    if attrs.target != expected_target:
         raise ValueError(
-            f"tlx_wave bridge only supports TTGIR target hip:gfx950, got {attrs.target}"
+            f"tlx_wave bridge expected TTGIR target {expected_target}, got {attrs.target}"
         )
     if attrs.threads_per_warp != 64:
         raise ValueError(
