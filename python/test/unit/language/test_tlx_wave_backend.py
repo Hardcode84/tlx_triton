@@ -684,6 +684,40 @@ def test_tlx_wave_lowers_tiled_convert_layout_dot_operand(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_tiled_mfma_fragment_local_store(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @tiled_mfma_fragment_local_store() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf32, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<64x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<64x32xf16, #shared, #smem, mutable> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<64x32xf32, #mma>
+    ttg.local_store %dot, %out_alloc : tensor<64x32xf32, #mma> -> !ttg.memdesc<64x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_mmas"] == 2
+    assert metadata["tlx_wave_num_fragment_fills"] == 2
+    assert metadata["tlx_wave_num_wave_barriers"] >= 1
+    assert "wave.store" in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_honors_converted_blocked_fragment_store_layout(tmp_path, monkeypatch):
     preamble = """
 #store = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -724,6 +758,139 @@ def test_tlx_wave_honors_converted_blocked_fragment_store_layout(tmp_path, monke
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_mmas"] == 1
     assert "wave.store" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_honors_converted_blocked_fragment_local_store_layout(
+    tmp_path, monkeypatch
+):
+    preamble = """
+#store = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @converted_blocked_fragment_local_store() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<32x32xf32, #mma>
+    %out = ttg.convert_layout %dot : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #store>
+    ttg.local_store %out, %out_alloc : tensor<32x32xf32, #store> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+
+    def fail_mfma_tile_local_store(*args, **kwargs):
+        raise AssertionError("converted blocked local store used MFMA fallback")
+
+    monkeypatch.setattr(
+        wave_bridge_emit,
+        "_emit_mfma_fragment_tile_local_store",
+        fail_mfma_tile_local_store,
+    )
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_mmas"] == 1
+    assert metadata["tlx_wave_num_wave_barriers"] >= 1
+    assert "wave.store" in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_rejects_unsupported_blocked_fragment_local_store_layout(tmp_path):
+    preamble = """
+#bad_store = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @unsupported_blocked_fragment_local_store() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<32x32xf32, #mma>
+    %out = ttg.convert_layout %dot : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #bad_store>
+    ttg.local_store %out, %out_alloc : tensor<32x32xf32, #bad_store> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "fragment store through #ttg.amd_mfma" in message
+    assert "unsupported blocked store layout" in message
+    assert "sizePerThread=(1, 2)" in message
+    del ctx
+
+
+def test_tlx_wave_rejects_unlowered_blocked_fragment_local_store_conversion(tmp_path):
+    dot_func = """
+  tt.func public @unlowered_blocked_fragment_local_store() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %out = ttg.convert_layout %dot : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    ttg.local_store %out, %out_alloc : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>> -> !ttg.memdesc<32x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func)
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "unlowered layout conversion" in message
+    assert "sizePerThread = [2, 2]" in message
+    assert "sizePerThread = [1, 2]" in message
+    del ctx
+
+
+def test_tlx_wave_rejects_unlowered_blocked_to_mfma_local_store_conversion(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+"""
+    dot_func = """
+  tt.func public @unlowered_blocked_to_mfma_local_store() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>}>> -> tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>>
+    %out = ttg.convert_layout %dot : tensor<32x32xf32, #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>> -> tensor<32x32xf32, #mma>
+    ttg.local_store %out, %out_alloc : tensor<32x32xf32, #mma> -> !ttg.memdesc<32x32xf32, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "unlowered layout conversion" in message
+    assert "sizePerThread = [2, 2]" in message
+    assert "#ttg.amd_mfma" in message
     del ctx
 
 
@@ -4157,7 +4324,7 @@ def test_tlx_wave_bridge_reaches_dot_validation_after_tt_load(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_local_store_of_dot_fragment(tmp_path):
+def test_tlx_wave_bridge_lowers_local_store_of_dot_fragment(tmp_path):
     dot_func = """
   tt.func public @dot_with_local_store() attributes {noinline = false} {
     %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>, #ttg.shared_memory, mutable>
@@ -4171,10 +4338,17 @@ def test_tlx_wave_bridge_rejects_local_store_of_dot_fragment(tmp_path):
     tt.return
   }
 """
+    metadata = {}
     mod, ctx = _parse_ttgir(tmp_path, dot_func)
 
-    with pytest.raises(ValueError, match="ttg\\.local_store.*fragment"):
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_mmas"] == 1
+    assert metadata["tlx_wave_num_wave_barriers"] >= 1
+    assert "wave.store" in wave_artifact
     del ctx
 
 

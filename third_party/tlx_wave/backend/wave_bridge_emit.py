@@ -4578,6 +4578,18 @@ def _has_supported_fragment_store_layout(value_plan):
     return _is_supported_fragment_store_layout(layout)
 
 
+def _has_blocked_fragment_store_layout(value_plan):
+    try:
+        _blocked_encoding_info(
+            value_plan.encoding_attr,
+            value_plan.encoding,
+            "fragment store value",
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def _dot_operand_encoding_info(value, context):
     attr = value.encoding_attr
     if attr is None or not _attr_bool(attr, "is_dot_operand_encoding"):
@@ -8351,6 +8363,41 @@ def _emit_fragment_store(
     return token
 
 
+def _emit_fragment_local_store(
+    builder,
+    state,
+    lowered,
+    store_plan,
+    memdesc,
+    memdescs,
+    lds_layout,
+    after_token,
+    w,
+):
+    fragment = lowered.value
+    regs = builder.fragment_unpack(fragment)
+    frag = w.FragmentType(fragment.type)
+    token = after_token
+    for component in range(frag.registers):
+        dim_bindings, width = _store_dim_bindings(
+            builder, store_plan, lowered, w, component=component
+        )
+        ptr = _emit_memdesc_ptr(
+            builder,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            dim_bindings,
+            width,
+            w,
+            "ttg.local_store",
+        )
+        value = _extract_fragment_component(regs, component, width, w)
+        token = _emit_component_store(builder, value, ptr, None, token, w)
+    return token
+
+
 def _fragment_store_tile_dim_bindings(
     builder,
     value_plan,
@@ -8543,6 +8590,111 @@ def _emit_mfma_fragment_tile_store(
     return token
 
 
+def _emit_mfma_fragment_tile_local_store(
+    builder,
+    state,
+    fragments,
+    tile_shape,
+    value_plan,
+    memdesc,
+    memdescs,
+    lds_layout,
+    after_token,
+    w,
+):
+    if value_plan.element_type != "f32":
+        raise ValueError(
+            "tlx_wave bridge supports MFMA fragment local stores only for f32 "
+            f"values, got type={value_plan.type}"
+        )
+    expected_tile_shape = _fragment_tile_shape_for_rank2_shape(
+        value_plan.shape, "ttg.local_store MFMA value"
+    )
+    if tuple(tile_shape) != expected_tile_shape:
+        raise ValueError(
+            "tlx_wave bridge cannot lower MFMA fragment local store: fragment "
+            f"tile shape {tile_shape} does not match value tile shape "
+            f"{expected_tile_shape}"
+        )
+    if len(fragments) != tile_shape[0] * tile_shape[1]:
+        raise ValueError(
+            "tlx_wave bridge cannot lower MFMA fragment local store: got "
+            f"{len(fragments)} fragment(s), expected "
+            f"{tile_shape[0] * tile_shape[1]}"
+        )
+
+    token = after_token
+    for row in range(tile_shape[0]):
+        for col in range(tile_shape[1]):
+            fragment = fragments[_fragment_tuple_index(tile_shape, row, col)]
+            regs = builder.fragment_unpack(fragment)
+            frag = w.FragmentType(fragment.type)
+            tile_offsets = (
+                row * _GFX950_MMA_SHAPE[0],
+                col * _GFX950_MMA_SHAPE[1],
+            )
+            for component in range(frag.registers):
+                dim_bindings, width, active = _fragment_store_tile_dim_bindings(
+                    builder,
+                    value_plan,
+                    fragment,
+                    tile_offsets,
+                    component,
+                    w,
+                )
+                ptr = _emit_memdesc_ptr(
+                    builder,
+                    memdesc,
+                    memdescs,
+                    lds_layout,
+                    state,
+                    dim_bindings,
+                    width,
+                    w,
+                    "ttg.local_store",
+                )
+                value = _extract_fragment_component(regs, component, width, w)
+                token = _emit_component_store(
+                    builder,
+                    value,
+                    ptr,
+                    active,
+                    token,
+                    w,
+                )
+    return token
+
+
+def _reject_unlowered_fragment_local_store_conversion(value_plan, physical_plan):
+    if value_plan.value_id == physical_plan.value_id:
+        return
+    try:
+        physical_layout = _blocked_encoding_info(
+            physical_plan.encoding_attr,
+            physical_plan.encoding,
+            "fragment local-store physical value",
+        )
+    except ValueError:
+        return
+    try:
+        value_layout = _blocked_encoding_info(
+            value_plan.encoding_attr,
+            value_plan.encoding,
+            "fragment local-store value",
+        )
+    except ValueError:
+        value_layout = None
+    if value_layout is not None and _same_blocked_encoding(
+        value_layout, physical_layout
+    ):
+        return
+    raise ValueError(
+        "tlx_wave bridge cannot lower fragment local store after unlowered "
+        "layout conversion from blocked physical layout; physical "
+        f"encoding={physical_plan.encoding}; requested encoding={value_plan.encoding}"
+    )
+
+
 def _physical_plan_is_mfma(physical_plan, context):
     try:
         return _amd_mfma_encoding_info(physical_plan.encoding, context) is not None
@@ -8657,6 +8809,90 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
             "tlx_wave bridge cannot lower ttg.local_store: stored value "
             f"{value_id} from {value_plan.producer} has not been lowered"
         )
+    if not isinstance(lowered, _WaveValue):
+        raise ValueError("tlx_wave bridge internal error: untyped ttg.local_store value")
+
+    if lowered.kind == "fragment":
+        physical_plan = _physical_value_plan(values, lowered, value_id)
+        _reject_unlowered_fragment_local_store_conversion(value_plan, physical_plan)
+        if _has_blocked_fragment_store_layout(value_plan):
+            store_plan = _validate_fragment_store_value(value_plan, physical_plan)
+            token = _emit_fragment_local_store(
+                builder,
+                state,
+                lowered,
+                store_plan,
+                memdesc,
+                memdescs,
+                lds_layout,
+                _mem_root(state),
+                w,
+            )
+            _set_mem_root(state, builder.barrier(token))
+            stats.barriers += 1
+            return
+        if _physical_plan_is_mfma(physical_plan, "ttg.local_store physical value"):
+            token = _emit_mfma_fragment_tile_local_store(
+                builder,
+                state,
+                (lowered.value,),
+                (1, 1),
+                value_plan,
+                memdesc,
+                memdescs,
+                lds_layout,
+                _mem_root(state),
+                w,
+            )
+            _set_mem_root(state, builder.barrier(token))
+            stats.barriers += 1
+            return
+        store_plan = _validate_fragment_store_value(value_plan, physical_plan)
+        token = _emit_fragment_local_store(
+            builder,
+            state,
+            lowered,
+            store_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            _mem_root(state),
+            w,
+        )
+        _set_mem_root(state, builder.barrier(token))
+        stats.barriers += 1
+        return
+
+    if lowered.kind == "fragment_tuple":
+        physical_plan = _physical_value_plan(values, lowered, value_id)
+        if _has_blocked_fragment_store_layout(value_plan):
+            raise ValueError(
+                "tlx_wave bridge cannot lower tiled MFMA fragment local store "
+                f"through blocked store layout yet; got {value_plan.encoding}"
+            )
+        if not _physical_plan_is_mfma(
+            physical_plan, "ttg.local_store physical value"
+        ):
+            raise ValueError(
+                "tlx_wave bridge cannot lower fragment_tuple local store without "
+                f"#ttg.amd_mfma physical layout; got {physical_plan.encoding}"
+            )
+        token = _emit_mfma_fragment_tile_local_store(
+            builder,
+            state,
+            _fragment_tuple_values(lowered, "ttg.local_store value"),
+            _fragment_tuple_tile_shape(lowered, "ttg.local_store value"),
+            value_plan,
+            memdesc,
+            memdescs,
+            lds_layout,
+            _mem_root(state),
+            w,
+        )
+        _set_mem_root(state, builder.barrier(token))
+        stats.barriers += 1
+        return
+
     component_count = _blocked_layout_component_count(
         value_plan, "ttg.local_store value", "generic tensor lowering"
     )
