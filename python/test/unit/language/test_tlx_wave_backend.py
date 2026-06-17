@@ -1751,6 +1751,89 @@ def test_tlx_wave_async_copy_lowers_swizzled_f16_as_dma(tmp_path):
     del ctx
 
 
+def test_tlx_wave_async_copy_pointer_range_bounds_runtime_stride_dma_source(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_pointer_range_dma(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}, %stride: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %c0 : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %stride_splat = tt.splat %stride : i32 -> tensor<32x1xi32, #blocked>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<32x1xi32, #blocked>
+    %row_off = arith.muli %rows_2d, %stride_splat : tensor<32x1xi32, #blocked>
+    %row_offs = tt.broadcast %row_off : tensor<32x1xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x32xi32, #blocked>
+    %col_offs = tt.broadcast %cols_2d : tensor<1x32xi32, #blocked> -> tensor<32x32xi32, #blocked>
+    %offs = arith.addi %row_offs, %col_offs : tensor<32x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f16>, #blocked>, tensor<32x32xi32, #blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<32x32x!tt.ptr<f16>, #blocked> -> <32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    machine = _run_waveamd_to_machine(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    assert "wave.assume" in wave_artifact
+    assert "1073741823" in wave_artifact
+    assert "waveamdmachine.global_load_lds_b128" in machine
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_async_copy_pointer_range_does_not_assume_negative_offset_nonnegative(
+    tmp_path,
+):
+    async_func = """
+  tt.func public @async_pointer_range_negative_offset(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>
+    %halo = arith.constant dense<16> : tensor<512xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>
+    %offsets = arith.subi %range, %halo : tensor<512xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<512x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>
+    %ptr = tt.addptr %base, %offsets : tensor<512x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>, tensor<512xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<512x!tt.ptr<f16>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>> -> <512xf16, #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>, #ttg.shared_memory, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_dma_load_lds"] == 1
+    bounded_offset_assumes = [
+        line
+        for line in wave_artifact.splitlines()
+        if "1073741823" in line
+    ]
+    assert bounded_offset_assumes
+    assert all('"x >= 0"' not in line for line in bounded_offset_assumes)
+    del ctx
+
+
 def test_tlx_wave_async_copy_lowers_contiguous_bf16_as_16_byte_dma(tmp_path):
     async_func = """
   tt.func public @async_bf16_wide_dma(%arg0: !tt.ptr<bf16>) attributes {noinline = false} {

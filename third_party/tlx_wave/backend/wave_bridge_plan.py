@@ -13,6 +13,7 @@ class _KernelArg:
     wave_type: str
     kind: str
     divisibility: int | None
+    pointer_range: int | None
 
 
 @dataclass(frozen=True)
@@ -2271,6 +2272,10 @@ def _kernel_from_module(mod):
                 _arg_int_attr(
                     arg_attrs[index] if index < len(arg_attrs) else None,
                     "tt.divisibility",
+                ),
+                _arg_int_attr(
+                    arg_attrs[index] if index < len(arg_attrs) else None,
+                    "tt.pointer_range",
                 ),
             )
         )

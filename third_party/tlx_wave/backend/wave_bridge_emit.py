@@ -198,6 +198,7 @@ class _MaskCompare:
 @dataclass(frozen=True)
 class _PointerBase:
     value: object
+    pointer_range: int | None = None
 
 
 @dataclass(frozen=True)
@@ -972,6 +973,107 @@ def _materialize_pointer_value(builder, source, dim_bindings, w):
         offset = _materialize_index_value(builder, source.offset, dim_bindings, w)
         return builder.ptr_add(base, offset)
     return source
+
+
+def _split_pointer_add_source(source):
+    offsets = []
+    while isinstance(source, _PointerAdd):
+        offsets.append(source.offset)
+        source = source.base
+    offsets.reverse()
+    return source, tuple(offsets)
+
+
+def _pointer_source_base_pointer_range(source):
+    base, _ = _split_pointer_add_source(source)
+    if isinstance(base, _PointerBase):
+        return base.pointer_range
+    return None
+
+
+def _small_pointer_element_offset_upper(pointer_range, element_byte_width):
+    if (
+        pointer_range is None
+        or pointer_range <= 0
+        or pointer_range > 32
+        or element_byte_width is None
+        or element_byte_width <= 0
+    ):
+        return None
+    # Triton's AMD backend uses tt.pointer_range=32 for host pointers whose
+    # backing allocation fits in signed i32 byte offsets.
+    byte_upper = (1 << (int(pointer_range) - 1)) - 1
+    return byte_upper // int(element_byte_width)
+
+
+def _assume_small_pointer_element_offset(
+    builder,
+    offset,
+    pointer_range,
+    element_byte_width,
+    is_nonnegative,
+    w,
+):
+    upper = _small_pointer_element_offset_upper(pointer_range, element_byte_width)
+    if upper is None or not hasattr(builder, "assume"):
+        return offset
+    x = w.sym_ctx.sym("x")
+    assumptions = [x <= int(upper)]
+    if is_nonnegative:
+        assumptions.insert(0, x >= 0)
+    return builder.assume(offset, assumptions, name="x")
+
+
+def _add_index_values(builder, lhs, rhs, w):
+    width = None
+    for value in (lhs, rhs):
+        if w.SimdType.isinstance(value.type):
+            width = w.SimdType(value.type).width
+            break
+    lhs = _maybe_splat(builder, lhs, width, w)
+    rhs = _maybe_splat(builder, rhs, width, w)
+    return builder.binary(w.BinaryKind.AddI, lhs, rhs)
+
+
+def _materialize_dma_source_pointer_value(
+    builder,
+    state,
+    source,
+    dim_bindings,
+    element_byte_width,
+    shape,
+    inner_dim,
+    packet_elements,
+    w,
+):
+    base_source, offsets = _split_pointer_add_source(source)
+    if not offsets:
+        return _materialize_pointer_value(builder, source, dim_bindings, w)
+    base = _materialize_pointer_value(builder, base_source, dim_bindings, w)
+    offset = _materialize_index_value(builder, offsets[0], dim_bindings, w)
+    for next_offset in offsets[1:]:
+        offset = _add_index_values(
+            builder,
+            offset,
+            _materialize_index_value(builder, next_offset, dim_bindings, w),
+            w,
+        )
+    offset = _assume_small_pointer_element_offset(
+        builder,
+        offset,
+        _pointer_source_base_pointer_range(base_source),
+        element_byte_width,
+        _dma_source_element_offset_proves_nonnegative(
+            state,
+            source,
+            shape,
+            inner_dim,
+            packet_elements,
+            w,
+        ),
+        w,
+    )
+    return builder.ptr_add(base, offset)
 
 
 def _wave_element_type(element_type, w, context):
@@ -3117,11 +3219,12 @@ def _init_argument_wave_values(builder, kernel, values, state, w):
             continue
         arg = builder.args[value.base_arg_index]
         if value.type_kind == "pointer":
+            arg_info = kernel.args[value.base_arg_index]
             _set_wave_value(
                 wave_values,
                 value.value_id,
                 "pointer_expr",
-                arg,
+                _PointerBase(arg, pointer_range=arg_info.pointer_range),
             )
         elif value.type_kind == "scalar" and _is_bool_value(value):
             _set_wave_value(
@@ -3897,7 +4000,11 @@ def _emit_addptr_op(builder, op, values, wave_values, w):
         wave_values, op.operands[1], "index_expr", "tt.addptr"
     )
     result = values[op.results[0]]
-    if not _is_deferred_pointer(base) and not _is_deferred_index(offset):
+    if (
+        _pointer_source_base_pointer_range(base) is None
+        and not _is_deferred_pointer(base)
+        and not _is_deferred_index(offset)
+    ):
         _set_wave_value(
             wave_values,
             result.value_id,
@@ -5195,6 +5302,146 @@ def _ixsimpl_assume_fact_exprs(state, unknowns, w):
     return tuple(assumptions)
 
 
+def _ixsimpl_index_source_proves_lower_bound(
+    source,
+    lower_bound,
+    assumptions,
+    w,
+    unknowns,
+):
+    expr = _ixsimpl_index_expr(source, w, unknowns)
+    if expr is not None and _ixsimpl_proves(expr >= int(lower_bound), assumptions, w):
+        return True
+    if isinstance(source, _IndexExpr):
+        if source.materialized is not None:
+            return _ixsimpl_index_source_proves_lower_bound(
+                source.materialized,
+                lower_bound,
+                assumptions,
+                w,
+                unknowns,
+            )
+        binding_assumptions = []
+        for symbol, binding in source.bindings.items():
+            if _ixsimpl_index_source_proves_lower_bound(
+                binding,
+                0,
+                assumptions,
+                w,
+                unknowns,
+            ):
+                binding_assumptions.append(symbol >= 0)
+        if binding_assumptions and _ixsimpl_proves(
+            source.expr >= int(lower_bound),
+            assumptions + tuple(binding_assumptions),
+            w,
+        ):
+            return True
+        return False
+    if not isinstance(source, _IndexBinary):
+        return False
+    kind = str(source.kind)
+    if kind == "addi":
+        if lower_bound != 0:
+            return False
+        return _ixsimpl_index_source_proves_lower_bound(
+            source.lhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.rhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        )
+    if kind == "muli":
+        if lower_bound != 0:
+            return False
+        return _ixsimpl_index_source_proves_lower_bound(
+            source.lhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.rhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        )
+    if kind in {"remsi", "remui"}:
+        if lower_bound != 0:
+            return False
+        return _ixsimpl_index_source_proves_lower_bound(
+            source.lhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.rhs,
+            1,
+            assumptions,
+            w,
+            unknowns,
+        )
+    return False
+
+
+def _ixsimpl_pointer_source_offset_proves_nonnegative(
+    source,
+    assumptions,
+    w,
+    unknowns,
+):
+    if isinstance(source, _PointerBase):
+        return True
+    if isinstance(source, _PointerAdd):
+        return _ixsimpl_pointer_source_offset_proves_nonnegative(
+            source.base,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.offset,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        )
+    offset = _ixsimpl_pointer_offset_expr(source, w, unknowns)
+    if offset is None:
+        return False
+    return _ixsimpl_proves(offset >= 0, assumptions, w)
+
+
+def _dma_source_element_offset_proves_nonnegative(
+    state,
+    pointer_source,
+    shape,
+    inner_dim,
+    packet_elements,
+    w,
+):
+    unknowns = {}
+    assumptions = _dma_packet_dim_assumptions(
+        shape,
+        inner_dim,
+        packet_elements,
+        w,
+    ) + _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    return _ixsimpl_pointer_source_offset_proves_nonnegative(
+        pointer_source,
+        assumptions,
+        w,
+        unknowns,
+    )
+
+
 def _require_dma_packet_source_contiguous_bytes(
     state,
     pointer_source,
@@ -5386,10 +5633,15 @@ def _emit_dma_packet_ptrs(
         component,
         w,
     )
-    source = _materialize_pointer_value(
+    source = _materialize_dma_source_pointer_value(
         builder,
+        state,
         pointer_source,
         dim_bindings,
+        address.element_byte_width,
+        address_plan.shape,
+        len(address_plan.shape) - 1,
+        packet_elements,
         w,
     )
     destination_base = _emit_memdesc_base_ptr(
@@ -6327,6 +6579,7 @@ def _emit_scoped_control_block(
     stats,
     control_context,
     bindings=(),
+    assume_facts=(),
     mem_state=None,
     capture_mem_state=False,
 ):
@@ -6336,6 +6589,7 @@ def _emit_scoped_control_block(
             state["mem_state"] = mem_state
         for value_id, lowered in bindings:
             state["wave_values"][value_id] = lowered
+        state["assume_facts"].extend(assume_facts)
         yielded = _emit_raw_block(
             builder,
             kernel,
@@ -6434,6 +6688,21 @@ def _materialize_for_bound(builder, state, value_id, w, context):
             f"got {lowered.kind}"
         )
     return _control_value_to_mlir(builder, lowered, w, context)
+
+
+def _scf_for_induction_lower_fact(state, op, induction_value_id):
+    lower = _const_int_value(state["values"], op.operands[0])
+    step = _const_int_value(state["values"], op.operands[2])
+    if lower is None or lower < 0 or step is None or step <= 0:
+        return None
+    return _AssumeFact(induction_value_id, "range", lower=lower)
+
+
+def _assume_scf_for_induction_lower(builder, induction, fact, w):
+    if fact is None or fact.lower is None or not hasattr(builder, "assume"):
+        return induction
+    x = w.sym_ctx.sym("x")
+    return builder.assume(induction, [x >= int(fact.lower)], name="x")
 
 
 def _walk_raw_region_ops(raw_ops):
@@ -6598,10 +6867,22 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
             user_iter_args = iter_args[: len(user_init_values)]
             hidden_iter_args = iter_args[len(user_init_values) :]
             body_mem_state = _loop_mem_state_from_iter_args(hidden_iter_args, mem_shape)
+            induction_value_id = _value_id(body_args[0])
+            induction_fact = _scf_for_induction_lower_fact(
+                state,
+                op,
+                induction_value_id,
+            )
+            induction = _assume_scf_for_induction_lower(
+                builder,
+                for_op.induction_variable,
+                induction_fact,
+                w,
+            )
             bindings = [
                 (
-                    _value_id(body_args[0]),
-                    _WaveValue("index_expr", for_op.induction_variable),
+                    induction_value_id,
+                    _WaveValue("index_expr", induction),
                 )
             ]
             iter_offset = 0
@@ -6628,6 +6909,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
                 stats,
                 "scf.for",
                 bindings=tuple(bindings),
+                assume_facts=() if induction_fact is None else (induction_fact,),
                 mem_state=body_mem_state,
                 capture_mem_state=mem_shape is not None,
             )
@@ -6669,9 +6951,21 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
         return
 
     with builder.for_loop(lower, upper, step) as induction:
+        induction_value_id = _value_id(body_args[0])
+        induction_fact = _scf_for_induction_lower_fact(
+            state,
+            op,
+            induction_value_id,
+        )
+        induction = _assume_scf_for_induction_lower(
+            builder,
+            induction,
+            induction_fact,
+            w,
+        )
         bindings = (
             (
-                _value_id(body_args[0]),
+                induction_value_id,
                 _WaveValue("index_expr", induction),
             ),
         )
@@ -6685,6 +6979,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
             stats,
             "scf.for",
             bindings=bindings,
+            assume_facts=() if induction_fact is None else (induction_fact,),
         )
         if yielded not in (None, ()):
             raise ValueError(
