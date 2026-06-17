@@ -60,6 +60,17 @@ _GFX950_PIPELINED_STORE_LAYOUT = _BlockedEncodingInfo(
     warps_per_cta=(4, 1),
     order=(1, 0),
 )
+_GFX950_CONVERTED_DOT_PARENT_LAYOUT = _BlockedEncodingInfo(
+    size_per_thread=(1, 4),
+    threads_per_warp=(4, 16),
+    warps_per_cta=(4, 1),
+    order=(1, 0),
+)
+_GFX950_BLOCKED_DOT_PARENT_MMA16_LAYOUTS = (
+    _GFX950_DOT_PARENT_LAYOUT,
+    _GFX950_CONVERTED_DOT_PARENT_LAYOUT,
+    _GFX950_PIPELINED_STORE_LAYOUT,
+)
 
 
 class _DmaDestinationNotWholeWaveContiguous(ValueError):
@@ -366,6 +377,26 @@ def _same_dot_parent_encoding(lhs, rhs):
     if isinstance(lhs, _AMDMfmaEncodingInfo) and isinstance(rhs, _AMDMfmaEncodingInfo):
         return _same_amd_mfma_encoding(lhs, rhs)
     return False
+
+
+def _format_dot_parent_encoding(parent):
+    if isinstance(parent, _BlockedEncodingInfo):
+        return (
+            "#ttg.blocked<"
+            f"sizePerThread={parent.size_per_thread}, "
+            f"threadsPerWarp={parent.threads_per_warp}, "
+            f"warpsPerCTA={parent.warps_per_cta}, "
+            f"order={parent.order}>"
+        )
+    if isinstance(parent, _AMDMfmaEncodingInfo):
+        return (
+            "#ttg.amd_mfma<"
+            f"version={parent.version}, "
+            f"warpsPerCTA={parent.warps_per_cta}, "
+            f"instrShape={parent.instr_shape}, "
+            f"isTransposed={parent.is_transposed}>"
+        )
+    return str(parent)
 
 
 def _same_layout_encoding(lhs, rhs):
@@ -4528,6 +4559,7 @@ def _is_supported_fragment_store_layout(layout):
         _same_blocked_encoding(layout, supported)
         for supported in (
             _GFX950_DOT_PARENT_LAYOUT,
+            _GFX950_CONVERTED_DOT_PARENT_LAYOUT,
             _GFX950_PROPAGATED_STORE_LAYOUT,
             _GFX950_PIPELINED_STORE_LAYOUT,
         )
@@ -7010,14 +7042,22 @@ def _dot_operand_mma_shape(info, context, attrs=None):
                 "tlx_wave bridge cannot lower blocked-parent tt.dot to gfx950 "
                 f"Wave MFMA for TTGIR target {attrs.target}"
             )
-        if _same_blocked_encoding(parent, _GFX950_DOT_PARENT_LAYOUT):
+        if any(
+            _same_blocked_encoding(parent, layout)
+            for layout in _GFX950_BLOCKED_DOT_PARENT_MMA16_LAYOUTS
+        ):
             return _GFX950_MMA16_INFO
+        supported = ", ".join(
+            _format_dot_parent_encoding(layout)
+            for layout in _GFX950_BLOCKED_DOT_PARENT_MMA16_LAYOUTS
+        )
         raise ValueError(
-            "tlx_wave bridge supports blocked dot operand parents only for the "
-            "gfx950 dot-parent layout; "
+            "tlx_wave bridge supports blocked dot operand parents only for "
+            "known gfx950 16x16x32 MFMA layouts; "
             f"got sizePerThread={parent.size_per_thread}, "
             f"threadsPerWarp={parent.threads_per_warp}, "
-            f"warpsPerCTA={parent.warps_per_cta}, order={parent.order}"
+            f"warpsPerCTA={parent.warps_per_cta}, order={parent.order}; "
+            f"supported layouts: {supported}"
         )
     if not isinstance(parent, _AMDMfmaEncodingInfo):
         raise ValueError(
@@ -8085,6 +8125,15 @@ def _forward_lowered_value(op, values, wave_values):
     )
 
 
+def _dot_operand_parent_message(value, context):
+    try:
+        return _format_dot_parent_encoding(
+            _dot_operand_encoding_info(value, context).parent
+        )
+    except ValueError:
+        return value.encoding or value.type
+
+
 def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
     if len(op.operands) != 1 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected ttg.convert_layout with one value")
@@ -8124,7 +8173,20 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
         )
     memdescs = state["memdescs"]
     memdesc = memdescs[address.memdesc_value_id]
-    capability = _physical_local_load_fragment_capability(result, memdesc)
+    try:
+        capability = _physical_local_load_fragment_capability(result, memdesc)
+    except ValueError as exc:
+        source_plan = values[source_id]
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.convert_layout to a dot operand "
+            "fragment from a ttg.local_load source; "
+            "unsupported dot operand layout conversion; "
+            "source parent: "
+            f"{_dot_operand_parent_message(source_plan, 'ttg.convert_layout source')}; "
+            "result parent: "
+            f"{_dot_operand_parent_message(result, 'ttg.convert_layout result')}; "
+            f"reason: {exc}"
+        ) from exc
     fragment, token = _emit_dot_operand_fragment_tile_load(
         builder,
         address,
