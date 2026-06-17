@@ -1023,7 +1023,9 @@ def _pointer_source_base_pointer_range(source):
     return None
 
 
-def _small_pointer_element_offset_upper(pointer_range, element_byte_width):
+def _small_pointer_element_offset_upper(
+    pointer_range, element_byte_width, access_byte_width=None
+):
     if (
         pointer_range is None
         or pointer_range <= 0
@@ -1032,9 +1034,18 @@ def _small_pointer_element_offset_upper(pointer_range, element_byte_width):
         or element_byte_width <= 0
     ):
         return None
+    if access_byte_width is None:
+        access_byte_width = int(element_byte_width)
+    if access_byte_width <= 0:
+        return None
     # Triton's AMD backend uses tt.pointer_range=32 for host pointers whose
     # backing allocation fits in signed i32 byte offsets.
     byte_upper = (1 << (int(pointer_range) - 1)) - 1
+    # Wave buffer promotion validates the whole operation payload, so prove the
+    # starting element leaves room for the access bytes.
+    byte_upper -= int(access_byte_width)
+    if byte_upper < 0:
+        return None
     return byte_upper // int(element_byte_width)
 
 
@@ -1045,8 +1056,13 @@ def _assume_small_pointer_element_offset(
     element_byte_width,
     is_nonnegative,
     w,
+    access_byte_width=None,
 ):
-    upper = _small_pointer_element_offset_upper(pointer_range, element_byte_width)
+    upper = _small_pointer_element_offset_upper(
+        pointer_range,
+        element_byte_width,
+        access_byte_width=access_byte_width,
+    )
     if upper is None or not hasattr(builder, "assume"):
         return offset
     x = w.sym_ctx.sym("x")
@@ -1065,6 +1081,71 @@ def _add_index_values(builder, lhs, rhs, w):
     lhs = _maybe_splat(builder, lhs, width, w)
     rhs = _maybe_splat(builder, rhs, width, w)
     return builder.binary(w.BinaryKind.AddI, lhs, rhs)
+
+
+def _tensor_dim_nonnegative_assumptions(shape, w):
+    return tuple(_dim_symbol(w, dim) >= 0 for dim in range(len(shape or ())))
+
+
+def _pointer_source_element_offset_proves_nonnegative(
+    state,
+    pointer_source,
+    shape,
+    w,
+):
+    unknowns = {}
+    assumptions = _tensor_dim_nonnegative_assumptions(
+        shape,
+        w,
+    ) + _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    return _ixsimpl_pointer_source_offset_proves_nonnegative(
+        pointer_source,
+        assumptions,
+        w,
+        unknowns,
+    )
+
+
+def _materialize_bounded_pointer_value(
+    builder,
+    state,
+    source,
+    dim_bindings,
+    element_byte_width,
+    access_byte_width,
+    shape,
+    w,
+    *,
+    assume_pointer_range=True,
+):
+    base_source, offsets = _split_pointer_add_source(source)
+    if not offsets:
+        return _materialize_pointer_value(builder, source, dim_bindings, w)
+    base = _materialize_pointer_value(builder, base_source, dim_bindings, w)
+    offset = _materialize_index_value(builder, offsets[0], dim_bindings, w)
+    for next_offset in offsets[1:]:
+        offset = _add_index_values(
+            builder,
+            offset,
+            _materialize_index_value(builder, next_offset, dim_bindings, w),
+            w,
+        )
+    if assume_pointer_range:
+        offset = _assume_small_pointer_element_offset(
+            builder,
+            offset,
+            _pointer_source_base_pointer_range(base_source),
+            element_byte_width,
+            _pointer_source_element_offset_proves_nonnegative(
+                state,
+                source,
+                shape,
+                w,
+            ),
+            w,
+            access_byte_width=access_byte_width,
+        )
+    return builder.ptr_add(base, offset)
 
 
 def _materialize_dma_source_pointer_value(
@@ -1104,6 +1185,7 @@ def _materialize_dma_source_pointer_value(
             w,
         ),
         w,
+        access_byte_width=packet_elements * int(element_byte_width),
     )
     return builder.ptr_add(base, offset)
 
@@ -4361,6 +4443,23 @@ def _layout_thread_count(layout):
     return _product(layout.threads_per_warp) * _product(layout.warps_per_cta)
 
 
+def _blocked_layout_component_all_lanes_active(
+    value_plan, context, lowering_name, component=0
+):
+    layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
+    width = _product(layout.threads_per_warp)
+    for thread in range(width):
+        coords = _blocked_layout_static_coord(
+            layout,
+            value_plan.shape,
+            thread,
+            component,
+        )
+        if any(coord >= int(extent) for coord, extent in zip(coords, value_plan.shape)):
+            return False
+    return True
+
+
 def _simd_convert_error(reason, source_plan, result_plan):
     raise ValueError(
         "tlx_wave bridge cannot lower ttg.convert_layout for SIMD tensor data: "
@@ -5905,11 +6004,22 @@ def _emit_async_copy_via_load_store(
             "ttg.async_copy_global_to_local source",
             component=component,
         )
-        source = _materialize_pointer_value(
+        source = _materialize_bounded_pointer_value(
             builder,
+            state,
             pointer_source,
             dim_bindings,
+            address.element_byte_width,
+            address.element_byte_width,
+            address_plan.shape,
             w,
+            assume_pointer_range=mask_value is None
+            and _blocked_layout_component_all_lanes_active(
+                address_plan,
+                "ttg.async_copy_global_to_local source",
+                "generic tensor lowering",
+                component=component,
+            ),
         )
         mask = active
         if mask_value is not None:
@@ -8467,11 +8577,18 @@ def _emit_fragment_store(
         dim_bindings, width = _store_dim_bindings(
             builder, store_plan, lowered, w, component=component
         )
-        ptr = _materialize_pointer_value(
+        ptr = _materialize_bounded_pointer_value(
             builder,
+            state,
             pointer_source,
             dim_bindings,
+            store_plan.element_byte_width,
+            int(store_plan.element_byte_width) * vector_width
+            if store_plan.element_byte_width is not None
+            else None,
+            store_plan.shape,
             w,
+            assume_pointer_range=mask_id is None,
         )
         mask = (
             _materialize_mask_value(
@@ -8635,6 +8752,47 @@ def _fragment_store_tile_dim_bindings(
     return dim_bindings, frag.wave_size, active
 
 
+def _fragment_store_tile_component_all_lanes_active(
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    w,
+):
+    frag = w.FragmentType(fragment.type)
+    if frag.registers == _GFX950_MMA32_INFO.acc_registers:
+        for thread in range(frag.wave_size):
+            lane = thread % _GFX950_MMA32_INFO.wave_size
+            coords = (
+                int(tile_offsets[0]) + lane % _GFX950_MMA32_INFO.output_tile_shape[0],
+                int(tile_offsets[1])
+                + 4 * (lane // _GFX950_MMA32_INFO.output_tile_shape[0])
+                + int(component % 4)
+                + int(8 * (component // 4)),
+            )
+            if any(
+                coord >= int(extent) for coord, extent in zip(coords, value_plan.shape)
+            ):
+                return False
+        return True
+
+    layout = _GFX950_DOT_PARENT_LAYOUT
+    for thread in range(frag.wave_size):
+        local_coords = _blocked_layout_static_coord(
+            layout,
+            _GFX950_MMA_SHAPE,
+            thread,
+            component,
+        )
+        coords = tuple(
+            int(tile_offsets[dim]) + local_coords[dim]
+            for dim in range(len(local_coords))
+        )
+        if any(coord >= int(extent) for coord, extent in zip(coords, value_plan.shape)):
+            return False
+    return True
+
+
 def _emit_mfma_fragment_tile_store(
     builder,
     state,
@@ -8686,8 +8844,9 @@ def _emit_mfma_fragment_tile_store(
                     component,
                     w,
                 )
-                ptr = _materialize_pointer_value(
+                ptr = _materialize_bounded_pointer_value(
                     builder,
+                    state,
                     _require_lowered_value(
                         state["wave_values"],
                         ptr_id,
@@ -8695,7 +8854,18 @@ def _emit_mfma_fragment_tile_store(
                         "tt.store pointer",
                     ),
                     dim_bindings,
+                    value_plan.element_byte_width,
+                    value_plan.element_byte_width,
+                    value_plan.shape,
                     w,
+                    assume_pointer_range=mask_id is None
+                    and _fragment_store_tile_component_all_lanes_active(
+                        value_plan,
+                        fragment,
+                        tile_offsets,
+                        component,
+                        w,
+                    ),
                 )
                 mask = active
                 if mask_id is not None:
@@ -8858,8 +9028,9 @@ def _emit_global_load_op(builder, op, state, w):
         dim_bindings, width, active = _blocked_tensor_dim_bindings(
             builder, result_plan, w, "tt.load result", component=component
         )
-        ptr = _materialize_pointer_value(
+        ptr = _materialize_bounded_pointer_value(
             builder,
+            state,
             _require_lowered_value(
                 wave_values,
                 op.operands[0],
@@ -8867,7 +9038,17 @@ def _emit_global_load_op(builder, op, state, w):
                 "tt.load pointer",
             ),
             dim_bindings,
+            result_plan.element_byte_width,
+            result_plan.element_byte_width,
+            result_plan.shape,
             w,
+            assume_pointer_range=len(op.operands) == 1
+            and _blocked_layout_component_all_lanes_active(
+                result_plan,
+                "tt.load result",
+                "generic tensor lowering",
+                component=component,
+            ),
         )
         mask = active
         if len(op.operands) > 1:
@@ -9343,8 +9524,9 @@ def _emit_store_op(builder, op, state, w):
             dim_bindings, width, active = _blocked_tensor_dim_bindings(
                 builder, value_plan, w, "tt.store value", component=component
             )
-            ptr = _materialize_pointer_value(
+            ptr = _materialize_bounded_pointer_value(
                 builder,
+                state,
                 _require_lowered_value(
                     wave_values,
                     ptr_id,
@@ -9352,7 +9534,17 @@ def _emit_store_op(builder, op, state, w):
                     "tt.store pointer",
                 ),
                 dim_bindings,
+                value_plan.element_byte_width,
+                value_plan.element_byte_width,
+                value_plan.shape,
                 w,
+                assume_pointer_range=mask_id is None
+                and _blocked_layout_component_all_lanes_active(
+                    value_plan,
+                    "tt.store value",
+                    "generic tensor lowering",
+                    component=component,
+                ),
             )
             mask = active
             if mask_id is not None:

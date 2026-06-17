@@ -267,6 +267,19 @@ def _run_waveamd_to_machine(wave_artifact):
     return result.stdout
 
 
+def _run_wave_promote_buffer(wave_artifact):
+    result = subprocess.run(
+        [wave_bridge_emit._wave_opt(), "-", "--wave-promote-global-to-buffer"],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
 def _run_wave_promote_buffer_to_machine(wave_artifact):
     result = subprocess.run(
         [
@@ -2003,15 +2016,157 @@ def test_tlx_wave_async_copy_pointer_range_bounds_runtime_stride_dma_source(
     wave_artifact = wave_bridge.stop_before_wave_lowering(
         mod, metadata, _wave_bridge_options()
     )
-    machine = _run_waveamd_to_machine(wave_artifact)
+    machine = _run_wave_promote_buffer_to_machine(wave_artifact)
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_async_copies"] == 1
     assert metadata["tlx_wave_num_dma_load_lds"] == 1
     assert "wave.assume" in wave_artifact
-    assert "1073741823" in wave_artifact
-    assert "waveamdmachine.global_load_lds_b128" in machine
+    assert "1073741815" in wave_artifact
+    assert "waveamdmachine.buffer_load_lds_b128" in machine
     assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
+def test_tlx_wave_store_pointer_range_promotes_runtime_stride_buffer_store(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    store_func = """
+  tt.func public @store_pointer_range(%arg0: !tt.ptr<f32> {tt.pointer_range = 32 : i32}, %stride: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %c0 : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %offs = arith.addi %stride_splat, %range : tensor<64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %value = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, store_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    machine = _run_wave_promote_buffer_to_machine(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "536870910" in wave_artifact
+    assert "waveamdmachine.buffer_store_b32" in machine
+    assert "waveamdmachine.global_store" not in machine
+    del ctx
+
+
+def test_tlx_wave_load_pointer_range_promotes_runtime_stride_buffer_load(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    load_func = """
+  tt.func public @load_pointer_range(%arg0: !tt.ptr<f32> {tt.pointer_range = 32 : i32}, %stride: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %c0 : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %offs = arith.addi %stride_splat, %range : tensor<64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %loaded = tt.load %ptr : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, load_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    machine = _run_wave_promote_buffer_to_machine(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "536870910" in wave_artifact
+    assert "waveamdmachine.buffer_load_b32" in machine
+    assert "waveamdmachine.global_load_b32" not in machine
+    del ctx
+
+
+def test_tlx_wave_store_without_pointer_range_does_not_promote_buffer_store(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    store_func = """
+  tt.func public @store_no_pointer_range(%arg0: !tt.ptr<f32>, %stride: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %c0 : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %offs = arith.addi %stride_splat, %range : tensor<64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %value = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, store_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    promoted = _run_wave_promote_buffer(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "waveamd.make_buffer" not in promoted
+    assert "wave.store" in promoted
+    del ctx
+
+
+def test_tlx_wave_store_pointer_range_partial_block_does_not_assume_inactive_lanes(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    store_func = """
+  tt.func public @store_pointer_range_partial(%arg0: !tt.ptr<f32> {tt.pointer_range = 32 : i32}, %stride: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %c0 : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %range = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<32xi32, #blocked>
+    %offs = arith.addi %stride_splat, %range : tensor<32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
+    %value = arith.constant dense<1.000000e+00> : tensor<32xf32, #blocked>
+    tt.store %ptr, %value : tensor<32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, store_func, preamble=preamble, num_warps=1)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    promoted = _run_wave_promote_buffer(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "536870910" not in wave_artifact
+    assert "waveamd.make_buffer" not in promoted
+    assert "wave.store" in promoted
     del ctx
 
 
@@ -2038,16 +2193,19 @@ def test_tlx_wave_async_copy_pointer_range_does_not_assume_negative_offset_nonne
     wave_artifact = wave_bridge.stop_before_wave_lowering(
         mod, metadata, _wave_bridge_options()
     )
+    promoted = _run_wave_promote_buffer(wave_artifact)
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert metadata["tlx_wave_num_dma_load_lds"] == 1
     bounded_offset_assumes = [
         line
         for line in wave_artifact.splitlines()
-        if "1073741823" in line
+        if "1073741815" in line
     ]
     assert bounded_offset_assumes
     assert all('"x >= 0"' not in line for line in bounded_offset_assumes)
+    assert "waveamd.make_buffer" not in promoted
+    assert "waveamd.dma_load_lds" in promoted
     del ctx
 
 
