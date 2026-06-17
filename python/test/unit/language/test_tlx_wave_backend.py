@@ -4500,7 +4500,7 @@ def test_tlx_wave_bridge_lowers_gfx950_32x32x16_mfma_layout(tmp_path):
     assert metadata["tlx_wave_num_fragment_fills"] == 1
     assert metadata["tlx_wave_num_mmas"] == 2
     assert (
-        wave_artifact.count(f'kind = "{wave_bridge._GFX950_F16_MMA32_KIND}"')
+        wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA32_KIND}"')
         == 2
     )
     assert "waveamdmachine.mfma_f32_32x32x16_f16" in machine

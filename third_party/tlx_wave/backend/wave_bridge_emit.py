@@ -1,3 +1,4 @@
+import math
 import os
 import subprocess
 import sys
@@ -1929,7 +1930,6 @@ def _padded_physical_coords_expr(w, data_element_linear, shape, info, context):
     tile_shape = tuple(int(dim) for dim in shape[prefix_rank:])
     tile_elements = _product(tile_shape)
     prefix_linear = w.floor(data_element_linear / tile_elements)
-    tile_linear = w.mod(data_element_linear, tile_elements)
     row_major_prefix = tuple(reversed(range(prefix_rank)))
     prefix_coords = (
         _delinearize_expr(w, prefix_linear, prefix_shape, row_major_prefix)
@@ -1940,7 +1940,7 @@ def _padded_physical_coords_expr(w, data_element_linear, shape, info, context):
     for (layout_dim, logical_bit), physical_bit in _padded_layout_bit_mapping(
         info, context
     ).items():
-        bit = w.mod(w.floor(tile_linear / (1 << int(physical_bit))), 2)
+        bit = w.mod(w.floor(data_element_linear / (1 << int(physical_bit))), 2)
         tile_coords[int(layout_dim)] = tile_coords[int(layout_dim)] + bit * (
             1 << int(logical_bit)
         )
@@ -1997,6 +1997,13 @@ def _swizzled_physical_coords_expr(w, physical_element_linear, shape, shared, co
             f"tlx_wave bridge cannot lower {context}: invalid swizzled shared "
             f"parameters vec={vec}, perPhase={per_phase}, maxPhase={max_phase}"
         )
+    prefix_rank = len(shape) - 2
+    cols = int(shape[prefix_rank + 1])
+    if cols % vec:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: swizzled shared columns "
+            f"{cols} are not divisible by vec={vec}"
+        )
     coords = list(
         _delinearize_expr(
             w,
@@ -2005,11 +2012,11 @@ def _swizzled_physical_coords_expr(w, physical_element_linear, shape, shared, co
             tuple(reversed(range(len(shape)))),
         )
     )
-    prefix_rank = len(shape) - 2
     row = coords[prefix_rank]
     swizzled_col = coords[prefix_rank + 1]
     phase = w.mod(w.floor(row / per_phase), max_phase)
-    col_group = w.xor(w.floor(swizzled_col / vec), phase)
+    swizzled_col_group = w.mod(w.floor(physical_element_linear / vec), cols // vec)
+    col_group = w.xor(swizzled_col_group, phase)
     coords[prefix_rank + 1] = col_group * vec + w.mod(swizzled_col, vec)
     return tuple(coords)
 
@@ -4270,6 +4277,26 @@ def _delinearize_expr(w, linear, shape, order):
         coords[dim] = w.mod(remainder, extent)
         remainder = w.floor(remainder / extent)
     return tuple(coords)
+
+
+def _delinearize_row_major_strided_symbol_expr(w, symbol, stride, shape):
+    if len(shape) != 2:
+        return None
+    rows, cols = (int(shape[0]), int(shape[1]))
+    stride = int(stride)
+    if rows <= 0 or cols <= 0 or stride <= 0:
+        return None
+
+    common = math.gcd(stride, cols)
+    col_factor = stride // common
+    col_extent = cols // common
+    col_base = symbol if col_factor == 1 else symbol * col_factor
+    col = w.mod(col_base, col_extent)
+    if common != 1:
+        col = col * common
+
+    row = w.mod(w.floor((symbol * stride) / cols), rows)
+    return (row, col)
 
 
 def _delinearize_index(linear, shape, order):
@@ -7432,9 +7459,13 @@ def _fragment_lane_dim_bindings(
     suffix = "_".join(str(int(offset)) for offset in tile_offsets)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_{suffix}_lane")
     elements_per_lane = int(registers) * (4 // int(memdesc.element_byte_width))
-    element_linear = lane_sym * int(elements_per_lane)
     row_major_order = tuple(reversed(range(len(source_shape))))
-    coords = _delinearize_expr(w, element_linear, source_shape, row_major_order)
+    coords = _delinearize_row_major_strided_symbol_expr(
+        w, lane_sym, elements_per_lane, source_shape
+    )
+    if coords is None:
+        element_linear = lane_sym * int(elements_per_lane)
+        coords = _delinearize_expr(w, element_linear, source_shape, row_major_order)
     return {
         _dim_symbol(w, dim): builder.index_expr(
             coords[dim] + int(tile_offsets[dim]), {lane_sym: lane}

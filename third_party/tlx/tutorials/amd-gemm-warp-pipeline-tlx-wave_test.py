@@ -133,7 +133,7 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "scf.for" in wave
     assert "waveamd.dma_load_lds" in wave
-    assert 'kind = "mfma.f32.32x32x16.f16"' in wave
+    assert 'waveamd.mma "mfma.f32.32x32x16.f16"' in wave
     assert "waveamdmachine.target" in wave
     assert (
         "#ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>"
@@ -154,7 +154,7 @@ def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert "waveamd.mma" in wave
-    assert 'kind = "mfma.f32.32x32x16.f16"' in wave
+    assert 'waveamd.mma "mfma.f32.32x32x16.f16"' in wave
 
 
 def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
@@ -190,7 +190,7 @@ def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas >= 32
     assert compiled.metadata.tlx_wave_num_fragment_fills >= 32
-    assert 'kind = "mfma.f32.32x32x16.f16"' in wave
+    assert 'waveamd.mma "mfma.f32.32x32x16.f16"' in wave
 
 
 def test_gemm_wp_tlx_wave_warmup_lowers_8_warp_32x32_layout(monkeypatch, tmp_path):
@@ -209,7 +209,7 @@ def test_gemm_wp_tlx_wave_warmup_lowers_8_warp_32x32_layout(monkeypatch, tmp_pat
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas > 1
-    assert 'kind = "mfma.f32.32x32x16.f16"' in wave
+    assert 'waveamd.mma "mfma.f32.32x32x16.f16"' in wave
 
 
 def test_gemm_wp_validation_allows_non_unit_inner_strides():
