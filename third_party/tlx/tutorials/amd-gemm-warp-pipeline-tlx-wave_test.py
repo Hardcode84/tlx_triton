@@ -34,6 +34,8 @@ def _warmup_gemm_wp_tlx_wave(
     num_warps=4,
     group_m=16,
     num_buffers=2,
+    matrix_instr_nonkdim=16,
+    kpack=1,
     a_strides=None,
     b_strides=None,
     c_strides=None,
@@ -98,7 +100,8 @@ def _warmup_gemm_wp_tlx_wave(
             num_warps=num_warps,
             num_stages=1,
             waves_per_eu=0,
-            matrix_instr_nonkdim=16,
+            matrix_instr_nonkdim=matrix_instr_nonkdim,
+            kpack=kpack,
             grid=grid,
         )
     return compiled
@@ -127,6 +130,17 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert "waveamd.dma_load_lds" in wave
     assert "waveamd.mma" in wave
     assert "waveamdmachine.target" in wave
+
+
+def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(
+    monkeypatch, tmp_path
+):
+    with pytest.warns(UserWarning, match="kpack is deprecated"):
+        compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch, kpack=2)
+
+    wave = _wave_text(compiled)
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert "waveamd.mma" in wave
 
 
 def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):

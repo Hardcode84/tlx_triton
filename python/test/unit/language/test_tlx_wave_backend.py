@@ -217,12 +217,15 @@ def _wave_bridge_options(arch="gfx950", warp_size=64):
     return SimpleNamespace(arch=arch, warp_size=warp_size)
 
 
-def test_tlx_wave_backend_defaults_and_accepts_mfma_nonkdim():
+def test_tlx_wave_backend_defaults_and_accepts_mfma_options():
     backend = make_backend(GFX950_WAVE)
 
     assert backend.parse_options({}).matrix_instr_nonkdim == 16
     assert backend.parse_options({"matrix_instr_nonkdim": 32}).matrix_instr_nonkdim == 32
+    with pytest.warns(UserWarning, match="kpack is deprecated"):
+        assert backend.parse_options({"kpack": 2}).kpack == 1
     assert make_backend(GFX942_WAVE).parse_options({}).matrix_instr_nonkdim == 16
+    assert make_backend(GFX942_WAVE).parse_options({"kpack": 2}).kpack == 2
 
 
 def _parse_ttgir(
@@ -4020,6 +4023,34 @@ def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
     assert "gfx942/CDNA3 MFMA" in message
     assert "wave32" in message
     assert "wave64" in message
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_gfx950_non_16_mfma_layout(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @dot_local_load_mfma32() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
+
+    with pytest.raises(ValueError) as exc_info:
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    message = str(exc_info.value)
+    assert "instrShape = [16, 16, 32]" in message
+    assert "instrShape=(32, 32, 16)" in message
+    assert "version=4" in message
     del ctx
 
 
