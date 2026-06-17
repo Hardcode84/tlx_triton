@@ -1,3 +1,4 @@
+import ast
 import math
 import os
 import subprocess
@@ -102,6 +103,15 @@ class _DotOperandFragmentLoad:
     info: _DotOperandEncodingInfo
     mma: _MmaShapeInfo
     tile_shape: tuple[int, int] = (1, 1)
+
+
+@dataclass(frozen=True)
+class _LinearEncodingInfo:
+    register_bases: tuple[tuple[int, ...], ...]
+    lane_bases: tuple[tuple[int, ...], ...]
+    warp_bases: tuple[tuple[int, ...], ...]
+    threads_per_warp: tuple[int, ...]
+    warps_per_cta: tuple[int, ...]
 
 
 _GFX950_MMA16_INFO = _MmaShapeInfo(
@@ -303,6 +313,97 @@ def _blocked_encoding_info(attr, raw_encoding, context):
         _int_tuple(_attr_value(attr, "get_blocked_threads_per_warp")),
         _int_tuple(_attr_value(attr, "get_blocked_warps_per_cta")),
         _int_tuple(_attr_value(attr, "get_blocked_order")),
+    )
+
+
+def _extract_linear_basis_list(raw_encoding, name, context):
+    raw = str(raw_encoding)
+    marker = f"{name} ="
+    marker_index = raw.find(marker)
+    if marker_index < 0:
+        raise ValueError(
+            f"tlx_wave bridge expected #ttg.linear basis '{name}' for {context}, "
+            f"got {raw_encoding}"
+        )
+    start = raw.find("[", marker_index + len(marker))
+    if start < 0:
+        raise ValueError(
+            f"tlx_wave bridge expected #ttg.linear basis list for {context}, "
+            f"got {raw_encoding}"
+        )
+    depth = 0
+    end = None
+    for index in range(start, len(raw)):
+        char = raw[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end is None:
+        raise ValueError(
+            f"tlx_wave bridge found unterminated #ttg.linear basis list for "
+            f"{context}: {raw_encoding}"
+        )
+    try:
+        values = ast.literal_eval(raw[start:end])
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(
+            f"tlx_wave bridge could not parse #ttg.linear basis '{name}' for "
+            f"{context}: {raw_encoding}"
+        ) from exc
+    if not isinstance(values, list):
+        raise ValueError(
+            f"tlx_wave bridge expected #ttg.linear basis '{name}' to be a list "
+            f"for {context}, got {raw_encoding}"
+        )
+    bases = []
+    for basis in values:
+        if not isinstance(basis, list):
+            raise ValueError(
+                f"tlx_wave bridge expected #ttg.linear basis '{name}' entries "
+                f"to be lists for {context}, got {raw_encoding}"
+            )
+        bases.append(tuple(int(value) for value in basis))
+    return tuple(bases)
+
+
+def _linear_encoding_info(attr, raw_encoding, context, rank):
+    raw = str(attr) if attr is not None else str(raw_encoding)
+    if not raw.startswith("#ttg.linear<"):
+        raise ValueError(
+            f"tlx_wave bridge expected #ttg.linear encoding for {context}, "
+            f"got {raw_encoding}"
+        )
+    register_bases = _extract_linear_basis_list(raw, "register", context)
+    lane_bases = _extract_linear_basis_list(raw, "lane", context)
+    warp_bases = _extract_linear_basis_list(raw, "warp", context)
+    block_bases = _extract_linear_basis_list(raw, "block", context)
+    if block_bases:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower #ttg.linear encoding with block "
+            f"bases for {context}: {raw_encoding}"
+        )
+    for name, bases in (
+        ("register", register_bases),
+        ("lane", lane_bases),
+        ("warp", warp_bases),
+    ):
+        for basis in bases:
+            if len(basis) != rank:
+                raise ValueError(
+                    f"tlx_wave bridge #ttg.linear {name} basis rank does not "
+                    f"match {context}: rank={rank}, basis={basis}, "
+                    f"encoding={raw_encoding}"
+                )
+    return _LinearEncodingInfo(
+        register_bases,
+        lane_bases,
+        warp_bases,
+        (1 << len(lane_bases),),
+        (1 << len(warp_bases),),
     )
 
 
@@ -1287,6 +1388,29 @@ def _blocked_tensor_layout_info(value_plan, context, lowering_name):
     return layout
 
 
+def _dma_source_tensor_layout_info(value_plan, context, lowering_name):
+    if value_plan.type_kind != "tensor" or not value_plan.shape:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: expected ranked tensor, "
+            f"got {value_plan.type}"
+        )
+    if len(value_plan.shape) > 2:
+        raise ValueError(
+            f"tlx_wave bridge {lowering_name} supports rank <= 2 for "
+            f"{context}, got shape={value_plan.shape}"
+        )
+    if value_plan.encoding_attr is not None and _attr_bool(
+        value_plan.encoding_attr, "is_blocked_encoding"
+    ):
+        return _blocked_tensor_layout_info(value_plan, context, lowering_name)
+    return _linear_encoding_info(
+        value_plan.encoding_attr,
+        value_plan.encoding,
+        context,
+        len(value_plan.shape),
+    )
+
+
 def _blocked_layout_component_count(value_plan, context, lowering_name):
     layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
     return _product(
@@ -1296,6 +1420,23 @@ def _blocked_layout_component_count(value_plan, context, lowering_name):
             context,
             lowering_name,
         )
+    )
+
+
+def _linear_layout_component_count(layout):
+    return 1 << len(layout.register_bases)
+
+
+def _async_copy_source_layout_component_count(
+    value_plan, layout, context, lowering_name
+):
+    if isinstance(layout, _BlockedEncodingInfo):
+        return _blocked_layout_component_count(value_plan, context, lowering_name)
+    if isinstance(layout, _LinearEncodingInfo):
+        return _linear_layout_component_count(layout)
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported async copy "
+        f"source layout {value_plan.encoding}"
     )
 
 
@@ -1405,6 +1546,85 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context, component=0):
         "tlx_tensor",
         "generic tensor lowering",
         component=component,
+    )
+
+
+def _linear_layout_coord_exprs(layout, rank, register, lane, warp, w):
+    coords = [w.sym_ctx.int_(0) for _ in range(rank)]
+    for bit, basis in enumerate(layout.register_bases):
+        if int(register) & (1 << bit):
+            for dim in range(rank):
+                if basis[dim]:
+                    coords[dim] = coords[dim] + int(basis[dim])
+    for value, bases in ((lane, layout.lane_bases), (warp, layout.warp_bases)):
+        for bit, basis in enumerate(bases):
+            layout_bit = w.mod(w.floor(value / (1 << bit)), 2)
+            for dim in range(rank):
+                if basis[dim]:
+                    coords[dim] = coords[dim] + layout_bit * int(basis[dim])
+    return tuple(coords)
+
+
+def _linear_layout_dim_bindings(
+    builder, value_plan, layout, w, context, symbol_prefix, lowering_name, component=0
+):
+    component_count = _linear_layout_component_count(layout)
+    if component < 0 or component >= component_count:
+        raise ValueError(
+            f"tlx_wave bridge {lowering_name} component {component} is out of "
+            f"range for {context}: register components={component_count}, "
+            f"encoding={value_plan.encoding}"
+        )
+    rank = len(value_plan.shape)
+    width = _dma_layout_width(layout)
+    thread = builder.workitem_id(axis=0, width=width)
+    thread = _assume_nonnegative(builder, thread, w)
+    thread_sym = w.sym(f"{symbol_prefix}_{value_plan.value_id}_thread")
+    lane = w.mod(thread_sym, width)
+    warp = w.floor(thread_sym / width)
+    coords = _linear_layout_coord_exprs(layout, rank, component, lane, warp, w)
+
+    dim_bindings = {}
+    active = None
+    for dim in range(rank):
+        coord = builder.index_expr(coords[dim], {thread_sym: thread})
+        dim_bindings[_dim_symbol(w, dim)] = coord
+        extent = builder.splat(
+            builder.constant(w.index_type(), value_plan.shape[dim]),
+            width=width,
+        )
+        in_bounds = _wave_cmpi(
+            builder, "ult", _maybe_splat(builder, coord, width, w), extent, w
+        )
+        active = _wave_mask_and(builder, active, in_bounds, w, width)
+    return dim_bindings, width, active
+
+
+def _async_copy_source_dim_bindings(
+    builder, value_plan, layout, w, context, component=0
+):
+    if isinstance(layout, _BlockedEncodingInfo):
+        return _blocked_tensor_dim_bindings(
+            builder,
+            value_plan,
+            w,
+            context,
+            component=component,
+        )
+    if isinstance(layout, _LinearEncodingInfo):
+        return _linear_layout_dim_bindings(
+            builder,
+            value_plan,
+            layout,
+            w,
+            context,
+            "tlx_async_copy",
+            "generic async copy lowering",
+            component=component,
+        )
+    raise ValueError(
+        f"tlx_wave bridge cannot lower {context}: unsupported async copy "
+        f"source layout {value_plan.encoding}"
     )
 
 
@@ -1947,8 +2167,8 @@ def _require_dma_destination_whole_wave_contiguous(
     component,
     context,
 ):
-    width = _product(layout.threads_per_warp)
-    cta_threads = width * _product(layout.warps_per_cta)
+    width = _dma_layout_width(layout)
+    cta_threads = _dma_layout_cta_threads(layout)
     total_packets = _product(value_plan.shape) // int(packet_elements)
     component_packet_start = int(component) * cta_threads
     active_lanes = max(0, min(width, total_packets - component_packet_start))
@@ -4460,6 +4680,41 @@ def _blocked_layout_component_all_lanes_active(
     return True
 
 
+def _linear_layout_component_all_lanes_active(value_plan, layout, component=0):
+    rank = len(value_plan.shape)
+    for thread in range(_dma_layout_cta_threads(layout)):
+        width = _dma_layout_width(layout)
+        coords = _linear_layout_static_coords(
+            layout,
+            rank,
+            component,
+            thread % width,
+            thread // width,
+        )
+        if any(coord >= int(extent) for coord, extent in zip(coords, value_plan.shape)):
+            return False
+    return True
+
+
+def _async_copy_source_component_all_lanes_active(
+    value_plan, layout, context, lowering_name, component=0
+):
+    if isinstance(layout, _BlockedEncodingInfo):
+        return _blocked_layout_component_all_lanes_active(
+            value_plan,
+            context,
+            lowering_name,
+            component=component,
+        )
+    if isinstance(layout, _LinearEncodingInfo):
+        return _linear_layout_component_all_lanes_active(
+            value_plan,
+            layout,
+            component=component,
+        )
+    return False
+
+
 def _simd_convert_error(reason, source_plan, result_plan):
     raise ValueError(
         "tlx_wave bridge cannot lower ttg.convert_layout for SIMD tensor data: "
@@ -4852,7 +5107,6 @@ def _dma_packet_layout_supported(address, memdesc):
     if padded is not None:
         return (
             memdesc.element_type in {"f16", "bf16"}
-            and memdesc.shape == _GFX950_MMA_SHAPE
             and address.shape == memdesc.shape
         )
     try:
@@ -4867,7 +5121,6 @@ def _dma_packet_layout_supported(address, memdesc):
         return True
     return _is_supported_swizzled_shared_layout(memdesc, shared) and (
         memdesc.element_type in {"f16", "bf16"}
-        and memdesc.shape == _GFX950_MMA_SHAPE
         and address.shape == memdesc.shape
     )
 
@@ -4917,6 +5170,87 @@ def _dma_packet_elements(address, packet_bytes):
     return packet_bytes // address.element_byte_width
 
 
+def _dma_layout_width(layout):
+    return _product(layout.threads_per_warp)
+
+
+def _dma_layout_cta_threads(layout):
+    return _dma_layout_width(layout) * _product(layout.warps_per_cta)
+
+
+def _log2_int(value):
+    if value <= 0:
+        return None
+    bits = int(value).bit_length() - 1
+    return bits if (1 << bits) == int(value) else None
+
+
+def _linear_layout_static_coords(layout, rank, register, lane, warp):
+    coords = [0 for _ in range(rank)]
+    for value, bases in (
+        (register, layout.register_bases),
+        (lane, layout.lane_bases),
+        (warp, layout.warp_bases),
+    ):
+        for bit, basis in enumerate(bases):
+            if int(value) & (1 << bit):
+                for dim in range(rank):
+                    coords[dim] += int(basis[dim])
+    return tuple(coords)
+
+
+def _validate_linear_dma_packet_layout(layout, address_plan, memdesc, packet_elements):
+    packet_bits = _log2_int(packet_elements)
+    if packet_bits is None:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: #ttg.linear DMA packet element count "
+            f"{packet_elements} is not a power of two"
+        )
+    if len(layout.register_bases) < packet_bits:
+        raise ValueError(
+            "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+            "without faithful DMA: #ttg.linear source layout has only "
+            f"{len(layout.register_bases)} register basis bit(s), fewer than "
+            f"the {packet_bits} needed for {packet_elements} element packets"
+        )
+    rank = len(address_plan.shape)
+    inner_dim = rank - 1
+    for bit in range(packet_bits):
+        expected = [0 for _ in range(rank)]
+        expected[inner_dim] = 1 << bit
+        if layout.register_bases[bit] != tuple(expected):
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "without faithful DMA: #ttg.linear source layout does not map "
+                f"packet register bit {bit} to contiguous innermost elements; "
+                f"basis={layout.register_bases[bit]}, expected={tuple(expected)}"
+            )
+    width = _dma_layout_width(layout)
+    cta_threads = _dma_layout_cta_threads(layout)
+    total_packets = _product(address_plan.shape) // int(packet_elements)
+    for packet_index in range(total_packets):
+        component = packet_index // cta_threads
+        thread = packet_index % cta_threads
+        lane = thread % width
+        warp = thread // width
+        register = component << packet_bits
+        coords = _linear_layout_static_coords(layout, rank, register, lane, warp)
+        expected = _dma_packet_start_coords_static(
+            memdesc,
+            packet_elements,
+            packet_index,
+            "ttg.async_copy_global_to_local destination",
+        )
+        if coords != expected:
+            raise ValueError(
+                "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
+                "without faithful DMA: #ttg.linear source layout does not "
+                "match destination physical packet order; packet "
+                f"{packet_index} maps to {coords}, expected {expected}"
+            )
+
+
 def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
     context = (
         "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
@@ -4933,12 +5267,11 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
             f"{context}: source tensor shape {address_plan.shape} does not "
             f"match destination memdesc shape {memdesc.shape}"
         )
-    layout = _blocked_tensor_layout_info(
+    layout = _dma_source_tensor_layout_info(
         address_plan,
         "ttg.async_copy_global_to_local source",
         "async copy DMA packet lowering",
     )
-    width = _product(layout.threads_per_warp)
     rank = len(address_plan.shape)
     inner_dim = rank - 1
     if int(address_plan.shape[inner_dim]) % packet_elements:
@@ -4946,11 +5279,15 @@ def _validate_dma_packet_layout(address_plan, address, memdesc, packet_bytes):
             f"{context}: innermost tensor extent {address_plan.shape[inner_dim]} "
             f"is not divisible by {packet_elements} element DMA packets"
         )
+    if isinstance(layout, _LinearEncodingInfo):
+        _validate_linear_dma_packet_layout(
+            layout, address_plan, memdesc, packet_elements
+        )
     _require_dma_destination_physical_packets(
         memdesc,
         packet_elements,
         packet_bytes,
-        width,
+        _dma_layout_width(layout),
         context,
     )
     return layout
@@ -4978,8 +5315,7 @@ def _dma_packet_component_count(value_plan, layout, packet_elements):
             "without faithful DMA: tensor element count is not divisible by "
             f"{packet_elements} element DMA packets"
         )
-    width = _product(layout.threads_per_warp)
-    cta_threads = width * _product(layout.warps_per_cta)
+    cta_threads = _dma_layout_cta_threads(layout)
     if cta_threads <= 0:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
@@ -5004,8 +5340,8 @@ def _dma_packet_dim_bindings(
             f"{component} is out of range for {component_count} packet "
             "component(s)"
         )
-    width = _product(layout.threads_per_warp)
-    cta_threads = width * _product(layout.warps_per_cta)
+    width = _dma_layout_width(layout)
+    cta_threads = _dma_layout_cta_threads(layout)
     total_packets = _product(value_plan.shape) // int(packet_elements)
     thread = builder.workitem_id(axis=0, width=width)
     thread = _assume_nonnegative(builder, thread, w)
@@ -5056,8 +5392,8 @@ def _dma_packet_uniform_dim_bindings(
     thread,
     w,
 ):
-    width = _product(layout.threads_per_warp)
-    cta_threads = width * _product(layout.warps_per_cta)
+    width = _dma_layout_width(layout)
+    cta_threads = _dma_layout_cta_threads(layout)
     thread_first = builder.read_first(thread)
     thread_first = _assume_nonnegative(builder, thread_first, w)
     thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread_first")
@@ -5990,16 +6326,23 @@ def _emit_async_copy_via_load_store(
         address,
         "ttg.async_copy_global_to_local source",
     )
-    component_count = _blocked_layout_component_count(
+    source_layout = _dma_source_tensor_layout_info(
         address_plan,
+        "ttg.async_copy_global_to_local source",
+        "generic async copy lowering",
+    )
+    component_count = _async_copy_source_layout_component_count(
+        address_plan,
+        source_layout,
         "ttg.async_copy_global_to_local source",
         "generic async copy lowering",
     )
     token = after_token
     for component in range(component_count):
-        dim_bindings, width, active = _blocked_tensor_dim_bindings(
+        dim_bindings, width, active = _async_copy_source_dim_bindings(
             builder,
             address_plan,
+            source_layout,
             w,
             "ttg.async_copy_global_to_local source",
             component=component,
@@ -6014,8 +6357,9 @@ def _emit_async_copy_via_load_store(
             address_plan.shape,
             w,
             assume_pointer_range=mask_value is None
-            and _blocked_layout_component_all_lanes_active(
+            and _async_copy_source_component_all_lanes_active(
                 address_plan,
+                source_layout,
                 "ttg.async_copy_global_to_local source",
                 "generic tensor lowering",
                 component=component,

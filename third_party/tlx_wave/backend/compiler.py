@@ -98,6 +98,10 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
+        if amd_compiler.is_async_copy_enabled(options.arch):
+            amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir")
 

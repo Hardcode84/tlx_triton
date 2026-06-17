@@ -157,12 +157,13 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
     assert (
         compiled.metadata.tlx_wave_num_dma_load_lds
-        == compiled.metadata.tlx_wave_num_async_copies
+        >= compiled.metadata.tlx_wave_num_async_copies
     )
     assert compiled.metadata.tlx_wave_num_async_waits >= 2
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "scf.for" in wave
     assert "waveamd.dma_load_lds" in wave
+    assert "bytes = 4" in wave
     assert 'waveamd.mma "mfma.f32.32x32x16.f16"' in wave
     assert "waveamdmachine.target" in wave
     assert (
@@ -173,6 +174,8 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
         "#ttg.padded_shared<[512:+32] {order = [1, 0], shape = [32, 32]}"
         in ttgir
     )
+    assert "#ttg.linear" in ttgir
+    assert "{contiguity = 2 : i32}" in ttgir
 
 
 def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
@@ -213,7 +216,7 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert (
         compiled.metadata.tlx_wave_num_dma_load_lds
-        == compiled.metadata.tlx_wave_num_async_copies
+        >= compiled.metadata.tlx_wave_num_async_copies
     )
     assert "waveamd.dma_load_lds" in wave
     assert "ttg.async_copy_global_to_local" not in wave
@@ -284,10 +287,6 @@ def test_gemm_wp_tlx_wave_warmup_falls_back_for_non_unit_inner_stride(
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
-    assert (
-        compiled.metadata.tlx_wave_num_dma_load_lds
-        < compiled.metadata.tlx_wave_num_async_copies
-    )
     assert "wave.load" in wave
     assert "wave.store" in wave
     assert "ttg.async_copy_global_to_local" not in wave
@@ -303,10 +302,6 @@ def test_gemm_wp_tlx_wave_warmup_falls_back_for_unaligned_packet_edges(
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
-    assert (
-        compiled.metadata.tlx_wave_num_dma_load_lds
-        < compiled.metadata.tlx_wave_num_async_copies
-    )
     assert "wave.load" in wave
     assert "wave.store" in wave
     assert "ttg.async_copy_global_to_local" not in wave

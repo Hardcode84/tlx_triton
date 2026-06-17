@@ -2076,6 +2076,39 @@ def test_tlx_wave_async_copy_lowers_swizzled_f16_as_dma(tmp_path):
     del ctx
 
 
+def test_tlx_wave_async_copy_linear_source_falls_back_without_dma(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [[0, 1], [16, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = []}>
+#shared = #ttg.padded_shared<[64:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [2, 0], [4, 0], [8, 0], [16, 0], [1, 0]], block = []}>
+#smem = #ttg.shared_memory
+"""
+    async_func = """
+  tt.func public @async_linear_fallback(%arg0: !tt.ptr<f16>) attributes {noinline = false} {
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #linear>
+    %base = tt.splat %arg0 : !tt.ptr<f16> -> tensor<32x32x!tt.ptr<f16>, #linear>
+    %ptr = tt.addptr %base, %zero : tensor<32x32x!tt.ptr<f16>, #linear>, tensor<32x32xi32, #linear>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %token = ttg.async_copy_global_to_local %ptr, %alloc : tensor<32x32x!tt.ptr<f16>, #linear> -> <32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, async_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_async_copies"] == 1
+    assert metadata["tlx_wave_num_dma_load_lds"] == 0
+    assert "waveamd.dma_load_lds" not in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "ttg.async_copy_global_to_local" not in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_async_copy_pointer_range_bounds_runtime_stride_dma_source(
     tmp_path,
 ):
