@@ -761,6 +761,56 @@ def test_tlx_wave_honors_converted_blocked_fragment_store_layout(tmp_path, monke
     del ctx
 
 
+def test_tlx_wave_vectorizes_mfma32_fragment_store(tmp_path):
+    preamble = """
+#store = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @mfma32_fragment_store(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<32x32xf32, #mma>
+    %out = ttg.convert_layout %dot : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #store>
+    %row_stride = arith.constant dense<32> : tensor<32x1xi32, #store>
+    %rows = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #store}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<32xi32, #ttg.slice<{dim = 1, parent = #store}>> -> tensor<32x1xi32, #store>
+    %row_off = arith.muli %rows_2d, %row_stride : tensor<32x1xi32, #store>
+    %row_offs = tt.broadcast %row_off : tensor<32x1xi32, #store> -> tensor<32x32xi32, #store>
+    %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #store}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #store}>> -> tensor<1x32xi32, #store>
+    %col_offs = tt.broadcast %cols_2d : tensor<1x32xi32, #store> -> tensor<32x32xi32, #store>
+    %offsets = arith.addi %row_offs, %col_offs : tensor<32x32xi32, #store>
+    %out_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #store>
+    %out_ptr = tt.addptr %out_base, %offsets : tensor<32x32x!tt.ptr<f32>, #store>, tensor<32x32xi32, #store>
+    tt.store %out_ptr, %out : tensor<32x32x!tt.ptr<f32>, #store>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble, num_warps=4)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_mmas"] == 2
+    assert wave_artifact.count("wave.pack") == 4
+    assert wave_artifact.count("wave.store") == 4
+    assert "(!wave.simd<vector<4xi32>, 64>" in wave_artifact
+    assert (
+        "(!wave.simd<i32, 64>, !wave.simd<!wave.ptr<#wave.global, f32>"
+        not in wave_artifact
+    )
+    del ctx
+
+
 def test_tlx_wave_honors_converted_blocked_fragment_local_store_layout(
     tmp_path, monkeypatch
 ):

@@ -8333,6 +8333,101 @@ def _extract_fragment_component(regs, component, width, w):
     return wave.ExtractOp(w.simd_type(w.i32(), width), regs, component).result
 
 
+def _mfma_fragment_store_vector_width(value_plan, frag):
+    if (
+        len(value_plan.shape) != 2
+        or frag.registers != _GFX950_MMA32_INFO.acc_registers
+    ):
+        return 1
+    if value_plan.element_byte_width is None:
+        raise ValueError(
+            "tlx_wave bridge cannot vectorize MFMA fragment store: unknown "
+            f"element byte width for {value_plan.type}"
+        )
+    element_byte_width = int(value_plan.element_byte_width)
+    if element_byte_width <= 0 or 16 % element_byte_width:
+        raise ValueError(
+            "tlx_wave bridge cannot vectorize MFMA fragment store: unsupported "
+            f"element byte width {element_byte_width} for {value_plan.type}"
+        )
+    vector_width = 16 // element_byte_width
+    if frag.registers % vector_width:
+        return 1
+    return vector_width
+
+
+def _mfma32_component_dim_exprs(value_plan, component, w):
+    thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_thread")
+    coords = _mfma32_accumulator_dim_exprs(thread_sym, component, w)
+    return {
+        _dim_symbol(w, dim): w.mod(coords[dim], value_plan.shape[dim])
+        for dim in range(len(value_plan.shape))
+    }
+
+
+def _store_component_pointer_offset_expr(pointer_offset, value_plan, component, w):
+    expr = pointer_offset
+    for symbol, replacement in _mfma32_component_dim_exprs(
+        value_plan, component, w
+    ).items():
+        expr = expr.subs(symbol, replacement)
+    return expr
+
+
+def _mfma32_store_pointer_components_contiguous(
+    pointer_source, value_plan, component, count, w
+):
+    if count <= 1:
+        return True
+    unknowns = {}
+    pointer_offset = _ixsimpl_pointer_offset_expr(pointer_source, w, unknowns)
+    if pointer_offset is None:
+        return False
+    assumptions = ()
+    first = _store_component_pointer_offset_expr(
+        pointer_offset, value_plan, component, w
+    )
+    for index in range(1, count):
+        candidate = _store_component_pointer_offset_expr(
+            pointer_offset, value_plan, component + index, w
+        )
+        if not _ixsimpl_expr_equal(candidate, first + index, assumptions, w):
+            return False
+    return True
+
+
+def _mfma_fragment_store_vector_width_for_store(
+    pointer_source, value_plan, frag, component, mask_id, w
+):
+    if mask_id is not None:
+        return 1
+    vector_width = _mfma_fragment_store_vector_width(value_plan, frag)
+    if component % vector_width or component + vector_width > frag.registers:
+        return 1
+    if not _mfma32_store_pointer_components_contiguous(
+        pointer_source, value_plan, component, vector_width, w
+    ):
+        return 1
+    return vector_width
+
+
+def _extract_fragment_store_value(regs, component, count, width, w):
+    if count == 1:
+        return _extract_fragment_component(regs, component, width, w)
+    wave = getattr(w, "wave", None)
+    if wave is None:
+        raise RuntimeError(
+            "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+            "generated wave dialect module"
+        )
+    value_type = w.simd_type(w.vector_type(count, w.i32()), width)
+    values = [
+        _extract_fragment_component(regs, component + index, width, w)
+        for index in range(count)
+    ]
+    return wave.PackOp(value_type, values).result
+
+
 def _emit_component_store(builder, value, ptr, mask, after_token, w):
     if mask is None:
         return builder.store(value, ptr, after=after_token)
@@ -8358,18 +8453,23 @@ def _emit_fragment_store(
     regs = builder.fragment_unpack(fragment)
     frag = w.FragmentType(fragment.type)
     token = after_token
-    for component in range(frag.registers):
+    pointer_source = _require_lowered_value(
+        state["wave_values"],
+        ptr_id,
+        "pointer_expr",
+        "tt.store pointer",
+    )
+    component = 0
+    while component < frag.registers:
+        vector_width = _mfma_fragment_store_vector_width_for_store(
+            pointer_source, store_plan, frag, component, mask_id, w
+        )
         dim_bindings, width = _store_dim_bindings(
             builder, store_plan, lowered, w, component=component
         )
         ptr = _materialize_pointer_value(
             builder,
-            _require_lowered_value(
-                state["wave_values"],
-                ptr_id,
-                "pointer_expr",
-                "tt.store pointer",
-            ),
+            pointer_source,
             dim_bindings,
             w,
         )
@@ -8389,8 +8489,11 @@ def _emit_fragment_store(
             if mask_id is not None
             else None
         )
-        value = _extract_fragment_component(regs, component, width, w)
+        value = _extract_fragment_store_value(
+            regs, component, vector_width, width, w
+        )
         token = _emit_component_store(builder, value, ptr, mask, token, w)
+        component += vector_width
     return token
 
 
