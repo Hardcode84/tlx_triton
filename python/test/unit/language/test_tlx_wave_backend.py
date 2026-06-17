@@ -220,11 +220,11 @@ def _wave_bridge_options(arch="gfx950", warp_size=64):
 def test_tlx_wave_backend_defaults_and_accepts_mfma_options():
     backend = make_backend(GFX950_WAVE)
 
-    assert backend.parse_options({}).matrix_instr_nonkdim == 16
+    assert backend.parse_options({}).matrix_instr_nonkdim == 0
     assert backend.parse_options({"matrix_instr_nonkdim": 32}).matrix_instr_nonkdim == 32
     with pytest.warns(UserWarning, match="kpack is deprecated"):
         assert backend.parse_options({"kpack": 2}).kpack == 1
-    assert make_backend(GFX942_WAVE).parse_options({}).matrix_instr_nonkdim == 16
+    assert make_backend(GFX942_WAVE).parse_options({}).matrix_instr_nonkdim == 0
     assert make_backend(GFX942_WAVE).parse_options({"kpack": 2}).kpack == 2
 
 
@@ -1359,7 +1359,9 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
         },
     )
 
-    compiled = triton_compile(src, target=GFX950_WAVE)
+    compiled = triton_compile(
+        src, target=GFX950_WAVE, options={"matrix_instr_nonkdim": 16}
+    )
     ttgir = _asm_text(compiled, "ttgir")
     wave_artifact = _asm_text(compiled, "wave")
 
@@ -3226,6 +3228,161 @@ def test_tlx_wave_mfma_tile_store_coords_include_warp_offsets():
     assert "(4*mod(floor((floor((tlx_store_77_32_0_thread/64))/1)),4))" in dim0
     assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
 
+    class FakeW32(FakeW):
+        class FragmentType:
+            def __init__(self, typ):
+                self.registers = 16
+                self.wave_size = 64
+
+    builder = FakeBuilder()
+    bindings, width, active = wave_bridge_emit._fragment_store_tile_dim_bindings(
+        builder,
+        value_plan,
+        fragment,
+        tile_offsets=(32, 0),
+        component=4,
+        w=FakeW32(),
+    )
+
+    assert width == 64
+    assert active is not None
+    dim0 = str(builder.index_exprs[0][0])
+    dim1 = str(builder.index_exprs[1][0])
+    assert "32+mod(mod(tlx_store_77_32_0_thread,64),32)" in dim0
+    assert "4*floor((mod(tlx_store_77_32_0_thread,64)/32))" in dim1
+    assert "+8" in dim1
+    assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
+
+
+def test_tlx_wave_mfma32_single_fragment_store_uses_mfma_coords():
+    class FakeExpr:
+        def __init__(self, text):
+            self.text = str(text)
+
+        def __str__(self):
+            return self.text
+
+        def __repr__(self):
+            return self.text
+
+        def __add__(self, other):
+            return FakeExpr(f"({self}+{other})")
+
+        def __radd__(self, other):
+            return FakeExpr(f"({other}+{self})")
+
+        def __mul__(self, other):
+            return FakeExpr(f"({self}*{other})")
+
+        def __rmul__(self, other):
+            return FakeExpr(f"({other}*{self})")
+
+        def __truediv__(self, other):
+            return FakeExpr(f"({self}/{other})")
+
+    class FakeBlockedEncoding:
+        def is_blocked_encoding(self):
+            return True
+
+        def get_blocked_size_per_thread(self):
+            return (1, 4)
+
+        def get_blocked_threads_per_warp(self):
+            return (8, 8)
+
+        def get_blocked_warps_per_cta(self):
+            return (4, 1)
+
+        def get_blocked_order(self):
+            return (1, 0)
+
+    class FakeSimdType:
+        def __init__(self, width, element_type="index"):
+            self.width = width
+            self.element_type = element_type
+
+    class FakeValue:
+        def __init__(self, name, typ=None):
+            self.name = name
+            self.type = typ
+
+    class FakeW:
+        class FragmentType:
+            def __init__(self, typ):
+                self.registers = 16
+                self.wave_size = 64
+
+        class SimdType:
+            @staticmethod
+            def isinstance(typ):
+                return isinstance(typ, FakeSimdType)
+
+            def __init__(self, typ):
+                self.width = typ.width
+                self.element_type = typ.element_type
+
+        class sym_ctx:
+            @staticmethod
+            def int_(value):
+                return FakeExpr(value)
+
+        @staticmethod
+        def sym(name):
+            return FakeExpr(name)
+
+        @staticmethod
+        def mod(lhs, rhs):
+            return FakeExpr(f"mod({lhs},{rhs})")
+
+        @staticmethod
+        def floor(value):
+            return FakeExpr(f"floor({value})")
+
+    class FakeBuilder:
+        def __init__(self):
+            self.index_exprs = []
+
+        def workitem_id(self, axis=0, width=64):
+            return FakeValue(f"thread{axis}", FakeSimdType(width, "index"))
+
+        def index_expr(self, expr, bindings=None, result_type=None):
+            value = FakeValue(
+                f"idx{len(self.index_exprs)}",
+                result_type or FakeSimdType(64, "index"),
+            )
+            self.index_exprs.append((expr, bindings or {}, value))
+            return value
+
+    value_plan = SimpleNamespace(
+        value_id=88,
+        type_kind="tensor",
+        type="tensor<32x32xf32>",
+        element_type="f32",
+        shape=(32, 32),
+        encoding=(
+            "#ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], "
+            "warpsPerCTA = [4, 1], order = [1, 0]}>"
+        ),
+        encoding_attr=FakeBlockedEncoding(),
+    )
+    builder = FakeBuilder()
+
+    bindings, width = wave_bridge_emit._store_dim_bindings(
+        builder,
+        value_plan,
+        FakeValue("frag", typ="fragment"),
+        FakeW(),
+        component=4,
+    )
+
+    assert width == 64
+    dim0 = str(builder.index_exprs[0][0])
+    dim1 = str(builder.index_exprs[1][0])
+    assert "mod(mod(mod(tlx_store_88_thread,64),32),32)" in dim0
+    assert "4*floor((mod(tlx_store_88_thread,64)/32))" in dim1
+    assert "+8" in dim1
+    assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
+
 
 def test_tlx_wave_bridge_async_coords_include_size_per_thread_component():
     class FakeExpr:
@@ -4026,10 +4183,10 @@ def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_gfx950_non_16_mfma_layout(tmp_path):
+def test_tlx_wave_bridge_lowers_gfx950_32x32x16_mfma_layout(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>
 #smem = #ttg.shared_memory
 """
     dot_func = """
@@ -4045,12 +4202,21 @@ def test_tlx_wave_bridge_rejects_gfx950_non_16_mfma_layout(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, dot_func, preamble=preamble)
 
-    with pytest.raises(ValueError) as exc_info:
-        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
-    message = str(exc_info.value)
-    assert "instrShape = [16, 16, 32]" in message
-    assert "instrShape=(32, 32, 16)" in message
-    assert "version=4" in message
+    metadata = {}
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+    machine = _run_waveamd_to_machine(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 4
+    assert metadata["tlx_wave_num_fragment_fills"] == 1
+    assert metadata["tlx_wave_num_mmas"] == 2
+    assert (
+        wave_artifact.count(f'kind = "{wave_bridge._GFX950_F16_MMA32_KIND}"')
+        == 2
+    )
+    assert "waveamdmachine.mfma_f32_32x32x16_f16" in machine
     del ctx
 
 

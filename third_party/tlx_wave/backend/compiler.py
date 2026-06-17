@@ -34,10 +34,9 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     def parse_options(self, opts) -> Any:
         opts = dict(opts)
         opts["backend_name"] = "tlx_wave"
-        # Select the gfx950-friendly MFMA shape by default, while allowing
-        # callers to request other AMD MFMA layouts. The bridge validates the
-        # concrete TTGIR layout before emitting Wave IR.
-        opts.setdefault("matrix_instr_nonkdim", 16)
+        # Match the AMD/HIP backend contract: matrix_instr_nonkdim=0 leaves
+        # Triton's AMD matmul pass free to derive the MFMA shape from the tile.
+        # The bridge validates the concrete TTGIR layout before emitting Wave IR.
         options = super().parse_options(opts)
         if options.arch not in {"gfx942", "gfx950"}:
             raise ValueError(

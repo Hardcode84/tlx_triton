@@ -9,8 +9,10 @@ from .wave_bridge_plan import (
     _ASSUME_TREE_OPS,
     _AMDMfmaEncodingInfo,
     _GFX950_BF16_MMA_KIND,
+    _GFX950_BF16_MMA32_KIND,
     _GFX950_DOT_PARENT_LAYOUT,
     _GFX950_F16_MMA_KIND,
+    _GFX950_F16_MMA32_KIND,
     _GFX950_MMA_M,
     _GFX950_MMA_N,
     _GFX950_MMA_REGS,
@@ -73,9 +75,41 @@ class _WaveValue:
 
 
 @dataclass(frozen=True)
+class _MmaShapeInfo:
+    instr_shape: tuple[int, int, int]
+    fragment_shape: tuple[int, int]
+    output_tile_shape: tuple[int, int]
+    k_dim: int
+    wave_size: int
+    operand_registers: int
+    acc_registers: int
+
+
+@dataclass(frozen=True)
 class _DotOperandFragmentLoad:
     info: _DotOperandEncodingInfo
+    mma: _MmaShapeInfo
     tile_shape: tuple[int, int] = (1, 1)
+
+
+_GFX950_MMA16_INFO = _MmaShapeInfo(
+    instr_shape=(16, 16, 32),
+    fragment_shape=(_GFX950_MMA_M, _GFX950_MMA_N),
+    output_tile_shape=_GFX950_MMA_SHAPE,
+    k_dim=32,
+    wave_size=_GFX950_MMA_WAVE,
+    operand_registers=_GFX950_MMA_REGS,
+    acc_registers=_GFX950_MMA_REGS,
+)
+_GFX950_MMA32_INFO = _MmaShapeInfo(
+    instr_shape=(32, 32, 16),
+    fragment_shape=(32, 32),
+    output_tile_shape=_GFX950_MMA_SHAPE,
+    k_dim=16,
+    wave_size=_GFX950_MMA_WAVE,
+    operand_registers=_GFX950_MMA_REGS,
+    acc_registers=16,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +117,13 @@ class _IndexExpr:
     expr: object
     bindings: dict
     materialized: object | None = None
+
+
+def _assume_nonnegative(builder, value, w):
+    if not hasattr(builder, "assume"):
+        return value
+    x = w.sym("x")
+    return builder.assume(value, [x >= 0], name="x")
 
 
 @dataclass(frozen=True)
@@ -838,6 +879,34 @@ def _materialize_index_value(builder, source, dim_bindings, w, force_width=None)
     return _maybe_splat(builder, source, force_width, w)
 
 
+def _add_index_expr_binding(bindings, symbol, value):
+    existing = bindings.get(symbol)
+    if existing is None:
+        bindings[symbol] = value
+        return
+    if existing is not value and existing != value:
+        raise ValueError(f"conflicting index expression binding for {symbol}")
+
+
+def _inline_index_expr_bindings(source, w):
+    if not isinstance(source, _IndexExpr) or source.materialized is not None:
+        return source
+    substitutions = {}
+    bindings = {}
+    for symbol, value in source.bindings.items():
+        if isinstance(value, _IndexExpr):
+            nested = _inline_index_expr_bindings(value, w)
+            substitutions[symbol] = nested.expr
+            for nested_symbol, nested_value in nested.bindings.items():
+                _add_index_expr_binding(bindings, nested_symbol, nested_value)
+            continue
+        _add_index_expr_binding(bindings, symbol, value)
+    expr = source.expr
+    if substitutions:
+        expr = expr.subs(substitutions)
+    return _IndexExpr(expr, bindings)
+
+
 def _index_select_compare_value(
     builder,
     predicate,
@@ -1064,6 +1133,7 @@ def _blocked_layout_dim_bindings(
     rank = len(value_plan.shape)
     width = _product(layout.threads_per_warp)
     thread = builder.workitem_id(axis=0, width=width)
+    thread = _assume_nonnegative(builder, thread, w)
     thread_sym = w.sym(f"{symbol_prefix}_{value_plan.value_id}_thread")
     lane_coords = _delinearize_expr(
         w,
@@ -1996,18 +2066,40 @@ def _require_dma_destination_physical_packets(
                 )
 
 
-def _require_fragment_load_physical_contiguous(value, memdesc, tile_offsets=(0, 0)):
-    element_count = _GFX950_MMA_REGS * (4 // int(memdesc.element_byte_width))
-    for lane in range(_GFX950_MMA_WAVE):
+def _dot_operand_fragment_source_shape(info, mma):
+    if mma.instr_shape == (32, 32, 16):
+        if info.op_idx == 0:
+            return (mma.output_tile_shape[0], mma.k_dim)
+        if info.op_idx == 1:
+            return (mma.k_dim, mma.output_tile_shape[1])
+    return mma.output_tile_shape
+
+
+def _require_fragment_load_physical_contiguous(
+    value,
+    memdesc,
+    tile_offsets=(0, 0),
+    *,
+    info=None,
+    mma=None,
+):
+    mma = _GFX950_MMA16_INFO if mma is None else mma
+    source_shape = (
+        mma.output_tile_shape
+        if info is None
+        else _dot_operand_fragment_source_shape(info, mma)
+    )
+    element_count = mma.operand_registers * (4 // int(memdesc.element_byte_width))
+    for lane in range(mma.wave_size):
         first = None
         for element in range(element_count):
             local_coords = _static_delinearize_row_major(
                 lane * element_count + element,
-                _GFX950_MMA_SHAPE,
+                source_shape,
             )
             coords = tuple(
                 int(tile_offsets[dim]) + int(local_coords[dim])
-                for dim in range(len(_GFX950_MMA_SHAPE))
+                for dim in range(len(source_shape))
             )
             for dim, coord in enumerate(coords):
                 if coord < 0 or coord >= int(memdesc.shape[dim]):
@@ -2021,7 +2113,7 @@ def _require_fragment_load_physical_contiguous(value, memdesc, tile_offsets=(0, 
                 memdesc.shape,
                 coords,
                 "ttg.local_load fragment source",
-            )
+                )
             if first is None:
                 first = byte_offset
                 if first % 4:
@@ -3112,7 +3204,12 @@ def _emit_constant_op(builder, op, values, wave_values, w, stats=None):
             wave_values,
             value.value_id,
             "fragment",
-            builder.fragment_fill(zero, _acc_fragment_type(w)),
+            builder.fragment_fill(
+                zero,
+                _acc_fragment_type_for_value(
+                    value, w, "arith.constant f32 tensor result"
+                ),
+            ),
         )
         if stats is not None:
             stats.fragment_fills += 1
@@ -3126,8 +3223,11 @@ def _emit_constant_op(builder, op, values, wave_values, w, stats=None):
             value.shape, "arith.constant #ttg.amd_mfma result"
         )
         zero = builder.constant(w.i32(), 0)
+        acc_type = _acc_fragment_type_for_value(
+            value, w, "arith.constant #ttg.amd_mfma result"
+        )
         fragments = tuple(
-            builder.fragment_fill(zero, _acc_fragment_type(w))
+            builder.fragment_fill(zero, acc_type)
             for _ in range(tile_shape[0] * tile_shape[1])
         )
         _set_wave_value(
@@ -4199,6 +4299,17 @@ def _blocked_layout_component_permutation(source_plan, result_plan):
     return tuple(permutation)
 
 
+def _mfma32_accumulator_dim_exprs(thread_sym, component, w):
+    lane_expr = w.mod(thread_sym, _GFX950_MMA32_INFO.wave_size)
+    row = w.mod(lane_expr, _GFX950_MMA32_INFO.output_tile_shape[0])
+    col = 4 * w.floor(lane_expr / _GFX950_MMA32_INFO.output_tile_shape[0])
+    if component % 4:
+        col = int(component % 4) + col
+    if component // 4:
+        col = col + int(8 * (component // 4))
+    return row, col
+
+
 def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     raw_value = _raw_wave_value(wave_value)
     if not value_plan.shape:
@@ -4226,6 +4337,26 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     ):
         layout = _GFX950_DOT_PARENT_LAYOUT
     rank = len(value_plan.shape)
+    if rank == 2 and frag.registers == _GFX950_MMA32_INFO.acc_registers:
+        if component < 0 or component >= frag.registers:
+            raise ValueError(
+                f"tlx_wave bridge fragment component {component} is out of range "
+                f"for {frag.registers} registers"
+            )
+        thread = builder.workitem_id(axis=0, width=frag.wave_size)
+        thread = _assume_nonnegative(builder, thread, w)
+        thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_thread")
+        coords = _mfma32_accumulator_dim_exprs(thread_sym, component, w)
+        return (
+            {
+                _dim_symbol(w, dim): builder.index_expr(
+                    w.mod(coords[dim], value_plan.shape[dim]),
+                    {thread_sym: thread},
+                )
+                for dim in range(rank)
+            },
+            frag.wave_size,
+        )
     if (
         len(layout.size_per_thread) != rank
         or len(layout.threads_per_warp) != rank
@@ -4257,6 +4388,7 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
         )
 
     thread = builder.workitem_id(axis=0, width=frag.wave_size)
+    thread = _assume_nonnegative(builder, thread, w)
     thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_thread")
     thread_expr = thread_sym
     register_coords = _delinearize_expr(
@@ -4599,6 +4731,7 @@ def _dma_packet_dim_bindings(
     cta_threads = width * _product(layout.warps_per_cta)
     total_packets = _product(value_plan.shape) // int(packet_elements)
     thread = builder.workitem_id(axis=0, width=width)
+    thread = _assume_nonnegative(builder, thread, w)
     thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread")
     packet_index_expr = w.sym_ctx.int_(component * cta_threads) + thread_sym
     element_linear = packet_index_expr * int(packet_elements)
@@ -4649,6 +4782,7 @@ def _dma_packet_uniform_dim_bindings(
     width = _product(layout.threads_per_warp)
     cta_threads = width * _product(layout.warps_per_cta)
     thread_first = builder.read_first(thread)
+    thread_first = _assume_nonnegative(builder, thread_first, w)
     thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread_first")
     packet_index_expr = w.sym_ctx.int_(component * cta_threads) + thread_sym
     element_linear = packet_index_expr * int(packet_elements)
@@ -4661,7 +4795,7 @@ def _dma_packet_uniform_dim_bindings(
 
     dim_bindings = {}
     for dim in range(len(value_plan.shape)):
-        dim_bindings[_dim_symbol(w, dim)] = builder.index_expr(
+        dim_bindings[_dim_symbol(w, dim)] = _IndexExpr(
             coords[dim],
             {thread_sym: thread_first},
         )
@@ -5287,6 +5421,7 @@ def _emit_dma_packet_ptrs(
         packet_bytes,
         w,
     )
+    destination_offset = _inline_index_expr_bindings(destination_offset, w)
     destination = builder.ptr_add(
         destination_base,
         _materialize_index_value(builder, destination_offset, {}, w),
@@ -6558,54 +6693,57 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
             )
 
 
-def _gfx950_mma_kind_for_element_type(element_type):
+def _gfx950_mma_kind_for_element_type(element_type, mma):
     if element_type == "f16":
-        return _GFX950_F16_MMA_KIND
+        if mma.instr_shape == (16, 16, 32):
+            return _GFX950_F16_MMA_KIND
+        if mma.instr_shape == (32, 32, 16):
+            return _GFX950_F16_MMA32_KIND
     if element_type == "bf16":
-        return _GFX950_BF16_MMA_KIND
+        if mma.instr_shape == (16, 16, 32):
+            return _GFX950_BF16_MMA_KIND
+        if mma.instr_shape == (32, 32, 16):
+            return _GFX950_BF16_MMA32_KIND
     return None
 
 
-def _dot_operand_mma_kind(info, element_type, context, attrs=None):
-    kind = _gfx950_mma_kind_for_element_type(element_type)
-    if kind is None:
-        raise ValueError(
-            "tlx_wave bridge supports only f16/bf16 tt.dot operands for "
-            "Wave MFMA lowering; "
-            f"got {element_type} while lowering {context}"
-        )
-    if isinstance(info.parent, _BlockedEncodingInfo):
+def _dot_operand_mma_shape(info, context, attrs=None):
+    parent = info.parent
+    if isinstance(parent, _BlockedEncodingInfo):
         if attrs is not None and attrs.target != "hip:gfx950":
             raise ValueError(
                 "tlx_wave bridge cannot lower blocked-parent tt.dot to gfx950 "
-                f"Wave MFMA kind {kind} for TTGIR target {attrs.target}"
+                f"Wave MFMA for TTGIR target {attrs.target}"
             )
-        if _same_blocked_encoding(info.parent, _GFX950_DOT_PARENT_LAYOUT):
-            return kind
+        if _same_blocked_encoding(parent, _GFX950_DOT_PARENT_LAYOUT):
+            return _GFX950_MMA16_INFO
         raise ValueError(
             "tlx_wave bridge supports blocked dot operand parents only for the "
             "gfx950 dot-parent layout; "
-            f"got sizePerThread={info.parent.size_per_thread}, "
-            f"threadsPerWarp={info.parent.threads_per_warp}, "
-            f"warpsPerCTA={info.parent.warps_per_cta}, order={info.parent.order}"
+            f"got sizePerThread={parent.size_per_thread}, "
+            f"threadsPerWarp={parent.threads_per_warp}, "
+            f"warpsPerCTA={parent.warps_per_cta}, order={parent.order}"
         )
-    if not isinstance(info.parent, _AMDMfmaEncodingInfo):
+    if not isinstance(parent, _AMDMfmaEncodingInfo):
         raise ValueError(
             f"tlx_wave bridge expected blocked or #ttg.amd_mfma parent layout "
-            f"for {context}, got {info.parent}"
+            f"for {context}, got {parent}"
         )
-    if (
-        info.parent.version == 4
-        and info.parent.instr_shape == (16, 16, 32)
-        and info.parent.is_transposed
-    ):
+    if parent.version == 4 and parent.instr_shape in {
+        (16, 16, 32),
+        (32, 32, 16),
+    } and parent.is_transposed:
         if attrs is not None and attrs.target != "hip:gfx950":
             raise ValueError(
                 "tlx_wave bridge cannot lower gfx950 #ttg.amd_mfma parent to "
-                f"Wave MFMA kind {kind} for TTGIR target {attrs.target}"
+                f"Wave MFMA for TTGIR target {attrs.target}"
             )
-        return kind
-    if info.parent.version == 3 and info.parent.instr_shape == (16, 16, 16):
+        return (
+            _GFX950_MMA16_INFO
+            if parent.instr_shape == (16, 16, 32)
+            else _GFX950_MMA32_INFO
+        )
+    if parent.version == 3 and parent.instr_shape == (16, 16, 16):
         raise ValueError(
             "tlx_wave bridge cannot lower gfx942/CDNA3 MFMA through high-level "
             "WaveAMD yet: Wave models mfma.f32.16x16x16 fragments as wave32, "
@@ -6613,12 +6751,24 @@ def _dot_operand_mma_kind(info, element_type, context, attrs=None):
         )
     raise ValueError(
         "tlx_wave bridge supports only gfx950 #ttg.amd_mfma<{version = 4, "
-        "instrShape = [16, 16, 32], isTransposed = true}> for Wave MFMA "
-        f"lowering; got version={info.parent.version}, "
-        f"warpsPerCTA={info.parent.warps_per_cta}, "
-        f"instrShape={info.parent.instr_shape}, "
-        f"isTransposed={info.parent.is_transposed}"
+        "instrShape = [16, 16, 32] or [32, 32, 16], isTransposed = true}> "
+        f"for Wave MFMA lowering; got version={parent.version}, "
+        f"warpsPerCTA={parent.warps_per_cta}, "
+        f"instrShape={parent.instr_shape}, "
+        f"isTransposed={parent.is_transposed}"
     )
+
+
+def _dot_operand_mma_kind(info, element_type, context, attrs=None):
+    mma = _dot_operand_mma_shape(info, context, attrs=attrs)
+    kind = _gfx950_mma_kind_for_element_type(element_type, mma)
+    if kind is None:
+        raise ValueError(
+            "tlx_wave bridge supports only f16/bf16 tt.dot operands for "
+            "Wave MFMA lowering; "
+            f"got {element_type} while lowering {context}"
+        )
+    return kind
 
 
 def _fragment_type_for_dot_operand(info, element_type, w):
@@ -6626,26 +6776,42 @@ def _fragment_type_for_dot_operand(info, element_type, w):
         raise ValueError(
             f"tlx_wave bridge supports #ttg.dot_op opIdx 0/1, got {info.op_idx}"
         )
+    mma = _dot_operand_mma_shape(info, "ttg.local_load result")
     _dot_operand_mma_kind(info, element_type, "ttg.local_load result")
     return w.fragment_type(
         info.op_idx,
         _wave_element_type(element_type, w, "ttg.local_load fragment"),
-        rows=_GFX950_MMA_M,
-        columns=_GFX950_MMA_N,
-        wave_size=_GFX950_MMA_WAVE,
-        registers=_GFX950_MMA_REGS,
+        rows=mma.fragment_shape[0],
+        columns=mma.fragment_shape[1],
+        wave_size=mma.wave_size,
+        registers=mma.operand_registers,
     )
 
 
-def _acc_fragment_type(w):
+def _acc_fragment_type(w, mma=None):
+    mma = _GFX950_MMA16_INFO if mma is None else mma
     return w.fragment_type(
         2,
         w.f32(),
-        rows=_GFX950_MMA_M,
-        columns=_GFX950_MMA_N,
-        wave_size=_GFX950_MMA_WAVE,
-        registers=_GFX950_MMA_REGS,
+        rows=mma.fragment_shape[0],
+        columns=mma.fragment_shape[1],
+        wave_size=mma.wave_size,
+        registers=mma.acc_registers,
     )
+
+
+def _mma_shape_for_result_value(value, context):
+    try:
+        layout = _dot_result_layout_info(value.encoding_attr, value.encoding, context)
+    except ValueError:
+        return _GFX950_MMA16_INFO
+    if isinstance(layout, _AMDMfmaEncodingInfo):
+        return _dot_operand_mma_shape(SimpleNamespace(parent=layout), context)
+    return _GFX950_MMA16_INFO
+
+
+def _acc_fragment_type_for_value(value, w, context):
+    return _acc_fragment_type(w, _mma_shape_for_result_value(value, context))
 
 
 def _unsupported_fragment_local_load(value, reason, memdesc=None):
@@ -6733,37 +6899,53 @@ def _dot_operand_fragment_tile_shape(value, info, context):
             value,
             f"expected rank-2 dot operand for {context}, got shape {value.shape}",
         )
+    mma = _dot_operand_mma_shape(info, context)
+    output_m, output_n = mma.output_tile_shape
     if info.op_idx == 0:
-        if value.shape[1] != _GFX950_MMA_SHAPE[1]:
+        if value.shape[1] % mma.k_dim:
             _unsupported_fragment_local_load(
                 value,
-                f"expected opIdx 0 K dimension {_GFX950_MMA_SHAPE[1]}, "
+                f"expected opIdx 0 K dimension to be a multiple of {mma.k_dim}, "
                 f"got shape {value.shape}",
             )
-        if value.shape[0] % _GFX950_MMA_SHAPE[0]:
+        if value.shape[0] % output_m:
             _unsupported_fragment_local_load(
                 value,
                 f"expected opIdx 0 M dimension to be a multiple of "
-                f"{_GFX950_MMA_SHAPE[0]}, got shape {value.shape}",
+                f"{output_m}, got shape {value.shape}",
             )
-        return (int(value.shape[0]) // _GFX950_MMA_SHAPE[0], 1)
+        return (int(value.shape[0]) // output_m, int(value.shape[1]) // mma.k_dim)
     if info.op_idx == 1:
-        if value.shape[0] != _GFX950_MMA_SHAPE[0]:
+        if value.shape[0] % mma.k_dim:
             _unsupported_fragment_local_load(
                 value,
-                f"expected opIdx 1 K dimension {_GFX950_MMA_SHAPE[0]}, "
+                f"expected opIdx 1 K dimension to be a multiple of {mma.k_dim}, "
                 f"got shape {value.shape}",
             )
-        if value.shape[1] % _GFX950_MMA_SHAPE[1]:
+        if value.shape[1] % output_n:
             _unsupported_fragment_local_load(
                 value,
                 f"expected opIdx 1 N dimension to be a multiple of "
-                f"{_GFX950_MMA_SHAPE[1]}, got shape {value.shape}",
+                f"{output_n}, got shape {value.shape}",
             )
-        return (1, int(value.shape[1]) // _GFX950_MMA_SHAPE[1])
+        return (int(value.shape[0]) // mma.k_dim, int(value.shape[1]) // output_n)
     _unsupported_fragment_local_load(
         value, f"expected #ttg.dot_op opIdx 0/1 for {context}, got {info.op_idx}"
     )
+
+
+def _dot_operand_tile_offsets(info, mma, row, col):
+    if info.op_idx == 0:
+        return (
+            int(row) * int(mma.output_tile_shape[0]),
+            int(col) * int(mma.k_dim),
+        )
+    if info.op_idx == 1:
+        return (
+            int(row) * int(mma.k_dim),
+            int(col) * int(mma.output_tile_shape[1]),
+        )
+    raise ValueError(f"tlx_wave bridge expected #ttg.dot_op opIdx 0/1, got {info.op_idx}")
 
 
 def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
@@ -6792,19 +6974,23 @@ def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
             f"expected shared memdesc source shape {value.shape}, got {memdesc.shape}",
             memdesc,
         )
+    try:
+        mma = _dot_operand_mma_shape(info, "ttg.local_load result")
+    except ValueError as exc:
+        _unsupported_fragment_local_load(value, str(exc), memdesc)
     tile_shape = _dot_operand_fragment_tile_shape(value, info, "ttg.local_load result")
     _validate_supported_dot_local_load_layout(value, memdesc, info)
     for row in range(tile_shape[0]):
         for col in range(tile_shape[1]):
+            tile_offsets = _dot_operand_tile_offsets(info, mma, row, col)
             _require_fragment_load_physical_contiguous(
                 value,
                 memdesc,
-                (
-                    row * _GFX950_MMA_SHAPE[0],
-                    col * _GFX950_MMA_SHAPE[1],
-                ),
+                tile_offsets,
+                info=info,
+                mma=mma,
             )
-    return tile_shape
+    return tile_shape, mma
 
 
 def _physical_local_load_fragment_capability(value, memdesc):
@@ -6813,8 +6999,8 @@ def _physical_local_load_fragment_capability(value, memdesc):
     ):
         return None
     info = _dot_operand_encoding_info(value, "ttg.local_load result")
-    tile_shape = _validate_dot_operand_fragment_tile_load(value, memdesc, info)
-    return _DotOperandFragmentLoad(info, tile_shape)
+    tile_shape, mma = _validate_dot_operand_fragment_tile_load(value, memdesc, info)
+    return _DotOperandFragmentLoad(info, mma, tile_shape)
 
 
 def _physical_local_load_fragment_regs_capability(value, memdesc):
@@ -6883,19 +7069,30 @@ def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, 
         _unsupported_fragment_local_load(value, str(exc), memdesc)
 
 
-def _fragment_lane_dim_bindings(builder, value, memdesc, w, tile_offsets=(0, 0)):
-    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
+def _fragment_lane_dim_bindings(
+    builder,
+    value,
+    memdesc,
+    w,
+    tile_offsets=(0, 0),
+    *,
+    source_shape=None,
+    wave_size=_GFX950_MMA_WAVE,
+    registers=_GFX950_MMA_REGS,
+):
+    source_shape = _GFX950_MMA_SHAPE if source_shape is None else source_shape
+    lane = builder.lane_id(width=wave_size)
     suffix = "_".join(str(int(offset)) for offset in tile_offsets)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_{suffix}_lane")
-    elements_per_lane = _GFX950_MMA_REGS * (4 // int(memdesc.element_byte_width))
+    elements_per_lane = int(registers) * (4 // int(memdesc.element_byte_width))
     element_linear = lane_sym * int(elements_per_lane)
-    row_major_order = tuple(reversed(range(len(_GFX950_MMA_SHAPE))))
-    coords = _delinearize_expr(w, element_linear, _GFX950_MMA_SHAPE, row_major_order)
+    row_major_order = tuple(reversed(range(len(source_shape))))
+    coords = _delinearize_expr(w, element_linear, source_shape, row_major_order)
     return {
         _dim_symbol(w, dim): builder.index_expr(
             coords[dim] + int(tile_offsets[dim]), {lane_sym: lane}
         )
-        for dim in range(len(_GFX950_MMA_SHAPE))
+        for dim in range(len(source_shape))
     }
 
 
@@ -6939,11 +7136,19 @@ def _dense_fragment_tile_base_dwords(memdesc, tile_offsets):
     return byte_offset // 4
 
 
-def _fragment_dense_i32_offset(builder, value, w, tile_base_dwords=0):
-    lane = builder.lane_id(width=_GFX950_MMA_WAVE)
+def _fragment_dense_i32_offset(
+    builder,
+    value,
+    w,
+    tile_base_dwords=0,
+    *,
+    wave_size=_GFX950_MMA_WAVE,
+    registers=_GFX950_MMA_REGS,
+):
+    lane = builder.lane_id(width=wave_size)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane_dense")
     return builder.index_expr(
-        w.sym_ctx.int_(int(tile_base_dwords)) + lane_sym * _GFX950_MMA_REGS,
+        w.sym_ctx.int_(int(tile_base_dwords)) + lane_sym * int(registers),
         {lane_sym: lane},
     )
 
@@ -6957,13 +7162,29 @@ def _emit_fragment_i32_ptr(
     state,
     w,
     tile_offsets=(0, 0),
+    *,
+    info=None,
+    mma=None,
 ):
+    mma = _GFX950_MMA16_INFO if mma is None else mma
+    source_shape = (
+        mma.output_tile_shape
+        if info is None
+        else _dot_operand_fragment_source_shape(info, mma)
+    )
     base = _emit_memdesc_i32_ptr(
         builder, value, memdesc, memdescs, lds_layout, state, w
     )
     if _memdesc_needs_encoded_fragment_offset(memdesc):
         dim_bindings = _fragment_lane_dim_bindings(
-            builder, value, memdesc, w, tile_offsets=tile_offsets
+            builder,
+            value,
+            memdesc,
+            w,
+            tile_offsets=tile_offsets,
+            source_shape=source_shape,
+            wave_size=mma.wave_size,
+            registers=mma.operand_registers,
         )
         offset = _memdesc_pointer_offset_expr(
             memdesc,
@@ -6980,11 +7201,13 @@ def _emit_fragment_i32_ptr(
             value,
             w,
             tile_base_dwords=_dense_fragment_tile_base_dwords(memdesc, tile_offsets),
+            wave_size=mma.wave_size,
+            registers=mma.operand_registers,
         )
     return builder.ptr_add(
         base,
         offset,
-        w.simd_ptr_type(w.i32(), w.shared_address_space(), _GFX950_MMA_WAVE),
+        w.simd_ptr_type(w.i32(), w.shared_address_space(), mma.wave_size),
     )
 
 
@@ -7011,6 +7234,8 @@ def _emit_dot_operand_fragment_load(
         state,
         w,
         tile_offsets=tile_offsets,
+        info=capability.info,
+        mma=capability.mma,
     )
     fragment, token = builder.fragment_load(
         ptr,
@@ -7039,6 +7264,9 @@ def _emit_dot_operand_fragment_tile_load(
     token = after_token
     for row in range(capability.tile_shape[0]):
         for col in range(capability.tile_shape[1]):
+            tile_offsets = _dot_operand_tile_offsets(
+                capability.info, capability.mma, row, col
+            )
             fragment, token = _emit_dot_operand_fragment_load(
                 builder,
                 address,
@@ -7051,10 +7279,7 @@ def _emit_dot_operand_fragment_tile_load(
                 token,
                 w,
                 stats,
-                tile_offsets=(
-                    row * _GFX950_MMA_SHAPE[0],
-                    col * _GFX950_MMA_SHAPE[1],
-                ),
+                tile_offsets=tile_offsets,
             )
             fragments.append(fragment)
     if len(fragments) == 1:
@@ -7091,7 +7316,16 @@ def _emit_dot_operand_register_load(
     return regs, token
 
 
-def _emit_accumulator_fragment(builder, value, wave_values, w, stats, values=None):
+def _emit_accumulator_fragment(
+    builder,
+    value,
+    wave_values,
+    w,
+    stats,
+    values=None,
+    mma=None,
+):
+    mma = _GFX950_MMA16_INFO if mma is None else mma
     tile_shape = _fragment_tile_shape_for_rank2_shape(value.shape, "tt.dot accumulator")
     tile_count = tile_shape[0] * tile_shape[1]
     if value.value_id in wave_values:
@@ -7139,7 +7373,7 @@ def _emit_accumulator_fragment(builder, value, wave_values, w, stats, values=Non
     ):
         zero = builder.constant(w.i32(), 0)
         fragments = tuple(
-            builder.fragment_fill(zero, _acc_fragment_type(w))
+            builder.fragment_fill(zero, _acc_fragment_type(w, mma))
             for _ in range(tile_count)
         )
         if tile_count == 1:
@@ -7196,32 +7430,41 @@ def _validate_dot_op(operands, acc, result, attrs):
             f"operand encodings: {encodings}"
         )
     element_type = next(iter(element_types))
-    lhs_shape = role_values[0].shape
-    rhs_shape = role_values[1].shape
-    if (
-        len(lhs_shape) != 2
-        or len(rhs_shape) != 2
-        or lhs_shape[1] != _GFX950_MMA_SHAPE[1]
-        or rhs_shape[0] != _GFX950_MMA_SHAPE[0]
-        or lhs_shape[0] % _GFX950_MMA_SHAPE[0]
-        or rhs_shape[1] % _GFX950_MMA_SHAPE[1]
-    ):
-        shapes = ", ".join(str(value.shape) for value in operands)
-        encodings = ", ".join(value.encoding or "<none>" for value in operands)
-        raise ValueError(
-            "tlx_wave bridge supports tt.dot operands only as Mx32 and 32xN "
-            "static f16/bf16 MFMA tiles with M/N multiples of 32; "
-            f"shapes={shapes}; operand encodings: {encodings}"
-        )
     if not _same_dot_parent_encoding(role_infos[0].parent, role_infos[1].parent):
         raise ValueError(
             "tlx_wave bridge expected matching tt.dot operand parent layouts; "
             f"role0 encoding: {role_values[0].encoding}; "
             f"role1 encoding: {role_values[1].encoding}"
         )
-    mma_kind = _dot_operand_mma_kind(
-        role_infos[0], element_type, "tt.dot operand", attrs=attrs
+    mma = _dot_operand_mma_shape(
+        role_infos[0], "tt.dot operand", attrs=attrs
     )
+    mma_kind = _gfx950_mma_kind_for_element_type(element_type, mma)
+    if mma_kind is None:
+        raise ValueError(
+            "tlx_wave bridge supports only matching f16 x f16 or bf16 x bf16 "
+            "tt.dot operands for Wave MFMA lowering; "
+            f"operand element types={sorted(element_types)}"
+        )
+    lhs_shape = role_values[0].shape
+    rhs_shape = role_values[1].shape
+    output_m, output_n = mma.output_tile_shape
+    if (
+        len(lhs_shape) != 2
+        or len(rhs_shape) != 2
+        or lhs_shape[1] != rhs_shape[0]
+        or lhs_shape[1] % mma.k_dim
+        or lhs_shape[0] % output_m
+        or rhs_shape[1] % output_n
+    ):
+        shapes = ", ".join(str(value.shape) for value in operands)
+        encodings = ", ".join(value.encoding or "<none>" for value in operands)
+        raise ValueError(
+            "tlx_wave bridge supports tt.dot operands only as MxK and KxN "
+            f"static f16/bf16 MFMA tiles with K a multiple of {mma.k_dim} "
+            f"and M/N multiples of {mma.output_tile_shape}; "
+            f"shapes={shapes}; operand encodings: {encodings}"
+        )
 
     result_layout = _dot_result_layout_info(
         result.encoding_attr, result.encoding, "tt.dot result"
@@ -7248,7 +7491,7 @@ def _validate_dot_op(operands, acc, result, attrs):
                 "tlx_wave bridge expected tt.dot accumulator layout to match result; "
                 f"accumulator encoding: {acc.encoding}; result encoding: {result.encoding}"
             )
-    return role_values, mma_kind
+    return role_values, mma_kind, mma
 
 
 def _emit_dot_op(builder, op, state, w, stats):
@@ -7259,7 +7502,7 @@ def _emit_dot_op(builder, op, state, w, stats):
     operands = tuple(values[operand] for operand in op.operands[:2])
     acc = values[op.operands[2]]
     result = values[op.results[0]]
-    role_values, mma_kind = _validate_dot_op(
+    role_values, mma_kind, mma = _validate_dot_op(
         operands, acc, result, state["attrs"]
     )
     if (
@@ -7273,7 +7516,7 @@ def _emit_dot_op(builder, op, state, w, stats):
             f"role1 encoding: {role_values[1].encoding}"
         )
     acc_fragment = _emit_accumulator_fragment(
-        builder, acc, wave_values, w, stats, values=values
+        builder, acc, wave_values, w, stats, values=values, mma=mma
     )
     lhs_fragments, lhs_tile_shape = _require_physical_dot_operand_fragments(
         values, wave_values, role_values[0], "tt.dot operand role0"
@@ -7287,6 +7530,7 @@ def _emit_dot_op(builder, op, state, w, stats):
     if (
         lhs_tile_shape[0] != result_tile_shape[0]
         or rhs_tile_shape[1] != result_tile_shape[1]
+        or lhs_tile_shape[1] != rhs_tile_shape[0]
     ):
         raise ValueError(
             "tlx_wave bridge cannot lower tt.dot: operand fragment tile shapes "
@@ -7298,19 +7542,25 @@ def _emit_dot_op(builder, op, state, w, stats):
     )
     dots = []
     for row in range(result_tile_shape[0]):
-        lhs_fragment = lhs_fragments[_fragment_tuple_index(lhs_tile_shape, row, 0)]
         for col in range(result_tile_shape[1]):
-            rhs_fragment = rhs_fragments[_fragment_tuple_index(rhs_tile_shape, 0, col)]
             acc_tile = acc_fragments[_fragment_tuple_index(result_tile_shape, row, col)]
-            dots.append(
-                builder.mma(
+            for k_tile in range(lhs_tile_shape[1]):
+                lhs_fragment = lhs_fragments[
+                    _fragment_tuple_index(lhs_tile_shape, row, k_tile)
+                ]
+                rhs_fragment = rhs_fragments[
+                    _fragment_tuple_index(rhs_tile_shape, k_tile, col)
+                ]
+                acc_tile = builder.mma(
                     mma_kind,
                     lhs_fragment,
                     rhs_fragment,
                     acc_tile,
                 )
+            dots.append(
+                acc_tile
             )
-    stats.mmas += len(dots)
+    stats.mmas += len(dots) * lhs_tile_shape[1]
     if result_tile_shape == (1, 1):
         _set_wave_value(wave_values, result.value_id, "fragment", dots[0])
         return
@@ -7753,6 +8003,38 @@ def _fragment_store_tile_dim_bindings(
     w,
 ):
     frag = w.FragmentType(fragment.type)
+    if frag.registers == _GFX950_MMA32_INFO.acc_registers:
+        if component < 0 or component >= frag.registers:
+            raise ValueError(
+                f"tlx_wave bridge fragment component {component} is out of range "
+                f"for {frag.registers} registers"
+            )
+        thread = builder.workitem_id(axis=0, width=frag.wave_size)
+        thread = _assume_nonnegative(builder, thread, w)
+        suffix = "_".join(str(int(offset)) for offset in tile_offsets)
+        thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_{suffix}_thread")
+        coords = _mfma32_accumulator_dim_exprs(thread_sym, component, w)
+        dim_bindings = {}
+        active = None
+        for dim in range(2):
+            coord = builder.index_expr(
+                int(tile_offsets[dim]) + coords[dim], {thread_sym: thread}
+            )
+            dim_bindings[_dim_symbol(w, dim)] = coord
+            extent = builder.splat(
+                builder.constant(w.index_type(), value_plan.shape[dim]),
+                width=frag.wave_size,
+            )
+            in_bounds = _wave_cmpi(
+                builder,
+                "ult",
+                _maybe_splat(builder, coord, frag.wave_size, w),
+                extent,
+                w,
+            )
+            active = _wave_mask_and(builder, active, in_bounds, w, frag.wave_size)
+        return dim_bindings, frag.wave_size, active
+
     layout = _GFX950_DOT_PARENT_LAYOUT
     if _product(layout.size_per_thread) != frag.registers:
         raise ValueError(
@@ -7773,6 +8055,7 @@ def _fragment_store_tile_dim_bindings(
         )
 
     thread = builder.workitem_id(axis=0, width=frag.wave_size)
+    thread = _assume_nonnegative(builder, thread, w)
     suffix = "_".join(str(int(offset)) for offset in tile_offsets)
     thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_{suffix}_thread")
     thread_expr = thread_sym

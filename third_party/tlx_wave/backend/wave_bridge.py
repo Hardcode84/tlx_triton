@@ -8,7 +8,9 @@ from .wave_bridge_emit import (
 )
 from .wave_bridge_plan import (
     _GFX950_BF16_MMA_KIND,
+    _GFX950_BF16_MMA32_KIND,
     _GFX950_F16_MMA_KIND,
+    _GFX950_F16_MMA32_KIND,
     _GFX950_MMA_SHAPE,
     _bridge_plan_metadata,
     _bridge_stage,
