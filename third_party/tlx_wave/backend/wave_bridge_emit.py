@@ -8661,6 +8661,39 @@ def _emit_component_store(builder, value, ptr, mask, after_token, w):
     return where_op.results[0]
 
 
+def _emit_masked_bounded_component_store(
+    builder,
+    state,
+    value,
+    pointer_source,
+    dim_bindings,
+    value_plan,
+    access_byte_width,
+    mask,
+    after_token,
+    w,
+):
+    if after_token is None:
+        after_token = builder.token()
+    # Keep pointer-range assumptions under the mask so inactive lanes do not
+    # need to satisfy bounds that only hold for the actual store.
+    with builder.where(mask, [w.mem_token_type()]) as where_op:
+        ptr = _materialize_bounded_pointer_value(
+            builder,
+            state,
+            pointer_source,
+            dim_bindings,
+            value_plan.element_byte_width,
+            access_byte_width,
+            value_plan.shape,
+            w,
+            assume_pointer_range=True,
+        )
+        token = builder.store(value, ptr, after=after_token)
+        builder.yield_([token])
+    return where_op.results[0]
+
+
 def _emit_fragment_store(
     builder,
     state,
@@ -8699,18 +8732,10 @@ def _emit_fragment_store(
         dim_bindings, width = _store_dim_bindings(
             builder, store_plan, lowered, w, component=component
         )
-        ptr = _materialize_bounded_pointer_value(
-            builder,
-            state,
-            pointer_source,
-            dim_bindings,
-            store_plan.element_byte_width,
+        access_byte_width = (
             int(store_plan.element_byte_width) * vector_width
             if store_plan.element_byte_width is not None
-            else None,
-            store_plan.shape,
-            w,
-            assume_pointer_range=mask_id is None,
+            else None
         )
         mask = (
             _materialize_mask_value(
@@ -8726,7 +8751,32 @@ def _emit_fragment_store(
         value = _extract_fragment_store_value(
             regs, component, vector_width, width, w
         )
-        token = _emit_component_store(builder, value, ptr, mask, token, w)
+        if mask is not None and vector_width > 1:
+            token = _emit_masked_bounded_component_store(
+                builder,
+                state,
+                value,
+                pointer_source,
+                dim_bindings,
+                store_plan,
+                access_byte_width,
+                mask,
+                token,
+                w,
+            )
+        else:
+            ptr = _materialize_bounded_pointer_value(
+                builder,
+                state,
+                pointer_source,
+                dim_bindings,
+                store_plan.element_byte_width,
+                access_byte_width,
+                store_plan.shape,
+                w,
+                assume_pointer_range=mask_id is None,
+            )
+            token = _emit_component_store(builder, value, ptr, mask, token, w)
         component += vector_width
     return token
 

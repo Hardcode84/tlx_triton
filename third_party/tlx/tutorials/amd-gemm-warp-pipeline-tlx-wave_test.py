@@ -1,4 +1,5 @@
 import importlib.util
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,35 @@ def _wave_text(compiled):
     return _asm_text(compiled, "wave")
 
 
+def _run_wave_promote_buffer_to_machine(wave_artifact):
+    wave_opt = (
+        Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
+    )
+    if not wave_opt.exists():
+        pytest.skip("wave-opt is not built")
+    result = subprocess.run(
+        [
+            str(wave_opt),
+            "-",
+            "--wave-expand-integer-div-rem",
+            "--canonicalize",
+            "--cse",
+            "--wave-simplify-index-exprs",
+            "--canonicalize",
+            "--cse",
+            "--wave-promote-global-to-buffer",
+            "--waveamd-to-machine",
+        ],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
 def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
 
@@ -143,6 +173,25 @@ def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
         "#ttg.padded_shared<[512:+32] {order = [1, 0], shape = [32, 32]}"
         in ttgir
     )
+
+
+def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
+    monkeypatch, tmp_path
+):
+    compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
+
+    wave = _wave_text(compiled)
+    machine = _run_wave_promote_buffer_to_machine(wave)
+
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert wave.count("wave.pack") >= 4
+    assert (
+        '#wave.pred<"x >= 0">, #wave.pred<"-536870907 + x <= 0">'
+        in wave
+    )
+    assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 4
+    assert "waveamdmachine.global_store_b32_addr64" not in machine
+    assert "waveamdmachine.global_store_b128_addr64" not in machine
 
 
 def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(

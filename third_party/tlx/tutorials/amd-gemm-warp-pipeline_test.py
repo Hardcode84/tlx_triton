@@ -63,6 +63,8 @@ def gemm_wp(
     tl.assume(stride_ak > 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
     pid = tl.program_id(0)
     num_pid_m = m_cdiv_num // BLOCK_M
