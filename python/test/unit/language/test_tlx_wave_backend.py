@@ -5040,7 +5040,16 @@ def test_tlx_wave_bridge_lowers_bf16_dot_local_load(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
+@pytest.mark.parametrize(
+    ("element_type", "mma_kind", "machine_op"),
+    [
+        ("f16", "mfma.f32.16x16x16.f16", "mfma_f32_16x16x16_f16"),
+        ("bf16", "mfma.f32.16x16x16.bf16", "mfma_f32_16x16x16_bf16"),
+    ],
+)
+def test_tlx_wave_bridge_lowers_gfx942_mfma_local_load(
+    tmp_path, element_type, mma_kind, machine_op
+):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -5048,19 +5057,70 @@ def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
 """
     dot_func = """
   tt.func public @dot_local_load_mfma_gfx942() attributes {noinline = false} {
-    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
-    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32x__ELEMENT_TYPE__, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32x__ELEMENT_TYPE__, #shared, #smem, mutable>
     %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
-    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
-    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
-    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32x__ELEMENT_TYPE__, #shared, #smem, mutable> -> tensor<32x32x__ELEMENT_TYPE__, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32x__ELEMENT_TYPE__, #shared, #smem, mutable> -> tensor<32x32x__ELEMENT_TYPE__, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32x__ELEMENT_TYPE__, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x32x__ELEMENT_TYPE__, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<32x32xf32, #mma>
     tt.return
   }
-"""
+""".replace("__ELEMENT_TYPE__", element_type)
+    metadata = {}
     mod, ctx = _parse_ttgir(
         tmp_path,
         dot_func,
         target="hip:gfx942",
+        preamble=preamble,
+    )
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options(arch="gfx942")
+    )
+    machine = _run_waveamd_to_machine(wave_artifact)
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 4
+    assert metadata["tlx_wave_num_fragment_packs"] == 4
+    assert metadata["tlx_wave_num_fragment_fills"] == 1
+    assert metadata["tlx_wave_num_mmas"] == 2
+    assert wave_artifact.count(f'waveamd.mma "{mma_kind}"') == 2
+    assert f"waveamdmachine.{machine_op}" in machine
+    del ctx
+
+
+@pytest.mark.parametrize(
+    ("warps_per_cta", "m_dim", "n_dim", "num_warps"),
+    [
+        ("[4, 1]", 64, 16, 4),
+        ("[1, 4]", 16, 64, 4),
+        ("[1, 2]", 16, 32, 2),
+    ],
+)
+def test_tlx_wave_bridge_rejects_gfx942_non_32x32_mfma_cta_tiles(
+    tmp_path, warps_per_cta, m_dim, n_dim, num_warps
+):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = __WARPS_PER_CTA__, instrShape = [16, 16, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+""".replace("__WARPS_PER_CTA__", warps_per_cta)
+    dot_func = """
+  tt.func public @dot_local_load_mfma_gfx942_non_32x32() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<__M__x16xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<16x__N__xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<__M__x__N__xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<__M__x16xf16, #shared, #smem, mutable> -> tensor<__M__x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<16x__N__xf16, #shared, #smem, mutable> -> tensor<16x__N__xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<__M__x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<16x__N__xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<__M__x__N__xf32, #mma>
+    tt.return
+  }
+""".replace("__M__", str(m_dim)).replace("__N__", str(n_dim))
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        dot_func,
+        target="hip:gfx942",
+        num_warps=num_warps,
         preamble=preamble,
     )
 
@@ -5069,9 +5129,13 @@ def test_tlx_wave_bridge_rejects_gfx942_mfma_wave32_gap(tmp_path):
             mod, {}, _wave_bridge_options(arch="gfx942")
         )
     message = str(exc_info.value)
-    assert "gfx942/CDNA3 MFMA" in message
-    assert "wave32" in message
-    assert "wave64" in message
+    assert "gfx942/CDNA3 MFMA16" in message
+    assert "32x32 CTA tile" in message
+    assert "warpsPerCTA=(2, 2)" in message
+    expected_warps = tuple(
+        int(part.strip()) for part in warps_per_cta[1:-1].split(",")
+    )
+    assert f"warpsPerCTA={expected_warps}" in message
     del ctx
 
 

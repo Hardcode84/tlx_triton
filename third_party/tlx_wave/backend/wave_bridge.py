@@ -11,6 +11,8 @@ from .wave_bridge_plan import (
     _GFX950_BF16_MMA32_KIND,
     _GFX950_F16_MMA_KIND,
     _GFX950_F16_MMA32_KIND,
+    _GFX942_BF16_MMA_KIND,
+    _GFX942_F16_MMA_KIND,
     _GFX950_MMA_SHAPE,
     _bridge_plan_metadata,
     _bridge_stage,
@@ -30,7 +32,7 @@ def stop_before_wave_lowering(mod, metadata, options):
     This stage preserves the public kernel ABI and lowers the supported
     TTGIR graph prefix into Wave/WaveAMD memory-token operations. For the
     supported dot/MMA op path it also lowers dot-operand local loads and
-    f16/bf16 to f32 tt.dot SSA flow into gfx950 WaveAMD MFMA fragments.
+    f16/bf16 to f32 tt.dot SSA flow into WaveAMD MFMA fragments.
     """
     attrs = _module_attrs(mod)
     _validate_target(options, attrs)
