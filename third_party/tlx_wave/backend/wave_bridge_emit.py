@@ -1759,6 +1759,29 @@ def _apply_symbolic_padding(byte_offset, element_byte_width, info, w, context):
     return padded
 
 
+def _padded_row_major_tile_offset_expr(shape, prefix_rank, info, w, context):
+    tile_shape = tuple(int(dim) for dim in shape[prefix_rank:])
+    mapping = _padded_layout_bit_mapping(info, context)
+    expected_bit = 0
+    for tile_dim in reversed(range(len(tile_shape))):
+        bits = _log2_int(tile_shape[tile_dim])
+        if bits is None:
+            return None
+        for logical_bit in range(bits):
+            if mapping.get((tile_dim, logical_bit)) != expected_bit:
+                return None
+            expected_bit += 1
+    if len(mapping) != expected_bit:
+        return None
+
+    offset = w.sym_ctx.int_(0)
+    stride = 1
+    for tile_dim in reversed(range(len(tile_shape))):
+        offset = offset + _dim_symbol(w, prefix_rank + tile_dim) * stride
+        stride *= int(tile_shape[tile_dim])
+    return offset
+
+
 def _padded_shared_byte_offset_expr(
     shape,
     dim_bindings,
@@ -1795,6 +1818,24 @@ def _padded_shared_byte_offset_expr(
         )
         byte_offset = byte_offset + prefix.expr * int(tile_bytes)
         bindings.update(prefix.bindings)
+
+    row_major_tile_offset = _padded_row_major_tile_offset_expr(
+        shape,
+        prefix_rank,
+        info,
+        w,
+        context,
+    )
+    if row_major_tile_offset is not None:
+        tile_byte_offset = row_major_tile_offset * int(element_byte_width)
+        byte_offset = byte_offset + _apply_symbolic_padding(
+            tile_byte_offset,
+            element_byte_width,
+            info,
+            w,
+            context,
+        )
+        return _IndexExpr(byte_offset, bindings)
 
     mapping = _padded_layout_bit_mapping(info, context)
     tile_element_offset = w.sym_ctx.int_(0)
@@ -1967,6 +2008,133 @@ def _memdesc_dma_dword_offset_expr(
         w,
         "ttg.async_copy_global_to_local destination",
     )
+
+
+def _padded_dma_packet_dword_offset_expr(
+    memdesc,
+    packet_index,
+    packet_elements,
+    packet_bytes,
+    w,
+    context,
+):
+    info = _padded_shared_encoding_info(memdesc.encoding, context)
+    if info is None:
+        return None
+    if memdesc.element_byte_width is None:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: unknown element byte width "
+            "for padded shared-memory DMA address"
+        )
+    if packet_bytes % 4:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: {packet_bytes}-byte DMA "
+            "packet is not addressable as i32 LDS words"
+        )
+    if int(packet_elements) * int(memdesc.element_byte_width) != int(packet_bytes):
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: DMA packet has "
+            f"{packet_elements} elements but {packet_bytes} bytes for "
+            f"{memdesc.element_type}"
+        )
+
+    rank = len(info.offset_vectors[0])
+    if len(memdesc.shape) < rank:
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {context}: padded_shared rank {rank} "
+            f"exceeds memdesc shape {memdesc.shape}"
+        )
+    prefix_rank = len(memdesc.shape) - rank
+    tile_shape = tuple(int(dim) for dim in memdesc.shape[prefix_rank:])
+    if (
+        _padded_row_major_tile_offset_expr(
+            memdesc.shape,
+            prefix_rank,
+            info,
+            w,
+            context,
+        )
+        is None
+    ):
+        return None
+    tile_elements = _product(tile_shape)
+    dwords_per_packet = int(packet_bytes) // 4
+
+    tile_packet_index = packet_index
+    offset = packet_index * dwords_per_packet
+    if prefix_rank:
+        if tile_elements % int(packet_elements):
+            return None
+        packets_per_tile = tile_elements // int(packet_elements)
+        if _log2_int(packets_per_tile) is None:
+            return None
+        tile_storage_bytes = _padded_shared_tile_storage_bytes(
+            tile_shape,
+            memdesc.element_byte_width,
+            info,
+            context,
+        )
+        if tile_storage_bytes % 4:
+            return None
+        prefix_packet = w.floor(packet_index / packets_per_tile)
+        tile_packet_index = w.mod(packet_index, packets_per_tile)
+        offset = (
+            prefix_packet * int(tile_storage_bytes // 4)
+            + tile_packet_index * dwords_per_packet
+        )
+
+    tile_byte_offset = tile_packet_index * int(packet_bytes)
+    for interval, padding in zip(info.intervals, info.paddings):
+        interval_bytes = int(interval) * int(memdesc.element_byte_width)
+        padding_bytes = int(padding) * int(memdesc.element_byte_width)
+        if interval_bytes <= 0 or padding_bytes <= 0:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context}: invalid "
+                "padded_shared interval"
+            )
+        if padding_bytes % 4:
+            return None
+        offset = offset + w.floor(tile_byte_offset / interval_bytes) * int(
+            padding_bytes // 4
+        )
+    return offset
+
+
+def _dma_packet_uniform_destination_dword_offset_expr(
+    builder,
+    value_plan,
+    memdesc,
+    layout,
+    packet_elements,
+    packet_bytes,
+    component,
+    thread,
+    w,
+):
+    if (
+        _padded_shared_encoding_info(
+            memdesc.encoding,
+            "ttg.async_copy_global_to_local destination",
+        )
+        is None
+    ):
+        return None
+    thread_first = builder.read_first(thread)
+    thread_first = _assume_nonnegative(builder, thread_first, w)
+    thread_sym = w.sym(f"tlx_dma_{value_plan.value_id}_thread_first")
+    packet_index = w.sym_ctx.int_(component * _dma_layout_cta_threads(layout))
+    packet_index = packet_index + thread_sym
+    offset = _padded_dma_packet_dword_offset_expr(
+        memdesc,
+        packet_index,
+        packet_elements,
+        packet_bytes,
+        w,
+        "ttg.async_copy_global_to_local destination",
+    )
+    if offset is None:
+        return None
+    return _IndexExpr(offset, {thread_sym: thread_first})
 
 
 def _zero_index_expr(w):
@@ -3621,6 +3789,79 @@ def _arith_mixed_error(op_name, lhs, rhs):
     )
 
 
+def _constant_index_source_value(source):
+    if isinstance(source, int) and not isinstance(source, bool):
+        return int(source)
+    if (
+        isinstance(source, _IndexExpr)
+        and not source.bindings
+        and source.materialized is None
+    ):
+        try:
+            value = int(source.expr)
+        except (TypeError, ValueError):
+            return None
+        expr_tag = getattr(source.expr, "tag", None)
+        if expr_tag is not None:
+            is_exact = expr_tag == 0
+        else:
+            equals = getattr(source.expr, "equals", None)
+            is_exact = equals(value) if equals is not None else source.expr == value
+        if is_exact is not True:
+            return None
+        return value
+    return None
+
+
+def _assume_facts_prove_nonnegative(state, value_id):
+    if state is None:
+        return False
+    for fact in state.get("assume_facts", ()):
+        if (
+            fact.value_id == value_id
+            and fact.kind == "range"
+            and fact.lower is not None
+            and int(fact.lower) >= 0
+        ):
+            return True
+    return False
+
+
+def _index_source_proves_nonnegative(state, value_id, source, w):
+    const_value = _constant_index_source_value(source)
+    if const_value is not None:
+        return const_value >= 0
+    if _assume_facts_prove_nonnegative(state, value_id):
+        return True
+    unknowns = {}
+    assumptions = (
+        _ixsimpl_assume_fact_exprs(state, unknowns, w) if state is not None else ()
+    )
+    return _ixsimpl_index_source_proves_lower_bound(
+        source,
+        0,
+        assumptions,
+        w,
+        unknowns,
+    )
+
+
+def _pow2_index_div_rem_expr(op_name, lhs, rhs, lhs_value_id, w, state):
+    if op_name not in {"arith.divsi", "arith.divui", "arith.remsi", "arith.remui"}:
+        return None
+    divisor = _constant_index_source_value(rhs)
+    if divisor is None or divisor <= 0 or _log2_int(divisor) is None:
+        return None
+    if not _index_source_proves_nonnegative(state, lhs_value_id, lhs, w):
+        return None
+    lhs_symbol = w.sym(f"tlx_pow2_{op_name.split('.')[-1]}_{lhs_value_id}_lhs")
+    if op_name in {"arith.divsi", "arith.divui"}:
+        expr = w.floor(lhs_symbol / int(divisor))
+    else:
+        expr = w.mod(lhs_symbol, int(divisor))
+    return _IndexExpr(expr, {lhs_symbol: lhs}), divisor
+
+
 def _init_argument_wave_values(builder, kernel, values, state, w):
     wave_values = state["wave_values"]
     for value in values.values():
@@ -3882,6 +4123,29 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
                 materialized=materialized,
             ),
         )
+        return
+
+    pow2_expr = _pow2_index_div_rem_expr(
+        op.name,
+        lhs,
+        rhs,
+        op.operands[0],
+        w,
+        state,
+    )
+    if pow2_expr is not None:
+        folded, divisor = pow2_expr
+        _set_wave_value(
+            wave_values,
+            result.value_id,
+            "index_expr",
+            folded,
+        )
+        if state is not None:
+            upper = divisor - 1 if op.name in {"arith.remsi", "arith.remui"} else None
+            state["assume_facts"].append(
+                _AssumeFact(result.value_id, "range", lower=0, upper=upper)
+            )
         return
 
     binary_kind = _wave_binary_kind_for_op(op.name, w)
@@ -6378,24 +6642,36 @@ def _emit_dma_packet_ptrs(
         w,
         "ttg.async_copy_global_to_local destination",
     )
-    uniform_bindings = _dma_packet_uniform_dim_bindings(
+    destination_offset = _dma_packet_uniform_destination_dword_offset_expr(
         builder,
         address_plan,
         memdesc,
         layout,
         packet_elements,
+        packet_bytes,
         component,
         thread,
         w,
     )
-    destination_offset = _memdesc_dma_dword_offset_expr(
-        memdesc,
-        memdesc.shape,
-        uniform_bindings,
-        packet_elements,
-        packet_bytes,
-        w,
-    )
+    if destination_offset is None:
+        uniform_bindings = _dma_packet_uniform_dim_bindings(
+            builder,
+            address_plan,
+            memdesc,
+            layout,
+            packet_elements,
+            component,
+            thread,
+            w,
+        )
+        destination_offset = _memdesc_dma_dword_offset_expr(
+            memdesc,
+            memdesc.shape,
+            uniform_bindings,
+            packet_elements,
+            packet_bytes,
+            w,
+        )
     destination_offset = _inline_index_expr_bindings(destination_offset, w)
     destination = builder.ptr_add(
         destination_base,

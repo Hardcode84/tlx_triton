@@ -1,3 +1,4 @@
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -34,6 +35,21 @@ def _asm_text(compiled, artifact):
     if isinstance(text, bytes):
         text = text.decode("utf-8")
     return text
+
+
+def _wave_expr_lengths_with_name(artifact, name):
+    escaped = re.escape(name)
+    patterns = (
+        re.compile(
+            rf'#wave\.expr<"([^"]*)">, names = \[[^\]]*{escaped}[^\]]*\]'
+        ),
+        re.compile(rf'wave\.index_expr <"([^"]*)"> \[[^\]]*{escaped}[^\]]*\]'),
+    )
+    return [
+        len(match.group(1))
+        for pattern in patterns
+        for match in pattern.finditer(artifact)
+    ]
 
 
 @triton.jit
@@ -1595,6 +1611,41 @@ def test_tlx_wave_lowers_2d_non_dot_local_memory_roundtrip(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_row_major_padded_shared_offsets_compactly(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.padded_shared<[512:+32] {order = [1, 0], shape = [32, 32]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @row_major_padded_roundtrip(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %zero = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %offs = arith.constant dense<0> : tensor<32x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    ttg.local_store %zero, %alloc : tensor<32x32xf32, #blocked> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    %loaded = ttg.local_load %alloc : !ttg.memdesc<32x32xf32, #shared, #smem, mutable> -> tensor<32x32xf32, #blocked>
+    tt.store %ptr, %loaded : tensor<32x32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_wave_local_loads"] == 1
+    local_expr_lengths = _wave_expr_lengths_with_name(wave_artifact, "tlx_dim1")
+    assert local_expr_lengths
+    assert max(local_expr_lengths) < 128
+    assert "ttg.local_load" not in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_rejects_non_contiguous_2d_shared_local_addressing(tmp_path):
     local_func = """
   tt.func public @generic_shared_2d_bad_order(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
@@ -1696,6 +1747,11 @@ def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_as_dma():
     assert compiled.metadata.tlx_wave_num_async_copies == 4
     assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
     assert wave_artifact.count("waveamd.dma_load_lds") == 4
+    dma_destination_expr_lengths = _wave_expr_lengths_with_name(
+        wave_artifact, "thread_first"
+    )
+    assert dma_destination_expr_lengths
+    assert max(dma_destination_expr_lengths) < 512
     assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
@@ -3228,6 +3284,41 @@ def test_tlx_wave_bridge_keeps_pow2_assumed_product_symbolic(tmp_path):
     assert "x &" in wave
     assert "-2147483647 + x <= 0" in wave
     assert "llvm.intr.assume" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_folds_nonnegative_pow2_index_div_rem(tmp_path):
+    arith_func = """
+  tt.func public @nonnegative_pow2_index_div_rem(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %nonnegative = arith.cmpi sge, %arg1, %c0 : i32
+    llvm.intr.assume %nonnegative : i1
+    %q = arith.divsi %arg1, %c32 : i32
+    %r = arith.remsi %arg1, %c32 : i32
+    %value_scalar = arith.addi %q, %r : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %value_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "tlx_pow2_divsi_" in wave
+    assert "tlx_pow2_remsi_" in wave
+    assert "floor(1/32*" in wave
+    assert "Mod(tlx_pow2_remsi_" in wave
+    assert "wave.binary divsi" not in wave
+    assert "wave.binary remsi" not in wave
+    assert "arith.divsi" not in wave
+    assert "arith.remsi" not in wave
     del ctx
 
 
