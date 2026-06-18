@@ -153,11 +153,84 @@ class _IndexExpr:
     materialized: object | None = None
 
 
+@dataclass(frozen=True)
+class _AssumedIndexBinding:
+    value: object
+    bits: int
+    lower: int | None = None
+
+
 def _assume_nonnegative(builder, value, w):
     if not hasattr(builder, "assume"):
         return value
     x = w.sym("x")
-    return builder.assume(value, [x >= 0], name="x")
+    assumptions = [x >= 0]
+    integer_bits = _wave_integer_type_bit_width(getattr(value, "type", None), w)
+    if integer_bits is not None and integer_bits < 64:
+        _, signed_max = _signed_integer_bounds(integer_bits)
+        assumptions.append(x <= signed_max)
+    return builder.assume(value, assumptions, name="x")
+
+
+def _integer_type_bit_width(type_name):
+    if not isinstance(type_name, str) or not type_name.startswith("i"):
+        return None
+    bits_text = type_name[1:]
+    if not bits_text.isdigit():
+        return None
+    bits = int(bits_text)
+    if bits <= 1:
+        return None
+    return bits
+
+
+def _scalar_signed_integer_bit_width(value):
+    if value.type_kind != "scalar" or _is_bool_value(value):
+        return None
+    bits = _integer_type_bit_width(value.type)
+    if bits is None or bits >= 64:
+        return None
+    return bits
+
+
+def _signed_integer_bounds(bits):
+    return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+
+
+def _wave_integer_type_bit_width(type_value, w):
+    if type_value is None:
+        return None
+    for bits, attr in ((8, "i8"), (16, "i16"), (32, "i32"), (64, "i64")):
+        type_factory = getattr(w, attr, None)
+        if type_factory is None:
+            continue
+        try:
+            if type_value == type_factory():
+                return bits
+        except (AttributeError, TypeError):
+            pass
+    simd_type = getattr(w, "SimdType", None)
+    if simd_type is not None:
+        try:
+            if simd_type.isinstance(type_value):
+                simd = simd_type(type_value)
+                for attr in ("element_type", "elementType", "element"):
+                    element_type = getattr(simd, attr, None)
+                    if element_type is not None:
+                        return _wave_integer_type_bit_width(element_type, w)
+        except (AttributeError, TypeError):
+            pass
+    return None
+
+
+def _assume_signed_integer_width(builder, value, bits, w, lower=None):
+    if not hasattr(builder, "assume"):
+        return value
+    signed_min, signed_max = _signed_integer_bounds(bits)
+    if lower is not None:
+        signed_min = max(signed_min, int(lower))
+    x = w.sym("x")
+    return builder.assume(value, [x >= signed_min, x <= signed_max], name="x")
 
 
 @dataclass(frozen=True)
@@ -960,6 +1033,11 @@ def _dim_binding_value(dim_bindings, binding, w):
 
 
 def _materialize_index_value(builder, source, dim_bindings, w, force_width=None):
+    if isinstance(source, _AssumedIndexBinding):
+        value = _assume_signed_integer_width(
+            builder, source.value, source.bits, w, lower=source.lower
+        )
+        return _maybe_splat(builder, value, force_width, w)
     if isinstance(source, _IndexExpr):
         if source.materialized is not None:
             value = _materialize_index_value(
@@ -3591,6 +3669,8 @@ def _emit_masked_load(builder, ptr, result_type, mask, fallback, after_token, w)
 
 
 def _shift_index_dims(source, axis):
+    if isinstance(source, _AssumedIndexBinding):
+        return source
     if isinstance(source, _DimBinding):
         dim = source.dim + 1 if source.dim >= axis else source.dim
         return _DimBinding(dim)
@@ -3900,12 +3980,25 @@ def _init_argument_wave_values(builder, kernel, values, state, w):
                 _ScalarBool(arg),
             )
         elif value.type_kind == "scalar" and _is_integer_or_index_value(value):
+            binding = arg
+            integer_bits = _scalar_signed_integer_bit_width(value)
+            if integer_bits is not None:
+                binding = _AssumedIndexBinding(arg, integer_bits)
+                signed_min, signed_max = _signed_integer_bounds(integer_bits)
+                state["assume_facts"].append(
+                    _AssumeFact(
+                        value.value_id,
+                        "range",
+                        lower=signed_min,
+                        upper=signed_max,
+                    )
+                )
             symbol = w.sym(f"tlx_arg_{value.value_id}")
             _set_wave_value(
                 wave_values,
                 value.value_id,
                 "index_expr",
-                _IndexExpr(symbol, {symbol: arg}),
+                _IndexExpr(symbol, {symbol: binding}),
             )
             arg_info = kernel.args[value.base_arg_index]
             if arg_info.divisibility is not None and arg_info.divisibility > 1:
@@ -4061,13 +4154,17 @@ def _emit_program_id_op(builder, state, op, values, wave_values, w):
         binding = builder.workgroup_id(axis)
         bindings[axis] = binding
     symbol = w.sym(f"tlx_program_id_{axis}")
+    source = _IndexExpr(
+        symbol,
+        {symbol: _AssumedIndexBinding(binding, 32, lower=0)},
+    )
     _set_wave_value(
         wave_values,
         value.value_id,
         "index_expr",
-        builder.index_expr(symbol, {symbol: binding}),
+        _materialize_index_value(builder, source, {}, w),
     )
-    fact = _AssumeFact(value.value_id, "range", lower=0)
+    fact = _AssumeFact(value.value_id, "range", lower=0, upper=(1 << 31) - 1)
     state["assume_facts"].append(fact)
     _emit_assume_fact(builder, state, fact, w)
 
@@ -6005,6 +6102,8 @@ def _ixsimpl_unknown_expr(source, unknowns, w):
 
 
 def _index_source_depends_on_dim(source, dim):
+    if isinstance(source, _AssumedIndexBinding):
+        return False
     if isinstance(source, _DimBinding):
         return source.dim == dim
     if isinstance(source, _IndexExpr):
@@ -6050,6 +6149,8 @@ def _ixsimpl_apply_index_binary(kind, lhs, rhs):
 
 
 def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
+    if isinstance(source, _AssumedIndexBinding):
+        return _ixsimpl_index_expr(source.value, w, unknowns, opaque_dim)
     if isinstance(source, bool):
         return None
     if isinstance(source, int):
@@ -6091,6 +6192,10 @@ def _ixsimpl_index_expr(source, w, unknowns, opaque_dim=None):
 def _ixsimpl_index_packet_expr(
     source, w, unknowns, inner_dim, packet_elements, assumptions
 ):
+    if isinstance(source, _AssumedIndexBinding):
+        return _ixsimpl_index_packet_expr(
+            source.value, w, unknowns, inner_dim, packet_elements, assumptions
+        )
     if isinstance(source, bool):
         return None
     if isinstance(source, int):

@@ -199,6 +199,7 @@ def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
         '#wave.pred<"x >= 0">, #wave.pred<"-536870907 + x <= 0">'
         in wave
     )
+    assert '#wave.pred<"x >= 0">, #wave.pred<"-2147483647 + x <= 0">' in wave
     assert "floor(1/8*tlx_pow2_divsi" in wave
     assert "Mod(tlx_pow2_remsi" in wave
     assert len(machine.splitlines()) < 32_000

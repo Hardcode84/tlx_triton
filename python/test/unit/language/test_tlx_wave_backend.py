@@ -502,6 +502,9 @@ def test_tlx_wave_lowers_integer_argument_splat_store(tmp_path):
     )
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert 'wave.assume %arg1 as "x"' in wave_artifact
+    assert '#wave.pred<"2147483648 + x >= 0">' in wave_artifact
+    assert '#wave.pred<"-2147483647 + x <= 0">' in wave_artifact
     assert "wave.splat" in wave_artifact
     assert wave_artifact.count("wave.store") == 1
     del ctx
@@ -3185,7 +3188,9 @@ def test_tlx_wave_bridge_lowers_llvm_assume_range_and_divisibility(tmp_path):
     wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert wave.count("wave.assume") == 3
+    assert wave.count("wave.assume") == 4
+    assert '#wave.pred<"2147483648 + x >= 0">' in wave
+    assert '#wave.pred<"-2147483647 + x <= 0">' in wave
     assert '#wave.pred<"-1 + x >= 0">' in wave
     assert '#wave.pred<"-127 + x <= 0">' in wave
     assert '#wave.pred<"Mod(x, 16) == 0">' in wave
@@ -3214,7 +3219,9 @@ def test_tlx_wave_bridge_lowers_llvm_assume_power_of_two(tmp_path):
     wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert wave.count("wave.assume") == 2
+    assert wave.count("wave.assume") == 3
+    assert '#wave.pred<"2147483648 + x >= 0">' in wave
+    assert '#wave.pred<"-2147483647 + x <= 0">' in wave
     assert '#wave.pred<"-1 + x >= 0">' in wave
     assert "x &" in wave
     assert "== 0" in wave
