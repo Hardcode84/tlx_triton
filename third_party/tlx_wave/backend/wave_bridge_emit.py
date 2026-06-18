@@ -4067,6 +4067,9 @@ def _emit_program_id_op(builder, state, op, values, wave_values, w):
         "index_expr",
         builder.index_expr(symbol, {symbol: binding}),
     )
+    fact = _AssumeFact(value.value_id, "range", lower=0)
+    state["assume_facts"].append(fact)
+    _emit_assume_fact(builder, state, fact, w)
 
 
 def _emit_make_range_op(op, values, wave_values, w):

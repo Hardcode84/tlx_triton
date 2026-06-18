@@ -199,6 +199,11 @@ def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
         '#wave.pred<"x >= 0">, #wave.pred<"-536870907 + x <= 0">'
         in wave
     )
+    assert "floor(1/8*tlx_pow2_divsi" in wave
+    assert "Mod(tlx_pow2_remsi" in wave
+    assert len(machine.splitlines()) < 32_000
+    assert machine.count("waveamdmachine.tuple_to_elements") < 8_000
+    assert machine.count("waveamdmachine.s_cselect_b32") < 1_200
     assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 4
     assert "waveamdmachine.global_store_b32_addr64" not in machine
     assert "waveamdmachine.global_store_b128_addr64" not in machine
