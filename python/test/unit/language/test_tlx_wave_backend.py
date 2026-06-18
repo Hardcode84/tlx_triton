@@ -5040,14 +5040,18 @@ def test_tlx_wave_bridge_lowers_gfx950_32x32x16_mfma_layout(tmp_path):
     machine = _run_waveamd_to_machine(wave_artifact)
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert metadata["tlx_wave_num_wave_local_loads"] == 4
+    assert metadata["tlx_wave_num_wave_local_loads"] == 6
+    assert metadata["tlx_wave_num_fragment_packs"] == 4
     assert metadata["tlx_wave_num_fragment_fills"] == 1
     assert metadata["tlx_wave_num_mmas"] == 2
-    assert (
-        wave_artifact.count(f'waveamd.mma "{wave_bridge._GFX950_F16_MMA32_KIND}"')
-        == 2
-    )
-    assert "waveamdmachine.mfma_f32_32x32x16_f16" in machine
+    assert wave_artifact.count("wave.load") == 2
+    assert wave_artifact.count("waveamd.transpose_load") == 4
+    assert wave_artifact.count("wave.pack") == 2
+    assert wave_artifact.count('"waveamd.mma"') == 2
+    assert wave_artifact.count(f'kind = "{wave_bridge._GFX950_F16_MMA32_KIND}"') == 2
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 2
+    assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 4
+    assert machine.count("waveamdmachine.mfma_f32_32x32x16_f16") == 2
     del ctx
 
 

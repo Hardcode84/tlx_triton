@@ -8270,6 +8270,267 @@ def _emit_fragment_i32_ptr(
     )
 
 
+def _b16_transpose_load_shared_layout(memdesc):
+    if (
+        _validate_padded_shared_layout(
+            memdesc,
+            "ttg.local_load transpose fragment source",
+        )
+        is not None
+    ):
+        return True
+    try:
+        shared = _swizzled_shared_encoding_info(
+            memdesc.encoding_attr,
+            memdesc.encoding,
+            "ttg.local_load transpose fragment source",
+        )
+    except ValueError:
+        return False
+    return (
+        shared.vec == 8
+        and shared.per_phase == 4
+        and shared.max_phase == 4
+        and shared.order == (1, 0)
+    )
+
+
+def _can_emit_b16_transpose_fragment_load(value, memdesc, capability):
+    return (
+        capability.info.op_idx == 1
+        and capability.mma.instr_shape == (32, 32, 16)
+        and capability.mma.wave_size == 64
+        and capability.mma.operand_registers == 4
+        and value.element_type in {"f16", "bf16"}
+        and value.element_byte_width == 2
+        and memdesc.element_type == value.element_type
+        and memdesc.element_byte_width == 2
+        and _b16_transpose_load_shared_layout(memdesc)
+    )
+
+
+def _transpose_fragment_chunk_tile_offsets(tile_offsets, chunk):
+    offsets = list(tile_offsets)
+    offsets[-1] += 4 * int(chunk)
+    return tuple(offsets)
+
+
+def _require_b16_transpose_fragment_load_physical_contiguous(
+    value,
+    memdesc,
+    capability,
+    tile_offsets=(0, 0),
+):
+    source_shape = _dot_operand_fragment_source_shape(
+        capability.info,
+        capability.mma,
+    )
+    elements_per_lane = capability.mma.operand_registers * (
+        4 // int(memdesc.element_byte_width)
+    )
+    if elements_per_lane != 8:
+        _unsupported_fragment_local_load(
+            value,
+            f"expected 8 f16/bf16 elements per lane for transpose load, got {elements_per_lane}",
+            memdesc,
+        )
+    for chunk in range(2):
+        chunk_offsets = _transpose_fragment_chunk_tile_offsets(tile_offsets, chunk)
+        for lane in range(capability.mma.wave_size):
+            local_coords = _static_delinearize_row_major(
+                lane * elements_per_lane,
+                source_shape,
+            )
+            coords = tuple(
+                int(chunk_offsets[dim]) + int(local_coords[dim])
+                for dim in range(len(source_shape))
+            )
+            first = None
+            for element in range(4):
+                packet_coords = list(coords)
+                packet_coords[-1] += element
+                for dim, coord in enumerate(packet_coords):
+                    if coord < 0 or coord >= int(memdesc.shape[dim]):
+                        _unsupported_fragment_local_load(
+                            value,
+                            "transpose load packet coordinate "
+                            f"{tuple(packet_coords)} exceeds memdesc shape "
+                            f"{memdesc.shape}",
+                            memdesc,
+                        )
+                byte_offset = _memdesc_static_byte_offset(
+                    memdesc,
+                    memdesc.shape,
+                    tuple(packet_coords),
+                    "ttg.local_load transpose fragment source",
+                )
+                if first is None:
+                    first = byte_offset
+                    if first % 8:
+                        _unsupported_fragment_local_load(
+                            value,
+                            "transpose load packet physical byte offset "
+                            f"{first} is not 8-byte aligned",
+                            memdesc,
+                        )
+                    continue
+                expected = first + element * int(memdesc.element_byte_width)
+                if byte_offset != expected:
+                    _unsupported_fragment_local_load(
+                        value,
+                        "transpose load packet starting at "
+                        f"{coords} is not physically contiguous in shared memory",
+                        memdesc,
+                    )
+
+
+def _emit_fragment_element_ptr(
+    builder,
+    value,
+    memdesc,
+    memdescs,
+    lds_layout,
+    state,
+    w,
+    tile_offsets=(0, 0),
+    *,
+    info,
+    mma,
+):
+    element_type = _wave_element_type(
+        value.element_type,
+        w,
+        "ttg.local_load transpose fragment source",
+    )
+    base = _emit_memdesc_base_ptr(
+        builder,
+        memdesc,
+        memdescs,
+        lds_layout,
+        state,
+        element_type,
+        value.element_byte_width,
+        w,
+        "ttg.local_load transpose fragment source",
+    )
+    source_shape = _dot_operand_fragment_source_shape(info, mma)
+    dim_bindings = _fragment_lane_dim_bindings(
+        builder,
+        value,
+        memdesc,
+        w,
+        tile_offsets=tile_offsets,
+        source_shape=source_shape,
+        wave_size=mma.wave_size,
+        registers=mma.operand_registers,
+    )
+    offset = _memdesc_pointer_offset_expr(
+        memdesc,
+        memdesc.shape,
+        dim_bindings,
+        value.element_byte_width,
+        w,
+        "ttg.local_load transpose fragment source",
+    )
+    return builder.ptr_add(
+        base,
+        _materialize_index_value(builder, offset, {}, w),
+        w.simd_ptr_type(element_type, w.shared_address_space(), mma.wave_size),
+    )
+
+
+def _wave_extract_op(w):
+    wave = getattr(w, "wave", None)
+    if wave is None:
+        raise RuntimeError(
+            "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+            "generated wave dialect module"
+        )
+    return wave.ExtractOp
+
+
+def _wave_pack_op(w):
+    wave = getattr(w, "wave", None)
+    if wave is None:
+        raise RuntimeError(
+            "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+            "generated wave dialect module"
+        )
+    return wave.PackOp
+
+
+def _extract_simd_vector_component(value, component, element_type, width, w):
+    return _wave_extract_op(w)(w.simd_type(element_type, width), value, component).result
+
+
+def _emit_b16_transpose_dot_operand_fragment_load(
+    builder,
+    value,
+    memdesc,
+    memdescs,
+    capability,
+    lds_layout,
+    state,
+    after_token,
+    w,
+    stats,
+    tile_offsets=(0, 0),
+):
+    _require_b16_transpose_fragment_load_physical_contiguous(
+        value,
+        memdesc,
+        capability,
+        tile_offsets=tile_offsets,
+    )
+    element_type = _wave_element_type(
+        value.element_type,
+        w,
+        "ttg.local_load transpose fragment result",
+    )
+    load_type = w.simd_type(
+        w.vector_type(4, element_type),
+        width=capability.mma.wave_size,
+    )
+    components = []
+    token = after_token
+    for chunk in range(2):
+        ptr = _emit_fragment_element_ptr(
+            builder,
+            value,
+            memdesc,
+            memdescs,
+            lds_layout,
+            state,
+            w,
+            tile_offsets=_transpose_fragment_chunk_tile_offsets(tile_offsets, chunk),
+            info=capability.info,
+            mma=capability.mma,
+        )
+        loaded, token = builder.transpose_load(ptr, load_type, after=token)
+        stats.local_loads += 1
+        components.extend(
+            _extract_simd_vector_component(
+                loaded,
+                component,
+                element_type,
+                capability.mma.wave_size,
+                w,
+            )
+            for component in range(4)
+        )
+    packed_type = w.simd_type(
+        w.vector_type(8, element_type),
+        width=capability.mma.wave_size,
+    )
+    regs = _wave_pack_op(w)(packed_type, components).result
+    fragment = builder.fragment_pack(
+        regs,
+        _fragment_type_for_dot_operand(capability.info, value.element_type, w),
+    )
+    stats.fragment_packs += 1
+    return fragment, token
+
+
 def _emit_dot_operand_fragment_load(
     builder,
     address,
@@ -8284,6 +8545,20 @@ def _emit_dot_operand_fragment_load(
     stats,
     tile_offsets=(0, 0),
 ):
+    if _can_emit_b16_transpose_fragment_load(value, memdesc, capability):
+        return _emit_b16_transpose_dot_operand_fragment_load(
+            builder,
+            value,
+            memdesc,
+            memdescs,
+            capability,
+            lds_layout,
+            state,
+            after_token,
+            w,
+            stats,
+            tile_offsets=tile_offsets,
+        )
     ptr = _emit_fragment_i32_ptr(
         builder,
         value,
