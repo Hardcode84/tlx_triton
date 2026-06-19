@@ -313,7 +313,9 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741815 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
     assert "waveamdmachine.v_cvt_f16_f32" in machine
-    assert "waveamdmachine.global_store_b16_addr64" in machine
+    assert machine.count("waveamdmachine.buffer_store_b32") == 128
+    assert "waveamdmachine.global_store_b16_addr64" not in machine
+    assert len(machine.splitlines()) < 22_000
 
 
 def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(

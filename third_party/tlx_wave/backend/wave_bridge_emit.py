@@ -3994,15 +3994,28 @@ def _index_source_proves_nonnegative(state, value_id, source, w):
     )
 
 
+def _index_source_proven_lower_bound(state, source, w):
+    unknowns = {}
+    assumptions = (
+        _ixsimpl_assume_fact_exprs(state, unknowns, w, include_planned=True)
+        if state is not None
+        else ()
+    )
+    if _ixsimpl_index_source_proves_lower_bound(source, 1, assumptions, w, unknowns):
+        return 1
+    if _ixsimpl_index_source_proves_lower_bound(source, 0, assumptions, w, unknowns):
+        return 0
+    return None
+
+
 def _assumed_index_source_for_result(result, source, state, w):
     integer_bits = _scalar_signed_integer_bit_width(result)
     if integer_bits is None:
         return source
     lower = _assume_facts_lower_bound(state, result.value_id)
-    if lower is None and _index_source_proves_nonnegative(
-        state, result.value_id, source, w
-    ):
-        lower = 0
+    proven_lower = _index_source_proven_lower_bound(state, source, w)
+    if proven_lower is not None:
+        lower = proven_lower if lower is None else max(lower, proven_lower)
     return _AssumedIndexBinding(source, integer_bits, lower=lower)
 
 
@@ -6532,28 +6545,39 @@ def _ixsimpl_index_source_proves_lower_bound(
     w,
     unknowns,
 ):
+    if (
+        isinstance(source, _AssumedIndexBinding)
+        and source.lower is not None
+        and int(source.lower) >= int(lower_bound)
+    ):
+        return True
     expr = _ixsimpl_index_expr(source, w, unknowns)
     if expr is not None and _ixsimpl_proves(expr >= int(lower_bound), assumptions, w):
         return True
     if isinstance(source, _IndexExpr):
-        if source.materialized is not None:
-            return _ixsimpl_index_source_proves_lower_bound(
+        if (
+            source.materialized is not None
+            and _ixsimpl_index_source_proves_lower_bound(
                 source.materialized,
                 lower_bound,
                 assumptions,
                 w,
                 unknowns,
             )
+        ):
+            return True
         binding_assumptions = []
         for symbol, binding in source.bindings.items():
-            if _ixsimpl_index_source_proves_lower_bound(
-                binding,
-                0,
-                assumptions,
-                w,
-                unknowns,
-            ):
-                binding_assumptions.append(symbol >= 0)
+            for candidate_lower in (1, 0):
+                if _ixsimpl_index_source_proves_lower_bound(
+                    binding,
+                    candidate_lower,
+                    assumptions,
+                    w,
+                    unknowns,
+                ):
+                    binding_assumptions.append(symbol >= candidate_lower)
+                    break
         if binding_assumptions and _ixsimpl_proves(
             source.expr >= int(lower_bound),
             assumptions + tuple(binding_assumptions),
@@ -10006,6 +10030,39 @@ def _convert_fragment_store_value(builder, value, value_plan, width, w):
     return value
 
 
+def _extract_converted_fragment_store_value(
+    builder,
+    regs,
+    component,
+    count,
+    width,
+    value_plan,
+    w,
+    unpack_element_type,
+):
+    if value_plan.element_type == "f16" and count > 1:
+        wave = getattr(w, "wave", None)
+        if wave is None:
+            raise RuntimeError(
+                "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+                "generated wave dialect module"
+            )
+        values = []
+        for index in range(count):
+            scalar = _extract_fragment_component(
+                regs, component + index, width, w, unpack_element_type
+            )
+            values.append(
+                _convert_fragment_store_value(builder, scalar, value_plan, width, w)
+            )
+        value_type = w.simd_type(w.vector_type(count, w.f16()), width)
+        return wave.PackOp(value_type, values).result
+    value = _extract_fragment_store_value(
+        regs, component, count, width, w, unpack_element_type
+    )
+    return _convert_fragment_store_value(builder, value, value_plan, width, w)
+
+
 def _extract_fragment_component(regs, component, width, w, element_type="i32"):
     wave = getattr(w, "wave", None)
     if wave is None:
@@ -10214,6 +10271,303 @@ def _mfma_fragment_store_vector_width_for_store(
     return vector_width
 
 
+def _fragment_store_vector_width_candidates(value_plan, frag, component):
+    if (
+        value_plan.element_type not in {"f32", "f16"}
+        or len(value_plan.shape) != 2
+        or value_plan.element_byte_width is None
+    ):
+        return ()
+    element_byte_width = int(value_plan.element_byte_width)
+    if element_byte_width <= 0:
+        return ()
+    max_count = min(int(frag.registers) - int(component), 16 // element_byte_width)
+    candidates = []
+    count = 1
+    while count * 2 <= max_count:
+        count *= 2
+    while count > 1:
+        if component % count == 0 and (count * element_byte_width) % 4 == 0:
+            candidates.append(count)
+        count //= 2
+    return tuple(candidates)
+
+
+def _fragment_store_tile_component_dim_exprs(
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    w,
+):
+    frag = w.FragmentType(fragment.type)
+    suffix = "_".join(str(int(offset)) for offset in tile_offsets)
+    thread_sym = w.sym(f"tlx_store_{value_plan.value_id}_{suffix}_thread")
+    if frag.registers == _GFX950_MMA32_INFO.acc_registers:
+        coords = _mfma32_accumulator_dim_exprs(thread_sym, component, w)
+        return {
+            _dim_symbol(w, dim): int(tile_offsets[dim]) + coords[dim]
+            for dim in range(len(value_plan.shape))
+        }
+
+    layout = _GFX950_DOT_PARENT_LAYOUT
+    threads_per_warp = _product(layout.threads_per_warp)
+    register_coords = _delinearize_expr(
+        w, w.sym_ctx.int_(component), layout.size_per_thread, layout.order
+    )
+    lane_coords = _delinearize_expr(
+        w,
+        w.mod(thread_sym, threads_per_warp),
+        layout.threads_per_warp,
+        layout.order,
+    )
+    warp_coords = _delinearize_expr(
+        w,
+        w.floor(thread_sym / threads_per_warp),
+        layout.warps_per_cta,
+        layout.order,
+    )
+    return {
+        _dim_symbol(w, dim): int(tile_offsets[dim])
+        + register_coords[dim]
+        + layout.size_per_thread[dim]
+        * (lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim])
+        for dim in range(len(value_plan.shape))
+    }
+
+
+def _fragment_store_tile_component_expr(
+    expr,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    w,
+):
+    for symbol, replacement in _fragment_store_tile_component_dim_exprs(
+        value_plan, fragment, tile_offsets, component, w
+    ).items():
+        expr = expr.subs(symbol, replacement)
+    return expr
+
+
+def _fragment_store_tile_pointer_components_contiguous(
+    pointer_source,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    count,
+    w,
+):
+    if count <= 1:
+        return True
+    unknowns = {}
+    pointer_offset = _ixsimpl_pointer_offset_expr(pointer_source, w, unknowns)
+    if pointer_offset is None:
+        return False
+    assumptions = ()
+    first = _fragment_store_tile_component_expr(
+        pointer_offset, value_plan, fragment, tile_offsets, component, w
+    )
+    for index in range(1, count):
+        candidate = _fragment_store_tile_component_expr(
+            pointer_offset,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component + index,
+            w,
+        )
+        if not _ixsimpl_expr_equal(candidate, first + index, assumptions, w):
+            return False
+    return True
+
+
+def _fragment_store_tile_component_index_expr(
+    source,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    w,
+    unknowns,
+):
+    expr = _ixsimpl_index_expr(source, w, unknowns)
+    if expr is None:
+        return None
+    return _fragment_store_tile_component_expr(
+        expr, value_plan, fragment, tile_offsets, component, w
+    )
+
+
+def _fragment_store_tile_mask_compare_components_uniform(
+    source,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    count,
+    assumptions,
+    w,
+    unknowns,
+):
+    first_lhs = _fragment_store_tile_component_index_expr(
+        source.lhs, value_plan, fragment, tile_offsets, component, w, unknowns
+    )
+    first_rhs = _fragment_store_tile_component_index_expr(
+        source.rhs, value_plan, fragment, tile_offsets, component, w, unknowns
+    )
+    if first_lhs is None or first_rhs is None:
+        return False
+    first = _ixsimpl_mask_compare_expr(source.predicate, first_lhs, first_rhs, w)
+    if first is None:
+        return False
+    for index in range(1, count):
+        lhs = _fragment_store_tile_component_index_expr(
+            source.lhs,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component + index,
+            w,
+            unknowns,
+        )
+        rhs = _fragment_store_tile_component_index_expr(
+            source.rhs,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component + index,
+            w,
+            unknowns,
+        )
+        if lhs is None or rhs is None:
+            return False
+        candidate = _ixsimpl_mask_compare_expr(source.predicate, lhs, rhs, w)
+        if candidate is None:
+            return False
+        if _ixsimpl_predicate_equivalent(first, candidate, assumptions, w):
+            continue
+        if source.predicate == "slt" and _mfma32_store_component_slt_uniform(
+            first_lhs, first_rhs, lhs, rhs, index, count, assumptions, w
+        ):
+            continue
+        if source.predicate == "sgt" and _mfma32_store_component_slt_uniform(
+            first_rhs, first_lhs, rhs, lhs, index, count, assumptions, w
+        ):
+            continue
+        return False
+    return True
+
+
+def _fragment_store_tile_mask_components_uniform(
+    state,
+    mask_source,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    count,
+    w,
+):
+    if mask_source is None or count <= 1:
+        return True
+    if isinstance(mask_source, _MaskConst):
+        return True
+    unknowns = {}
+    assumptions = _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    if isinstance(mask_source, _MaskAnd):
+        return _fragment_store_tile_mask_components_uniform(
+            state,
+            mask_source.lhs,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component,
+            count,
+            w,
+        ) and _fragment_store_tile_mask_components_uniform(
+            state,
+            mask_source.rhs,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component,
+            count,
+            w,
+        )
+    if isinstance(mask_source, _MaskCompare):
+        return _fragment_store_tile_mask_compare_components_uniform(
+            mask_source,
+            value_plan,
+            fragment,
+            tile_offsets,
+            component,
+            count,
+            assumptions,
+            w,
+            unknowns,
+        )
+    mask = _ixsimpl_mask_expr(mask_source, w, unknowns)
+    if mask is None:
+        return False
+    first = _fragment_store_tile_component_expr(
+        mask, value_plan, fragment, tile_offsets, component, w
+    )
+    for index in range(1, count):
+        candidate = _fragment_store_tile_component_expr(
+            mask, value_plan, fragment, tile_offsets, component + index, w
+        )
+        if not _ixsimpl_predicate_equivalent(first, candidate, assumptions, w):
+            return False
+    return True
+
+
+def _fragment_store_tile_components_all_lanes_active(
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    count,
+    w,
+):
+    return all(
+        _fragment_store_tile_component_all_lanes_active(
+            value_plan, fragment, tile_offsets, component + index, w
+        )
+        for index in range(count)
+    )
+
+
+def _fragment_store_tile_vector_width_for_store(
+    state,
+    pointer_source,
+    mask_source,
+    value_plan,
+    fragment,
+    tile_offsets,
+    component,
+    w,
+):
+    frag = w.FragmentType(fragment.type)
+    for count in _fragment_store_vector_width_candidates(value_plan, frag, component):
+        if not _fragment_store_tile_components_all_lanes_active(
+            value_plan, fragment, tile_offsets, component, count, w
+        ):
+            continue
+        if not _fragment_store_tile_pointer_components_contiguous(
+            pointer_source, value_plan, fragment, tile_offsets, component, count, w
+        ):
+            continue
+        if not _fragment_store_tile_mask_components_uniform(
+            state, mask_source, value_plan, fragment, tile_offsets, component, count, w
+        ):
+            continue
+        return count
+    return 1
+
+
 def _extract_fragment_store_value(regs, component, count, width, w, element_type="i32"):
     if count == 1:
         return _extract_fragment_component(regs, component, width, w, element_type)
@@ -10336,11 +10690,15 @@ def _emit_fragment_store(
             if mask_id is not None
             else None
         )
-        value = _extract_fragment_store_value(
-            regs, component, vector_width, width, w, unpack_element_type
-        )
-        value = _convert_fragment_store_value(
-            builder, value, store_plan, width, w
+        value = _extract_converted_fragment_store_value(
+            builder,
+            regs,
+            component,
+            vector_width,
+            width,
+            store_plan,
+            w,
+            unpack_element_type,
         )
         if mask is not None and vector_width > 1:
             token = _emit_masked_bounded_component_store(
@@ -10403,10 +10761,16 @@ def _emit_fragment_local_store(
             w,
             "ttg.local_store",
         )
-        value = _extract_fragment_component(
-            regs, component, width, w, unpack_element_type
+        value = _extract_converted_fragment_store_value(
+            builder,
+            regs,
+            component,
+            1,
+            width,
+            store_plan,
+            w,
+            unpack_element_type,
         )
-        value = _convert_fragment_store_value(builder, value, store_plan, width, w)
         token = _emit_component_store(builder, value, ptr, None, token, w)
     return token
 
@@ -10592,6 +10956,22 @@ def _emit_mfma_fragment_tile_store(
 
     token = after_token
     unpack_element_type = _fragment_store_unpack_element_type(value_plan)
+    pointer_source = _require_lowered_value(
+        state["wave_values"],
+        ptr_id,
+        "pointer_expr",
+        "tt.store pointer",
+    )
+    mask_source = (
+        _require_lowered_value(
+            state["wave_values"],
+            mask_id,
+            "mask_expr",
+            "tt.store mask",
+        )
+        if mask_id is not None
+        else None
+    )
     for row in range(tile_shape[0]):
         for col in range(tile_shape[1]):
             fragment = fragments[_fragment_tuple_index(tile_shape, row, col)]
@@ -10601,7 +10981,18 @@ def _emit_mfma_fragment_tile_store(
                 row * mma.output_tile_shape[0],
                 col * mma.output_tile_shape[1],
             )
-            for component in range(frag.registers):
+            component = 0
+            while component < frag.registers:
+                vector_width = _fragment_store_tile_vector_width_for_store(
+                    state,
+                    pointer_source,
+                    mask_source,
+                    value_plan,
+                    fragment,
+                    tile_offsets,
+                    component,
+                    w,
+                )
                 dim_bindings, width, active = _fragment_store_tile_dim_bindings(
                     builder,
                     value_plan,
@@ -10610,58 +11001,73 @@ def _emit_mfma_fragment_tile_store(
                     component,
                     w,
                 )
-                ptr = _materialize_bounded_pointer_value(
-                    builder,
-                    state,
-                    _require_lowered_value(
-                        state["wave_values"],
-                        ptr_id,
-                        "pointer_expr",
-                        "tt.store pointer",
-                    ),
-                    dim_bindings,
-                    value_plan.element_byte_width,
-                    value_plan.element_byte_width,
-                    value_plan.shape,
+                components_active = _fragment_store_tile_components_all_lanes_active(
+                    value_plan,
+                    fragment,
+                    tile_offsets,
+                    component,
+                    vector_width,
                     w,
-                    assume_pointer_range=mask_id is None
-                    and _fragment_store_tile_component_all_lanes_active(
-                        value_plan,
-                        fragment,
-                        tile_offsets,
-                        component,
-                        w,
-                    ),
                 )
-                mask = active
+                access_byte_width = (
+                    int(value_plan.element_byte_width) * vector_width
+                    if value_plan.element_byte_width is not None
+                    else None
+                )
+                mask = None if components_active else active
                 if mask_id is not None:
                     user_mask = _materialize_mask_value(
                         builder,
-                        _require_lowered_value(
-                            state["wave_values"],
-                            mask_id,
-                            "mask_expr",
-                            "tt.store mask",
-                        ),
+                        mask_source,
                         dim_bindings,
                         w,
                         width,
                     )
                     mask = _wave_mask_and(builder, mask, user_mask, w, width)
-                value = _extract_fragment_component(
-                    regs, component, width, w, unpack_element_type
-                )
-                value = _convert_fragment_store_value(
-                    builder, value, value_plan, width, w
-                )
-                token = _emit_component_store(
+                value = _extract_converted_fragment_store_value(
                     builder,
-                    value,
-                    ptr,
-                    mask,
-                    token,
+                    regs,
+                    component,
+                    vector_width,
+                    width,
+                    value_plan,
                     w,
+                    unpack_element_type,
                 )
+                if mask is not None and vector_width > 1:
+                    token = _emit_masked_bounded_component_store(
+                        builder,
+                        state,
+                        value,
+                        pointer_source,
+                        dim_bindings,
+                        value_plan,
+                        access_byte_width,
+                        mask,
+                        token,
+                        w,
+                    )
+                else:
+                    ptr = _materialize_bounded_pointer_value(
+                        builder,
+                        state,
+                        pointer_source,
+                        dim_bindings,
+                        value_plan.element_byte_width,
+                        access_byte_width,
+                        value_plan.shape,
+                        w,
+                        assume_pointer_range=mask_id is None and components_active,
+                    )
+                    token = _emit_component_store(
+                        builder,
+                        value,
+                        ptr,
+                        mask,
+                        token,
+                        w,
+                    )
+                component += vector_width
     return token
 
 
@@ -10732,11 +11138,15 @@ def _emit_mfma_fragment_tile_local_store(
                     w,
                     "ttg.local_store",
                 )
-                value = _extract_fragment_component(
-                    regs, component, width, w, unpack_element_type
-                )
-                value = _convert_fragment_store_value(
-                    builder, value, value_plan, width, w
+                value = _extract_converted_fragment_store_value(
+                    builder,
+                    regs,
+                    component,
+                    1,
+                    width,
+                    value_plan,
+                    w,
+                    unpack_element_type,
                 )
                 token = _emit_component_store(
                     builder,

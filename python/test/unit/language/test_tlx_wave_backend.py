@@ -3423,6 +3423,7 @@ def test_tlx_wave_bridge_uses_later_assume_for_pow2_index_div(tmp_path):
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert "tlx_pow2_divsi_" in wave
     assert "floor(1/32*" in wave
+    assert '#wave.pred<"-1 + x >= 0">' in wave
     assert "wave.binary divsi" not in wave
     assert "llvm.intr.assume" not in wave
     del ctx
@@ -3472,6 +3473,45 @@ def test_tlx_wave_bridge_preserves_i32_assume_for_dynamic_index_divisor(tmp_path
     %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %value = tt.splat %q : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary divsi" in wave
+    assert re.search(
+        r'wave\.assume %\d+ as "x" '
+        r'\[#wave\.pred<"-1 \+ x >= 0">, '
+        r'#wave\.pred<"-2147483647 \+ x <= 0">\] : index',
+        wave,
+    )
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_preserves_positive_pow2_div_product(tmp_path):
+    arith_func = """
+  tt.func public @positive_pow2_div_product(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c4 = arith.constant 4 : i32
+    %c31 = arith.constant 31 : i32
+    %c32 = arith.constant 32 : i32
+    %num = arith.addi %arg1, %c31 : i32
+    %q = arith.divsi %num, %c32 : i32
+    %divisor = arith.muli %q, %c4 : i32
+    %positive = arith.cmpi sgt, %arg1, %c0 : i32
+    llvm.intr.assume %positive : i1
+    %pid = tt.get_program_id x : i32
+    %group = arith.divsi %pid, %divisor : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %group : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.return
   }
