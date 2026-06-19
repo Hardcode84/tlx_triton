@@ -11,6 +11,7 @@ from dataclasses import replace
 
 _DEPENDENCY_NAMES = (
     "_GFX950_DOT_PARENT_LAYOUT",
+    "_GFX950_MMA16_INFO",
     "_GFX950_MMA32_INFO",
     "_GFX950_MMA_SHAPE",
     "_MaskAnd",
@@ -114,6 +115,10 @@ def _validate_fragment_store_value(value_plan, physical_plan):
             "tlx_wave bridge expected blocked or #ttg.amd_mfma encoding for "
             f"fragment store physical value, got {physical_plan.encoding}"
         )
+    _validate_mfma_fragment_store_mma(
+        _mma_shape_for_result_value(physical_plan, "fragment store physical value"),
+        "fragment store through blocked store layout",
+    )
     value_layout = _blocked_encoding_info(
         value_plan.encoding_attr,
         value_plan.encoding,
@@ -130,6 +135,17 @@ def _validate_fragment_store_value(value_plan, physical_plan):
             f"order={value_layout.order}"
         )
     return value_plan
+
+
+def _validate_mfma_fragment_store_mma(mma, context):
+    if mma in (_GFX950_MMA16_INFO, _GFX950_MMA32_INFO):
+        return
+    raise ValueError(
+        "tlx_wave bridge cannot lower "
+        f"{context}: MFMA fragment store mapping is implemented only for gfx950 "
+        "16x16x32 and 32x32x16 accumulators; "
+        f"got instrShape={mma.instr_shape}"
+    )
 
 
 def _fragment_unpack_as(builder, fragment, element_type, w):
@@ -1069,6 +1085,7 @@ def _emit_mfma_fragment_tile_store(
     fragments,
     tile_shape,
     value_plan,
+    physical_plan,
     ptr_id,
     mask_id,
     after_token,
@@ -1079,7 +1096,9 @@ def _emit_mfma_fragment_tile_store(
             "tlx_wave bridge supports MFMA fragment stores only for f32/f16 "
             f"values, got type={value_plan.type}"
         )
-    mma = _mma_shape_for_result_value(value_plan, "tt.store MFMA value")
+    physical_plan = value_plan if physical_plan is None else physical_plan
+    mma = _mma_shape_for_result_value(physical_plan, "tt.store MFMA value")
+    _validate_mfma_fragment_store_mma(mma, "tt.store MFMA value")
     expected_tile_shape = _fragment_tile_shape_for_rank2_shape(
         value_plan.shape,
         "tt.store MFMA value",
@@ -1221,6 +1240,7 @@ def _emit_mfma_fragment_tile_local_store(
     fragments,
     tile_shape,
     value_plan,
+    physical_plan,
     memdesc,
     memdescs,
     lds_layout,
@@ -1232,7 +1252,9 @@ def _emit_mfma_fragment_tile_local_store(
             "tlx_wave bridge supports MFMA fragment local stores only for f32/f16 "
             f"values, got type={value_plan.type}"
         )
-    mma = _mma_shape_for_result_value(value_plan, "ttg.local_store MFMA value")
+    physical_plan = value_plan if physical_plan is None else physical_plan
+    mma = _mma_shape_for_result_value(physical_plan, "ttg.local_store MFMA value")
+    _validate_mfma_fragment_store_mma(mma, "ttg.local_store MFMA value")
     expected_tile_shape = _fragment_tile_shape_for_rank2_shape(
         value_plan.shape,
         "ttg.local_store MFMA value",

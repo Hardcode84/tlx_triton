@@ -4154,6 +4154,21 @@ def _pow2_index_div_rem_expr(op_name, lhs, rhs, lhs_value_id, w, state):
     return _IndexExpr(expr, {lhs_symbol: lhs}), divisor
 
 
+def _nonnegative_signed_div_rem_kind(op_name, lhs, rhs, op, state, w):
+    if op_name not in {"arith.divsi", "arith.remsi"}:
+        return None
+    if getattr(w, "BinaryKind", None) is None:
+        return None
+    if not (
+        _index_source_proves_nonnegative(state, op.operands[0], lhs, w)
+        and _index_source_proves_nonnegative(state, op.operands[1], rhs, w)
+    ):
+        return None
+    if op_name == "arith.divsi":
+        return w.BinaryKind.DivUI
+    return w.BinaryKind.RemUI
+
+
 def _init_argument_wave_values(builder, kernel, values, state, w):
     wave_values = state["wave_values"]
     for value in values.values():
@@ -4254,26 +4269,6 @@ def _emit_constant_op(builder, op, values, wave_values, w, stats=None):
     elif (
         value.type_kind == "tensor"
         and value.element_type == "f32"
-        and value.shape == _GFX950_MMA_SHAPE
-        and const in (0, 0.0)
-    ):
-        zero = builder.constant(w.i32(), 0)
-        _set_wave_value(
-            wave_values,
-            value.value_id,
-            "fragment",
-            builder.fragment_fill(
-                zero,
-                _acc_fragment_type_for_value(
-                    value, w, "arith.constant f32 tensor result"
-                ),
-            ),
-        )
-        if stats is not None:
-            stats.fragment_fills += 1
-    elif (
-        value.type_kind == "tensor"
-        and value.element_type == "f32"
         and const in (0, 0.0)
         and _amd_mfma_encoding_info(value.encoding, "arith.constant result") is not None
     ):
@@ -4291,15 +4286,24 @@ def _emit_constant_op(builder, op, values, wave_values, w, stats=None):
             builder.fragment_fill(zero, acc_type)
             for _ in range(tile_shape[0] * tile_shape[1])
         )
-        _set_wave_value(
-            wave_values,
-            value.value_id,
-            "fragment_tuple",
-            fragments,
-            aux=_fragment_tuple_aux(tile_shape),
-        )
+        if tile_shape == (1, 1):
+            _set_wave_value(wave_values, value.value_id, "fragment", fragments[0])
+        else:
+            _set_wave_value(
+                wave_values,
+                value.value_id,
+                "fragment_tuple",
+                fragments,
+                aux=_fragment_tuple_aux(tile_shape),
+            )
         if stats is not None:
             stats.fragment_fills += len(fragments)
+    elif value.type_kind == "tensor" and _attr_bool(
+        value.encoding_attr, "is_dot_operand_encoding"
+    ):
+        # Dot operand constants are validated by tt.dot; they are not standalone
+        # SIMD tensor data and should not force generic tensor lowering.
+        return
     elif _is_data_tensor(value) and isinstance(const, (int, float)):
         component_count = _tensor_layout_component_count(
             value, "arith.constant result", "SIMD tensor constant"
@@ -4462,7 +4466,9 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
             )
         return
 
-    binary_kind = _wave_binary_kind_for_op(op.name, w)
+    binary_kind = _nonnegative_signed_div_rem_kind(op.name, lhs, rhs, op, state, w)
+    if binary_kind is None:
+        binary_kind = _wave_binary_kind_for_op(op.name, w)
     if binary_kind is not None:
         source = _IndexBinary(binary_kind, lhs, rhs)
         source = _assumed_index_source_for_result(result, source, state, w)
@@ -4500,8 +4506,10 @@ def _wave_binary_kind_for_op(op_name, w):
         "arith.subi": binary_kind.SubI,
         "arith.divsi": binary_kind.DivSI,
         "arith.divui": binary_kind.DivUI,
+        "arith.ori": binary_kind.OrI,
         "arith.remsi": binary_kind.RemSI,
         "arith.remui": binary_kind.RemUI,
+        "arith.xori": binary_kind.XOrI,
     }.get(op_name)
 
 
@@ -4518,13 +4526,7 @@ def _arith_overflow_flags(op):
 def _index_overflow_flags(op, lhs, rhs):
     if _is_deferred_index(lhs) or _is_deferred_index(rhs):
         return False, False
-    nsw, nuw = _arith_overflow_flags(op)
-    if op.name == "arith.muli":
-        # The bridge already treats scalar index expressions as mathematical
-        # offsets. Emit the matching no-signed-wrap contract so Wave range
-        # analysis can reason about products before division/rem.
-        nsw = True
-    return nsw, nuw
+    return _arith_overflow_flags(op)
 
 
 def _simd_binary_kind_for_op(op_name, w):
@@ -6145,9 +6147,11 @@ def _emit_generic_value_op(builder, state, op, w):
         "arith.minsi",
         "arith.minui",
         "arith.muli",
+        "arith.ori",
         "arith.remsi",
         "arith.remui",
         "arith.subi",
+        "arith.xori",
     }:
         _emit_arith_binary_op(builder, op, values, wave_values, w, state)
     elif op.name in {"arith.extf", "arith.truncf"}:
@@ -7084,13 +7088,17 @@ def _dot_operand_mma_kind(info, element_type, context, attrs=None):
     return kind
 
 
-def _fragment_type_for_dot_operand(info, element_type, w):
+def _fragment_type_for_dot_operand(info, element_type, w, mma=None):
     if info.op_idx not in (0, 1):
         raise ValueError(
             f"tlx_wave bridge supports #ttg.dot_op opIdx 0/1, got {info.op_idx}"
         )
-    mma = _dot_operand_mma_shape(info, "ttg.local_load result")
-    _dot_operand_mma_kind(info, element_type, "ttg.local_load result")
+    mma = _dot_operand_mma_shape(info, "ttg.local_load result") if mma is None else mma
+    if _mma_kind_for_element_type(element_type, mma) is None:
+        raise ValueError(
+            "tlx_wave bridge supports only f16/bf16 ttg.local_load fragments for "
+            f"Wave MFMA lowering; got {element_type}"
+        )
     return w.fragment_type(
         info.op_idx,
         _wave_element_type(element_type, w, "ttg.local_load fragment"),
@@ -7116,11 +7124,17 @@ def _acc_fragment_type(w, mma=None):
 def _mma_shape_for_result_value(value, context):
     try:
         layout = _dot_result_layout_info(value.encoding_attr, value.encoding, context)
-    except ValueError:
-        return _GFX950_MMA16_INFO
+    except ValueError as exc:
+        raise ValueError(
+            "tlx_wave bridge expected #ttg.amd_mfma result layout for "
+            f"{context}, got {value.encoding}"
+        ) from exc
     if isinstance(layout, _AMDMfmaEncodingInfo):
         return _dot_operand_mma_shape(SimpleNamespace(parent=layout), context)
-    return _GFX950_MMA16_INFO
+    raise ValueError(
+        "tlx_wave bridge expected #ttg.amd_mfma result layout for "
+        f"{context}, got {value.encoding}"
+    )
 
 
 def _acc_fragment_type_for_value(value, w, context):
@@ -7137,9 +7151,11 @@ def _unsupported_fragment_local_load(value, reason, memdesc=None):
     raise ValueError(message)
 
 
-def _validate_supported_dot_local_load_layout(value, memdesc, info):
+def _validate_supported_dot_local_load_layout(value, memdesc, info, attrs):
     try:
-        _dot_operand_mma_kind(info, value.element_type, "ttg.local_load result")
+        _dot_operand_mma_kind(
+            info, value.element_type, "ttg.local_load result", attrs=attrs
+        )
     except ValueError as exc:
         _unsupported_fragment_local_load(
             value,
@@ -7168,7 +7184,7 @@ def _validate_supported_dot_local_load_layout(value, memdesc, info):
         )
 
 
-def _validate_dot_operand_fragment_load(value, memdesc, info):
+def _validate_dot_operand_fragment_load(value, memdesc, info, attrs):
     if value.element_type not in {"f16", "bf16"} or value.element_byte_width != 2:
         _unsupported_fragment_local_load(
             value, f"expected f16/bf16 dot operand, got {value.element_type}", memdesc
@@ -7202,17 +7218,17 @@ def _validate_dot_operand_fragment_load(value, memdesc, info):
             f"expected 32x32 shared memdesc source, got {memdesc.shape}",
             memdesc,
         )
-    _validate_supported_dot_local_load_layout(value, memdesc, info)
+    _validate_supported_dot_local_load_layout(value, memdesc, info, attrs)
     _require_fragment_load_physical_contiguous(value, memdesc)
 
 
-def _dot_operand_fragment_tile_shape(value, info, context):
+def _dot_operand_fragment_tile_shape(value, info, context, attrs=None):
     if len(value.shape) != 2:
         _unsupported_fragment_local_load(
             value,
             f"expected rank-2 dot operand for {context}, got shape {value.shape}",
         )
-    mma = _dot_operand_mma_shape(info, context)
+    mma = _dot_operand_mma_shape(info, context, attrs=attrs)
     output_m, output_n = mma.output_tile_shape
     if info.op_idx == 0:
         if value.shape[1] % mma.k_dim:
@@ -7261,7 +7277,7 @@ def _dot_operand_tile_offsets(info, mma, row, col):
     raise ValueError(f"tlx_wave bridge expected #ttg.dot_op opIdx 0/1, got {info.op_idx}")
 
 
-def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
+def _validate_dot_operand_fragment_tile_load(value, memdesc, info, attrs):
     if value.element_type not in {"f16", "bf16"} or value.element_byte_width != 2:
         _unsupported_fragment_local_load(
             value, f"expected f16/bf16 dot operand, got {value.element_type}", memdesc
@@ -7288,11 +7304,13 @@ def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
             memdesc,
         )
     try:
-        mma = _dot_operand_mma_shape(info, "ttg.local_load result")
+        mma = _dot_operand_mma_shape(info, "ttg.local_load result", attrs=attrs)
     except ValueError as exc:
         _unsupported_fragment_local_load(value, str(exc), memdesc)
-    tile_shape = _dot_operand_fragment_tile_shape(value, info, "ttg.local_load result")
-    _validate_supported_dot_local_load_layout(value, memdesc, info)
+    tile_shape = _dot_operand_fragment_tile_shape(
+        value, info, "ttg.local_load result", attrs=attrs
+    )
+    _validate_supported_dot_local_load_layout(value, memdesc, info, attrs)
     for row in range(tile_shape[0]):
         for col in range(tile_shape[1]):
             tile_offsets = _dot_operand_tile_offsets(info, mma, row, col)
@@ -7306,13 +7324,15 @@ def _validate_dot_operand_fragment_tile_load(value, memdesc, info):
     return tile_shape, mma
 
 
-def _physical_local_load_fragment_capability(value, memdesc):
+def _physical_local_load_fragment_capability(value, memdesc, attrs):
     if value.encoding_attr is None or not _attr_bool(
         value.encoding_attr, "is_dot_operand_encoding"
     ):
         return None
     info = _dot_operand_encoding_info(value, "ttg.local_load result")
-    tile_shape, mma = _validate_dot_operand_fragment_tile_load(value, memdesc, info)
+    tile_shape, mma = _validate_dot_operand_fragment_tile_load(
+        value, memdesc, info, attrs
+    )
     return _DotOperandFragmentLoad(info, mma, tile_shape)
 
 
@@ -7792,7 +7812,9 @@ def _emit_b16_transpose_dot_operand_fragment_load(
     regs = _wave_pack_op(w)(packed_type, components).result
     fragment = builder.fragment_pack(
         regs,
-        _fragment_type_for_dot_operand(capability.info, value.element_type, w),
+        _fragment_type_for_dot_operand(
+            capability.info, value.element_type, w, capability.mma
+        ),
     )
     stats.fragment_packs += 1
     return fragment, token
@@ -7840,7 +7862,9 @@ def _emit_dot_operand_fragment_load(
     )
     fragment, token = builder.fragment_load(
         ptr,
-        _fragment_type_for_dot_operand(capability.info, value.element_type, w),
+        _fragment_type_for_dot_operand(
+            capability.info, value.element_type, w, capability.mma
+        ),
         after=after_token,
     )
     stats.local_loads += 1
@@ -7933,6 +7957,62 @@ def _emit_accumulator_fragment(
         mma.output_tile_shape,
     )
     tile_count = tile_shape[0] * tile_shape[1]
+    lowered = wave_values.get(value.value_id)
+    if isinstance(lowered, _WaveValue) and lowered.kind in {"fragment", "fragment_tuple"}:
+        if values is not None:
+            physical_plan = _physical_value_plan(values, lowered, value.value_id)
+            if not _same_layout_encoding(physical_plan, value):
+                raise ValueError(
+                    "tlx_wave bridge cannot use a fragment with an unlowered "
+                    "layout conversion as a tt.dot accumulator; "
+                    f"physical encoding: {physical_plan.encoding}; "
+                    f"accumulator encoding: {value.encoding}"
+                )
+        if tile_count == 1:
+            return _require_wave_value(
+                wave_values,
+                value.value_id,
+                ("fragment",),
+                "tt.dot accumulator",
+            )
+        if lowered.kind != "fragment_tuple":
+            raise ValueError(
+                "tlx_wave bridge cannot lower tt.dot accumulator: expected "
+                f"fragment_tuple for tiled accumulator, got {lowered.kind}; "
+                f"type={value.type}, encoding={value.encoding}"
+            )
+        lowered_tile_shape = _fragment_tuple_tile_shape(lowered, "tt.dot accumulator")
+        if lowered_tile_shape != tile_shape:
+            raise ValueError(
+                "tlx_wave bridge cannot lower tt.dot accumulator: fragment "
+                f"tuple tile shape {lowered_tile_shape} does not match "
+                f"accumulator tile shape {tile_shape}"
+            )
+        return _fragment_tuple_values(lowered, "tt.dot accumulator")
+    if (
+        value.producer == "arith.constant"
+        and value.type_kind == "tensor"
+        and value.element_type == "f32"
+        and value.const_value in (0, 0.0)
+    ):
+        zero = builder.constant(w.i32(), 0)
+        fragments = tuple(
+            builder.fragment_fill(zero, _acc_fragment_type(w, mma))
+            for _ in range(tile_count)
+        )
+        if tile_count == 1:
+            _set_wave_value(wave_values, value.value_id, "fragment", fragments[0])
+            stats.fragment_fills += 1
+            return fragments[0]
+        _set_wave_value(
+            wave_values,
+            value.value_id,
+            "fragment_tuple",
+            fragments,
+            aux=_fragment_tuple_aux(tile_shape),
+        )
+        stats.fragment_fills += tile_count
+        return fragments
     if value.value_id in wave_values:
         lowered = wave_values[value.value_id]
         if values is not None and isinstance(lowered, _WaveValue):
@@ -7970,30 +8050,6 @@ def _emit_accumulator_fragment(
                 f"accumulator tile shape {tile_shape}"
             )
         return _fragment_tuple_values(lowered, "tt.dot accumulator")
-    if (
-        value.producer == "arith.constant"
-        and value.type_kind == "tensor"
-        and value.element_type == "f32"
-        and value.const_value in (0, 0.0)
-    ):
-        zero = builder.constant(w.i32(), 0)
-        fragments = tuple(
-            builder.fragment_fill(zero, _acc_fragment_type(w, mma))
-            for _ in range(tile_count)
-        )
-        if tile_count == 1:
-            _set_wave_value(wave_values, value.value_id, "fragment", fragments[0])
-            stats.fragment_fills += 1
-            return fragments[0]
-        _set_wave_value(
-            wave_values,
-            value.value_id,
-            "fragment_tuple",
-            fragments,
-            aux=_fragment_tuple_aux(tile_shape),
-        )
-        stats.fragment_fills += tile_count
-        return fragments
     raise ValueError(
         "tlx_wave bridge supports tt.dot accumulators only from prior tt.dot "
         "results or zero f32 tensor constants; "
@@ -8453,9 +8509,12 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
     source = state["wave_values"].get(source_id)
     if isinstance(source, _WaveValue) and source.kind == "fragment_regs":
         info = _dot_operand_encoding_info(result, "ttg.convert_layout result")
+        mma = _dot_operand_mma_shape(
+            info, "ttg.convert_layout result", attrs=state["attrs"]
+        )
         fragment = builder.fragment_pack(
             source.value,
-            _fragment_type_for_dot_operand(info, result.element_type, w),
+            _fragment_type_for_dot_operand(info, result.element_type, w, mma),
         )
         stats.fragment_packs += 1
         _set_wave_value(state["wave_values"], result_id, "fragment", fragment)
@@ -8463,9 +8522,12 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
     fragment_regs = _materialize_fragment_regs_aux(source)
     if fragment_regs is not None:
         info = _dot_operand_encoding_info(result, "ttg.convert_layout result")
+        mma = _dot_operand_mma_shape(
+            info, "ttg.convert_layout result", attrs=state["attrs"]
+        )
         fragment = builder.fragment_pack(
             fragment_regs,
-            _fragment_type_for_dot_operand(info, result.element_type, w),
+            _fragment_type_for_dot_operand(info, result.element_type, w, mma),
         )
         stats.fragment_packs += 1
         _set_wave_value(state["wave_values"], result_id, "fragment", fragment)
@@ -8479,7 +8541,9 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
     memdescs = state["memdescs"]
     memdesc = memdescs[address.memdesc_value_id]
     try:
-        capability = _physical_local_load_fragment_capability(result, memdesc)
+        capability = _physical_local_load_fragment_capability(
+            result, memdesc, state["attrs"]
+        )
     except ValueError as exc:
         source_plan = values[source_id]
         raise ValueError(
@@ -8522,6 +8586,50 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
 _fragment_store.configure_fragment_store_dependencies(globals())
 
 
+def _is_default_memory_attr(name, value):
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    if name == "isVolatile":
+        return value is False or text in {"false", "0"}
+    if name == "cache":
+        return text in {
+            "1",
+            "none",
+            "#tt.cache_modifier<none>",
+            "#triton.cache_modifier<none>",
+        }
+    if name == "evict":
+        return text in {
+            "1",
+            "normal",
+            "#tt.eviction_policy<normal>",
+            "#triton.eviction_policy<normal>",
+        }
+    return False
+
+
+def _reject_unsupported_global_memory_attrs(op, context):
+    supported_defaults = {"cache", "evict", "isVolatile"}
+    ignored_attrs = {"operandSegmentSizes"}
+    attrs = dict(op.get_attrs()) if hasattr(op, "get_attrs") else getattr(op, "attrs", {})
+    for name, value in attrs.items():
+        if name in ignored_attrs:
+            continue
+        if name not in supported_defaults:
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context} with unsupported "
+                f"memory attribute {name}={value}; Wave lowering does not "
+                "preserve this attribute yet"
+            )
+        if not _is_default_memory_attr(name, value):
+            raise ValueError(
+                f"tlx_wave bridge cannot lower {context} with non-default "
+                f"{name}={value}; Wave lowering does not preserve this "
+                "memory attribute yet"
+            )
+
+
 def _emit_global_load_op(builder, op, state, w):
     values = state["values"]
     wave_values = state["wave_values"]
@@ -8532,6 +8640,7 @@ def _emit_global_load_op(builder, op, state, w):
             "tlx_wave bridge cannot lower tt.load with more than pointer, "
             "mask, and `other` operands yet"
         )
+    _reject_unsupported_global_memory_attrs(op, "tt.load")
 
     result_id = op.results[0]
     result_plan = values[result_id]
@@ -8686,6 +8795,7 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
                 (lowered.value,),
                 (1, 1),
                 value_plan,
+                physical_plan,
                 memdesc,
                 memdescs,
                 lds_layout,
@@ -8731,6 +8841,7 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
             _fragment_tuple_values(lowered, "ttg.local_store value"),
             _fragment_tuple_tile_shape(lowered, "ttg.local_store value"),
             value_plan,
+            physical_plan,
             memdesc,
             memdescs,
             lds_layout,
@@ -8898,7 +9009,9 @@ def _emit_local_load_op(
         else _mem_root(state)
     )
 
-    fragment_capability = _physical_local_load_fragment_capability(value, memdesc)
+    fragment_capability = _physical_local_load_fragment_capability(
+        value, memdesc, state["attrs"]
+    )
     if fragment_capability is not None:
         fragment, token = _emit_dot_operand_fragment_tile_load(
             builder,
@@ -8995,6 +9108,7 @@ def _emit_store_op(builder, op, state, w):
     wave_values = state["wave_values"]
     if len(op.operands) < 2:
         raise ValueError("tlx_wave bridge expected tt.store with pointer and value")
+    _reject_unsupported_global_memory_attrs(op, "tt.store")
     ptr_id = op.operands[0]
     value_id = op.operands[1]
     mask_id = op.operands[2] if len(op.operands) > 2 else None
@@ -9031,6 +9145,7 @@ def _emit_store_op(builder, op, state, w):
                 (lowered.value,),
                 (1, 1),
                 value_plan,
+                physical_plan,
                 ptr_id,
                 mask_id,
                 _mem_root(state),
@@ -9070,6 +9185,7 @@ def _emit_store_op(builder, op, state, w):
             _fragment_tuple_values(lowered, "tt.store value"),
             _fragment_tuple_tile_shape(lowered, "tt.store value"),
             value_plan,
+            physical_plan,
             ptr_id,
             mask_id,
             _mem_root(state),

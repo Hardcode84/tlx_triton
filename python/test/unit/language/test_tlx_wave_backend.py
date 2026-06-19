@@ -403,6 +403,37 @@ def test_tlx_wave_lowers_i32_load_add_store(tmp_path):
     del ctx
 
 
+def test_tlx_wave_lowers_i32_load_or_xor_store(tmp_path):
+    local_func = """
+  tt.func public @i32_bitwise_store(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %in_ptr = tt.addptr %in_base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %lhs = tt.load %in_ptr : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %rhs = tt.load %in_ptr : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %or = arith.ori %lhs, %rhs : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %xor = arith.xori %or, %lhs : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_base = tt.splat %arg1 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %out_ptr = tt.addptr %out_base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %out_ptr, %xor : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, local_func)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert wave_artifact.count("wave.load") == 2
+    assert wave_artifact.count("wave.store") == 1
+    assert "wave.binary ori" in wave_artifact
+    assert "wave.binary xori" in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_lowers_simd_compare_masked_store(tmp_path):
     local_func = """
   tt.func public @simd_compare_store(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) attributes {noinline = false} {
@@ -575,6 +606,34 @@ def test_tlx_wave_rejects_deferred_formula_mixed_with_simd_data(tmp_path):
 
     with pytest.raises(ValueError, match="deferred address/index formula"):
         wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_lowers_blocked_zero_32x32_as_generic_tensor(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+"""
+    zero_func = """
+  tt.func public @blocked_zero_tensor_store(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %zero = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %offs = arith.constant dense<0> : tensor<32x32xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %offs : tensor<32x32x!tt.ptr<f32>, #blocked>, tensor<32x32xi32, #blocked>
+    tt.store %ptr, %zero : tensor<32x32x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, zero_func, preamble=preamble)
+
+    wave_artifact = wave_bridge.stop_before_wave_lowering(
+        mod, metadata, _wave_bridge_options()
+    )
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_num_fragment_fills"] == 0
+    assert "waveamd.fragment_fill" not in wave_artifact
+    assert "wave.store" in wave_artifact
     del ctx
 
 
@@ -2161,6 +2220,47 @@ def test_tlx_wave_buffer_load_to_local_rejects_cache_modifier(tmp_path):
     del ctx
 
 
+def test_tlx_wave_global_load_rejects_cache_modifier(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+"""
+    load_func = """
+  tt.func public @global_load_cache_modifier(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %loaded = tt.load %ptr cacheModifier = cv : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, load_func, preamble=preamble)
+
+    with pytest.raises(ValueError, match=r"tt\.load.*non-default cache"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
+def test_tlx_wave_global_store_rejects_cache_modifier(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+"""
+    store_func = """
+  tt.func public @global_store_cache_modifier(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    tt.store %ptr, %value cacheModifier = cg : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, store_func, preamble=preamble)
+
+    with pytest.raises(ValueError, match=r"tt\.store.*non-default cache"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options())
+    del ctx
+
+
 def test_tlx_wave_async_copy_padded_chunk_crossing_pad_falls_back(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -3357,7 +3457,8 @@ def test_tlx_wave_bridge_keeps_pow2_assumed_product_symbolic(tmp_path):
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
     assert "wave.binary muli" not in wave
-    assert "wave.binary divsi" in wave
+    assert "wave.binary divui" in wave
+    assert "wave.binary divsi" not in wave
     assert "x &" in wave
     assert "-2147483647 + x <= 0" in wave
     assert "llvm.intr.assume" not in wave
@@ -3471,10 +3572,12 @@ def test_tlx_wave_bridge_preserves_i32_assume_for_dynamic_index_divisor(tmp_path
     llvm.intr.assume %positive : i1
     %pid = tt.get_program_id x : i32
     %q = arith.divsi %pid, %divisor : i32
+    %r = arith.remsi %pid, %divisor : i32
+    %sum = arith.addi %q, %r : i32
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
-    %value = tt.splat %q : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %sum : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     tt.return
   }
@@ -3485,7 +3588,10 @@ def test_tlx_wave_bridge_preserves_i32_assume_for_dynamic_index_divisor(tmp_path
     wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert "wave.binary divsi" in wave
+    assert "wave.binary divui" in wave
+    assert "wave.binary remui" in wave
+    assert "wave.binary divsi" not in wave
+    assert "wave.binary remsi" not in wave
     assert re.search(
         r'wave\.assume %\d+ as "x" '
         r'\[#wave\.pred<"-1 \+ x >= 0">, '
@@ -3524,7 +3630,8 @@ def test_tlx_wave_bridge_preserves_positive_pow2_div_product(tmp_path):
     wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
 
     assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
-    assert "wave.binary divsi" in wave
+    assert "wave.binary divui" in wave
+    assert "wave.binary divsi" not in wave
     assert re.search(
         r'wave\.assume %\d+ as "x" '
         r'\[#wave\.pred<"-1 \+ x >= 0">, '
@@ -3645,7 +3752,34 @@ def test_tlx_wave_bridge_lowers_scalar_index_arithmetic(tmp_path):
     del ctx
 
 
-def test_tlx_wave_bridge_emits_nsw_for_scalar_index_product(tmp_path):
+def test_tlx_wave_bridge_lowers_scalar_index_bitwise_arithmetic(tmp_path):
+    arith_func = """
+  tt.func public @scalar_index_bitwise(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %pid = tt.get_program_id x : i32
+    %or = arith.ori %pid, %arg1 : i32
+    %xor = arith.xori %or, %pid : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %xor : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary ori" in wave
+    assert "wave.binary xori" in wave
+    assert "arith.ori" not in wave
+    assert "arith.xori" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_does_not_invent_nsw_for_scalar_index_product(tmp_path):
     arith_func = """
   tt.func public @scalar_index_product(%arg0: !tt.ptr<i32>) attributes {noinline = false} {
     %c1 = arith.constant 1 : i32
@@ -3655,6 +3789,38 @@ def test_tlx_wave_bridge_emits_nsw_for_scalar_index_product(tmp_path):
     %q0 = arith.divsi %pid0, %c32 : i32
     %q1 = arith.divsi %pid1, %c32 : i32
     %product = arith.muli %q0, %q1 : i32
+    %value_scalar = arith.divsi %product, %c32 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %offset_base = tt.splat %value_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %offsets = arith.addi %offset_base, %range : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %offsets : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %data_scalar = arith.addi %c1, %c1 : i32
+    %data = tt.splat %data_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %data : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "overflow<nsw> : index, index -> index" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_preserves_explicit_nsw_for_scalar_index_product(tmp_path):
+    arith_func = """
+  tt.func public @scalar_index_product(%arg0: !tt.ptr<i32>) attributes {noinline = false} {
+    %c1 = arith.constant 1 : i32
+    %c32 = arith.constant 32 : i32
+    %pid0 = tt.get_program_id x : i32
+    %pid1 = tt.get_program_id y : i32
+    %q0 = arith.divsi %pid0, %c32 : i32
+    %q1 = arith.divsi %pid1, %c32 : i32
+    %product = arith.muli %q0, %q1 overflow<nsw> : i32
     %value_scalar = arith.divsi %product, %c32 : i32
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
     %offset_base = tt.splat %value_scalar : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
@@ -5436,6 +5602,101 @@ def test_tlx_wave_bridge_lowers_gfx942_mfma_local_load(
     assert metadata["tlx_wave_num_mmas"] == 2
     assert wave_artifact.count(f'waveamd.mma "{mma_kind}"') == 2
     assert f"waveamdmachine.{machine_op}" in machine
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_gfx942_mfma_result_store(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @dot_store_mfma_gfx942(%out: !tt.ptr<f32>) attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<32x32xf32, #mma>
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #mma>
+    %out_base = tt.splat %out : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #mma>
+    %out_ptr = tt.addptr %out_base, %zero : tensor<32x32x!tt.ptr<f32>, #mma>, tensor<32x32xi32, #mma>
+    tt.store %out_ptr, %dot : tensor<32x32x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        dot_func,
+        target="hip:gfx942",
+        preamble=preamble,
+    )
+
+    with pytest.raises(ValueError, match="MFMA fragment store mapping.*gfx950"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options(arch="gfx942"))
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_gfx942_converted_mfma_result_store(tmp_path):
+    preamble = """
+#store = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    dot_func = """
+  tt.func public @dot_converted_store_mfma_gfx942(%out: !tt.ptr<f32>) attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>> * tensor<32x32xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>> -> tensor<32x32xf32, #mma>
+    %converted = ttg.convert_layout %dot : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #store>
+    %zero = arith.constant dense<0> : tensor<32x32xi32, #store>
+    %out_base = tt.splat %out : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #store>
+    %out_ptr = tt.addptr %out_base, %zero : tensor<32x32x!tt.ptr<f32>, #store>, tensor<32x32xi32, #store>
+    tt.store %out_ptr, %converted : tensor<32x32x!tt.ptr<f32>, #store>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        dot_func,
+        target="hip:gfx942",
+        preamble=preamble,
+    )
+
+    with pytest.raises(ValueError, match="MFMA fragment store mapping.*gfx950"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options(arch="gfx942"))
+    del ctx
+
+
+def test_tlx_wave_bridge_rejects_gfx942_target_with_gfx950_local_load_parent(
+    tmp_path,
+):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 4, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @local_load_wrong_mfma_target() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        target="hip:gfx942",
+        preamble=preamble,
+    )
+
+    with pytest.raises(ValueError, match="cannot lower gfx950 .*TTGIR target hip:gfx942"):
+        wave_bridge.stop_before_wave_lowering(mod, {}, _wave_bridge_options(arch="gfx942"))
     del ctx
 
 

@@ -221,10 +221,12 @@ _ORDERED_BODY_VALUE_OPS = {
     "arith.minsi",
     "arith.minui",
     "arith.muli",
+    "arith.ori",
     "arith.remsi",
     "arith.remui",
     "arith.subi",
     "arith.truncf",
+    "arith.xori",
     "tt.addptr",
     "tt.broadcast",
     "tt.expand_dims",
@@ -1277,7 +1279,9 @@ def _value_plan_from_result(op, result_index, result, operand_plans, arg_info):
         "arith.andi",
         "arith.cmpi",
         "arith.muli",
+        "arith.ori",
         "arith.subi",
+        "arith.xori",
     }:
         varying_dims = _merge_varying_dims(*operand_plans)
         kind = op_name.split(".")[-1]
