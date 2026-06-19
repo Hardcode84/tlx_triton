@@ -4187,6 +4187,126 @@ def test_tlx_wave_bridge_blocked_layout_repeated_components_cover_extent():
     ) == (24, 0)
 
 
+def test_tlx_wave_local_load_fragment_indices_carry_nonnegative_assumes():
+    class FakeExpr:
+        def __init__(self, text):
+            self.text = str(text)
+
+        def __str__(self):
+            return self.text
+
+        def __repr__(self):
+            return self.text
+
+        def __add__(self, other):
+            return FakeExpr(f"({self}+{other})")
+
+        def __radd__(self, other):
+            return FakeExpr(f"({other}+{self})")
+
+        def __mul__(self, other):
+            return FakeExpr(f"({self}*{other})")
+
+        def __rmul__(self, other):
+            return FakeExpr(f"({other}*{self})")
+
+        def __truediv__(self, other):
+            return FakeExpr(f"({self}/{other})")
+
+        def __ge__(self, other):
+            return FakeExpr(f"({self}>={other})")
+
+    class FakeSimdType:
+        def __init__(self, width, element_type="index"):
+            self.width = width
+            self.element_type = element_type
+
+    class FakeValue:
+        def __init__(self, name, typ=None):
+            self.name = name
+            self.type = typ
+
+    class FakeW:
+        class SimdType:
+            @staticmethod
+            def isinstance(typ):
+                return isinstance(typ, FakeSimdType)
+
+            def __init__(self, typ):
+                self.width = typ.width
+                self.element_type = typ.element_type
+
+        class sym_ctx:
+            @staticmethod
+            def int_(value):
+                return FakeExpr(value)
+
+        @staticmethod
+        def sym(name):
+            return FakeExpr(name)
+
+        @staticmethod
+        def mod(lhs, rhs):
+            return FakeExpr(f"mod({lhs},{rhs})")
+
+        @staticmethod
+        def floor(value):
+            return FakeExpr(f"floor({value})")
+
+    class FakeBuilder:
+        def __init__(self):
+            self.index_exprs = []
+            self.assumes = []
+
+        def lane_id(self, width=64):
+            return FakeValue("lane", FakeSimdType(width, "index"))
+
+        def index_expr(self, expr, bindings=None, result_type=None):
+            value = FakeValue(
+                f"idx{len(self.index_exprs)}",
+                result_type or FakeSimdType(64, "index"),
+            )
+            self.index_exprs.append((expr, bindings or {}, value))
+            return value
+
+        def assume(self, value, assumptions, name="x"):
+            result = FakeValue(f"assume{len(self.assumes)}", value.type)
+            self.assumes.append((value, tuple(assumptions), name, result))
+            return result
+
+    builder = FakeBuilder()
+    value = SimpleNamespace(value_id=7)
+    memdesc = SimpleNamespace(element_byte_width=2)
+
+    bindings = wave_bridge_emit._fragment_lane_dim_bindings(
+        builder,
+        value,
+        memdesc,
+        FakeW(),
+        tile_offsets=(0, 8),
+        source_shape=(32, 32),
+        registers=4,
+    )
+    dense = wave_bridge_emit._fragment_dense_i32_offset(
+        builder,
+        value,
+        FakeW(),
+        tile_base_dwords=16,
+        registers=4,
+    )
+
+    assert len(builder.index_exprs) == 3
+    assert len(builder.assumes) == 3
+    assert {str(symbol) for symbol in bindings} == {"tlx_dim0", "tlx_dim1"}
+    assert all(
+        str(assumption) == "(x>=0)"
+        for _, assumptions, _, _ in builder.assumes
+        for assumption in assumptions
+    )
+    assert set(bindings.values()).issubset({assume[3] for assume in builder.assumes})
+    assert dense is builder.assumes[-1][3]
+
+
 def test_tlx_wave_mfma_tile_store_coords_include_warp_offsets():
     class FakeExpr:
         def __init__(self, text):

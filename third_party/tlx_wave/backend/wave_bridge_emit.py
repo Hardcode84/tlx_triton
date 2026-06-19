@@ -7366,6 +7366,10 @@ def _emit_memdesc_i32_ptr(builder, value, memdesc, memdescs, lds_layout, state, 
         _unsupported_fragment_local_load(value, str(exc), memdesc)
 
 
+def _local_load_nonnegative_index_expr(builder, expr, bindings, w):
+    return _assume_nonnegative(builder, builder.index_expr(expr, bindings), w)
+
+
 def _fragment_lane_dim_bindings(
     builder,
     value,
@@ -7390,8 +7394,11 @@ def _fragment_lane_dim_bindings(
         element_linear = lane_sym * int(elements_per_lane)
         coords = _delinearize_expr(w, element_linear, source_shape, row_major_order)
     return {
-        _dim_symbol(w, dim): builder.index_expr(
-            coords[dim] + int(tile_offsets[dim]), {lane_sym: lane}
+        _dim_symbol(w, dim): _local_load_nonnegative_index_expr(
+            builder,
+            coords[dim] + int(tile_offsets[dim]),
+            {lane_sym: lane},
+            w,
         )
         for dim in range(len(source_shape))
     }
@@ -7448,9 +7455,11 @@ def _fragment_dense_i32_offset(
 ):
     lane = builder.lane_id(width=wave_size)
     lane_sym = w.sym(f"tlx_local_load_{value.value_id}_lane_dense")
-    return builder.index_expr(
+    return _local_load_nonnegative_index_expr(
+        builder,
         w.sym_ctx.int_(int(tile_base_dwords)) + lane_sym * int(registers),
         {lane_sym: lane},
+        w,
     )
 
 
