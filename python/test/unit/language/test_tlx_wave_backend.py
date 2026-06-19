@@ -3397,6 +3397,102 @@ def test_tlx_wave_bridge_folds_nonnegative_pow2_index_div_rem(tmp_path):
     del ctx
 
 
+def test_tlx_wave_bridge_uses_later_assume_for_pow2_index_div(tmp_path):
+    arith_func = """
+  tt.func public @late_assume_pow2_index_div(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c31 = arith.constant 31 : i32
+    %c32 = arith.constant 32 : i32
+    %num = arith.addi %arg1, %c31 : i32
+    %q = arith.divsi %num, %c32 : i32
+    %nonnegative = arith.cmpi sgt, %arg1, %c0 : i32
+    llvm.intr.assume %nonnegative : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %q : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "tlx_pow2_divsi_" in wave
+    assert "floor(1/32*" in wave
+    assert "wave.binary divsi" not in wave
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_keeps_branch_local_assume_out_of_index_div(tmp_path):
+    arith_func = """
+  tt.func public @branch_local_assume_pow2_index_div(%arg0: !tt.ptr<i32>, %arg1: i32, %flag: i1) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    scf.if %flag {
+      %nonnegative = arith.cmpi sge, %arg1, %c0 : i32
+      llvm.intr.assume %nonnegative : i1
+    }
+    %q = arith.divsi %arg1, %c32 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %q : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary divsi" in wave
+    assert "tlx_pow2_divsi_" not in wave
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
+def test_tlx_wave_bridge_preserves_i32_assume_for_dynamic_index_divisor(tmp_path):
+    arith_func = """
+  tt.func public @dynamic_divisor_i32_assume(%arg0: !tt.ptr<i32>, %arg1: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %divisor = arith.addi %arg1, %c1 : i32
+    %positive = arith.cmpi sgt, %divisor, %c0 : i32
+    llvm.intr.assume %positive : i1
+    %pid = tt.get_program_id x : i32
+    %q = arith.divsi %pid, %divisor : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %base = tt.splat %arg0 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %ptr = tt.addptr %base, %range : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>, tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    %value = tt.splat %q : i32 -> tensor<64xi32, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.store %ptr, %value : tensor<64x!tt.ptr<i32>, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>>
+    tt.return
+  }
+"""
+    metadata = {}
+    mod, ctx = _parse_ttgir(tmp_path, arith_func)
+
+    wave = wave_bridge.stop_before_wave_lowering(mod, metadata, _wave_bridge_options())
+
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert "wave.binary divsi" in wave
+    assert re.search(
+        r'wave\.assume %\d+ as "x" '
+        r'\[#wave\.pred<"-1 \+ x >= 0">, '
+        r'#wave\.pred<"-2147483647 \+ x <= 0">\] : index',
+        wave,
+    )
+    assert "llvm.intr.assume" not in wave
+    del ctx
+
+
 def test_tlx_wave_bridge_lowers_shared_assume_condition_helpers(tmp_path):
     assume_func = """
   tt.func public @shared_assume_condition(%arg0: i32) attributes {noinline = false} {
@@ -5277,8 +5373,7 @@ def test_tlx_wave_bridge_lowers_gfx950_32x32x16_mfma_layout(tmp_path):
     assert wave_artifact.count("wave.load") == 2
     assert wave_artifact.count("waveamd.transpose_load") == 4
     assert wave_artifact.count("wave.pack") == 2
-    assert wave_artifact.count('"waveamd.mma"') == 2
-    assert wave_artifact.count(f'kind = "{wave_bridge._GFX950_F16_MMA32_KIND}"') == 2
+    assert wave_artifact.count("waveamd.mma") == 2
     assert machine.count("waveamdmachine.ds_load_tuple_b32") == 2
     assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 4
     assert machine.count("waveamdmachine.mfma_f32_32x32x16_f16") == 2

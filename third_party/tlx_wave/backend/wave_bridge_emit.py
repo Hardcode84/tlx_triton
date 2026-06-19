@@ -315,6 +315,8 @@ class _PointerAdd:
 
 
 def _is_deferred_index(source):
+    if isinstance(source, _AssumedIndexBinding):
+        return _is_deferred_index(source.value)
     if isinstance(source, _DimBinding):
         return True
     if isinstance(source, _IndexExpr):
@@ -796,6 +798,28 @@ def _pow2_assumed_value_ids(plan):
     )
 
 
+def _planned_assume_facts(plan):
+    values = _values_by_id(plan)
+    op_by_result = _op_by_result_id(plan)
+    pow2_assumed_values = _pow2_assumed_value_ids(plan)
+    facts = []
+    for raw_op in plan.body_ops:
+        if raw_op.get_name() != "llvm.intr.assume":
+            continue
+        op = _raw_op_plan(raw_op)
+        if op.name != "llvm.intr.assume":
+            continue
+        for operand_id in op.operands:
+            for fact in _plan_assume_facts_for_value(values, op_by_result, operand_id):
+                if (
+                    fact.kind == "power_of_two_or_zero"
+                    and fact.value_id not in pow2_assumed_values
+                ):
+                    continue
+                facts.append(fact)
+    return tuple(facts)
+
+
 def _assume_tree_info(plan):
     op_by_result = _op_by_result_id(plan)
     users_by_value = _users_by_value_id(plan)
@@ -1034,8 +1058,9 @@ def _dim_binding_value(dim_bindings, binding, w):
 
 def _materialize_index_value(builder, source, dim_bindings, w, force_width=None):
     if isinstance(source, _AssumedIndexBinding):
+        value = _materialize_index_value(builder, source.value, dim_bindings, w)
         value = _assume_signed_integer_width(
-            builder, source.value, source.bits, w, lower=source.lower
+            builder, value, source.bits, w, lower=source.lower
         )
         return _maybe_splat(builder, value, force_width, w)
     if isinstance(source, _IndexExpr):
@@ -3670,7 +3695,11 @@ def _emit_masked_load(builder, ptr, result_type, mask, fallback, after_token, w)
 
 def _shift_index_dims(source, axis):
     if isinstance(source, _AssumedIndexBinding):
-        return source
+        return _AssumedIndexBinding(
+            _shift_index_dims(source.value, axis),
+            source.bits,
+            source.lower,
+        )
     if isinstance(source, _DimBinding):
         dim = source.dim + 1 if source.dim >= axis else source.dim
         return _DimBinding(dim)
@@ -3886,6 +3915,8 @@ def _arith_mixed_error(op_name, lhs, rhs):
 
 
 def _constant_index_source_value(source):
+    if isinstance(source, _AssumedIndexBinding):
+        return _constant_index_source_value(source.value)
     if isinstance(source, int) and not isinstance(source, bool):
         return int(source)
     if (
@@ -3912,7 +3943,9 @@ def _constant_index_source_value(source):
 def _assume_facts_prove_nonnegative(state, value_id):
     if state is None:
         return False
-    for fact in state.get("assume_facts", ()):
+    for fact in tuple(state.get("assume_facts", ())) + tuple(
+        state.get("planned_assume_facts", ())
+    ):
         if (
             fact.value_id == value_id
             and fact.kind == "range"
@@ -3923,6 +3956,23 @@ def _assume_facts_prove_nonnegative(state, value_id):
     return False
 
 
+def _assume_facts_lower_bound(state, value_id):
+    if state is None:
+        return None
+    lower = None
+    for fact in tuple(state.get("assume_facts", ())) + tuple(
+        state.get("planned_assume_facts", ())
+    ):
+        if (
+            fact.value_id == value_id
+            and fact.kind == "range"
+            and fact.lower is not None
+        ):
+            fact_lower = int(fact.lower)
+            lower = fact_lower if lower is None else max(lower, fact_lower)
+    return lower
+
+
 def _index_source_proves_nonnegative(state, value_id, source, w):
     const_value = _constant_index_source_value(source)
     if const_value is not None:
@@ -3931,7 +3981,9 @@ def _index_source_proves_nonnegative(state, value_id, source, w):
         return True
     unknowns = {}
     assumptions = (
-        _ixsimpl_assume_fact_exprs(state, unknowns, w) if state is not None else ()
+        _ixsimpl_assume_fact_exprs(state, unknowns, w, include_planned=True)
+        if state is not None
+        else ()
     )
     return _ixsimpl_index_source_proves_lower_bound(
         source,
@@ -3940,6 +3992,33 @@ def _index_source_proves_nonnegative(state, value_id, source, w):
         w,
         unknowns,
     )
+
+
+def _assumed_index_source_for_result(result, source, state, w):
+    integer_bits = _scalar_signed_integer_bit_width(result)
+    if integer_bits is None:
+        return source
+    lower = _assume_facts_lower_bound(state, result.value_id)
+    if lower is None and _index_source_proves_nonnegative(
+        state, result.value_id, source, w
+    ):
+        lower = 0
+    return _AssumedIndexBinding(source, integer_bits, lower=lower)
+
+
+def _assume_index_value_for_result(builder, value, result, w, lower=None):
+    integer_bits = _scalar_signed_integer_bit_width(result)
+    if integer_bits is not None:
+        return _assume_signed_integer_width(
+            builder,
+            value,
+            integer_bits,
+            w,
+            lower=lower,
+        )
+    if lower is not None and int(lower) >= 0:
+        return _assume_nonnegative(builder, value, w)
+    return value
 
 
 def _pow2_index_div_rem_expr(op_name, lhs, rhs, lhs_value_id, w, state):
@@ -4206,17 +4285,19 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
         expr = lhs_symbol - rhs_symbol
     if expr is not None:
         if getattr(w, "BinaryKind", None) is None:
+            source = _IndexExpr(
+                expr,
+                {
+                    lhs_symbol: _materialize_index_value(builder, lhs, {}, w),
+                    rhs_symbol: _materialize_index_value(builder, rhs, {}, w),
+                },
+            )
+            source = _assumed_index_source_for_result(result, source, state, w)
             _set_wave_value(
                 wave_values,
                 result.value_id,
                 "index_expr",
-                builder.index_expr(
-                    expr,
-                    {
-                        lhs_symbol: _materialize_index_value(builder, lhs, {}, w),
-                        rhs_symbol: _materialize_index_value(builder, rhs, {}, w),
-                    },
-                ),
+                _materialize_index_value(builder, source, {}, w),
             )
             return
 
@@ -4232,16 +4313,13 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
             binary_kind = _wave_binary_kind_for_op(op.name, w)
             if binary_kind is not None:
                 materialized = _IndexBinary(binary_kind, lhs, rhs, nsw=nsw, nuw=nuw)
-        _set_wave_value(
-            wave_values,
-            result.value_id,
-            "index_expr",
-            _IndexExpr(
-                expr,
-                {lhs_symbol: lhs, rhs_symbol: rhs},
-                materialized=materialized,
-            ),
+        source = _IndexExpr(
+            expr,
+            {lhs_symbol: lhs, rhs_symbol: rhs},
+            materialized=materialized,
         )
+        source = _assumed_index_source_for_result(result, source, state, w)
+        _set_wave_value(wave_values, result.value_id, "index_expr", source)
         return
 
     pow2_expr = _pow2_index_div_rem_expr(
@@ -4258,7 +4336,7 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
             wave_values,
             result.value_id,
             "index_expr",
-            folded,
+            _assumed_index_source_for_result(result, folded, state, w),
         )
         if state is not None:
             upper = divisor - 1 if op.name in {"arith.remsi", "arith.remui"} else None
@@ -4269,11 +4347,13 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
 
     binary_kind = _wave_binary_kind_for_op(op.name, w)
     if binary_kind is not None:
+        source = _IndexBinary(binary_kind, lhs, rhs)
+        source = _assumed_index_source_for_result(result, source, state, w)
         _set_wave_value(
             wave_values,
             result.value_id,
             "index_expr",
-            _IndexBinary(binary_kind, lhs, rhs),
+            source,
         )
         return
 
@@ -4284,7 +4364,12 @@ def _emit_index_binary_op(builder, op, values, wave_values, w, state=None):
         wave_values,
         result.value_id,
         "index_expr",
-        _IndexSelectCompare(minmax_predicate, lhs, rhs, lhs, rhs),
+        _assumed_index_source_for_result(
+            result,
+            _IndexSelectCompare(minmax_predicate, lhs, rhs, lhs, rhs),
+            state,
+            w,
+        ),
     )
 
 
@@ -6124,7 +6209,7 @@ def _ixsimpl_unknown_expr(source, unknowns, w):
 
 def _index_source_depends_on_dim(source, dim):
     if isinstance(source, _AssumedIndexBinding):
-        return False
+        return _index_source_depends_on_dim(source.value, dim)
     if isinstance(source, _DimBinding):
         return source.dim == dim
     if isinstance(source, _IndexExpr):
@@ -6404,9 +6489,12 @@ def _dma_packet_dim_assumptions(shape, inner_dim, packet_elements, w):
     return tuple(assumptions)
 
 
-def _ixsimpl_assume_fact_exprs(state, unknowns, w):
+def _ixsimpl_assume_fact_exprs(state, unknowns, w, *, include_planned=False):
     assumptions = []
-    for fact in state.get("assume_facts", ()):
+    facts = tuple(state.get("assume_facts", ()))
+    if include_planned:
+        facts = facts + tuple(state.get("planned_assume_facts", ()))
+    for fact in facts:
         lowered = state["wave_values"].get(fact.value_id)
         if not isinstance(lowered, _WaveValue) or lowered.kind != "index_expr":
             continue
@@ -7407,6 +7495,7 @@ def _committed_groups(state):
 def _initial_lowering_state(builder, kernel, attrs, plan, w):
     values = _values_by_id(plan)
     _, assume_only_values = _assume_tree_info(plan)
+    planned_assume_facts = _planned_assume_facts(plan)
     state = {
         "values": values,
         "attrs": attrs,
@@ -7417,6 +7506,7 @@ def _initial_lowering_state(builder, kernel, attrs, plan, w):
         "program_id_bindings": {},
         "mem_state": _MemState(),
         "assume_facts": [],
+        "planned_assume_facts": tuple(planned_assume_facts),
         "pow2_assumed_values": _pow2_assumed_value_ids(plan),
     }
     _init_argument_wave_values(builder, kernel, values, state, w)
@@ -7930,12 +8020,19 @@ def _emit_scf_if_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
         for result_id, result_info, result in zip(
             op.results, result_infos, if_builder_ref.op.results
         ):
+            result_plan = state["values"][result_id]
             if result_info["kind"] == "index_expr" and result_info.get(
                 "nonnegative"
             ):
-                result = _assume_nonnegative(builder, result, w)
+                result = _assume_index_value_for_result(
+                    builder, result, result_plan, w, lower=0
+                )
+                upper = None
+                integer_bits = _scalar_signed_integer_bit_width(result_plan)
+                if integer_bits is not None:
+                    _, upper = _signed_integer_bounds(integer_bits)
                 state["assume_facts"].append(
-                    _AssumeFact(result_id, "range", lower=0)
+                    _AssumeFact(result_id, "range", lower=0, upper=upper)
                 )
             _control_result_from_mlir_values(
                 state["wave_values"], result_id, result_info, (result,)
