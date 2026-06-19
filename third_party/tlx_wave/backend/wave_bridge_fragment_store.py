@@ -918,6 +918,9 @@ def _fragment_store_tile_dim_bindings(
     w,
 ):
     frag = w.FragmentType(fragment.type)
+    def nonnegative_index_expr(expr, bindings):
+        return _assume_nonnegative(builder, builder.index_expr(expr, bindings), w)
+
     if frag.registers == _GFX950_MMA32_INFO.acc_registers:
         if component < 0 or component >= frag.registers:
             raise ValueError(
@@ -932,8 +935,9 @@ def _fragment_store_tile_dim_bindings(
         dim_bindings = {}
         active = None
         for dim in range(2):
-            coord = builder.index_expr(
-                int(tile_offsets[dim]) + coords[dim], {thread_sym: thread}
+            coord = nonnegative_index_expr(
+                int(tile_offsets[dim]) + coords[dim],
+                {thread_sym: thread},
             )
             dim_bindings[_dim_symbol(w, dim)] = coord
             extent = builder.splat(
@@ -999,7 +1003,7 @@ def _fragment_store_tile_dim_bindings(
             + layout.size_per_thread[dim]
             * (lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim])
         )
-        coord = builder.index_expr(expr, {thread_sym: thread})
+        coord = nonnegative_index_expr(expr, {thread_sym: thread})
         dim_bindings[_dim_symbol(w, dim)] = coord
         extent = builder.splat(
             builder.constant(w.index_type(), value_plan.shape[dim]),
@@ -1328,5 +1332,4 @@ def _physical_plan_is_mfma(physical_plan, context):
         return _amd_mfma_encoding_info(physical_plan.encoding, context) is not None
     except ValueError as exc:
         raise ValueError(f"tlx_wave bridge cannot lower {context}: {exc}") from exc
-
 

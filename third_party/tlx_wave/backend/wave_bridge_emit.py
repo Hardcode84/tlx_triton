@@ -5644,6 +5644,10 @@ def _mfma32_accumulator_dim_exprs(thread_sym, component, w):
     return row, col
 
 
+def _store_nonnegative_index_expr(builder, expr, bindings, w):
+    return _assume_nonnegative(builder, builder.index_expr(expr, bindings), w)
+
+
 def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
     raw_value = _raw_wave_value(wave_value)
     if not value_plan.shape:
@@ -5683,9 +5687,11 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
         coords = _mfma32_accumulator_dim_exprs(thread_sym, component, w)
         return (
             {
-                _dim_symbol(w, dim): builder.index_expr(
+                _dim_symbol(w, dim): _store_nonnegative_index_expr(
+                    builder,
                     w.mod(coords[dim], value_plan.shape[dim]),
                     {thread_sym: thread},
+                    w,
                 )
                 for dim in range(rank)
             },
@@ -5743,9 +5749,11 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
         expr = register_coords[dim] + layout.size_per_thread[dim] * (
             lane_coords[dim] + layout.threads_per_warp[dim] * warp_coords[dim]
         )
-        dim_bindings[_dim_symbol(w, dim)] = builder.index_expr(
+        dim_bindings[_dim_symbol(w, dim)] = _store_nonnegative_index_expr(
+            builder,
             w.mod(expr, extent),
             {thread_sym: thread},
+            w,
         )
     return dim_bindings, frag.wave_size
 

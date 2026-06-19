@@ -315,6 +315,13 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_cvt_f16_f32" in machine
     assert machine.count("waveamdmachine.buffer_store_b32") == 128
     assert "waveamdmachine.global_store_b16_addr64" not in machine
+    assert "waveamdmachine.s_addc_u32" not in machine
+    assert "waveamdmachine.v_addc" not in machine
+    assert "waveamdmachine.s_lshl_b64" not in machine
+    assert "waveamdmachine.v_lshlrev_b64" not in machine
+    assert "waveamdmachine.v_lshrrev_b64" not in machine
+    assert machine.count("waveamdmachine.s_lshr_b64") <= 16
+    assert machine.count("waveamdmachine.s_add_u64") <= 64
     assert len(machine.splitlines()) < 22_000
 
 
