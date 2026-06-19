@@ -2047,6 +2047,8 @@ def test_tlx_wave_buffer_load_to_local_mask_other_uses_fallback(tmp_path):
     assert "waveamd.dma_load_lds" not in wave_artifact
     assert "wave.load" in wave_artifact
     assert "wave.store" in wave_artifact
+    assert "wave.constant false -> !wave.mask<64>" in wave_artifact
+    assert not re.search(r"wave\.cmpi ne (%\d+), \1\b", wave_artifact)
     assert "amdg.buffer_load_to_local" not in wave_artifact
     del ctx
 
@@ -3848,9 +3850,27 @@ def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
         def sym(name):
             return FakeExpr(name)
 
+        @staticmethod
+        def i1():
+            return "i1"
+
+        @staticmethod
+        def mask_type(width):
+            return FakeMaskType(width)
+
+        class IntegerAttr:
+            @staticmethod
+            def get(typ, value):
+                return (typ, value)
+
         class MaskType:
             def __init__(self, typ):
                 self.width = typ.width
+
+        class wave:
+            class ConstantOp:
+                def __init__(self, result_type, attr):
+                    self.result = FakeValue(f"mask_const_{attr[1]}", result_type)
 
     class FakeBuilder:
         def __init__(self):
@@ -3934,9 +3954,8 @@ def test_tlx_wave_bridge_emits_staged_index_pointer_mask_values():
 
     assert len(builder.index_exprs) == 2
     assert builder.index_exprs[0][2] in builder.index_exprs[1][1].values()
-    assert len(builder.cmpis) == 2
+    assert len(builder.cmpis) == 1
     assert builder.cmpis[0][0] == "ult"
-    assert builder.cmpis[1][0] == "ne"
     assert len(builder.ptr_adds) == 1
     assert builder.ptr_adds[0][1] is builder.index_exprs[1][2]
     assert len(builder.selects) == 1

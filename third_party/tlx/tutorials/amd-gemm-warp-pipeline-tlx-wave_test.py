@@ -233,6 +233,8 @@ def _run_wave_promote_buffer_to_machine(wave_artifact):
             "--cse",
             "--wave-promote-global-to-buffer",
             "--waveamd-to-machine",
+            "--canonicalize",
+            "--cse",
         ],
         input=wave_artifact,
         text=True,
@@ -292,9 +294,9 @@ def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
     assert '#wave.pred<"x >= 0">, #wave.pred<"-2147483647 + x <= 0">' in wave
     assert "floor(1/8*tlx_pow2_divsi" in wave
     assert "Mod(tlx_pow2_remsi" in wave
-    assert len(machine.splitlines()) < 32_000
-    assert machine.count("waveamdmachine.tuple_to_elements") < 8_000
-    assert machine.count("waveamdmachine.s_cselect_b32") < 1_200
+    assert len(machine.splitlines()) < 14_000
+    assert machine.count("waveamdmachine.tuple_to_elements") < 4_000
+    assert machine.count("waveamdmachine.s_cselect_b32") < 128
     assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 4
     assert "waveamdmachine.global_store_b32_addr64" not in machine
     assert "waveamdmachine.global_store_b128_addr64" not in machine
@@ -322,7 +324,10 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_lshrrev_b64" not in machine
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
-    assert len(machine.splitlines()) < 22_000
+    assert len(machine.splitlines()) < 5_000
+    assert machine.count("waveamdmachine.tuple_to_elements") < 256
+    assert machine.count("waveamdmachine.tuple_from_elements") < 512
+    assert machine.count("waveamdmachine.v_mov_b32_tuple") < 256
 
 
 def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(

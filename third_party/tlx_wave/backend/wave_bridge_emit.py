@@ -1259,14 +1259,22 @@ def _index_select_compare_value(
     return builder.select(condition, true_value, false_value)
 
 
-def _false_mask(builder, w, width):
+def _mask_const(builder, w, width, value):
+    if all(hasattr(w, name) for name in ("IntegerAttr", "i1", "mask_type", "wave")):
+        return w.wave.ConstantOp(
+            w.mask_type(width),
+            _binding_bool_attr(w, value),
+        ).result
     lane = builder.lane_id(width=width)
-    return _wave_cmpi(builder, "ne", lane, lane, w)
+    return _wave_cmpi(builder, "eq" if value else "ne", lane, lane, w)
+
+
+def _false_mask(builder, w, width):
+    return _mask_const(builder, w, width, False)
 
 
 def _true_mask(builder, w, width):
-    lane = builder.lane_id(width=width)
-    return _wave_cmpi(builder, "eq", lane, lane, w)
+    return _mask_const(builder, w, width, True)
 
 
 def _materialize_mask_value(builder, source, dim_bindings, w, width):
