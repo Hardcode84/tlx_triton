@@ -4597,6 +4597,27 @@ def _emit_float_cast_op(builder, op, values, wave_values, w):
         wave_values[result_id] = _result_wave_value_from_components(components)
         return
 
+    if source.kind in {"fragment", "fragment_tuple"}:
+        if source_plan.element_type == "f32" and result_plan.element_type == "f16":
+            _set_wave_value(
+                wave_values,
+                result_id,
+                source.kind,
+                source.value,
+                physical_value_id=(
+                    source.physical_value_id
+                    if source.physical_value_id is not None
+                    else source_id
+                ),
+                aux=source.aux,
+            )
+            return
+        raise ValueError(
+            f"tlx_wave bridge cannot lower {op.name}: unsupported fragment "
+            f"floating-point cast {source_plan.element_type} -> "
+            f"{result_plan.element_type}"
+        )
+
     raise ValueError(
         f"tlx_wave bridge cannot lower {op.name}: source value lowered as "
         f"{source.kind}, expected scalar or SIMD tensor data"
@@ -6138,12 +6159,12 @@ def _mask_source_depends_on_dim(source, dim):
 
 
 def _ixsimpl_apply_index_binary(kind, lhs, rhs):
-    kind = str(kind)
-    if kind == "addi":
+    kind = str(kind).lower()
+    if kind.endswith("addi"):
         return lhs + rhs
-    if kind == "muli":
+    if kind.endswith("muli"):
         return lhs * rhs
-    if kind == "subi":
+    if kind.endswith("subi"):
         return lhs - rhs
     return None
 
@@ -6452,10 +6473,24 @@ def _ixsimpl_index_source_proves_lower_bound(
         ):
             return True
         return False
+    if isinstance(source, _IndexSelectCompare):
+        return _ixsimpl_index_source_proves_lower_bound(
+            source.true_value,
+            lower_bound,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.false_value,
+            lower_bound,
+            assumptions,
+            w,
+            unknowns,
+        )
     if not isinstance(source, _IndexBinary):
         return False
-    kind = str(source.kind)
-    if kind == "addi":
+    kind = str(source.kind).lower()
+    if kind.endswith("addi"):
         if lower_bound != 0:
             return False
         return _ixsimpl_index_source_proves_lower_bound(
@@ -6471,7 +6506,7 @@ def _ixsimpl_index_source_proves_lower_bound(
             w,
             unknowns,
         )
-    if kind == "muli":
+    if kind.endswith("muli"):
         if lower_bound != 0:
             return False
         return _ixsimpl_index_source_proves_lower_bound(
@@ -6487,7 +6522,23 @@ def _ixsimpl_index_source_proves_lower_bound(
             w,
             unknowns,
         )
-    if kind in {"remsi", "remui"}:
+    if kind.endswith("divsi") or kind.endswith("divui"):
+        if lower_bound != 0:
+            return False
+        return _ixsimpl_index_source_proves_lower_bound(
+            source.lhs,
+            0,
+            assumptions,
+            w,
+            unknowns,
+        ) and _ixsimpl_index_source_proves_lower_bound(
+            source.rhs,
+            1,
+            assumptions,
+            w,
+            unknowns,
+        )
+    if kind.endswith("remsi") or kind.endswith("remui"):
         if lower_bound != 0:
             return False
         return _ixsimpl_index_source_proves_lower_bound(
@@ -7593,7 +7644,21 @@ def _set_control_result(wave_values, value_id, kind, value, aux=None):
     wave_values[value_id] = _WaveValue(kind, value, None, aux)
 
 
-def _control_info_for_lowered(kind, lowered):
+def _control_lowered_index_proves_nonnegative(state, lowered, w):
+    if not isinstance(lowered, _WaveValue) or lowered.kind != "index_expr":
+        return False
+    unknowns = {}
+    assumptions = _ixsimpl_assume_fact_exprs(state, unknowns, w)
+    return _ixsimpl_index_source_proves_lower_bound(
+        lowered.value,
+        0,
+        assumptions,
+        w,
+        unknowns,
+    )
+
+
+def _control_info_for_lowered(kind, lowered, *, nonnegative=False):
     primary_count = _control_primary_count(kind, lowered.value)
     aux = (
         _fragment_tuple_aux(_fragment_tuple_tile_shape(lowered, "SCF value"))
@@ -7606,7 +7671,32 @@ def _control_info_for_lowered(kind, lowered):
         "primary_count": primary_count,
         "has_fragment_regs": _has_fragment_regs_aux(lowered),
         "aux": aux,
+        "nonnegative": bool(nonnegative),
     }
+
+
+def _control_infos_compatible(lhs, rhs):
+    if len(lhs) != len(rhs):
+        return False
+    for lhs_info, rhs_info in zip(lhs, rhs):
+        lhs_cmp = dict(lhs_info)
+        rhs_cmp = dict(rhs_info)
+        lhs_cmp.pop("nonnegative", None)
+        rhs_cmp.pop("nonnegative", None)
+        if lhs_cmp != rhs_cmp:
+            return False
+    return True
+
+
+def _merge_control_infos(lhs, rhs):
+    merged = []
+    for lhs_info, rhs_info in zip(lhs, rhs):
+        info = dict(lhs_info)
+        info["nonnegative"] = bool(lhs_info.get("nonnegative")) and bool(
+            rhs_info.get("nonnegative")
+        )
+        merged.append(info)
+    return tuple(merged)
 
 
 def _control_result_from_mlir_values(wave_values, value_id, info, values):
@@ -7720,7 +7810,16 @@ def _control_yields_for_result_ids(
                 f"{expected_info['count']}"
             )
         materialized.extend(values)
-        infos.append(_control_info_for_lowered(expected_kind, lowered))
+        infos.append(
+            _control_info_for_lowered(
+                expected_kind,
+                lowered,
+                nonnegative=(
+                    expected_kind == "index_expr"
+                    and _control_lowered_index_proves_nonnegative(state, lowered, w)
+                ),
+            )
+        )
     return tuple(materialized), tuple(infos)
 
 
@@ -7820,16 +7919,24 @@ def _emit_scf_if_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
                         w,
                         "scf.if else",
                     )
-                    if else_infos != result_infos:
+                    if not _control_infos_compatible(else_infos, result_infos):
                         raise ValueError(
                             "tlx_wave bridge cannot lower scf.if: then/else "
                             f"yield kinds differ ({result_infos} vs {else_infos})"
                         )
+                    result_infos = _merge_control_infos(result_infos, else_infos)
                     builder.yield_(else_values)
     if result_types:
         for result_id, result_info, result in zip(
             op.results, result_infos, if_builder_ref.op.results
         ):
+            if result_info["kind"] == "index_expr" and result_info.get(
+                "nonnegative"
+            ):
+                result = _assume_nonnegative(builder, result, w)
+                state["assume_facts"].append(
+                    _AssumeFact(result_id, "range", lower=0)
+                )
             _control_result_from_mlir_values(
                 state["wave_values"], result_id, result_info, (result,)
             )
@@ -8084,7 +8191,7 @@ def _emit_scf_for_op(builder, kernel, raw_op, op, state, lds_layout, w, stats):
                 "scf.for",
                 expected_infos=carry_infos,
             )
-            if yield_infos != tuple(carry_infos):
+            if not _control_infos_compatible(yield_infos, tuple(carry_infos)):
                 raise ValueError(
                     "tlx_wave bridge cannot lower scf.for: iter_arg/yield "
                     f"kinds differ ({tuple(carry_infos)} vs {yield_infos})"
@@ -9699,18 +9806,19 @@ def _emit_dot_operand_convert_layout(builder, op, state, lds_layout, w, stats):
 
 
 def _validate_fragment_store_value(value_plan, physical_plan):
-    if value_plan.element_type != "f32" or value_plan.shape != _GFX950_MMA_SHAPE:
-        raise ValueError(
-            "tlx_wave bridge supports fragment tt.store only for f32 32x32 "
-            f"values, got type={value_plan.type}, encoding={value_plan.encoding}"
-        )
     if (
-        physical_plan.element_type != value_plan.element_type
-        or physical_plan.shape != value_plan.shape
+        value_plan.element_type not in {"f32", "f16"}
+        or value_plan.shape != _GFX950_MMA_SHAPE
     ):
         raise ValueError(
+            "tlx_wave bridge supports fragment tt.store only for f32/f16 32x32 "
+            f"values, got type={value_plan.type}, encoding={value_plan.encoding}"
+        )
+    if physical_plan.element_type != "f32" or physical_plan.shape != value_plan.shape:
+        raise ValueError(
             "tlx_wave bridge cannot store fragment through a layout conversion "
-            "that changes element type or shape: "
+            "that does not preserve an f32 physical accumulator with the same "
+            "shape: "
             f"physical type={physical_plan.type}, store type={value_plan.type}"
         )
     physical_layout = None
@@ -9733,7 +9841,12 @@ def _validate_fragment_store_value(value_plan, physical_plan):
                 f"warpsPerCTA={physical_layout.warps_per_cta}, "
                 f"order={physical_layout.order}"
             )
-        return physical_plan
+        return replace(
+            physical_plan,
+            type=value_plan.type,
+            element_type=value_plan.element_type,
+            element_byte_width=value_plan.element_byte_width,
+        )
     try:
         mfma = _amd_mfma_encoding_info(
             physical_plan.encoding,
@@ -9764,19 +9877,59 @@ def _validate_fragment_store_value(value_plan, physical_plan):
     return value_plan
 
 
-def _extract_fragment_component(regs, component, width, w):
+def _fragment_unpack_as(builder, fragment, element_type, w):
+    if element_type == "i32":
+        return builder.fragment_unpack(fragment)
+    waveamd = getattr(w, "waveamd", None)
+    if waveamd is None:
+        raise RuntimeError(
+            "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
+            "generated waveamd dialect module"
+        )
+    frag = w.FragmentType(fragment.type)
+    result_type = w.simd_type(
+        w.vector_type(
+            frag.registers,
+            _wave_element_type(element_type, w, "fragment unpack"),
+        ),
+        width=frag.wave_size,
+    )
+    return waveamd.FragmentUnpackOp(result_type, fragment).result
+
+
+def _fragment_store_unpack_element_type(value_plan):
+    if value_plan.element_type == "f16":
+        return "f32"
+    return "i32"
+
+
+def _convert_fragment_store_value(builder, value, value_plan, width, w):
+    if value_plan.element_type == "f16":
+        return builder.fpconvert(value, w.simd_type(w.f16(), width))
+    return value
+
+
+def _extract_fragment_component(regs, component, width, w, element_type="i32"):
     wave = getattr(w, "wave", None)
     if wave is None:
         raise RuntimeError(
             "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
             "generated wave dialect module"
         )
-    return wave.ExtractOp(w.simd_type(w.i32(), width), regs, component).result
+    return wave.ExtractOp(
+        w.simd_type(
+            _wave_element_type(element_type, w, "fragment component extract"),
+            width,
+        ),
+        regs,
+        component,
+    ).result
 
 
 def _mfma_fragment_store_vector_width(value_plan, frag):
     if (
-        len(value_plan.shape) != 2
+        value_plan.element_type != "f32"
+        or len(value_plan.shape) != 2
         or frag.registers != _GFX950_MMA32_INFO.acc_registers
     ):
         return 1
@@ -9964,18 +10117,24 @@ def _mfma_fragment_store_vector_width_for_store(
     return vector_width
 
 
-def _extract_fragment_store_value(regs, component, count, width, w):
+def _extract_fragment_store_value(regs, component, count, width, w, element_type="i32"):
     if count == 1:
-        return _extract_fragment_component(regs, component, width, w)
+        return _extract_fragment_component(regs, component, width, w, element_type)
     wave = getattr(w, "wave", None)
     if wave is None:
         raise RuntimeError(
             "tlx_wave bridge requires mlir.dialects.wave_dsl to expose the "
             "generated wave dialect module"
         )
-    value_type = w.simd_type(w.vector_type(count, w.i32()), width)
+    value_type = w.simd_type(
+        w.vector_type(
+            count,
+            _wave_element_type(element_type, w, "fragment packed store value"),
+        ),
+        width,
+    )
     values = [
-        _extract_fragment_component(regs, component + index, width, w)
+        _extract_fragment_component(regs, component + index, width, w, element_type)
         for index in range(count)
     ]
     return wave.PackOp(value_type, values).result
@@ -10036,8 +10195,9 @@ def _emit_fragment_store(
     w,
 ):
     fragment = lowered.value
-    regs = builder.fragment_unpack(fragment)
     frag = w.FragmentType(fragment.type)
+    unpack_element_type = _fragment_store_unpack_element_type(store_plan)
+    regs = _fragment_unpack_as(builder, fragment, unpack_element_type, w)
     token = after_token
     pointer_source = _require_lowered_value(
         state["wave_values"],
@@ -10080,7 +10240,10 @@ def _emit_fragment_store(
             else None
         )
         value = _extract_fragment_store_value(
-            regs, component, vector_width, width, w
+            regs, component, vector_width, width, w, unpack_element_type
+        )
+        value = _convert_fragment_store_value(
+            builder, value, store_plan, width, w
         )
         if mask is not None and vector_width > 1:
             token = _emit_masked_bounded_component_store(
@@ -10124,8 +10287,9 @@ def _emit_fragment_local_store(
     w,
 ):
     fragment = lowered.value
-    regs = builder.fragment_unpack(fragment)
     frag = w.FragmentType(fragment.type)
+    unpack_element_type = _fragment_store_unpack_element_type(store_plan)
+    regs = _fragment_unpack_as(builder, fragment, unpack_element_type, w)
     token = after_token
     for component in range(frag.registers):
         dim_bindings, width = _store_dim_bindings(
@@ -10142,7 +10306,10 @@ def _emit_fragment_local_store(
             w,
             "ttg.local_store",
         )
-        value = _extract_fragment_component(regs, component, width, w)
+        value = _extract_fragment_component(
+            regs, component, width, w, unpack_element_type
+        )
+        value = _convert_fragment_store_value(builder, value, store_plan, width, w)
         token = _emit_component_store(builder, value, ptr, None, token, w)
     return token
 
@@ -10302,9 +10469,9 @@ def _emit_mfma_fragment_tile_store(
     after_token,
     w,
 ):
-    if value_plan.element_type != "f32":
+    if value_plan.element_type not in {"f32", "f16"}:
         raise ValueError(
-            "tlx_wave bridge supports MFMA fragment stores only for f32 "
+            "tlx_wave bridge supports MFMA fragment stores only for f32/f16 "
             f"values, got type={value_plan.type}"
         )
     mma = _mma_shape_for_result_value(value_plan, "tt.store MFMA value")
@@ -10327,10 +10494,11 @@ def _emit_mfma_fragment_tile_store(
         )
 
     token = after_token
+    unpack_element_type = _fragment_store_unpack_element_type(value_plan)
     for row in range(tile_shape[0]):
         for col in range(tile_shape[1]):
             fragment = fragments[_fragment_tuple_index(tile_shape, row, col)]
-            regs = builder.fragment_unpack(fragment)
+            regs = _fragment_unpack_as(builder, fragment, unpack_element_type, w)
             frag = w.FragmentType(fragment.type)
             tile_offsets = (
                 row * mma.output_tile_shape[0],
@@ -10383,7 +10551,12 @@ def _emit_mfma_fragment_tile_store(
                         width,
                     )
                     mask = _wave_mask_and(builder, mask, user_mask, w, width)
-                value = _extract_fragment_component(regs, component, width, w)
+                value = _extract_fragment_component(
+                    regs, component, width, w, unpack_element_type
+                )
+                value = _convert_fragment_store_value(
+                    builder, value, value_plan, width, w
+                )
                 token = _emit_component_store(
                     builder,
                     value,
@@ -10407,9 +10580,9 @@ def _emit_mfma_fragment_tile_local_store(
     after_token,
     w,
 ):
-    if value_plan.element_type != "f32":
+    if value_plan.element_type not in {"f32", "f16"}:
         raise ValueError(
-            "tlx_wave bridge supports MFMA fragment local stores only for f32 "
+            "tlx_wave bridge supports MFMA fragment local stores only for f32/f16 "
             f"values, got type={value_plan.type}"
         )
     mma = _mma_shape_for_result_value(value_plan, "ttg.local_store MFMA value")
@@ -10432,10 +10605,11 @@ def _emit_mfma_fragment_tile_local_store(
         )
 
     token = after_token
+    unpack_element_type = _fragment_store_unpack_element_type(value_plan)
     for row in range(tile_shape[0]):
         for col in range(tile_shape[1]):
             fragment = fragments[_fragment_tuple_index(tile_shape, row, col)]
-            regs = builder.fragment_unpack(fragment)
+            regs = _fragment_unpack_as(builder, fragment, unpack_element_type, w)
             frag = w.FragmentType(fragment.type)
             tile_offsets = (
                 row * mma.output_tile_shape[0],
@@ -10461,7 +10635,12 @@ def _emit_mfma_fragment_tile_local_store(
                     w,
                     "ttg.local_store",
                 )
-                value = _extract_fragment_component(regs, component, width, w)
+                value = _extract_fragment_component(
+                    regs, component, width, w, unpack_element_type
+                )
+                value = _convert_fragment_store_value(
+                    builder, value, value_plan, width, w
+                )
                 token = _emit_component_store(
                     builder,
                     value,

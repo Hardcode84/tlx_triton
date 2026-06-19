@@ -14,6 +14,20 @@ def _load_gemm_wp_module():
     return module
 
 
+def _load_gfx9_v9_module():
+    path = (
+        Path(__file__).parent
+        / "gfx9_gemm"
+        / "a16w16"
+        / "v9_beyond_hotloop"
+        / "matmul_kernel.py"
+    )
+    spec = importlib.util.spec_from_file_location("tlx_wave_gfx9_v9_tutorial", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class _FakeTensor:
     def __init__(self, shape, strides):
         self.shape = shape
@@ -104,6 +118,82 @@ def _warmup_gemm_wp_tlx_wave(
             matrix_instr_nonkdim=matrix_instr_nonkdim,
             kpack=kpack,
             grid=grid,
+        )
+    return compiled
+
+
+def _warmup_gfx9_v9_tlx_wave(
+    tmp_path,
+    monkeypatch,
+    m=256,
+    n=256,
+    k=128,
+    block_m=256,
+    block_n=256,
+    block_k=64,
+    group_m=4,
+    num_xcds=8,
+):
+    import triton
+    from triton import knobs
+    from triton.backends import backends
+    from triton.runtime.jit import MockTensor
+
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+    wave_opt = (
+        Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
+    )
+    if wave_opt.exists():
+        monkeypatch.setenv("TRITON_WAVE_OPT", str(wave_opt))
+
+    if "tlx_wave" not in backends:
+        pytest.skip("tlx_wave backend is not installed")
+
+    with knobs.cache.scope(), knobs.runtime.scope():
+        knobs.cache.dir = str(tmp_path / "triton-cache-v9")
+        knobs.runtime.override_arch = "gfx950"
+        triton.runtime.driver._default = None
+        triton.runtime.driver._active = None
+        try:
+            target = triton.runtime.driver.active.get_current_target()
+        except RuntimeError as exc:
+            pytest.skip(f"tlx_wave backend is not active: {exc}")
+        if target.backend != "tlx_wave" or target.arch != "gfx950":
+            pytest.skip(f"requires tlx_wave:gfx950, got {target}")
+
+        tutorial = _load_gfx9_v9_module()
+        grid_mn = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+
+        a = MockTensor(torch.float16, [m, k])
+        b = MockTensor(torch.float16, [k, n])
+        c = MockTensor(torch.float16, [m, n])
+        a_strides = a.stride()
+        b_strides = b.stride()
+        c_strides = c.stride()
+        compiled = tutorial.v9_beyond_hotloop.warmup(
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            a_strides[0],
+            a_strides[1],
+            b_strides[0],
+            b_strides[1],
+            c_strides[0],
+            c_strides[1],
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_SIZE_M=group_m,
+            NUM_XCDS=num_xcds,
+            GRID_MN=grid_mn,
+            num_warps=8,
+            num_stages=1,
+            waves_per_eu=0,
+            matrix_instr_nonkdim=16,
+            grid=(grid_mn,),
         )
     return compiled
 
@@ -208,6 +298,22 @@ def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
     assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 4
     assert "waveamdmachine.global_store_b32_addr64" not in machine
     assert "waveamdmachine.global_store_b128_addr64" not in machine
+
+
+def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
+    compiled = _warmup_gfx9_v9_tlx_wave(tmp_path, monkeypatch)
+
+    wave = _wave_text(compiled)
+    machine = _run_wave_promote_buffer_to_machine(wave)
+
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_num_mmas == 256
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
+    assert wave.count("wave.cast fpconvert") == 256
+    assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741815 + x <= 0">' in wave
+    assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
+    assert "waveamdmachine.v_cvt_f16_f32" in machine
+    assert "waveamdmachine.global_store_b16_addr64" in machine
 
 
 def test_gemm_wp_tlx_wave_warmup_normalizes_deprecated_gfx950_kpack(

@@ -48,6 +48,8 @@ def v9_beyond_hotloop(
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
+    tl.assume(M > 0)
+    tl.assume(N > 0)
 
     # ── Grid-level scheduling (the only change vs v8) ──
     # Remap pid across XCDs, then swizzle into GROUP_SIZE_M-tall column groups.
@@ -70,13 +72,18 @@ def v9_beyond_hotloop(
         group_id = pid // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        tl.assume(group_size_m > 0)
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
     HALF_N: tl.constexpr = BLOCK_N // 2
 
