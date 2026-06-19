@@ -174,6 +174,12 @@ def _extract_converted_fragment_store_value(
     w,
     unpack_element_type,
 ):
+    if value_plan.element_type == "f16" and count == 2:
+        value = _extract_fragment_store_value(
+            regs, component, count, width, w, unpack_element_type
+        )
+        value_type = w.simd_type(w.vector_type(count, w.f16()), width)
+        return builder.fpconvert(value, value_type)
     if value_plan.element_type == "f16" and count > 1:
         wave = getattr(w, "wave", None)
         if wave is None:
@@ -1332,4 +1338,3 @@ def _physical_plan_is_mfma(physical_plan, context):
         return _amd_mfma_encoding_info(physical_plan.encoding, context) is not None
     except ValueError as exc:
         raise ValueError(f"tlx_wave bridge cannot lower {context}: {exc}") from exc
-

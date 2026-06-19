@@ -311,10 +311,11 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas == 256
     assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
-    assert wave.count("wave.cast fpconvert") == 256
+    assert wave.count("wave.cast fpconvert") == 128
     assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741815 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
-    assert "waveamdmachine.v_cvt_f16_f32" in machine
+    assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 128
+    assert "waveamdmachine.v_cvt_f16_f32" not in machine
     assert machine.count("waveamdmachine.buffer_store_b32") == 128
     assert "waveamdmachine.global_store_b16_addr64" not in machine
     assert "waveamdmachine.s_addc_u32" not in machine
@@ -325,8 +326,8 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
     assert len(machine.splitlines()) < 5_000
-    assert machine.count("waveamdmachine.tuple_to_elements") < 256
-    assert machine.count("waveamdmachine.tuple_from_elements") < 512
+    assert machine.count("waveamdmachine.tuple_to_elements") < 384
+    assert machine.count("waveamdmachine.tuple_from_elements") < 640
     assert machine.count("waveamdmachine.v_mov_b32_tuple") < 256
 
 
