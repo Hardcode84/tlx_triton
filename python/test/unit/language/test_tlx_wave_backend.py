@@ -19,6 +19,7 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave import wave_bridge_tools
     from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import canonicalize as converter_canonicalize
+    from triton.backends.tlx_wave.converter import domains as converter_domains
     from triton.backends.tlx_wave.converter import emission as converter_emission
     from triton.backends.tlx_wave.converter import facts as converter_facts
     from triton.backends.tlx_wave.converter import op_conversion as converter_op_conversion
@@ -35,6 +36,7 @@ else:
     wave_bridge_tools = None
     converter_diagnostics = None
     converter_canonicalize = None
+    converter_domains = None
     converter_emission = None
     converter_facts = None
     converter_op_conversion = None
@@ -118,6 +120,7 @@ def test_tlx_wave_converter_import_stage_boundary_is_static():
 
     assert "wave_bridge" not in converter_source_ir.__dict__
     assert "wave_bridge" not in converter_diagnostics.__dict__
+    assert "wave_bridge" not in converter_domains.__dict__
     assert "wave_bridge" not in converter_canonicalize.__dict__
     assert "wave_bridge" not in converter_source_import.__dict__
     assert "wave_bridge" not in converter_tokens.__dict__
@@ -126,6 +129,53 @@ def test_tlx_wave_converter_import_stage_boundary_is_static():
     assert "wave_bridge" not in converter_verifier.__dict__
     assert "wave_bridge" not in converter_emission.__dict__
     assert "wave_bridge" not in converter_pipeline.__dict__
+
+
+def test_tlx_wave_converter_lowering_domains_are_pure_policy():
+    tree = ast.parse(
+        Path(converter_domains.__file__).read_text(),
+        filename=converter_domains.__file__,
+    )
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.append(node.module)
+
+    assert imports == ["dataclasses"]
+
+
+def test_tlx_wave_converter_lowering_domains_cover_dispatch():
+    assert converter_domains.DOMAIN_NAMES == (
+        "arithmetic_control",
+        "memory_dma",
+        "local_memory_layout",
+        "mfma_fragment",
+        "store_epilogue",
+    )
+    assert converter_domains.source_domains_for_op("arith.addi") == (
+        "arithmetic_control",
+    )
+    assert converter_domains.source_domains_for_op("arith.constant") == (
+        "arithmetic_control",
+        "mfma_fragment",
+    )
+    assert converter_domains.source_domains_for_op("amdg.buffer_load_to_local") == (
+        "memory_dma",
+    )
+    assert converter_domains.target_domain_for_op("local_load_fragment") == (
+        "local_memory_layout"
+    )
+    assert converter_domains.target_domain_for_op("mma") == "mfma_fragment"
+    assert converter_domains.target_domain_for_op("buffer_store") == "store_epilogue"
+    assert (
+        converter_op_conversion._SUPPORTED_SOURCE_OPS
+        == converter_domains.all_source_ops()
+    )
+    assert set(converter_emission._TARGET_EMITTERS) == (
+        converter_domains.all_target_ops()
+    )
 
 
 def test_tlx_wave_converter_op_rewriters_do_not_accept_source_program():

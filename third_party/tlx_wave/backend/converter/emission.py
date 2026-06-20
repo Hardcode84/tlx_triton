@@ -6,6 +6,7 @@ import sys
 import warnings
 
 from .diagnostics import fail
+from . import domains
 from . import target_ir
 
 
@@ -61,89 +62,9 @@ def emit_wave_module(target_program, fact_program=None):
 
 
 def _emit_target_op(state, op):
-    if op.kind == "constant":
-        _emit_constant(state, op)
-        return
-    if op.kind == "binary":
-        _emit_binary(state, op)
-        return
-    if op.kind == "float_binary":
-        _emit_float_binary(state, op)
-        return
-    if op.kind == "cmpi":
-        _emit_cmpi(state, op)
-        return
-    if op.kind == "minsi":
-        _emit_minsi(state, op)
-        return
-    if op.kind == "assume":
-        _emit_assume(state, op)
-        return
-    if op.kind == "make_range":
-        _emit_make_range(state, op)
-        return
-    if op.kind == "splat":
-        _emit_splat(state, op)
-        return
-    if op.kind == "broadcast":
-        _emit_broadcast(state, op)
-        return
-    if op.kind == "addptr":
-        _emit_addptr(state, op)
-        return
-    if op.kind == "expand_dims":
-        _emit_expand_dims(state, op)
-        return
-    if op.kind == "program_id":
-        _emit_program_id(state, op)
-        return
-    if op.kind == "select":
-        _emit_select(state, op)
-        return
-    if op.kind == "local_alloc":
-        _emit_local_alloc(state, op)
-        return
-    if op.kind == "memdesc_index":
-        _emit_memdesc_index(state, op)
-        return
-    if op.kind == "buffer_load_to_local":
-        _emit_buffer_load_to_local(state, op)
-        return
-    if op.kind == "local_load_fragment":
-        _emit_local_load_fragment(state, op)
-        return
-    if op.kind == "fragment_fill":
-        _emit_fragment_fill(state, op)
-        return
-    if op.kind == "mma":
-        _emit_mma(state, op)
-        return
-    if op.kind == "fragment_truncf":
-        _emit_fragment_truncf(state, op)
-        return
-    if op.kind == "layout_convert":
-        _emit_layout_convert(state, op)
-        return
-    if op.kind == "buffer_store":
-        _emit_buffer_store(state, op)
-        return
-    if op.kind == "buffer_load":
-        _emit_buffer_load(state, op)
-        return
-    if op.kind == "async_commit_group":
-        _emit_async_commit_group(state, op)
-        return
-    if op.kind == "async_wait":
-        _emit_async_wait(state, op)
-        return
-    if op.kind == "return":
-        if op.operands:
-            fail(
-                "TLXW_EMIT_RETURN_VALUES",
-                STAGE,
-                "empty-return emission is supported first; return values are not",
-                target_op_id=op.target_op_id,
-            )
+    emitter = _TARGET_EMITTERS.get(op.kind)
+    if emitter is not None:
+        emitter(state, op)
         return
     fail(
         "TLXW_EMIT_UNSUPPORTED_TARGET_OP",
@@ -151,6 +72,17 @@ def _emit_target_op(state, op):
         f"no structural emission for target op {op.kind}",
         target_op_id=op.target_op_id,
     )
+
+
+def _emit_return(state, op):
+    del state
+    if op.operands:
+        fail(
+            "TLXW_EMIT_RETURN_VALUES",
+            STAGE,
+            "empty-return emission is supported first; return values are not",
+            target_op_id=op.target_op_id,
+        )
 
 
 def _emit_constant(state, op):
@@ -1605,6 +1537,40 @@ def _emit_buffer_load(state, op):
             )
         loaded_components.append(loaded)
     state.values[result_id] = _pack_components(tuple(loaded_components))
+
+
+_TARGET_EMITTERS = {
+    "constant": _emit_constant,
+    "binary": _emit_binary,
+    "float_binary": _emit_float_binary,
+    "cmpi": _emit_cmpi,
+    "minsi": _emit_minsi,
+    "assume": _emit_assume,
+    "make_range": _emit_make_range,
+    "splat": _emit_splat,
+    "broadcast": _emit_broadcast,
+    "addptr": _emit_addptr,
+    "expand_dims": _emit_expand_dims,
+    "program_id": _emit_program_id,
+    "select": _emit_select,
+    "local_alloc": _emit_local_alloc,
+    "memdesc_index": _emit_memdesc_index,
+    "buffer_load_to_local": _emit_buffer_load_to_local,
+    "local_load_fragment": _emit_local_load_fragment,
+    "fragment_fill": _emit_fragment_fill,
+    "mma": _emit_mma,
+    "fragment_truncf": _emit_fragment_truncf,
+    "layout_convert": _emit_layout_convert,
+    "buffer_store": _emit_buffer_store,
+    "buffer_load": _emit_buffer_load,
+    "async_commit_group": _emit_async_commit_group,
+    "async_wait": _emit_async_wait,
+    "return": _emit_return,
+}
+
+_UNOWNED_TARGET_OPS = frozenset(_TARGET_EMITTERS) - domains.all_target_ops()
+if _UNOWNED_TARGET_OPS:
+    raise RuntimeError(f"unsupported target op domains: {sorted(_UNOWNED_TARGET_OPS)}")
 
 
 def _scalar_constant(state, scalar_type, element_type, literal, op):

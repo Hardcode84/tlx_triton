@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .diagnostics import fail
+from . import domains
 from . import target_ir
 
 
@@ -348,33 +349,7 @@ def _operand_target_ids(builder, op):
 
 
 def _converter_for_op(op_name):
-    if op_name == "arith.constant":
-        return _convert_constant
-    if op_name in _BINARY_OPS:
-        return _convert_binary
-    if op_name in _FLOAT_BINARY_OPS:
-        return _convert_float_binary
-    if op_name == "arith.cmpi":
-        return _convert_cmpi
-    if op_name == "arith.minsi":
-        return _convert_minsi
-    if op_name == "llvm.intr.assume":
-        return _convert_assume
-    if op_name == "tt.make_range":
-        return _convert_make_range
-    if op_name == "tt.splat":
-        return _convert_splat
-    if op_name == "tt.addptr":
-        return _convert_addptr
-    if op_name == "tt.broadcast":
-        return _convert_broadcast
-    if op_name == "tt.expand_dims":
-        return _convert_expand_dims
-    if op_name == "tt.get_program_id":
-        return _convert_program_id
-    if op_name == "tt.return":
-        return _convert_return
-    return None
+    return _SIMPLE_OP_CONVERTERS.get(op_name)
 
 
 def _convert_constant(builder, view):
@@ -1407,6 +1382,45 @@ def _convert_return(builder, view):
         operands=view.operand_target_ids,
         source_op_index=view.op_index,
     )
+
+
+_SIMPLE_OP_CONVERTERS = {
+    "arith.constant": _convert_constant,
+    **{op_name: _convert_binary for op_name in _BINARY_OPS},
+    **{op_name: _convert_float_binary for op_name in _FLOAT_BINARY_OPS},
+    "arith.cmpi": _convert_cmpi,
+    "arith.minsi": _convert_minsi,
+    "llvm.intr.assume": _convert_assume,
+    "tt.make_range": _convert_make_range,
+    "tt.splat": _convert_splat,
+    "tt.addptr": _convert_addptr,
+    "tt.broadcast": _convert_broadcast,
+    "tt.expand_dims": _convert_expand_dims,
+    "tt.get_program_id": _convert_program_id,
+    "tt.return": _convert_return,
+}
+
+_SPECIALIZED_SOURCE_OPS = frozenset(
+    {
+        "arith.truncf",
+        "scf.if",
+        "ttg.local_alloc",
+        "ttg.memdesc_index",
+        "amdg.buffer_load_to_local",
+        "amdg.buffer_load",
+        "amdg.buffer_store",
+        "ttg.local_load",
+        "ttg.convert_layout",
+        "tt.dot",
+        "ttg.async_commit_group",
+        "ttg.async_wait",
+    }
+)
+
+_SUPPORTED_SOURCE_OPS = frozenset(_SIMPLE_OP_CONVERTERS) | _SPECIALIZED_SOURCE_OPS
+_UNOWNED_SOURCE_OPS = _SUPPORTED_SOURCE_OPS - domains.all_source_ops()
+if _UNOWNED_SOURCE_OPS:
+    raise RuntimeError(f"unsupported source op domains: {sorted(_UNOWNED_SOURCE_OPS)}")
 
 
 def _fact_ids_by_source_op(fact_program):
