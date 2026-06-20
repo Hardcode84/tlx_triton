@@ -6,7 +6,12 @@ import triton.backends.amd.compiler as amd_compiler
 from triton.backends.compiler import GPUTarget, Language
 
 from .converter import pipeline as converter_pipeline
-from .wave_bridge_tools import _verify_wave_module, _wave_opt
+from .wave_bridge_tools import (
+    _compile_wave_module_to_hsaco,
+    _verify_wave_module,
+    _wave_opt,
+    _wave_opt_sha256,
+)
 
 
 def _module_has_new_bridge_blocker(mod):
@@ -49,7 +54,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
-        self.binary_ext = "wave"
+        self.binary_ext = "hsaco"
 
     def get_target_name(self, options) -> str:
         return f"tlx_wave:{options.arch}"
@@ -167,17 +172,29 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         _populate_staged_converter_metadata(metadata, output, options, wave_opt)
         return wave_text
 
+    @staticmethod
+    def make_hsaco(src, metadata, options):
+        wave_opt = _wave_opt()
+        hsaco = _compile_wave_module_to_hsaco(src, wave_opt)
+        metadata["tlx_wave_binary_stage"] = "wave-compile-kernels"
+        metadata["tlx_wave_hsaco_size_bytes"] = len(hsaco)
+        return hsaco
+
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
             raise NotImplementedError("tlx_wave scaffold currently supports only Triton/TLX language input")
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
         stages["wave"] = lambda src, metadata: self.make_wave(src, metadata, options)
+        stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     def hash(self):
-        return f"{self.target}:stage6-staged-converter-gpu-module"
+        return (
+            f"{self.target}:stage7-staged-converter-hsaco:"
+            f"wave-opt-sha256={_wave_opt_sha256()}"
+        )
 
 
 def _validate_staged_converter_output(output, options):

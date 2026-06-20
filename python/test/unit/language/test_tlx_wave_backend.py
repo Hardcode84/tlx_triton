@@ -977,16 +977,38 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
     del ctx
 
 
+def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
+    backend = tlx_wave_compiler.TLXWaveBackend(GFX950_WAVE)
+    first_sha = "1" * 64
+    second_sha = "2" * 64
+
+    monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: first_sha)
+    first_hash = backend.hash()
+
+    monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
+    second_hash = backend.hash()
+
+    assert f"wave-opt-sha256={first_sha}" in first_hash
+    assert f"wave-opt-sha256={second_sha}" in second_hash
+    assert first_hash != second_hash
+
+
 def test_tlx_wave_backend_compile_uses_staged_converter():
     src = ASTSource(fn=_tlx_wave_stage_only_kernel, signature={}, constexprs={})
 
     compiled = triton_compile(src, target=GFX950_WAVE)
     wave_artifact = _asm_text(compiled, "wave")
+    hsaco = compiled.asm["hsaco"]
 
     assert "tlx_wave.new_converter" in wave_artifact
     assert "gpu.module @kernels" in wave_artifact
     assert "gpu.kernel" in wave_artifact
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert compiled.kernel == hsaco
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+    assert compiled.metadata.tlx_wave_hsaco_size_bytes == len(hsaco)
     assert compiled.metadata.tlx_wave_bridge_stage == "staged-converter"
     assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
     assert compiled.metadata.tlx_wave_plan_kind == "staged-converter"

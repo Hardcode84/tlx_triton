@@ -1,9 +1,64 @@
 """Wave tool discovery and verification helpers shared by bridge paths."""
 
+import functools
+import hashlib
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
+
+
+_WAVE_HSACO_PIPELINE = (
+    "--wavemeta-specialize",
+    "--canonicalize",
+    "--wave-normalize-pointer-offsets",
+    "--wave-generate-index-exprs",
+    "--wave-promote-global-to-buffer",
+    "--wave-combine-pointer-offsets",
+    "--wave-simplify-index-exprs",
+    "--wave-coalesce-memory",
+    "--canonicalize",
+    "--cse",
+    "--wave-form-packed-math",
+    "--canonicalize",
+    "--cse",
+    "--wave-normalize-pointer-offsets",
+    "--wave-generate-index-exprs",
+    "--wave-combine-pointer-offsets",
+    "--wave-simplify-index-exprs",
+    "--wave-promote-global-to-buffer",
+    "--wave-extract-loop-strides",
+    "--waveamd-dma-zero-fill",
+    "--loop-invariant-code-motion",
+    "--canonicalize",
+    "--wave-expand-integer-div-rem",
+    "--waveamd-to-machine",
+    "--canonicalize",
+    "--cse",
+    "--loop-invariant-code-motion",
+    "--waveamd-abi-lowering",
+    "--waveamd-decompose-mem-tuples",
+    "--waveamd-narrow-wide-int",
+    "--waveamd-form-fused-int",
+    "--waveamd-machine-cleanup",
+    "--canonicalize",
+    "--cse",
+    "--loop-invariant-code-motion",
+    "--cse",
+    "--waveamd-clear-regalloc-assignments",
+    "--waveamd-preserve-hw-regs",
+    "--canonicalize",
+    "--cse",
+    "--waveamd-reg-alloc",
+    "--waveamd-decompose-mem-tuples",
+    "--waveamd-pack-vgpr-zero-moves",
+    "--waveamd-insert-ticket-waits",
+    "--waveamd-insert-hazard-waits",
+    "--waveamd-resource-info",
+    "--waveamd-metadata",
+    "--wave-compile-kernels=features=",
+)
 
 
 def _repo_root():
@@ -79,21 +134,42 @@ def _load_wave_dsl():
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
 
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Attribute builder for .* is already registered",
+            category=RuntimeWarning,
+        )
+        try:
+            from mlir.dialects import wave_dsl as w
+        except Exception as exc:
+            candidates = "\n  ".join(str(path) for path in _candidate_wave_python_paths())
+            raise RuntimeError(
+                "tlx_wave requires Wave MLIR Python bindings from the third_party/wave submodule build. "
+                "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run "
+                "`python third_party/wave/build_tools/build_llvm.py --python-bindings` followed by "
+                "`cmake -S third_party/wave -B third_party/wave/build/wave-build "
+                "-G Ninja -DWAVE_ENABLE_PYTHON_BINDINGS=ON` and "
+                "`cmake --build third_party/wave/build/wave-build`. "
+                f"Unable to import mlir.dialects.wave_dsl: {type(exc).__name__}: {exc}. "
+                f"Checked Wave Python package candidates:\n  {candidates}"
+            ) from exc
+    return w
+
+
+def _load_wave_ir():
+    _load_wave_dsl()
     try:
-        from mlir.dialects import wave_dsl as w
+        from mlir import ir
+        from mlir.dialects import gpu
     except Exception as exc:
         candidates = "\n  ".join(str(path) for path in _candidate_wave_python_paths())
         raise RuntimeError(
-            "tlx_wave requires Wave MLIR Python bindings from the third_party/wave submodule build. "
-            "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run "
-            "`python third_party/wave/build_tools/build_llvm.py --python-bindings` followed by "
-            "`cmake -S third_party/wave -B third_party/wave/build/wave-build "
-            "-G Ninja -DWAVE_ENABLE_PYTHON_BINDINGS=ON` and "
-            "`cmake --build third_party/wave/build/wave-build`. "
-            f"Unable to import mlir.dialects.wave_dsl: {type(exc).__name__}: {exc}. "
+            "tlx_wave requires Wave MLIR Python bindings with the gpu dialect. "
+            f"Unable to import MLIR IR/gpu bindings: {type(exc).__name__}: {exc}. "
             f"Checked Wave Python package candidates:\n  {candidates}"
         ) from exc
-    return w
+    return ir, gpu
 
 
 def _wave_tool(tool_name, override_env=None):
@@ -116,6 +192,19 @@ def _wave_opt():
     return _wave_tool("wave-opt", override_env="TRITON_WAVE_OPT")
 
 
+@functools.lru_cache(maxsize=None)
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _wave_opt_sha256():
+    return _file_sha256(_wave_opt())
+
+
 def _verify_wave_module(wave_text, wave_opt):
     result = subprocess.run(
         [wave_opt, "-", "--verify-diagnostics"],
@@ -130,3 +219,45 @@ def _verify_wave_module(wave_text, wave_opt):
         raise RuntimeError(
             f"tlx_wave generated Wave module failed wave-opt verification: {detail}"
         )
+
+
+def _compile_wave_module_to_hsaco(wave_text, wave_opt):
+    result = subprocess.run(
+        [wave_opt, "-", *_WAVE_HSACO_PIPELINE],
+        input=wave_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"tlx_wave failed to compile Wave module to HSACO: {detail}")
+    return _extract_hsaco_from_gpu_binary(result.stdout)
+
+
+def _extract_hsaco_from_gpu_binary(binary_module_text):
+    ir, gpu = _load_wave_ir()
+    with ir.Context() as ctx, ir.Location.unknown():
+        _load_wave_dsl().register_dialects(ctx)
+        module = ir.Module.parse(binary_module_text)
+        binaries = [
+            op
+            for op in module.body.operations
+            if op.operation.name == "gpu.binary"
+        ]
+        if len(binaries) != 1:
+            raise RuntimeError(
+                "tlx_wave expected exactly one gpu.binary after Wave HSACO compilation, "
+                f"found {len(binaries)}"
+            )
+        objects = ir.ArrayAttr(binaries[0].attributes["objects"])
+        if len(objects) != 1:
+            raise RuntimeError(
+                "tlx_wave expected exactly one GPU object after Wave HSACO compilation, "
+                f"found {len(objects)}"
+            )
+        hsaco = bytes(gpu.ObjectAttr(objects[0]).object)
+    if not hsaco.startswith(b"\x7fELF"):
+        raise RuntimeError("tlx_wave Wave HSACO compilation produced a non-ELF object")
+    return hsaco

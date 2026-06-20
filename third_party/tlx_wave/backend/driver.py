@@ -14,8 +14,8 @@ class _TLXWaveUtils:
 
     def load_binary(self, name, kernel, shared, device):
         raise RuntimeError(
-            "tlx_wave emitted Wave IR only; no executable GPU binary was produced. "
-            "Inspect compiled.asm['ttgir'] or compiled.asm['wave'] for the current handoff."
+            "tlx_wave produced HSACO, but executable loading is not wired yet. "
+            "Inspect compiled.asm['wave'] and compiled.asm['hsaco'] for the current handoff."
         )
 
 
