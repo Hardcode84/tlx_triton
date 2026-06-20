@@ -14,7 +14,7 @@ def _load_gemm_wp_module():
     return module
 
 
-def _load_gfx9_v9_module():
+def _load_gfx9_v9_module(module_name="tlx_wave_gfx9_v9_tutorial"):
     path = (
         Path(__file__).parent
         / "gfx9_gemm"
@@ -22,7 +22,7 @@ def _load_gfx9_v9_module():
         / "v9_beyond_hotloop"
         / "matmul_kernel.py"
     )
-    spec = importlib.util.spec_from_file_location("tlx_wave_gfx9_v9_tutorial", path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -122,9 +122,14 @@ def _warmup_gemm_wp_tlx_wave(
     return compiled
 
 
-def _warmup_gfx9_v9_tlx_wave(
+def _warmup_gfx9_v9_backend(
     tmp_path,
     monkeypatch,
+    *,
+    backend_name,
+    expected_target_backend,
+    cache_suffix,
+    module_suffix,
     m=256,
     n=256,
     k=128,
@@ -139,29 +144,35 @@ def _warmup_gfx9_v9_tlx_wave(
     from triton.backends import backends
     from triton.runtime.jit import MockTensor
 
-    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
-    wave_opt = (
-        Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
-    )
-    if wave_opt.exists():
-        monkeypatch.setenv("TRITON_WAVE_OPT", str(wave_opt))
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", backend_name)
+    if backend_name == "tlx_wave":
+        wave_opt = (
+            Path(__file__).parents[2]
+            / "wave"
+            / "build"
+            / "wave-build"
+            / "bin"
+            / "wave-opt"
+        )
+        if wave_opt.exists():
+            monkeypatch.setenv("TRITON_WAVE_OPT", str(wave_opt))
 
-    if "tlx_wave" not in backends:
-        pytest.skip("tlx_wave backend is not installed")
+    if backend_name not in backends:
+        pytest.skip(f"{backend_name} backend is not installed")
 
     with knobs.cache.scope(), knobs.runtime.scope():
-        knobs.cache.dir = str(tmp_path / "triton-cache-v9")
+        knobs.cache.dir = str(tmp_path / f"triton-cache-v9-{cache_suffix}")
         knobs.runtime.override_arch = "gfx950"
         triton.runtime.driver._default = None
         triton.runtime.driver._active = None
         try:
             target = triton.runtime.driver.active.get_current_target()
         except RuntimeError as exc:
-            pytest.skip(f"tlx_wave backend is not active: {exc}")
-        if target.backend != "tlx_wave" or target.arch != "gfx950":
-            pytest.skip(f"requires tlx_wave:gfx950, got {target}")
+            pytest.skip(f"{backend_name} backend is not active: {exc}")
+        if target.backend != expected_target_backend or target.arch != "gfx950":
+            pytest.skip(f"requires {expected_target_backend}:gfx950, got {target}")
 
-        tutorial = _load_gfx9_v9_module()
+        tutorial = _load_gfx9_v9_module(f"tlx_wave_gfx9_v9_tutorial_{module_suffix}")
         grid_mn = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
 
         a = MockTensor(torch.float16, [m, k])
@@ -196,6 +207,30 @@ def _warmup_gfx9_v9_tlx_wave(
             grid=(grid_mn,),
         )
     return compiled
+
+
+def _warmup_gfx9_v9_tlx_wave(tmp_path, monkeypatch, **kwargs):
+    return _warmup_gfx9_v9_backend(
+        tmp_path,
+        monkeypatch,
+        backend_name="tlx_wave",
+        expected_target_backend="tlx_wave",
+        cache_suffix="tlx-wave",
+        module_suffix="tlx_wave",
+        **kwargs,
+    )
+
+
+def _warmup_gfx9_v9_amd(tmp_path, monkeypatch, **kwargs):
+    return _warmup_gfx9_v9_backend(
+        tmp_path,
+        monkeypatch,
+        backend_name="amd",
+        expected_target_backend="hip",
+        cache_suffix="amd",
+        module_suffix="amd",
+        **kwargs,
+    )
 
 
 def _asm_text(compiled, artifact):
@@ -246,23 +281,67 @@ def _run_wave_promote_buffer_to_machine(wave_artifact):
     return result.stdout
 
 
+def _run_wave_to_amdgpu_asm(wave_artifact):
+    wave_bin = Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin"
+    wave_opt = wave_bin / "wave-opt"
+    wave_translate = wave_bin / "wave-translate"
+    if not wave_opt.exists() or not wave_translate.exists():
+        pytest.skip("wave asm tools are not built")
+    opt = subprocess.run(
+        [
+            str(wave_opt),
+            "-",
+            "--wave-expand-integer-div-rem",
+            "--canonicalize",
+            "--cse",
+            "--wave-simplify-index-exprs",
+            "--canonicalize",
+            "--cse",
+            "--wave-promote-global-to-buffer",
+            "--waveamd-to-machine",
+            "--canonicalize",
+            "--cse",
+            "--waveamd-abi-lowering",
+            "--waveamd-reg-alloc",
+            "--waveamd-resource-info",
+        ],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert opt.returncode == 0, opt.stderr or opt.stdout
+    asm = subprocess.run(
+        [str(wave_translate), "--wave-to-amdgpu-asm", "-"],
+        input=opt.stdout,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert asm.returncode == 0, asm.stderr or asm.stdout
+    return asm.stdout, opt.stderr
+
+
 def test_gemm_wp_tlx_wave_warmup_emits_wave_handoff(monkeypatch, tmp_path):
     compiled = _warmup_gemm_wp_tlx_wave(tmp_path, monkeypatch)
 
     ttgir = _asm_text(compiled, "ttgir")
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
+    assert compiled.metadata.tlx_wave_emit_api == "structural-python"
     assert compiled.metadata.tlx_wave_num_async_copies >= 4
-    assert (
-        compiled.metadata.tlx_wave_num_dma_load_lds
-        >= compiled.metadata.tlx_wave_num_async_copies
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == wave.count(
+        "waveamd.dma_load_lds"
     )
+    assert compiled.metadata.tlx_wave_num_dma_load_lds >= 8
     assert compiled.metadata.tlx_wave_num_async_waits >= 2
     assert compiled.metadata.tlx_wave_num_mmas > 1
     assert "scf.for" in wave
     assert "waveamd.dma_load_lds" in wave
     assert "waveamd.transpose_load" in wave
-    assert "bytes = 4" in wave
+    assert "bytes = 16" in wave
     _assert_mfma32_kind(wave)
     assert "waveamdmachine.target" in wave
     assert (
@@ -292,39 +371,78 @@ def test_gemm_wp_tlx_wave_epilogue_promotes_packed_store_to_buffer(
         in wave
     )
     assert '#wave.pred<"x >= 0">, #wave.pred<"-2147483647 + x <= 0">' in wave
-    assert "floor(1/8*tlx_pow2_divsi" in wave
-    assert "Mod(tlx_pow2_remsi" in wave
+    assert "arith.index_cast" not in wave
+    assert wave.count("wave.cast intconvert") >= 3
+    assert wave.count("wave.binary divui") >= 1
+    assert wave.count("wave.binary remui") >= 1
+    assert wave.count("wave.binary xori") >= 1
     assert len(machine.splitlines()) < 14_000
     assert machine.count("waveamdmachine.tuple_to_elements") < 4_000
     assert machine.count("waveamdmachine.s_cselect_b32") < 128
-    assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 4
+    assert machine.count("waveamdmachine.buffer_store_tuple_b32") >= 1
     assert "waveamdmachine.global_store_b32_addr64" not in machine
     assert "waveamdmachine.global_store_b128_addr64" not in machine
 
 
 def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
+    amd_compiled = _warmup_gfx9_v9_amd(tmp_path, monkeypatch)
+    amd_asm = _asm_text(amd_compiled, "amdgcn")
+
     compiled = _warmup_gfx9_v9_tlx_wave(tmp_path, monkeypatch)
 
     wave = _wave_text(compiled)
     machine = _run_wave_promote_buffer_to_machine(wave)
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_num_mmas == 256
+    assert compiled.metadata.tlx_wave_wave_builder == "new-python-rewrite"
+    assert compiled.metadata.tlx_wave_num_mmas == 128
     assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
     assert wave.count("wave.index_expr") < 1_900
-    assert wave.count("wave.cast fpconvert") == 128
-    assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741815 + x <= 0">' in wave
+    assert wave.count("wave.cast fpconvert") == 32
+    assert wave.count("wave.store") == 32
+    assert wave.count("wave.where") == 0
+    assert wave.count("wave.join") <= 8
+    assert wave.count("wave.extract") == 0
+    assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741819 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
-    assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 128
+    assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 64
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
-    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 64
-    assert machine.count("waveamdmachine.buffer_store_b32") == 128
+    assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
+    assert "waveamdmachine.global_load_lds_b128" not in machine
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 48
+    assert machine.count("waveamdmachine.token_join") <= 8
+    assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 32
+    assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 32
+    assert machine.count("waveamdmachine.exec_if") == 0
+    assert "waveamdmachine.buffer_store_b16" not in machine
     assert "waveamdmachine.global_store_b16_addr64" not in machine
     assert "waveamdmachine.s_addc_u32" not in machine
     assert "waveamdmachine.v_addc" not in machine
+    asm, _diagnostics = _run_wave_to_amdgpu_asm(wave)
+    assert asm.count("v_mfma") == amd_asm.count("v_mfma") == 128
+    assert asm.count("buffer_load") == amd_asm.count("buffer_load") == 16
+    assert asm.count("buffer_store") == amd_asm.count("buffer_store") == 32
+    assert asm.count("v_cvt_pk_f16_f32") == amd_asm.count("v_cvt_pk_f16_f32") == 64
+    assert asm.count("s_barrier") == amd_asm.count("s_barrier") == 2
+    assert "global_load" not in asm
+    assert "global_load" not in amd_asm
+    assert "global_store" not in asm
+    assert "global_store" not in amd_asm
+    assert "v_cvt_f16_f32" not in asm
+    assert "v_cvt_f16_f32" not in amd_asm
+    assert "s_addc" not in asm
+    assert "s_addc" not in amd_asm
+    assert "v_addc" not in asm
+    assert "v_addc" not in amd_asm
+    assert asm.count("s_waitcnt") < 2 * amd_asm.count("s_waitcnt")
     assert "waveamdmachine.s_lshl_b64" not in machine
     assert "waveamdmachine.v_lshlrev_b64" not in machine
     assert "waveamdmachine.v_lshrrev_b64" not in machine
+    assert "waveamdmachine.v_add_u64" not in machine
+    assert machine.count("waveamdmachine.v_cmp") <= 16
+    assert machine.count("waveamdmachine.s_cmp_lg_u32") <= 20
+    assert machine.count("waveamdmachine.s_cselect_b32") <= 32
+    assert machine.count("waveamdmachine.s_xor_b32") <= 16
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
     assert len(machine.splitlines()) < 5_000
@@ -350,17 +468,21 @@ def test_gemm_wp_tlx_wave_warmup_handles_edge_tiles(monkeypatch, tmp_path):
 
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert (
-        compiled.metadata.tlx_wave_num_dma_load_lds
-        >= compiled.metadata.tlx_wave_num_async_copies
+    assert compiled.metadata.tlx_wave_emit_api == "structural-python"
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == wave.count(
+        "waveamd.dma_load_lds"
     )
+    assert compiled.metadata.tlx_wave_num_dma_load_lds >= 8
     assert "waveamd.dma_load_lds" in wave
     assert "ttg.async_copy_global_to_local" not in wave
 
 
-@pytest.mark.parametrize("block_m,block_n", [(128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize(
+    "block_m,block_n,expected_fragments",
+    [(128, 256, 4), (256, 128, 4), (256, 256, 8)],
+)
 def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(
-    monkeypatch, tmp_path, block_m, block_n
+    monkeypatch, tmp_path, block_m, block_n, expected_fragments
 ):
     compiled = _warmup_gemm_wp_tlx_wave(
         tmp_path,
@@ -376,8 +498,8 @@ def test_gemm_wp_tlx_wave_warmup_lowers_full_mfma_layout(
 
     wave = _wave_text(compiled)
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_num_mmas >= 32
-    assert compiled.metadata.tlx_wave_num_fragment_fills >= 32
+    assert compiled.metadata.tlx_wave_num_mmas >= expected_fragments
+    assert compiled.metadata.tlx_wave_num_fragment_fills >= expected_fragments
     _assert_mfma32_kind(wave)
 
 

@@ -9,6 +9,29 @@ from triton.backends.compiler import GPUTarget, Language
 from . import wave_bridge
 
 
+def _module_has_new_bridge_blocker(mod):
+    found = False
+
+    def visit(op):
+        nonlocal found
+        name = op.get_name()
+        segments = op.get_int_array_attr("operandSegmentSizes")
+        if name == "ttg.async_copy_global_to_local" and segments is not None:
+            if len(segments) >= 4 and int(segments[3]):
+                found = True
+                return False
+        if name == "amdg.buffer_load_to_local" and segments is not None:
+            if len(segments) >= 6 and (
+                int(segments[3]) or int(segments[4]) or int(segments[5])
+            ):
+                found = True
+                return False
+        return True
+
+    mod.walk(visit)
+    return found
+
+
 class TLXWaveBackend(amd_compiler.HIPBackend):
     """TLX-first AMD Wave backend scaffold.
 
@@ -112,6 +135,21 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        if not _module_has_new_bridge_blocker(mod):
+            amd.passes.ttgpuir.add_optimize_epilogue(pm)
+            amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
+            amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
+            amd.passes.ttgpuir.add_sink_layout_conversions(pm)
+            if knobs.amd.use_buffer_ops:
+                amd.passes.ttgpuir.add_canonicalize_pointers(pm)
+                passes.common.add_canonicalizer(pm)
+                amd.passes.ttgpuir.add_convert_to_buffer_ops(
+                    pm,
+                    options.arch,
+                    knobs.amd.use_buffer_atomics,
+                    knobs.amd.buffer_ops_analyze_small_tensor_range,
+                )
+                amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir_post_cf_lift")

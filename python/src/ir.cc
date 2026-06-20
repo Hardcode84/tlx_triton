@@ -741,6 +741,60 @@ void init_triton_ir(py::module_ &m) {
                return py::cast(dotOp.getParent());
              return py::none();
            })
+      .def("is_slice_encoding",
+           [](Attribute &self) { return isa<ttg::SliceEncodingAttr>(self); })
+      .def("get_slice_dim",
+           [](Attribute &self) -> py::object {
+             if (auto slice = dyn_cast<ttg::SliceEncodingAttr>(self))
+               return py::int_(slice.getDim());
+             return py::none();
+           })
+      .def("get_slice_parent",
+           [](Attribute &self) -> py::object {
+             if (auto slice = dyn_cast<ttg::SliceEncodingAttr>(self)) {
+               Attribute parent = slice.getParent();
+               return py::cast(parent);
+             }
+             return py::none();
+           })
+      .def("is_amd_mfma_encoding",
+           [](Attribute &self) { return isa<ttg::AMDMfmaEncodingAttr>(self); })
+      .def("get_amd_mfma_version",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::int_(mfma.getVersion());
+             return py::none();
+           })
+      .def("get_amd_mfma_warps_per_cta",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getWarpsPerCTA()));
+             return py::none();
+           })
+      .def("get_amd_mfma_instr_shape",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getInstrShape()));
+             return py::none();
+           })
+      .def("get_amd_mfma_is_transposed",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::bool_(mfma.getIsTransposed());
+             return py::none();
+           })
+      .def("get_amd_mfma_tiles_per_warp",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getTilesPerWarp()));
+             return py::none();
+           })
+      .def("get_amd_mfma_element_bit_width",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::int_(mfma.getElementBitWidth());
+             return py::none();
+           })
       .def("is_blocked_encoding",
            [](Attribute &self) { return isa<ttg::BlockedEncodingAttr>(self); })
       .def("get_blocked_size_per_thread",
@@ -841,6 +895,27 @@ void init_triton_ir(py::module_ &m) {
              if (auto swizzled =
                       dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
                 return py::cast(toInt64Vector(swizzled.getOrder()));
+              return py::none();
+           })
+      .def("is_padded_shared_encoding",
+           [](Attribute &self) { return static_cast<bool>(ttg::getPaddedEncoding(self)); })
+      .def("get_padded_shared_intervals",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(toInt64Vector(padded.getIntervals()));
+             return py::none();
+           })
+      .def("get_padded_shared_paddings",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(toInt64Vector(padded.getPaddings()));
+             return py::none();
+           })
+      .def("get_padded_shared_order",
+           [](Attribute &self) -> py::object {
+              if (auto padded = ttg::getPaddedEncoding(self))
+                return py::cast(
+                    toInt64Vector(ArrayRef<unsigned>(padded.getOrder())));
               return py::none();
             })
       .def("__str__", [](Attribute &self) {
