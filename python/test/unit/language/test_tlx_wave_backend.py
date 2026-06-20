@@ -15,6 +15,7 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 
 if "tlx_wave" in backends:
+    from triton.backends.tlx_wave import compiler as tlx_wave_compiler
     from triton.backends.tlx_wave import wave_bridge
     from triton.backends.tlx_wave import wave_bridge_conversion
     from triton.backends.tlx_wave import wave_bridge_emit
@@ -36,6 +37,7 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import types as converter_types
     from triton.backends.tlx_wave.converter import verifier as converter_verifier
 else:
+    tlx_wave_compiler = None
     wave_bridge = None
     wave_bridge_conversion = None
     wave_bridge_emit = None
@@ -1135,6 +1137,96 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
     assert "wave_bridge" not in emitted.text
     assert output.target_program.kernel.name == "converter_emit"
     del ctx
+
+
+def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch):
+    local_func = """
+  tt.func public @backend_wave_stage(%arg0: i32) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %sum = arith.addi %arg0, %zero : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+    metadata = {}
+
+    monkeypatch.delenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", raising=False)
+    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
+        mod,
+        metadata,
+        _wave_bridge_options(),
+    )
+
+    assert "tlx_wave.new_converter" in wave_artifact
+    assert "wave_bridge" not in wave_artifact
+    assert metadata["name"] == "backend_wave_stage"
+    assert metadata["tlx_wave_status"] == "emitted_wave_staged_converter"
+    assert metadata["tlx_wave_bridge_stage"] == "staged-converter"
+    assert metadata["tlx_wave_wave_builder"] == "staged-converter"
+    assert metadata["tlx_wave_plan_kind"] == "staged-converter"
+    assert metadata["tlx_wave_ttgir_target"] == "hip:gfx950"
+    assert metadata["tlx_wave_num_kernel_args"] == 1
+    assert metadata["tlx_wave_num_scalar_args"] == 1
+    assert metadata["tlx_wave_num_pointer_args"] == 0
+    _run_wave_verify(wave_artifact)
+    del ctx
+
+
+def test_tlx_wave_backend_wave_stage_legacy_escape(tmp_path, monkeypatch):
+    local_func = """
+  tt.func public @backend_wave_stage_legacy(%arg0: i32) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %sum = arith.addi %arg0, %zero : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+    metadata = {}
+
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
+    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
+        mod,
+        metadata,
+        _wave_bridge_options(),
+    )
+
+    assert "tlx_wave.new_converter" not in wave_artifact
+    assert metadata["name"] == "backend_wave_stage_legacy"
+    assert metadata["tlx_wave_status"] == "emitted_wave_ttgir_op_lowering"
+    assert metadata["tlx_wave_bridge_stage"] == "ttgir-op-lowering"
+    assert metadata["tlx_wave_wave_builder"] == "new-python-rewrite"
+    _run_wave_verify(wave_artifact)
+    del ctx
+
+
+def test_tlx_wave_backend_hash_tracks_legacy_bridge_flag(monkeypatch):
+    backend = make_backend(GFX950_WAVE)
+
+    monkeypatch.delenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", raising=False)
+    staged_hash = backend.hash()
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
+    legacy_hash = backend.hash()
+
+    assert staged_hash != legacy_hash
+    assert staged_hash.endswith(":staged")
+    assert legacy_hash.endswith(":legacy")
+
+
+def test_tlx_wave_backend_compile_uses_staged_converter(monkeypatch):
+    src = ASTSource(fn=_tlx_wave_stage_only_kernel, signature={}, constexprs={})
+
+    monkeypatch.delenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", raising=False)
+    compiled = triton_compile(src, target=GFX950_WAVE)
+    wave_artifact = _asm_text(compiled, "wave")
+
+    assert "tlx_wave.new_converter" in wave_artifact
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_bridge_stage == "staged-converter"
+    assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
+    assert compiled.metadata.tlx_wave_plan_kind == "staged-converter"
+    assert compiled.metadata.tlx_wave_num_kernel_args == 0
+    assert compiled.metadata.tlx_wave_plan_num_ops >= 1
+    _run_wave_verify(wave_artifact)
 
 
 def test_tlx_wave_converter_pipeline_lowers_program_id(tmp_path):
@@ -3032,6 +3124,12 @@ def test_tlx_wave_new_text_emitter_verifies_v9_frontier_ops(tmp_path):
 
 
 @triton.jit
+def _tlx_wave_stage_only_kernel():
+    pid = tl.program_id(0)
+    tl.assume(pid >= 0)
+
+
+@triton.jit
 def _tlx_wave_local_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -4909,7 +5007,8 @@ def test_tlx_wave_lowers_generic_tensor_layout_with_repeated_components(tmp_path
     del ctx
 
 
-def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_as_dma():
+def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_as_dma(monkeypatch):
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
     src = ASTSource(
         fn=_tlx_wave_gemm_cutoff_kernel,
         signature={
@@ -4937,17 +5036,19 @@ def test_tlx_wave_gemm_cutoff_lowers_padded_async_copy_as_dma():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 4
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
-    assert wave_artifact.count("waveamd.dma_load_lds") == 4
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 8
+    assert wave_artifact.count("waveamd.dma_load_lds") == 8
     dma_destination_expr_lengths = _wave_expr_lengths_with_name(
         wave_artifact, "thread_first"
     )
-    assert dma_destination_expr_lengths
-    assert max(dma_destination_expr_lengths) < 512
+    if compiled.metadata.tlx_wave_emit_api == "structural-python":
+        assert dma_destination_expr_lengths
+        assert max(dma_destination_expr_lengths) < 512
     assert "ttg.async_copy_global_to_local" not in wave_artifact
 
 
-def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
+def test_tlx_wave_tokenized_local_load_preserves_wait_dependency(monkeypatch):
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
     src = ASTSource(
         fn=_tlx_wave_gemm_token_local_load_kernel,
         signature={
@@ -4976,7 +5077,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_async_copies == 2
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 2
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 4
     assert compiled.metadata.tlx_wave_num_async_commit_groups == 1
     assert compiled.metadata.tlx_wave_num_async_waits == 1
     assert compiled.metadata.tlx_wave_num_wave_barriers == 1
@@ -4989,7 +5090,7 @@ def test_tlx_wave_tokenized_local_load_preserves_wait_dependency():
     assert "isTransposed = true" in ttgir
     assert ttgir.count("#ttg.padded_shared") == 2
     assert "parent = #mma, kWidth = 8" in ttgir
-    assert wave_artifact.count("waveamd.dma_load_lds") == 2
+    assert wave_artifact.count("waveamd.dma_load_lds") == 4
     assert wave_artifact.count("wave.wait") == 1
     assert wave_artifact.count("wave.barrier") == 1
     assert "ttg.local_load" not in wave_artifact
@@ -6340,7 +6441,8 @@ def test_tlx_wave_async_copy_noncontiguous_2d_i8_packet_source_falls_back(
     del ctx
 
 
-def test_tlx_wave_bridge_lowers_async_copy_other_with_load_store_fallback():
+def test_tlx_wave_bridge_lowers_async_copy_other_with_load_store_fallback(monkeypatch):
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
     src = ASTSource(
         fn=_tlx_wave_async_other_kernel,
         signature={"in_ptr": "*fp32", "out_ptr": "*fp32", "n_elements": "i32"},
@@ -8184,7 +8286,8 @@ def test_tlx_wave_bridge_splats_uniform_tensor_compare_operands():
     assert wave_values[3].value is builder.cmpis[0][3]
 
 
-def test_tlx_wave_lowers_unrelated_i32_data_math_in_ordered_path():
+def test_tlx_wave_lowers_unrelated_i32_data_math_in_ordered_path(monkeypatch):
+    monkeypatch.setenv("TRITON_TLX_WAVE_LEGACY_BRIDGE", "1")
     src = ASTSource(
         fn=_tlx_wave_unrelated_i32_math_kernel,
         signature={

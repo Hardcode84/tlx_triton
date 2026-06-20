@@ -1,4 +1,4 @@
-import functools
+import os
 from typing import Any
 
 from triton import knobs
@@ -7,6 +7,20 @@ import triton.backends.amd.compiler as amd_compiler
 from triton.backends.compiler import GPUTarget, Language
 
 from . import wave_bridge
+from .converter import pipeline as converter_pipeline
+from .wave_bridge_tools import _verify_wave_module, _wave_opt
+
+
+_LEGACY_BRIDGE_ENV = "TRITON_TLX_WAVE_LEGACY_BRIDGE"
+
+
+def _use_legacy_bridge():
+    return os.environ.get(_LEGACY_BRIDGE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _module_has_new_bridge_blocker(mod):
@@ -158,7 +172,17 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @staticmethod
     def make_wave(src, metadata, options):
-        return wave_bridge.stop_before_wave_lowering(src, metadata, options)
+        if _use_legacy_bridge():
+            return wave_bridge.stop_before_wave_lowering(src, metadata, options)
+
+        output = converter_pipeline.convert_ttgir_to_wave(src)
+        _validate_staged_converter_output(output, options)
+
+        wave_text = output.emitted_module.text
+        wave_opt = _wave_opt()
+        _verify_wave_module(wave_text, wave_opt)
+        _populate_staged_converter_metadata(metadata, output, options, wave_opt)
+        return wave_text
 
     def add_stages(self, stages, options, language):
         if language != Language.TRITON:
@@ -169,6 +193,69 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         if knobs.runtime.add_stages_inspection_hook is not None:
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
-    @functools.lru_cache()
     def hash(self):
-        return f"{self.target}:stage3-ttgir-graph-plan"
+        bridge_mode = "legacy" if _use_legacy_bridge() else "staged"
+        return f"{self.target}:stage4-staged-converter:{bridge_mode}"
+
+
+def _validate_staged_converter_output(output, options):
+    kernel = output.source_program.kernel
+    expected_target = f"hip:{options.arch}"
+    if kernel.target != expected_target:
+        raise ValueError(
+            f"tlx_wave staged converter expected TTGIR target {expected_target}, "
+            f"got {kernel.target}"
+        )
+    if int(kernel.threads_per_warp or options.warp_size) != int(options.warp_size):
+        raise ValueError(
+            "tlx_wave staged converter saw inconsistent wave size: "
+            f"TTGIR={kernel.threads_per_warp}, options={options.warp_size}"
+        )
+
+
+def _populate_staged_converter_metadata(metadata, output, options, wave_opt):
+    source_kernel = output.source_program.kernel
+    target_program = output.target_program
+    emitted = output.emitted_module
+    wave_text = emitted.text
+    target_values = {
+        value.target_value_id: value for value in target_program.values
+    }
+    arg_types = [
+        target_values[target_id].type
+        for target_id in target_program.kernel.arg_target_ids
+    ]
+
+    metadata["name"] = target_program.kernel.name
+    metadata["shared"] = emitted.lds_size
+    metadata["global_scratch_size"] = 0
+    metadata["global_scratch_align"] = 1
+    metadata["profile_scratch_size"] = 0
+    metadata["profile_scratch_align"] = 1
+    metadata["tlx_wave_status"] = "emitted_wave_staged_converter"
+    metadata["tlx_wave_bridge_stage"] = "staged-converter"
+    metadata["tlx_wave_wave_builder"] = "staged-converter"
+    metadata["tlx_wave_emit_api"] = "structural-python"
+    metadata["tlx_wave_plan_kind"] = "staged-converter"
+    metadata["tlx_wave_arch"] = options.arch
+    metadata["tlx_wave_ttgir_target"] = source_kernel.target
+    metadata["tlx_wave_num_ctas"] = int(source_kernel.num_ctas or 1)
+    metadata["tlx_wave_num_warps"] = int(source_kernel.num_warps or 1)
+    metadata["tlx_wave_threads_per_warp"] = int(
+        source_kernel.threads_per_warp or options.warp_size
+    )
+    metadata["tlx_wave_num_kernel_args"] = len(target_program.kernel.arg_target_ids)
+    metadata["tlx_wave_num_pointer_args"] = sum(
+        1 for target_type in arg_types if target_type.kind == "pointer"
+    )
+    metadata["tlx_wave_num_scalar_args"] = sum(
+        1 for target_type in arg_types if target_type.kind == "scalar"
+    )
+    metadata["tlx_wave_plan_num_values"] = len(target_program.values)
+    metadata["tlx_wave_plan_num_ops"] = len(target_program.ops)
+    metadata["tlx_wave_lds_size_bytes"] = emitted.lds_size
+    metadata["tlx_wave_num_mmas"] = wave_text.count("waveamd.mma")
+    metadata["tlx_wave_num_wave_joins"] = wave_text.count("wave.join")
+    metadata["tlx_wave_num_async_waits"] = wave_text.count("wave.wait")
+    metadata["tlx_wave_num_dma_load_lds"] = wave_text.count("waveamd.dma_load_lds")
+    metadata["tlx_wave_wave_opt"] = wave_opt
