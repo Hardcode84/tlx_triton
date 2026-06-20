@@ -1,0 +1,2905 @@
+"""Stateless source-op to target-program conversion."""
+
+from dataclasses import dataclass
+import re
+
+from .diagnostics import fail
+from . import target_ir
+
+
+STAGE = "op_conversion"
+
+_BINARY_OPS = {
+    "arith.addi": "addi",
+    "arith.subi": "subi",
+    "arith.muli": "muli",
+    "arith.andi": "andi",
+    "arith.ori": "ori",
+    "arith.xori": "xori",
+    "arith.divsi": "divsi",
+    "arith.divui": "divui",
+    "arith.remsi": "remsi",
+    "arith.remui": "remui",
+}
+
+
+@dataclass(frozen=True)
+class OpConversionView:
+    op_index: int
+    op_name: str
+    attrs: dict
+    operand_target_ids: tuple[int, ...]
+    result_target_ids: tuple[int, ...]
+    result_layout_map_ids: tuple[int, ...]
+    fact_ids: tuple[int, ...]
+    operand_fact_ids: tuple[int, ...]
+
+
+def convert_ops(source_program, type_layout_program, fact_program, token_program):
+    builder = target_ir.TargetBuilder(
+        target_ir.TargetKernel(
+            source_program.kernel.name,
+            source_program.kernel.target,
+            source_program.kernel.num_ctas,
+            source_program.kernel.num_warps,
+            source_program.kernel.threads_per_warp,
+            source_program.kernel.noinline,
+        )
+    )
+    fact_ids_by_op = _fact_ids_by_source_op(fact_program)
+    token_nodes_by_op = {node.op_index: node for node in token_program.nodes}
+    token_groups_by_commit = {
+        group.commit_op_index: group for group in token_program.groups
+    }
+    token_groups_by_id = {group.group_id: group for group in token_program.groups}
+    local_alloc_byte_offsets, _lds_size = _compute_local_alloc_layout(source_program)
+    static_memdesc_byte_offsets = _compute_static_memdesc_byte_offsets(
+        source_program,
+        local_alloc_byte_offsets,
+    )
+    _seed_kernel_arguments(builder, source_program, type_layout_program)
+
+    _convert_region(
+        builder,
+        source_program,
+        type_layout_program,
+        fact_program,
+        fact_ids_by_op,
+        token_nodes_by_op,
+        token_groups_by_commit,
+        token_groups_by_id,
+        local_alloc_byte_offsets,
+        static_memdesc_byte_offsets,
+        source_program.top_region_id,
+        allow_yield=False,
+    )
+
+    return builder.build()
+
+
+def _convert_region(
+    builder,
+    source_program,
+    type_layout_program,
+    fact_program,
+    fact_ids_by_op,
+    token_nodes_by_op,
+    token_groups_by_commit,
+    token_groups_by_id,
+    local_alloc_byte_offsets,
+    static_memdesc_byte_offsets,
+    region_id,
+    *,
+    allow_yield,
+):
+    for op_index in source_program.regions[region_id].op_indices:
+        op = source_program.ops[op_index]
+        if op.name == "scf.yield":
+            if not allow_yield:
+                fail(
+                    "TLXW_OP_UNEXPECTED_YIELD",
+                    STAGE,
+                    "scf.yield is only valid inside a converted region",
+                    source_op_index=op.index,
+                )
+            return op.operands
+        _convert_source_op(
+            builder,
+            source_program,
+            type_layout_program,
+            fact_program,
+            fact_ids_by_op,
+            token_nodes_by_op,
+            token_groups_by_commit,
+            token_groups_by_id,
+            local_alloc_byte_offsets,
+            static_memdesc_byte_offsets,
+            op,
+        )
+    if allow_yield:
+        fail(
+            "TLXW_OP_MISSING_YIELD",
+            STAGE,
+            f"region {region_id} has no scf.yield",
+        )
+    return ()
+
+
+def _convert_source_op(
+    builder,
+    source_program,
+    type_layout_program,
+    fact_program,
+    fact_ids_by_op,
+    token_nodes_by_op,
+    token_groups_by_commit,
+    token_groups_by_id,
+    local_alloc_byte_offsets,
+    static_memdesc_byte_offsets,
+    op,
+):
+    if op.name == "scf.if":
+        _convert_if(
+            builder,
+            source_program,
+            type_layout_program,
+            fact_program,
+            fact_ids_by_op,
+            token_nodes_by_op,
+            token_groups_by_commit,
+            token_groups_by_id,
+            local_alloc_byte_offsets,
+            static_memdesc_byte_offsets,
+            op,
+        )
+        return
+    if op.name == "arith.constant" and _has_fragment_result(type_layout_program, op):
+        _convert_fragment_constant(builder, type_layout_program, op)
+        return
+    if op.name == "arith.truncf" and _has_fragment_result(type_layout_program, op):
+        _convert_fragment_truncf(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.local_alloc":
+        _convert_local_alloc(
+            builder,
+            source_program,
+            type_layout_program,
+            local_alloc_byte_offsets,
+            op,
+        )
+        return
+    if op.name == "ttg.memdesc_index":
+        _convert_memdesc_index(
+            builder,
+            source_program,
+            type_layout_program,
+            static_memdesc_byte_offsets,
+            op,
+        )
+        return
+    if op.name == "ttg.local_load":
+        _convert_local_load(builder, source_program, type_layout_program, op)
+        return
+    if op.name == "ttg.convert_layout":
+        _convert_layout(builder, type_layout_program, op)
+        return
+    if op.name == "tt.dot":
+        _convert_dot(builder, type_layout_program, op)
+        return
+    if op.name == "amdg.buffer_load_to_local":
+        _convert_buffer_load_to_local(
+            builder,
+            source_program,
+            type_layout_program,
+            fact_program,
+            token_nodes_by_op,
+            op,
+        )
+        return
+    if op.name == "amdg.buffer_store":
+        _convert_buffer_store(
+            builder,
+            source_program,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "ttg.async_commit_group":
+        _convert_async_commit_group(
+            builder,
+            type_layout_program,
+            token_groups_by_commit,
+            op,
+        )
+        return
+    if op.name == "ttg.async_wait":
+        _convert_async_wait(
+            builder,
+            type_layout_program,
+            token_nodes_by_op,
+            token_groups_by_id,
+            op,
+        )
+        return
+    converter = _converter_for_op(op.name)
+    if converter is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED",
+            STAGE,
+            f"no op conversion for {op.name}",
+            source_op_index=op.index,
+        )
+    operand_target_ids = _operand_target_ids(builder, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    view = OpConversionView(
+        op.index,
+        op.name,
+        dict(op.attrs),
+        operand_target_ids,
+        result_target_ids,
+        result_layout_map_ids,
+        fact_ids_by_op.get(op.index, ()),
+        _operand_assume_fact_ids(fact_program, op),
+    )
+    converter(builder, view)
+
+
+def _seed_kernel_arguments(builder, source_program, type_layout_program):
+    arg_target_ids = []
+    for source_value_id in source_program.kernel.arg_ids:
+        converted = type_layout_program.values[source_value_id]
+        arg_target_ids.append(
+            builder.add_value(
+                target_ir.target_type_from_converted(converted.type),
+                source_value_id=source_value_id,
+                debug_name=f"arg{source_value_id}",
+            )
+        )
+    builder.set_kernel_arg_targets(tuple(arg_target_ids))
+
+
+def _declare_results(builder, op, type_layout_program):
+    result_target_ids = []
+    result_layout_map_ids = []
+    for source_value_id in op.results:
+        converted = type_layout_program.values[source_value_id]
+        result_target_ids.append(
+            builder.add_value(
+                target_ir.target_type_from_converted(converted.type),
+                source_value_id=source_value_id,
+                debug_name=f"v{source_value_id}",
+            )
+        )
+        if converted.layout_map_id is not None:
+            result_layout_map_ids.append(converted.layout_map_id)
+    return tuple(result_target_ids), tuple(result_layout_map_ids)
+
+
+def _operand_target_ids(builder, op):
+    operand_target_ids = []
+    for source_value_id in op.operands:
+        targets = builder.source_value_targets.get(source_value_id)
+        if not targets:
+            fail(
+                "TLXW_OP_UNCONVERTED_OPERAND",
+                STAGE,
+                f"operand {source_value_id} has no converted target value",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+        if len(targets) != 1:
+            fail(
+                "TLXW_OP_MULTI_VALUE_OPERAND",
+                STAGE,
+                f"operand {source_value_id} maps to multiple target values {targets}",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+        operand_target_ids.append(targets[0])
+    return tuple(operand_target_ids)
+
+
+def _converter_for_op(op_name):
+    if op_name == "arith.constant":
+        return _convert_constant
+    if op_name in _BINARY_OPS:
+        return _convert_binary
+    if op_name == "arith.cmpi":
+        return _convert_cmpi
+    if op_name == "arith.minsi":
+        return _convert_minsi
+    if op_name == "llvm.intr.assume":
+        return _convert_assume
+    if op_name == "tt.make_range":
+        return _convert_make_range
+    if op_name == "tt.splat":
+        return _convert_splat
+    if op_name == "tt.addptr":
+        return _convert_addptr
+    if op_name == "tt.broadcast":
+        return _convert_broadcast
+    if op_name == "tt.expand_dims":
+        return _convert_expand_dims
+    if op_name == "tt.get_program_id":
+        return _convert_program_id
+    if op_name == "tt.return":
+        return _convert_return
+    return None
+
+
+def _convert_constant(builder, view):
+    builder.add_op(
+        "constant",
+        results=view.result_target_ids,
+        attrs={
+            "value": _constant_literal(
+                view.attrs.get("value"),
+                source_op_index=view.op_index,
+            )
+        },
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_binary(builder, view):
+    attrs = {
+        "operation": _BINARY_OPS[view.op_name],
+        "source_width": _target_int_width(builder, view.result_target_ids),
+    }
+    nsw, nuw = _arith_overflow_flags(view)
+    if nsw:
+        attrs["nsw"] = True
+    if nuw:
+        attrs["nuw"] = True
+    builder.add_op(
+        "binary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs=attrs,
+        fact_ids=view.operand_fact_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_cmpi(builder, view):
+    builder.add_op(
+        "cmpi",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={
+            "predicate": _cmpi_predicate(view.attrs.get("predicate")),
+            "source_width": _target_int_width(builder, view.operand_target_ids),
+        },
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_minsi(builder, view):
+    builder.add_op(
+        "minsi",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"source_width": _target_int_width(builder, view.result_target_ids)},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_assume(builder, view):
+    if not view.fact_ids:
+        return
+    builder.add_op(
+        "assume",
+        operands=view.operand_target_ids,
+        fact_ids=view.fact_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _arith_overflow_flags(view):
+    if view.op_name not in {"arith.addi", "arith.muli", "arith.subi"}:
+        return False, False
+    attr = view.attrs.get("overflowFlags")
+    if attr is None:
+        return False, False
+    text = str(attr)
+    return "nsw" in text, "nuw" in text
+
+
+def _convert_make_range(builder, view):
+    builder.add_op(
+        "make_range",
+        results=view.result_target_ids,
+        attrs={
+            "start": _int_attr(view.attrs, "start"),
+            "end": _int_attr(view.attrs, "end"),
+        },
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_splat(builder, view):
+    builder.add_op(
+        "splat",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_addptr(builder, view):
+    builder.add_op(
+        "addptr",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_expand_dims(builder, view):
+    builder.add_op(
+        "expand_dims",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"axis": _int_attr(view.attrs, "axis")},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_broadcast(builder, view):
+    builder.add_op(
+        "broadcast",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_program_id(builder, view):
+    builder.add_op(
+        "program_id",
+        results=view.result_target_ids,
+        attrs={"axis": _int_attr(view.attrs, "axis")},
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_if(
+    builder,
+    source_program,
+    type_layout_program,
+    fact_program,
+    fact_ids_by_op,
+    token_nodes_by_op,
+    token_groups_by_commit,
+    token_groups_by_id,
+    local_alloc_byte_offsets,
+    static_memdesc_byte_offsets,
+    op,
+):
+    if len(op.operands) != 1 or len(op.region_ids) != 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_IF",
+            STAGE,
+            "scf.if conversion requires one condition and then/else regions",
+            source_op_index=op.index,
+        )
+    condition_targets = _operand_target_ids(builder, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    then_yields = _convert_region(
+        builder,
+        source_program,
+        type_layout_program,
+        fact_program,
+        fact_ids_by_op,
+        token_nodes_by_op,
+        token_groups_by_commit,
+        token_groups_by_id,
+        local_alloc_byte_offsets,
+        static_memdesc_byte_offsets,
+        op.region_ids[0],
+        allow_yield=True,
+    )
+    else_yields = _convert_region(
+        builder,
+        source_program,
+        type_layout_program,
+        fact_program,
+        fact_ids_by_op,
+        token_nodes_by_op,
+        token_groups_by_commit,
+        token_groups_by_id,
+        local_alloc_byte_offsets,
+        static_memdesc_byte_offsets,
+        op.region_ids[1],
+        allow_yield=True,
+    )
+    if len(then_yields) != len(result_target_ids) or len(else_yields) != len(result_target_ids):
+        fail(
+            "TLXW_OP_IF_YIELD_MISMATCH",
+            STAGE,
+            "scf.if yield counts must match result count",
+            source_op_index=op.index,
+        )
+    for index, result_target_id in enumerate(result_target_ids):
+        true_target_id = _single_source_target(builder, then_yields[index], op)
+        false_target_id = _single_source_target(builder, else_yields[index], op)
+        builder.add_op(
+            "select",
+            operands=(condition_targets[0], true_target_id, false_target_id),
+            results=(result_target_id,),
+            layout_map_ids=result_layout_map_ids,
+            source_op_index=op.index,
+        )
+
+
+def _convert_local_alloc(
+    builder,
+    source_program,
+    type_layout_program,
+    local_alloc_byte_offsets,
+    op,
+):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_LOCAL_ALLOC_RESULT",
+            STAGE,
+            "ttg.local_alloc must produce one memdesc result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    source_type = source_program.values[op.results[0]].type
+    shape = tuple(source_type.shape or source_type.alloc_shape)
+    allocation_bytes = _local_alloc_size_bytes(source_type, op.index, op.results[0])
+    builder.add_op(
+        "local_alloc",
+        results=result_target_ids,
+        attrs={
+            "allocation_bytes": allocation_bytes,
+            "byte_offset": int(local_alloc_byte_offsets[op.results[0]]),
+            "element_type": source_type.element_type,
+            "shape": tuple(int(dim) for dim in shape),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_index(
+    builder,
+    source_program,
+    type_layout_program,
+    static_memdesc_byte_offsets,
+    op,
+):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_INDEX",
+            STAGE,
+            "ttg.memdesc_index requires memdesc/index operands and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    source_type = source_program.values[op.results[0]].type
+    element_count = _product(source_type.alloc_shape or source_type.shape or (1,))
+    static_lds_byte_offset = static_memdesc_byte_offsets.get(op.results[0])
+    builder.add_op(
+        "memdesc_index",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "elements_per_slot": element_count,
+            "static_lds_byte_offset": static_lds_byte_offset,
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_buffer_load_to_local(
+    builder,
+    source_program,
+    type_layout_program,
+    fact_program,
+    token_nodes_by_op,
+    op,
+):
+    fields = _buffer_load_to_local_fields(op)
+    if fields["mask_value_id"] is not None or fields["other_value_id"] is not None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local mask/other fallback is not converted yet",
+            source_op_index=op.index,
+        )
+    if fields["stride_value_id"] is not None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local stride operand is not converted yet",
+            source_op_index=op.index,
+        )
+    _require_default_cache(fields["cache"], op)
+    token_node = token_nodes_by_op.get(op.index)
+    if token_node is None or token_node.value_id not in op.results:
+        fail(
+            "TLXW_OP_BUFFER_ASYNC_TOKEN",
+            STAGE,
+            "amdg.buffer_load_to_local requires a token graph node",
+            source_op_index=op.index,
+        )
+    range_fact = _pointer_byte_range_fact(
+        fact_program,
+        fields["base_value_id"],
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    operands = (
+        _single_source_target(builder, fields["memdesc_value_id"], op),
+        _single_source_target(builder, fields["base_value_id"], op),
+        _single_source_target(builder, fields["offset_value_id"], op),
+    )
+    memdesc_type = source_program.values[fields["memdesc_value_id"]].type
+    if memdesc_type.element_byte_width is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local DMA requires known element byte width",
+            source_op_index=op.index,
+            source_value_id=fields["memdesc_value_id"],
+        )
+    offset_type = type_layout_program.values[fields["offset_value_id"]].type
+    if offset_type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local requires SIMD offset components",
+            source_op_index=op.index,
+            source_value_id=fields["offset_value_id"],
+        )
+    component_offsets = _local_component_base_offsets(
+        source_program,
+        type_layout_program,
+        fields["memdesc_value_id"],
+        int(offset_type.component_count),
+        int(offset_type.lane_width or source_program.kernel.threads_per_warp or 64),
+        op,
+    )
+    packet_plan = _buffer_load_to_local_packet_plan(
+        source_program,
+        type_layout_program,
+        fact_program,
+        fields["memdesc_value_id"],
+        fields["offset_value_id"],
+        memdesc_type,
+        int(offset_type.lane_width or source_program.kernel.threads_per_warp or 64),
+        op,
+    )
+    if packet_plan is not None:
+        scalar_target_ids = tuple(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in packet_plan["scalar_value_ids"]
+        )
+        builder.add_op(
+            "buffer_load_to_local",
+            operands=(operands[0], operands[1], *scalar_target_ids),
+            results=result_target_ids,
+            attrs={
+                "cache_modifier": int(fields["cache"] or 1),
+                "component_count": int(packet_plan["component_count"]),
+                "component_thread_count": int(packet_plan["component_thread_count"]),
+                "destination_component_offsets": tuple(
+                    packet_plan["destination_component_offsets"]
+                ),
+                "destination_wave_count": int(packet_plan["destination_wave_count"]),
+                "destination_wave_stride_dwords": int(
+                    packet_plan["destination_wave_stride_dwords"]
+                ),
+                "element_byte_width": int(memdesc_type.element_byte_width),
+                "element_type": memdesc_type.element_type,
+                "lane_width": int(
+                    offset_type.lane_width
+                    or source_program.kernel.threads_per_warp
+                    or 64
+                ),
+                "mode": "dma_packet_lds",
+                "packet_bytes": int(packet_plan["packet_bytes"]),
+                "packet_elements": int(packet_plan["packet_elements"]),
+                "range_bytes": int(range_fact.upper),
+                "source_offset_range": (
+                    0,
+                    _buffer_source_offset_upper(
+                        range_fact.upper,
+                        packet_plan["packet_bytes"],
+                        memdesc_type.element_byte_width,
+                        op,
+                    ),
+                ),
+                "source_offset_terms": tuple(packet_plan["source_offset_terms"]),
+                "source_rank": len(memdesc_type.shape),
+                "source_scalar_count": len(scalar_target_ids),
+                "source_shape": tuple(int(dim) for dim in memdesc_type.shape),
+            },
+            fact_ids=(range_fact.fact_id,),
+            layout_map_ids=result_layout_map_ids,
+            source_op_index=op.index,
+        )
+        return
+    builder.add_op(
+        "buffer_load_to_local",
+        operands=operands,
+        results=result_target_ids,
+        attrs={
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": int(offset_type.component_count),
+            "destination_component_offsets": tuple(component_offsets),
+            "element_type": memdesc_type.element_type,
+            "lane_width": int(
+                offset_type.lane_width
+                or source_program.kernel.threads_per_warp
+                or 64
+            ),
+            "mode": "scalarized_load_store",
+            "range_bytes": int(range_fact.upper),
+        },
+        fact_ids=(range_fact.fact_id,),
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_buffer_store(builder, source_program, type_layout_program, fact_program, op):
+    fields = _buffer_store_fields(op)
+    _require_default_cache(fields["cache"], op)
+    range_fact = _pointer_byte_range_fact(fact_program, fields["base_value_id"], op)
+    value = type_layout_program.values[fields["value_value_id"]]
+    offsets = type_layout_program.values[fields["offset_value_id"]]
+    if int(value.type.component_count) != int(offsets.type.component_count):
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store value and offset components must match",
+            source_op_index=op.index,
+        )
+    operands = [
+        _single_source_target(builder, fields["value_value_id"], op),
+        _single_source_target(builder, fields["base_value_id"], op),
+        _single_source_target(builder, fields["offset_value_id"], op),
+    ]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) != int(value.type.component_count):
+            fail(
+                "TLXW_OP_BUFFER_STORE",
+                STAGE,
+                "amdg.buffer_store mask and value components must match",
+                source_op_index=op.index,
+            )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    element_byte_width = source_program.values[
+        fields["value_value_id"]
+    ].type.element_byte_width
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store requires known value element byte width",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    access_element_count = int(fields["contiguity"] or 1)
+    if access_element_count <= 0:
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store contiguity must be positive",
+            source_op_index=op.index,
+        )
+    access_bytes = int(element_byte_width) * access_element_count
+    has_mask = fields["mask_value_id"] is not None
+    builder.add_op(
+        "buffer_store",
+        operands=tuple(operands),
+        attrs={
+            "access_element_count": access_element_count,
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": int(value.type.component_count),
+            "element_byte_width": int(element_byte_width),
+            "element_type": value.type.element_type,
+            "has_mask": has_mask,
+            "inactive_offset": int(range_fact.upper),
+            "lane_width": int(value.type.lane_width or offsets.type.lane_width or 64),
+            "mask_mode": "select_oob_offset" if has_mask else "none",
+            "offset_range": (
+                0,
+                _buffer_source_offset_upper(
+                    range_fact.upper,
+                    access_bytes,
+                    element_byte_width,
+                    op,
+                ),
+            ),
+            "range_bytes": int(range_fact.upper),
+        },
+        fact_ids=(range_fact.fact_id,),
+        source_op_index=op.index,
+    )
+
+
+def _convert_local_load(builder, source_program, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_LOCAL_LOAD",
+            STAGE,
+            "ttg.local_load requires one memdesc operand and one result",
+            source_op_index=op.index,
+        )
+    result_value_id = op.results[0]
+    result = type_layout_program.values[result_value_id]
+    result_layout = (
+        None
+        if result.layout_map_id is None
+        else type_layout_program.layouts[int(result.layout_map_id)]
+    )
+    if result_layout is None or result_layout.kind != "dot_operand":
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "only dot-operand ttg.local_load is converted yet",
+            source_op_index=op.index,
+            source_value_id=result_value_id,
+        )
+    memdesc_value_id = op.operands[0]
+    memdesc_type = source_program.values[memdesc_value_id].type
+    registers = _fragment_registers(memdesc_type.element_type, result_layout, op)
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    fragment_rows, fragment_columns = _operand_fragment_shape(instr_shape, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    load_plan = _fragment_local_load_plan(
+        source_program,
+        type_layout_program,
+        memdesc_value_id,
+        result_layout,
+        int(result.type.component_count),
+        registers,
+        op,
+    )
+    builder.add_op(
+        "local_load_fragment",
+        operands=(_single_source_target(builder, memdesc_value_id, op),),
+        results=result_target_ids,
+        attrs={
+            "columns": int(fragment_columns),
+            "component_count": int(result.type.component_count),
+            "element_type": memdesc_type.element_type,
+            "lane_width": int(result.type.lane_width or 64),
+            "registers": int(registers),
+            "role": int(result_layout.properties["op_idx"]),
+            "rows": int(fragment_rows),
+            **load_plan,
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_fragment_constant(builder, type_layout_program, op):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_FRAGMENT_CONSTANT",
+            STAGE,
+            "fragment constants must have one result",
+            source_op_index=op.index,
+        )
+    result = type_layout_program.values[op.results[0]]
+    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if result_layout.kind != "amd_mfma":
+        fail(
+            "TLXW_OP_FRAGMENT_CONSTANT",
+            STAGE,
+            "only amd_mfma accumulator constants are converted as fragments",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    value = _constant_literal(op.attrs.get("value"), source_op_index=op.index)
+    if not _is_zero_literal(value):
+        fail(
+            "TLXW_OP_FRAGMENT_CONSTANT",
+            STAGE,
+            "only zero fragment constants are converted yet",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    registers = _acc_fragment_registers(result_layout, op)
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    fragment_rows, fragment_columns = _acc_fragment_shape(instr_shape, op)
+    builder.add_op(
+        "fragment_fill",
+        results=result_target_ids,
+        attrs={
+            "columns": int(fragment_columns),
+            "component_count": int(result.type.component_count),
+            "element_type": result_layout.element_type,
+            "fill_value": 0,
+            "lane_width": int(result.type.lane_width or 64),
+            "registers": int(registers),
+            "role": 2,
+            "rows": int(fragment_rows),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_dot(builder, type_layout_program, op):
+    if len(op.operands) != 3 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot requires lhs, rhs, accumulator, and one result",
+            source_op_index=op.index,
+        )
+    lhs = type_layout_program.values[op.operands[0]]
+    rhs = type_layout_program.values[op.operands[1]]
+    acc = type_layout_program.values[op.operands[2]]
+    result = type_layout_program.values[op.results[0]]
+    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if result_layout.kind != "amd_mfma":
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot result must use an amd_mfma layout",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    if instr_shape not in {(16, 16, 32), (32, 32, 16)}:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            f"unsupported MFMA instruction shape {instr_shape}",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    if lhs.type.element_type != rhs.type.element_type:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot lhs/rhs element types must match",
+            source_op_index=op.index,
+        )
+    kind = _mma_kind(lhs.type.element_type, instr_shape, op)
+    warps_per_cta = tuple(result_layout.properties.get("warps_per_cta", ()))
+    m_tiles, n_tiles = _mfma_per_wave_tiles(result_layout, instr_shape, warps_per_cta, op)
+    lhs_layout = _require_layout(type_layout_program, lhs.layout_map_id, op)
+    rhs_layout = _require_layout(type_layout_program, rhs.layout_map_id, op)
+    _require_dot_operand_layout(lhs_layout, 0, op)
+    _require_dot_operand_layout(rhs_layout, 1, op)
+    lhs_k_tiles = _dot_operand_k_tiles(lhs_layout, instr_shape, op)
+    rhs_k_tiles = _dot_operand_k_tiles(rhs_layout, instr_shape, op)
+    if lhs_k_tiles != rhs_k_tiles:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot lhs/rhs K tile counts do not match",
+            source_op_index=op.index,
+        )
+    k_tiles = lhs_k_tiles
+    if (
+        int(lhs.type.component_count) != m_tiles * k_tiles
+        or int(rhs.type.component_count) != n_tiles * k_tiles
+    ):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot operand fragment component counts do not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    if int(acc.type.component_count) != m_tiles * n_tiles:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot accumulator component count does not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "mma",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "kind": kind,
+            "k_tiles": int(k_tiles),
+            "m_tiles": int(m_tiles),
+            "n_tiles": int(n_tiles),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_fragment_truncf(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_FRAGMENT_TRUNCF",
+            STAGE,
+            "fragment arith.truncf requires one operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.element_type != "f32" or result.type.element_type != "f16":
+        fail(
+            "TLXW_OP_FRAGMENT_TRUNCF",
+            STAGE,
+            "only f32 to f16 fragment truncf is converted yet",
+            source_op_index=op.index,
+        )
+    if int(operand.type.component_count) != int(result.type.component_count):
+        fail(
+            "TLXW_OP_FRAGMENT_TRUNCF",
+            STAGE,
+            "fragment truncf component counts must match",
+            source_op_index=op.index,
+        )
+    operand_layout = type_layout_program.layouts[int(operand.layout_map_id)]
+    registers = _acc_fragment_registers(operand_layout, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "fragment_truncf",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "component_count": int(result.type.component_count),
+            "lane_width": int(result.type.lane_width or 64),
+            "registers": int(registers),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_layout(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_CONVERT_LAYOUT",
+            STAGE,
+            "ttg.convert_layout requires one operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    operand_layout = (
+        None
+        if operand.layout_map_id is None
+        else type_layout_program.layouts[int(operand.layout_map_id)]
+    )
+    result_layout = (
+        None
+        if result.layout_map_id is None
+        else type_layout_program.layouts[int(result.layout_map_id)]
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    if int(operand.type.component_count) == int(result.type.component_count):
+        mode = "alias"
+        group_size = 1
+    elif (
+        operand_layout is not None
+        and result_layout is not None
+        and operand_layout.kind == "blocked"
+        and result_layout.kind == "amd_mfma"
+        and int(operand.type.component_count) % int(result.type.component_count) == 0
+    ):
+        mode = "component_group_first"
+        group_size = int(operand.type.component_count) // int(result.type.component_count)
+    else:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "ttg.convert_layout requires an explicit remap; this layout "
+            "pair is not converted yet",
+            source_op_index=op.index,
+        )
+    builder.add_op(
+        "layout_convert",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "group_size": int(group_size),
+            "mode": mode,
+            "result_component_count": int(result.type.component_count),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_async_commit_group(builder, type_layout_program, token_groups_by_commit, op):
+    group = token_groups_by_commit.get(op.index)
+    if group is None:
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "ttg.async_commit_group requires a token group",
+            source_op_index=op.index,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    operands = tuple(
+        _single_source_target(builder, token_value_id, op)
+        for token_value_id in group.member_token_ids
+    )
+    builder.add_op(
+        "async_commit_group",
+        operands=operands,
+        results=result_target_ids,
+        attrs={
+            "group_id": int(group.group_id),
+            "member_count": len(group.member_token_ids),
+        },
+        source_op_index=op.index,
+    )
+
+
+def _convert_async_wait(
+    builder,
+    type_layout_program,
+    token_nodes_by_op,
+    token_groups_by_id,
+    op,
+):
+    node = token_nodes_by_op.get(op.index)
+    if node is None:
+        fail(
+            "TLXW_OP_ASYNC_WAIT_TOKEN",
+            STAGE,
+            "ttg.async_wait requires a token graph node",
+            source_op_index=op.index,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    if node.input_token_ids:
+        wait_token_ids = node.input_token_ids
+    else:
+        wait_token_ids = tuple(
+            token_groups_by_id[group_id].token_value_id
+            for group_id in node.waited_group_ids
+            if token_groups_by_id[group_id].token_value_id is not None
+        )
+    operands = tuple(
+        _single_source_target(builder, token_value_id, op)
+        for token_value_id in wait_token_ids
+    )
+    builder.add_op(
+        "async_wait",
+        operands=operands,
+        results=result_target_ids,
+        attrs={
+            "wait_group": -1 if node.wait_group is None else int(node.wait_group),
+            "waited_group_ids": tuple(int(group_id) for group_id in node.waited_group_ids),
+        },
+        source_op_index=op.index,
+    )
+
+
+def _convert_return(builder, view):
+    builder.add_op(
+        "return",
+        operands=view.operand_target_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _fact_ids_by_source_op(fact_program):
+    result = {}
+    for fact in fact_program.facts:
+        if fact.source_op_index is None:
+            continue
+        result.setdefault(fact.source_op_index, tuple())
+        result[fact.source_op_index] = (*result[fact.source_op_index], fact.fact_id)
+    return result
+
+
+def _operand_assume_fact_ids(fact_program, op):
+    fact_ids = []
+    seen = set()
+    for source_value_id in op.operands:
+        for fact_id in fact_program.by_value.get(source_value_id, ()):
+            fact = fact_program.facts[fact_id]
+            if fact.kind != "range" or fact.provenance != "llvm.intr.assume":
+                continue
+            if fact_id in seen:
+                continue
+            seen.add(fact_id)
+            fact_ids.append(fact_id)
+    return tuple(fact_ids)
+
+
+def _pointer_byte_range_fact(fact_program, value_id, op):
+    for fact_id in fact_program.by_value.get(value_id, ()):
+        fact = fact_program.facts[fact_id]
+        if fact.kind == "pointer_byte_range" and fact.upper is not None:
+            return fact
+    fail(
+        "TLXW_OP_MISSING_POINTER_RANGE_FACT",
+        STAGE,
+        "amdg.buffer_load_to_local requires a pointer byte-range fact",
+        source_op_index=op.index,
+        source_value_id=value_id,
+    )
+
+
+def _compute_local_alloc_layout(source_program):
+    offsets = {}
+    cursor = 0
+    for op in source_program.ops:
+        if op.name != "ttg.local_alloc" or not op.results:
+            continue
+        value_id = op.results[0]
+        size = _local_alloc_size_bytes(
+            source_program.values[value_id].type,
+            op.index,
+            value_id,
+        )
+        offsets[value_id] = cursor
+        cursor = _align_to(cursor + size, 16)
+    return offsets, cursor
+
+
+def _compute_static_memdesc_byte_offsets(source_program, local_alloc_byte_offsets):
+    offsets = dict(local_alloc_byte_offsets)
+    for op in source_program.ops:
+        if op.name != "ttg.memdesc_index" or len(op.operands) != 2 or len(op.results) != 1:
+            continue
+        base_offset = offsets.get(op.operands[0])
+        static_index = _direct_constant_int(source_program, op.operands[1])
+        if base_offset is None or static_index is None:
+            continue
+        slot_size = _memdesc_size_bytes(
+            source_program.values[op.results[0]].type,
+            op.index,
+            op.results[0],
+        )
+        offsets[op.results[0]] = int(base_offset) + int(static_index) * int(slot_size)
+    return offsets
+
+
+def _local_alloc_size_bytes(source_type, source_op_index, source_value_id):
+    return _memdesc_size_bytes(source_type, source_op_index, source_value_id)
+
+
+def _memdesc_size_bytes(source_type, source_op_index, source_value_id):
+    element_byte_width = source_type.element_byte_width
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_MEMDESC_ELEMENT_SIZE",
+            STAGE,
+            f"cannot size LDS allocation {source_type.raw}: unknown element byte width",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return _product(source_type.alloc_shape or source_type.shape or (1,)) * int(
+        element_byte_width
+    )
+
+
+def _align_to(value, alignment):
+    value = int(value)
+    alignment = int(alignment)
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _single_source_target(builder, source_value_id, op):
+    targets = builder.source_value_targets.get(source_value_id)
+    if not targets:
+        fail(
+            "TLXW_OP_UNCONVERTED_OPERAND",
+            STAGE,
+            f"yielded value {source_value_id} has no converted target value",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    if len(targets) != 1:
+        fail(
+            "TLXW_OP_MULTI_VALUE_OPERAND",
+            STAGE,
+            f"yielded value {source_value_id} maps to multiple target values {targets}",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    return targets[0]
+
+
+def _buffer_load_to_local_fields(op):
+    segments = _operand_segments(op, 6, (1, 1, 1, 0, 0, 0))
+    if int(segments[0]) != 1 or int(segments[1]) != 1 or int(segments[2]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local requires destination, base, and offsets",
+            source_op_index=op.index,
+        )
+    if any(int(segment) > 1 for segment in segments[3:]):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local optional segments must be scalar",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    base_index = int(segments[0])
+    offset_index = base_index + int(segments[1])
+    mask_index = offset_index + int(segments[2])
+    other_index = mask_index + int(segments[3])
+    stride_index = other_index + int(segments[4])
+    return {
+        "memdesc_value_id": op.operands[0],
+        "base_value_id": op.operands[base_index],
+        "offset_value_id": op.operands[offset_index],
+        "mask_value_id": op.operands[mask_index] if int(segments[3]) else None,
+        "other_value_id": op.operands[other_index] if int(segments[4]) else None,
+        "stride_value_id": op.operands[stride_index] if int(segments[5]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+    }
+
+
+def _buffer_store_fields(op):
+    segments = _operand_segments(op, 5, None)
+    if int(segments[0]) != 1 or int(segments[1]) != 1 or int(segments[2]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store requires value, base pointer, and offsets",
+            source_op_index=op.index,
+        )
+    if int(segments[3]) != 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store boundary-check operands are not converted yet",
+            source_op_index=op.index,
+        )
+    if int(segments[4]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store supports at most one mask operand",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    base_index = int(segments[0])
+    offset_index = base_index + int(segments[1])
+    mask_index = offset_index + int(segments[2]) + int(segments[3])
+    return {
+        "value_value_id": op.operands[0],
+        "base_value_id": op.operands[base_index],
+        "offset_value_id": op.operands[offset_index],
+        "mask_value_id": op.operands[mask_index] if int(segments[4]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
+    }
+
+
+def _operand_segments(op, expected_len, default):
+    segments = op.attrs.get("operandSegmentSizes")
+    if segments is None:
+        segments = default
+    segments = tuple(int(segment) for segment in segments)
+    if len(segments) != int(expected_len):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} expected {expected_len} operand segments, got {segments}",
+            source_op_index=op.index,
+        )
+    if any(segment < 0 for segment in segments):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} operand segments must be nonnegative, got {segments}",
+            source_op_index=op.index,
+        )
+    return segments
+
+
+def _require_operand_count(op, segments):
+    if sum(int(segment) for segment in segments) != len(op.operands):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} operand segments {segments} do not match "
+            f"{len(op.operands)} operands",
+            source_op_index=op.index,
+        )
+
+
+def _require_default_cache(cache, op):
+    if cache in (None, 1):
+        return
+    fail(
+        "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+        STAGE,
+        "Wave lowering does not support amdg.buffer_load_to_local "
+        f"cacheModifier={cache}",
+        source_op_index=op.index,
+    )
+
+
+def _local_component_base_offsets(
+    source_program,
+    type_layout_program,
+    memdesc_value_id,
+    component_count,
+    lane_width,
+    op,
+):
+    memdesc_type = source_program.values[memdesc_value_id].type
+    total_elements = _product(memdesc_type.shape or memdesc_type.alloc_shape)
+    if int(component_count) * int(lane_width) != total_elements:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local currently requires "
+            "all-active full components",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
+    layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    layout = (
+        None
+        if layout_id is None
+        else type_layout_program.layouts[int(layout_id)]
+    )
+    return tuple(
+        _physical_component_offset(layout, component * int(lane_width), lane_width, op)
+        for component in range(int(component_count))
+    )
+
+
+def _buffer_load_to_local_packet_plan(
+    source_program,
+    type_layout_program,
+    fact_program,
+    memdesc_value_id,
+    offset_value_id,
+    memdesc_type,
+    lane_width,
+    op,
+):
+    affine = fact_program.tensor_affine.get(offset_value_id)
+    if affine is None:
+        return None
+    shape = tuple(int(dim) for dim in memdesc_type.shape)
+    if tuple(affine.shape) != shape or not shape:
+        return None
+    packet_bytes = _dma_packet_bytes_for_element(memdesc_type.element_byte_width)
+    if packet_bytes is None:
+        return None
+    packet_elements = packet_bytes // int(memdesc_type.element_byte_width)
+    total_elements = _product(shape)
+    wave_count = int(source_program.kernel.num_warps or 1)
+    if wave_count <= 0:
+        return None
+    elements_per_wave_packet = int(lane_width) * int(packet_elements)
+    elements_per_cta_packet = int(wave_count) * elements_per_wave_packet
+    if total_elements % elements_per_cta_packet:
+        return None
+    component_count = total_elements // elements_per_cta_packet
+    layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    layout = (
+        None
+        if layout_id is None
+        else type_layout_program.layouts[int(layout_id)]
+    )
+    destination_offsets, destination_wave_stride_dwords = (
+        _packet_destination_offsets(
+            layout,
+            component_count,
+            elements_per_cta_packet,
+            elements_per_wave_packet,
+            memdesc_type.element_byte_width,
+            wave_count,
+            op,
+        )
+    )
+    scalar_value_ids, terms = _packet_affine_terms(affine)
+    return {
+        "component_thread_count": int(wave_count) * int(lane_width),
+        "component_count": int(component_count),
+        "destination_component_offsets": destination_offsets,
+        "destination_wave_count": int(wave_count),
+        "destination_wave_stride_dwords": int(destination_wave_stride_dwords),
+        "packet_bytes": int(packet_bytes),
+        "packet_elements": int(packet_elements),
+        "scalar_value_ids": tuple(scalar_value_ids),
+        "source_offset_terms": tuple(terms),
+    }
+
+
+def _packet_destination_offsets(
+    layout,
+    component_count,
+    elements_per_cta_packet,
+    elements_per_wave_packet,
+    element_byte_width,
+    wave_count,
+    op,
+):
+    destination_offsets = []
+    wave_stride_dwords = None
+    for component in range(int(component_count)):
+        component_linear = int(component) * int(elements_per_cta_packet)
+        wave_offsets = tuple(
+            _physical_component_offset(
+                layout,
+                component_linear + wave * int(elements_per_wave_packet),
+                elements_per_wave_packet,
+                op,
+            )
+            for wave in range(int(wave_count))
+        )
+        destination_offsets.append(wave_offsets[0])
+        component_deltas = []
+        for wave, wave_offset in enumerate(wave_offsets):
+            byte_delta = (int(wave_offset) - int(wave_offsets[0])) * int(element_byte_width)
+            if byte_delta % 4:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                    STAGE,
+                    "packet DMA destination wave offset must be dword aligned",
+                    source_op_index=op.index,
+                    source_value_id=layout.value_id if layout is not None else None,
+                )
+            component_deltas.append(byte_delta // 4)
+            if wave == 0:
+                continue
+            stride = component_deltas[1]
+            if byte_delta // 4 != stride * wave:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                    STAGE,
+                    "packet DMA destination wave offsets must form a uniform stride",
+                    source_op_index=op.index,
+                    source_value_id=layout.value_id if layout is not None else None,
+                )
+        component_stride = 0 if int(wave_count) == 1 else int(component_deltas[1])
+        if wave_stride_dwords is None:
+            wave_stride_dwords = component_stride
+        elif wave_stride_dwords != component_stride:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "packet DMA destination wave stride must be identical for all components",
+                source_op_index=op.index,
+                source_value_id=layout.value_id if layout is not None else None,
+            )
+    return tuple(destination_offsets), int(wave_stride_dwords or 0)
+
+
+def _dma_packet_bytes_for_element(element_byte_width):
+    if element_byte_width is None:
+        return None
+    element_byte_width = int(element_byte_width)
+    if element_byte_width <= 0:
+        return None
+    if 16 % element_byte_width == 0:
+        return 16
+    if 4 % element_byte_width == 0:
+        return 4
+    return None
+
+
+def _buffer_source_offset_upper(range_upper_bytes, packet_bytes, element_byte_width, op):
+    range_upper_bytes = int(range_upper_bytes)
+    packet_bytes = int(packet_bytes)
+    element_byte_width = int(element_byte_width)
+    if packet_bytes <= 0 or element_byte_width <= 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local source offset range requires "
+            "positive packet and element byte widths",
+            source_op_index=op.index,
+        )
+    if range_upper_bytes < packet_bytes - 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local packet exceeds source pointer range",
+            source_op_index=op.index,
+        )
+    return (range_upper_bytes - packet_bytes + 1) // element_byte_width
+
+
+def _packet_affine_terms(affine):
+    scalar_value_ids = []
+    scalar_slots = {}
+    terms = []
+    for term in affine.terms:
+        slots = tuple(_scalar_slot(value_id, scalar_value_ids, scalar_slots) for value_id in term.scalar_value_ids)
+        terms.append(
+            (
+                term.kind,
+                int(term.coefficient),
+                -1 if term.dim is None else int(term.dim),
+                slots,
+            )
+        )
+    return tuple(scalar_value_ids), tuple(terms)
+
+
+def _scalar_slot(value_id, scalar_value_ids, scalar_slots):
+    if value_id not in scalar_slots:
+        scalar_slots[value_id] = len(scalar_value_ids)
+        scalar_value_ids.append(value_id)
+    return scalar_slots[value_id]
+
+
+def _fragment_registers(element_type, result_layout, op):
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    if (
+        element_type in {"f16", "bf16"}
+        and instr_shape in {(16, 16, 32), (32, 32, 16)}
+    ):
+        return 4
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        "ttg.local_load fragment registers are not known for "
+        f"element_type={element_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+        source_value_id=result_layout.value_id,
+    )
+
+
+def _acc_fragment_registers(result_layout, op):
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    if result_layout.element_type == "f32" and instr_shape == (16, 16, 32):
+        return 4
+    if result_layout.element_type == "f32" and instr_shape == (32, 32, 16):
+        return 16
+    fail(
+        "TLXW_OP_FRAGMENT_CONSTANT",
+        STAGE,
+        "accumulator fragment registers are not known for "
+        f"element_type={result_layout.element_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+        source_value_id=result_layout.value_id,
+    )
+
+
+def _mma_kind(element_type, instr_shape, op):
+    if instr_shape == (16, 16, 32) and element_type == "f16":
+        return "mfma.f32.16x16x32.f16"
+    if instr_shape == (16, 16, 32) and element_type == "bf16":
+        return "mfma.f32.16x16x32.bf16"
+    if instr_shape == (32, 32, 16) and element_type == "f16":
+        return "mfma.f32.32x32x16.f16"
+    if instr_shape == (32, 32, 16) and element_type == "bf16":
+        return "mfma.f32.32x32x16.bf16"
+    fail(
+        "TLXW_OP_DOT",
+        STAGE,
+        f"unsupported MFMA element type {element_type} for {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _operand_fragment_shape(instr_shape, op):
+    if instr_shape == (16, 16, 32):
+        return 16, 16
+    if instr_shape == (32, 32, 16):
+        return 32, 32
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported local_load MFMA instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _acc_fragment_shape(instr_shape, op):
+    if instr_shape == (16, 16, 32):
+        return 16, 16
+    if instr_shape == (32, 32, 16):
+        return 32, 32
+    fail(
+        "TLXW_OP_FRAGMENT_CONSTANT",
+        STAGE,
+        f"unsupported accumulator MFMA instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _mfma_output_tile_shape(instr_shape, op):
+    if instr_shape in {(16, 16, 32), (32, 32, 16)}:
+        return 32, 32
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported MFMA instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _mfma_k_dim(instr_shape, op):
+    if instr_shape == (16, 16, 32):
+        return 32
+    if instr_shape == (32, 32, 16):
+        return 16
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported MFMA K dimension for instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _has_fragment_result(type_layout_program, op):
+    for value_id in op.results:
+        converted = type_layout_program.values[value_id]
+        if converted.type.representation in {"fragment", "fragment_tuple"}:
+            return True
+    return False
+
+
+def _require_layout(type_layout_program, layout_map_id, op):
+    if layout_map_id is None:
+        fail(
+            "TLXW_OP_MISSING_LAYOUT",
+            STAGE,
+            "operation requires a converted layout map",
+            source_op_index=op.index,
+        )
+    return type_layout_program.layouts[int(layout_map_id)]
+
+
+def _require_dot_operand_layout(layout, op_idx, op):
+    if layout.kind != "dot_operand" or int(layout.properties.get("op_idx", -1)) != int(op_idx):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            f"tt.dot operand {op_idx} must use matching dot_operand layout",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+
+
+def _mfma_per_wave_tiles(result_layout, instr_shape, warps_per_cta, op):
+    if len(instr_shape) < 3 or len(warps_per_cta) < 2:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot requires MFMA instrShape and warpsPerCTA metadata",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    warps_m = int(warps_per_cta[0])
+    warps_n = int(warps_per_cta[1])
+    if warps_m <= 0 or warps_n <= 0:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            f"invalid MFMA warpsPerCTA {warps_per_cta}",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    total_m_tiles = _ceil_div(int(result_layout.shape[0]), int(instr_shape[0]))
+    total_n_tiles = _ceil_div(int(result_layout.shape[1]), int(instr_shape[1]))
+    return _ceil_div(total_m_tiles, warps_m), _ceil_div(total_n_tiles, warps_n)
+
+
+def _dot_operand_k_tiles(layout, instr_shape, op):
+    op_idx = int(layout.properties["op_idx"])
+    if op_idx == 0:
+        if len(layout.shape) < 2:
+            fail(
+                "TLXW_OP_DOT",
+                STAGE,
+                "A dot operand requires rank-2 shape",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        return _ceil_div(int(layout.shape[1]), int(instr_shape[2]))
+    if op_idx == 1:
+        if len(layout.shape) < 2:
+            fail(
+                "TLXW_OP_DOT",
+                STAGE,
+                "B dot operand requires rank-2 shape",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        return _ceil_div(int(layout.shape[0]), int(instr_shape[2]))
+    fail(
+        "TLXW_OP_DOT",
+        STAGE,
+        f"unsupported dot operand index {op_idx}",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
+
+
+def _is_zero_literal(value):
+    if value in (0, 0.0, "0", "0.0"):
+        return True
+    text = str(value).strip().lower()
+    match = re.match(r"dense<([^>]+)>", text)
+    if match is not None:
+        try:
+            return float(match.group(1)) == 0.0
+        except ValueError:
+            return False
+    return False
+
+
+def _fragment_local_load_plan(
+    source_program,
+    type_layout_program,
+    memdesc_value_id,
+    result_layout,
+    component_count,
+    registers,
+    op,
+):
+    memdesc_type = source_program.values[memdesc_value_id].type
+    layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    layout = (
+        None
+        if layout_id is None
+        else type_layout_program.layouts[int(layout_id)]
+    )
+    transpose_plan = _b16_transpose_fragment_load_plan(
+        memdesc_type,
+        layout,
+        result_layout,
+        component_count,
+        registers,
+        op,
+    )
+    if transpose_plan is not None:
+        return transpose_plan
+    swizzled_plan = _swizzled_fragment_load_plan(
+        memdesc_type,
+        layout,
+        result_layout,
+        component_count,
+        registers,
+        op,
+    )
+    if swizzled_plan is not None:
+        return swizzled_plan
+    offset_plan = _fragment_component_dword_offsets(
+        source_program,
+        type_layout_program,
+        memdesc_value_id,
+        result_layout,
+        component_count,
+        registers,
+        op,
+    )
+    return {
+        "component_dword_offsets": tuple(offset_plan["component_dword_offsets"]),
+        "load_mode": "fragment_load",
+        "warps_per_cta": tuple(offset_plan["warps_per_cta"]),
+        "wave_tile_axis": offset_plan["wave_tile_axis"],
+        "wave_tile_stride_dwords": int(offset_plan["wave_tile_stride_dwords"]),
+    }
+
+
+def _b16_transpose_fragment_load_plan(
+    memdesc_type,
+    layout,
+    result_layout,
+    component_count,
+    registers,
+    op,
+):
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    op_idx = int(result_layout.properties.get("op_idx", -1))
+    if not (
+        op_idx == 1
+        and instr_shape in {(16, 16, 32), (32, 32, 16)}
+        and int(result_layout.lane_width) == 64
+        and int(registers) == 4
+        and result_layout.element_type in {"f16", "bf16"}
+        and memdesc_type.element_type == result_layout.element_type
+        and int(memdesc_type.element_byte_width or 0) == 2
+    ):
+        return None
+    if not _is_supported_b16_transpose_layout(layout):
+        return None
+    tile_plan = _fragment_component_tile_offsets(
+        memdesc_type,
+        result_layout,
+        component_count,
+        op,
+    )
+    source_shape = _dot_operand_source_shape(result_layout, instr_shape, op)
+    elements_per_lane = int(registers) * (4 // int(memdesc_type.element_byte_width))
+    if elements_per_lane != 8:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"b16 transpose local_load expects 8 elements per lane, got {elements_per_lane}",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    for tile_offsets in tile_plan["component_tile_offsets"]:
+        _validate_b16_transpose_packets(
+            layout,
+            tuple(int(dim) for dim in memdesc_type.shape),
+            source_shape,
+            tile_offsets,
+            int(memdesc_type.element_byte_width),
+            int(result_layout.lane_width),
+            elements_per_lane,
+            op,
+        )
+    chunk_element_deltas = _b16_transpose_chunk_element_deltas(
+        layout,
+        tuple(int(dim) for dim in memdesc_type.shape),
+        tuple(tile_plan["component_tile_offsets"]),
+        int(memdesc_type.element_byte_width),
+        int(result_layout.lane_width),
+        elements_per_lane,
+        2,
+        4,
+        tile_plan["wave_tile_axis"],
+        tuple(tile_plan["warps_per_cta"]),
+        int(tile_plan["wave_tile_stride_elements"]),
+        op,
+    )
+    attrs = _encoded_shared_layout_attrs(layout)
+    result = {
+        **attrs,
+        "chunk_elements": 4,
+        "chunks_per_component": 2,
+        "component_tile_offsets": tuple(tile_plan["component_tile_offsets"]),
+        "elements_per_lane": int(elements_per_lane),
+        "load_mode": "b16_transpose",
+        "memdesc_shape": tuple(int(dim) for dim in memdesc_type.shape),
+        "source_shape": tuple(source_shape),
+        "warps_per_cta": tuple(tile_plan["warps_per_cta"]),
+        "wave_tile_axis": tile_plan["wave_tile_axis"],
+        "wave_tile_stride_elements": int(tile_plan["wave_tile_stride_elements"]),
+    }
+    if chunk_element_deltas is not None:
+        result["chunk_element_deltas"] = tuple(chunk_element_deltas)
+    return result
+
+
+def _swizzled_fragment_load_plan(
+    memdesc_type,
+    layout,
+    result_layout,
+    component_count,
+    registers,
+    op,
+):
+    if layout is None or layout.kind != "swizzled_shared":
+        return None
+    if _is_identity_swizzled_layout(layout):
+        return None
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    if result_layout.element_type not in {"f16", "bf16"}:
+        return None
+    if memdesc_type.element_type != result_layout.element_type:
+        return None
+    if int(memdesc_type.element_byte_width or 0) != 2:
+        return None
+    if not _is_supported_swizzled_layout(layout):
+        return None
+    tile_plan = _fragment_component_tile_offsets(
+        memdesc_type,
+        result_layout,
+        component_count,
+        op,
+    )
+    source_shape = _dot_operand_source_shape(result_layout, instr_shape, op)
+    elements_per_lane = int(registers) * (4 // int(memdesc_type.element_byte_width))
+    for tile_offsets in tile_plan["component_tile_offsets"]:
+        _validate_fragment_load_packets(
+            layout,
+            tuple(int(dim) for dim in memdesc_type.shape),
+            source_shape,
+            tile_offsets,
+            int(memdesc_type.element_byte_width),
+            int(result_layout.lane_width),
+            elements_per_lane,
+            op,
+        )
+    attrs = _encoded_shared_layout_attrs(layout)
+    return {
+        **attrs,
+        "component_tile_offsets": tuple(tile_plan["component_tile_offsets"]),
+        "elements_per_lane": int(elements_per_lane),
+        "load_mode": "swizzled_fragment_load",
+        "memdesc_shape": tuple(int(dim) for dim in memdesc_type.shape),
+        "source_shape": tuple(source_shape),
+        "warps_per_cta": tuple(tile_plan["warps_per_cta"]),
+        "wave_tile_axis": tile_plan["wave_tile_axis"],
+        "wave_tile_stride_elements": int(tile_plan["wave_tile_stride_elements"]),
+    }
+
+
+def _fragment_component_tile_offsets(memdesc_type, result_layout, component_count, op):
+    shape = tuple(int(dim) for dim in memdesc_type.shape)
+    op_idx = int(result_layout.properties["op_idx"])
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    warps_per_cta = tuple(parent.get("warps_per_cta", ()))
+    if len(instr_shape) < 3 or len(warps_per_cta) < 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "dot-operand local_load requires MFMA instrShape and warpsPerCTA",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    tile_offsets = []
+    wave_tile_axis = "none"
+    wave_tile_stride_elements = 0
+    for component in range(int(component_count)):
+        if op_idx == 0:
+            if len(shape) < 2:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "A-fragment local_load requires rank-2 memdesc shape",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            k_tiles = _ceil_div(shape[1], instr_shape[2])
+            if component_count % k_tiles:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "A-fragment component count is not divisible by K tiles",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            per_wave_m_tiles = component_count // k_tiles
+            m_tile = component // k_tiles
+            k_tile = component % k_tiles
+            tile_offsets.append((m_tile * instr_shape[0], k_tile * instr_shape[2]))
+            wave_tile_axis = "m"
+            wave_tile_stride_elements = per_wave_m_tiles * instr_shape[0] * shape[1]
+        elif op_idx == 1:
+            if len(shape) < 2:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "B-fragment local_load requires rank-2 memdesc shape",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            k_tiles = _ceil_div(shape[0], instr_shape[2])
+            if component_count % k_tiles:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "B-fragment component count is not divisible by K tiles",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            per_wave_n_tiles = component_count // k_tiles
+            n_tile = component // k_tiles
+            k_tile = component % k_tiles
+            tile_offsets.append((k_tile * instr_shape[2], n_tile * instr_shape[1]))
+            wave_tile_axis = "n"
+            wave_tile_stride_elements = per_wave_n_tiles * instr_shape[1]
+        else:
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                f"unsupported dot operand index {op_idx}",
+                source_op_index=op.index,
+                source_value_id=result_layout.value_id,
+            )
+    return {
+        "component_tile_offsets": tuple(tuple(int(coord) for coord in offsets) for offsets in tile_offsets),
+        "warps_per_cta": tuple(int(value) for value in warps_per_cta),
+        "wave_tile_axis": wave_tile_axis,
+        "wave_tile_stride_elements": int(wave_tile_stride_elements),
+    }
+
+
+def _dot_operand_source_shape(result_layout, instr_shape, op):
+    output_m, output_n = _mfma_output_tile_shape(instr_shape, op)
+    k_dim = _mfma_k_dim(instr_shape, op)
+    op_idx = int(result_layout.properties.get("op_idx", -1))
+    if op_idx == 0:
+        return (output_m, k_dim)
+    if op_idx == 1:
+        return (k_dim, output_n)
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported dot operand index {op_idx}",
+        source_op_index=op.index,
+        source_value_id=result_layout.value_id,
+    )
+
+
+def _is_supported_b16_transpose_layout(layout):
+    if layout is None:
+        return False
+    if layout.kind == "padded_shared":
+        return True
+    return _is_supported_swizzled_layout(layout)
+
+
+def _is_supported_swizzled_layout(layout):
+    return (
+        layout is not None
+        and layout.kind == "swizzled_shared"
+        and int(layout.properties.get("vec", 0)) == 8
+        and int(layout.properties.get("per_phase", 0)) == 4
+        and int(layout.properties.get("max_phase", 0)) == 4
+        and tuple(layout.properties.get("order", ())) == (1, 0)
+    )
+
+
+def _is_identity_swizzled_layout(layout):
+    return (
+        layout is not None
+        and layout.kind == "swizzled_shared"
+        and int(layout.properties.get("vec", 0)) == 1
+        and int(layout.properties.get("per_phase", 0)) == 1
+        and int(layout.properties.get("max_phase", 0)) == 1
+        and tuple(layout.properties.get("order", ())) == (1, 0)
+    )
+
+
+def _encoded_shared_layout_attrs(layout):
+    if layout.kind == "swizzled_shared":
+        return {
+            "shared_layout_kind": "swizzled_shared",
+            "swizzled_max_phase": int(layout.properties["max_phase"]),
+            "swizzled_order": tuple(layout.properties["order"]),
+            "swizzled_per_phase": int(layout.properties["per_phase"]),
+            "swizzled_vec": int(layout.properties["vec"]),
+        }
+    if layout.kind == "padded_shared":
+        return {
+            "padded_intervals": tuple(layout.properties["intervals"]),
+            "padded_order": tuple(layout.properties["order"]),
+            "padded_paddings": tuple(layout.properties["paddings"]),
+            "shared_layout_kind": "padded_shared",
+        }
+    return {"shared_layout_kind": "dense"}
+
+
+def _validate_b16_transpose_packets(
+    layout,
+    memdesc_shape,
+    source_shape,
+    tile_offsets,
+    element_byte_width,
+    lane_width,
+    elements_per_lane,
+    op,
+):
+    for chunk in range(2):
+        chunk_offsets = tuple(
+            int(coord) + (4 * chunk if index == len(tile_offsets) - 1 else 0)
+            for index, coord in enumerate(tile_offsets)
+        )
+        for lane in range(int(lane_width)):
+            local_coords = _static_delinearize_row_major(
+                lane * int(elements_per_lane),
+                source_shape,
+                op,
+            )
+            coords = tuple(
+                int(chunk_offsets[dim]) + int(local_coords[dim])
+                for dim in range(len(source_shape))
+            )
+            first = None
+            for element in range(4):
+                packet_coords = list(coords)
+                packet_coords[-1] += element
+                _check_coords_in_bounds(packet_coords, memdesc_shape, op)
+                byte_offset = _static_shared_byte_offset(
+                    layout,
+                    memdesc_shape,
+                    tuple(packet_coords),
+                    int(element_byte_width),
+                    op,
+                )
+                if first is None:
+                    first = byte_offset
+                    if first % 8:
+                        fail(
+                            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                            STAGE,
+                            "transpose load packet physical byte offset "
+                            f"{first} is not 8-byte aligned",
+                            source_op_index=op.index,
+                        )
+                    continue
+                expected = first + element * int(element_byte_width)
+                if byte_offset != expected:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                        STAGE,
+                        "transpose load packet is not physically contiguous "
+                        f"at coords {tuple(packet_coords)}",
+                        source_op_index=op.index,
+                    )
+
+
+def _b16_transpose_chunk_element_deltas(
+    layout,
+    memdesc_shape,
+    component_tile_offsets,
+    element_byte_width,
+    lane_width,
+    elements_per_lane,
+    chunks_per_component,
+    chunk_elements,
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride_elements,
+    op,
+):
+    wave_offsets = _possible_wave_tile_element_offsets(
+        wave_tile_axis,
+        warps_per_cta,
+        wave_tile_stride_elements,
+        op,
+    )
+    result = []
+    for tile_offsets in component_tile_offsets:
+        tile_base = _static_linear_offset(memdesc_shape, tile_offsets)
+        component_deltas = []
+        for chunk in range(int(chunks_per_component)):
+            extra_elements = int(chunk_elements) * chunk
+            byte_deltas = set()
+            for wave_offset in wave_offsets:
+                for lane in range(int(lane_width)):
+                    base_linear = (
+                        int(tile_base)
+                        + int(lane) * int(elements_per_lane)
+                        + int(wave_offset)
+                    )
+                    base_byte = _static_shared_byte_offset_from_linear(
+                        layout,
+                        memdesc_shape,
+                        base_linear,
+                        int(element_byte_width),
+                        op,
+                    )
+                    chunk_byte = _static_shared_byte_offset_from_linear(
+                        layout,
+                        memdesc_shape,
+                        base_linear + int(extra_elements),
+                        int(element_byte_width),
+                        op,
+                    )
+                    if base_byte is None or chunk_byte is None:
+                        return None
+                    byte_deltas.add(chunk_byte - base_byte)
+            if len(byte_deltas) != 1:
+                return None
+            byte_delta = next(iter(byte_deltas))
+            if byte_delta % int(element_byte_width):
+                return None
+            component_deltas.append(byte_delta // int(element_byte_width))
+        result.append(tuple(component_deltas))
+    return tuple(result)
+
+
+def _possible_wave_tile_element_offsets(
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride_elements,
+    op,
+):
+    stride = int(wave_tile_stride_elements)
+    if wave_tile_axis == "none" or stride == 0:
+        return (0,)
+    if len(warps_per_cta) < 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "transpose load requires warpsPerCTA for wave-tile delta proof",
+            source_op_index=op.index,
+        )
+    if wave_tile_axis == "m":
+        count = int(warps_per_cta[0])
+    elif wave_tile_axis == "n":
+        count = int(warps_per_cta[1])
+    else:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"unsupported transpose load wave axis {wave_tile_axis}",
+            source_op_index=op.index,
+        )
+    if count <= 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "transpose load wave-tile delta proof requires positive warp count",
+            source_op_index=op.index,
+        )
+    return tuple(index * stride for index in range(count))
+
+
+def _validate_fragment_load_packets(
+    layout,
+    memdesc_shape,
+    source_shape,
+    tile_offsets,
+    element_byte_width,
+    lane_width,
+    elements_per_lane,
+    op,
+):
+    for lane in range(int(lane_width)):
+        first = None
+        for element in range(int(elements_per_lane)):
+            local_coords = _static_delinearize_row_major(
+                lane * int(elements_per_lane) + element,
+                source_shape,
+                op,
+            )
+            coords = tuple(
+                int(tile_offsets[dim]) + int(local_coords[dim])
+                for dim in range(len(source_shape))
+            )
+            _check_coords_in_bounds(coords, memdesc_shape, op)
+            byte_offset = _static_shared_byte_offset(
+                layout,
+                memdesc_shape,
+                coords,
+                int(element_byte_width),
+                op,
+            )
+            if first is None:
+                first = byte_offset
+                if first % 4:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                        STAGE,
+                        "fragment load packet physical byte offset "
+                        f"{first} is not dword aligned",
+                        source_op_index=op.index,
+                    )
+                continue
+            expected = first + element * int(element_byte_width)
+            if byte_offset != expected:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "fragment load packet is not physically contiguous "
+                    f"at coords {coords}",
+                    source_op_index=op.index,
+                )
+
+
+def _check_coords_in_bounds(coords, shape, op):
+    for dim, coord in enumerate(coords):
+        if int(coord) < 0 or int(coord) >= int(shape[dim]):
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                f"fragment load coordinate {tuple(coords)} exceeds memdesc shape {shape}",
+                source_op_index=op.index,
+            )
+
+
+def _static_shared_byte_offset(layout, shape, coords, element_byte_width, op):
+    if layout is None or layout.kind in {"none", "linear"}:
+        return _static_linear_offset(shape, coords) * int(element_byte_width)
+    if layout.kind == "swizzled_shared":
+        return _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op)
+    if layout.kind == "padded_shared":
+        return _static_padded_byte_offset(layout, shape, coords, element_byte_width, op)
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported shared layout {layout.kind} for static packet validation",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
+
+
+def _static_shared_byte_offset_from_linear(
+    layout,
+    shape,
+    linear,
+    element_byte_width,
+    op,
+):
+    if int(linear) < 0 or int(linear) >= _product(shape):
+        return None
+    coords = _static_delinearize_row_major(linear, shape, op)
+    return _static_shared_byte_offset(
+        layout,
+        shape,
+        coords,
+        int(element_byte_width),
+        op,
+    )
+
+
+def _static_linear_offset(shape, coords):
+    offset = 0
+    for dim, coord in enumerate(coords):
+        stride = _product(shape[dim + 1 :])
+        offset += int(coord) * stride
+    return int(offset)
+
+
+def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
+    if len(shape) != 2 or tuple(layout.properties.get("order", ())) != (1, 0):
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "only rank-2 order=[1,0] swizzled shared layout is supported",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    cols = int(shape[1])
+    vec = int(layout.properties["vec"])
+    if cols % vec:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"swizzled shared columns {cols} are not divisible by vec={vec}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    row = int(coords[0])
+    col = int(coords[1])
+    phase = (row // int(layout.properties["per_phase"])) % int(
+        layout.properties["max_phase"]
+    )
+    swizzled_col = ((col // vec) ^ phase) * vec + (col % vec)
+    if swizzled_col >= cols:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"swizzled column {swizzled_col} exceeds extent {cols}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    return (row * cols + swizzled_col) * int(element_byte_width)
+
+
+def _static_padded_byte_offset(layout, shape, coords, element_byte_width, op):
+    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), ()}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"unsupported padded shared order {layout.properties.get('order')}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    linear = _static_linear_offset(shape, coords)
+    encoded = linear
+    for interval, padding in zip(
+        layout.properties.get("intervals", ()),
+        layout.properties.get("paddings", ()),
+    ):
+        encoded += (linear // int(interval)) * int(padding)
+    return encoded * int(element_byte_width)
+
+
+def _static_delinearize_row_major(linear, shape, op):
+    coords = [0] * len(shape)
+    remainder = int(linear)
+    for dim in reversed(range(len(shape))):
+        extent = int(shape[dim])
+        coords[dim] = remainder % extent
+        remainder //= extent
+    if remainder:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"fragment packet linear index {linear} exceeds shape {shape}",
+            source_op_index=op.index,
+        )
+    return tuple(coords)
+
+
+def _fragment_component_dword_offsets(
+    source_program,
+    type_layout_program,
+    memdesc_value_id,
+    result_layout,
+    component_count,
+    registers,
+    op,
+):
+    memdesc_type = source_program.values[memdesc_value_id].type
+    if memdesc_type.element_byte_width is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "ttg.local_load requires a known memdesc element width",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
+    layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    layout = (
+        None
+        if layout_id is None
+        else type_layout_program.layouts[int(layout_id)]
+    )
+    shape = tuple(int(dim) for dim in memdesc_type.shape)
+    op_idx = int(result_layout.properties["op_idx"])
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    warps_per_cta = tuple(parent.get("warps_per_cta", ()))
+    if len(instr_shape) < 3 or len(warps_per_cta) < 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "dot-operand local_load requires MFMA instrShape and warpsPerCTA",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    offsets = []
+    linear_offsets = []
+    wave_tile_axis = "none"
+    wave_tile_stride_elements = 0
+    for component in range(int(component_count)):
+        if op_idx == 0:
+            if len(shape) < 2:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "A-fragment local_load requires rank-2 memdesc shape",
+                    source_op_index=op.index,
+                    source_value_id=memdesc_value_id,
+                )
+            k_tiles = _ceil_div(shape[1], instr_shape[2])
+            if component_count % k_tiles:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "A-fragment component count is not divisible by K tiles",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            per_wave_m_tiles = component_count // k_tiles
+            m_tile = component // k_tiles
+            k_tile = component % k_tiles
+            linear = m_tile * instr_shape[0] * shape[1] + k_tile * instr_shape[2]
+            wave_tile_axis = "m"
+            wave_tile_stride_elements = per_wave_m_tiles * instr_shape[0] * shape[1]
+        elif op_idx == 1:
+            if len(shape) < 2:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "B-fragment local_load requires rank-2 memdesc shape",
+                    source_op_index=op.index,
+                    source_value_id=memdesc_value_id,
+                )
+            k_tiles = _ceil_div(shape[0], instr_shape[2])
+            if component_count % k_tiles:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                    STAGE,
+                    "B-fragment component count is not divisible by K tiles",
+                    source_op_index=op.index,
+                    source_value_id=result_layout.value_id,
+                )
+            per_wave_n_tiles = component_count // k_tiles
+            n_tile = component // k_tiles
+            k_tile = component % k_tiles
+            linear = k_tile * instr_shape[2] * shape[1] + n_tile * instr_shape[1]
+            wave_tile_axis = "n"
+            wave_tile_stride_elements = per_wave_n_tiles * instr_shape[1]
+        else:
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                f"unsupported dot operand index {op_idx}",
+                source_op_index=op.index,
+                source_value_id=result_layout.value_id,
+            )
+        linear_offsets.append(int(linear))
+        physical = _physical_element_offset(layout, linear, op)
+        byte_offset = physical * int(memdesc_type.element_byte_width)
+        if byte_offset % 4:
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "fragment local_load base must be dword aligned",
+                source_op_index=op.index,
+                source_value_id=memdesc_value_id,
+            )
+        offsets.append(byte_offset // 4)
+    wave_tile_stride_dwords = _element_stride_to_dwords(
+        layout,
+        wave_tile_stride_elements,
+        int(memdesc_type.element_byte_width),
+        tuple(linear_offsets),
+        op,
+    )
+    return {
+        "component_dword_offsets": tuple(offsets),
+        "warps_per_cta": tuple(int(value) for value in warps_per_cta),
+        "wave_tile_axis": wave_tile_axis,
+        "wave_tile_stride_dwords": int(wave_tile_stride_dwords),
+    }
+
+
+def _physical_element_offset(layout, linear, op):
+    return _physical_component_offset(layout, int(linear), 1, op)
+
+
+def _element_stride_to_dwords(layout, element_stride, element_byte_width, linear_offsets, op):
+    if int(element_stride) == 0:
+        return 0
+    if layout is None or layout.kind in {"none", "swizzled_shared"}:
+        if layout is not None and layout.kind == "swizzled_shared":
+            _require_identity_swizzled(layout, op)
+        byte_stride = int(element_stride) * int(element_byte_width)
+    elif layout.kind == "padded_shared":
+        physical_strides = {
+            _physical_component_offset(layout, int(linear) + int(element_stride), 1, op)
+            - _physical_component_offset(layout, int(linear), 1, op)
+            for linear in linear_offsets
+        }
+        if len(physical_strides) != 1:
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "padded shared MFMA local_load needs per-component wave "
+                "stride remaps",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        byte_stride = next(iter(physical_strides)) * int(element_byte_width)
+    else:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"MFMA local_load destination layout {layout.kind} is not converted yet",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    if byte_stride % 4:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "fragment local_load wave tile stride must be dword aligned",
+            source_op_index=op.index,
+            source_value_id=layout.value_id if layout is not None else None,
+        )
+    return byte_stride // 4
+
+
+def _physical_component_offset(layout, linear_start, lane_width, op):
+    linear_end = int(linear_start) + int(lane_width) - 1
+    if layout is None or layout.kind in {"none", "swizzled_shared"}:
+        if layout is not None and layout.kind == "swizzled_shared":
+            _require_identity_swizzled(layout, op)
+        return int(linear_start)
+    if layout.kind == "padded_shared":
+        intervals = layout.properties.get("intervals", ())
+        paddings = layout.properties.get("paddings", ())
+        if len(intervals) != 1 or len(paddings) != 1:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "scalarized amdg.buffer_load_to_local supports one "
+                "padded interval",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        interval = int(intervals[0])
+        padding = int(paddings[0])
+        if interval <= 0:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "padded shared interval must be positive",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        if linear_start // interval != linear_end // interval:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "scalarized amdg.buffer_load_to_local component crosses "
+                "a padded LDS interval",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        return int(linear_start) + (int(linear_start) // interval) * padding
+    fail(
+        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        f"amdg.buffer_load_to_local destination layout {layout.kind} "
+        "is not converted yet",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
+
+
+def _require_identity_swizzled(layout, op):
+    props = layout.properties
+    if (
+        int(props.get("vec", 0)) == 1
+        and int(props.get("per_phase", 0)) == 1
+        and int(props.get("max_phase", 0)) == 1
+    ):
+        return
+    fail(
+        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        "amdg.buffer_load_to_local swizzled destination requires an "
+        "explicit remap target op",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
+
+
+def _direct_constant_int(source_program, value_id):
+    source_value = source_program.values.get(value_id)
+    if source_value is None or source_value.owner_op_index is None:
+        return None
+    owner = source_program.ops[source_value.owner_op_index]
+    if owner.name != "arith.constant" or len(owner.results) != 1:
+        return None
+    literal = _constant_literal(
+        owner.attrs.get("value"),
+        source_op_index=owner.index,
+    )
+    return literal if type(literal) is int else None
+
+
+def _constant_literal(value, *, source_op_index=None):
+    if value is None:
+        return None
+    text = str(value).strip()
+    dense = re.fullmatch(r"dense<([^>]*)>\s*(?::.*)?", text, re.DOTALL)
+    if dense is not None:
+        payload = dense.group(1).strip()
+        if payload.startswith("[") or "," in payload:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONSTANT",
+                STAGE,
+                "tensor constants are converted only for dense splats",
+                source_op_index=source_op_index,
+            )
+        text = payload
+    else:
+        text = text.split(":", 1)[0].strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    match = re.fullmatch(r"([+-]?(?:0[xX][0-9a-fA-F]+|\d+))", text)
+    if match is not None:
+        return int(match.group(1), 0)
+    match = re.fullmatch(
+        r"([+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?)",
+        text,
+    )
+    if match is not None:
+        return float(match.group(1))
+    return text
+
+
+def _cmpi_predicate(value):
+    predicates = {
+        0: "eq",
+        1: "ne",
+        2: "slt",
+        3: "sle",
+        4: "sgt",
+        5: "sge",
+        6: "ult",
+        7: "ule",
+        8: "ugt",
+        9: "uge",
+    }
+    if value is None:
+        return "unknown"
+    if isinstance(value, str) and value in predicates.values():
+        return value
+    return predicates.get(int(value), str(value))
+
+
+def _target_int_width(builder, target_value_ids):
+    for target_value_id in target_value_ids:
+        target_type = builder.values[target_value_id].type
+        width = _int_width(target_type.element_type)
+        if width is not None:
+            return width
+    return None
+
+
+def _int_width(raw_type):
+    match = re.fullmatch(r"i([0-9]+)", str(raw_type))
+    return None if match is None else int(match.group(1))
+
+
+def _product(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _ceil_div(lhs, rhs):
+    return (int(lhs) + int(rhs) - 1) // int(rhs)
+
+
+def _int_attr(attrs, name):
+    value = attrs.get(name)
+    if value is None:
+        fail(
+            "TLXW_OP_MISSING_ATTR",
+            STAGE,
+            f"required attr {name} is missing",
+        )
+    return int(value)
+
+
+def _int_attr_or_default(attrs, name, default):
+    value = attrs.get(name)
+    return int(default) if value is None else int(value)

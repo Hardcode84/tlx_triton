@@ -1,0 +1,165 @@
+"""Target-program verifier for the TLX Wave converter."""
+
+from .diagnostics import fail
+
+
+STAGE = "verification"
+
+_PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_store"})
+
+
+def verify_target_program(
+    target_program,
+    *,
+    source_program=None,
+    fact_program=None,
+    token_program=None,
+):
+    _verify_target_value_ids(target_program)
+    _verify_ops(target_program, fact_program)
+    if source_program is not None:
+        _verify_source_results_covered(source_program, target_program)
+    if token_program is not None and source_program is not None:
+        _verify_memory_effects_tokenized(source_program, token_program)
+    return True
+
+
+def _verify_target_value_ids(target_program):
+    for expected_id, value in enumerate(target_program.values):
+        if value.target_value_id != expected_id:
+            fail(
+                "TLXW_VERIFY_VALUE_ID",
+                STAGE,
+                f"target value id {value.target_value_id} does not match "
+                f"position {expected_id}",
+                target_value_id=value.target_value_id,
+            )
+
+
+def _verify_ops(target_program, fact_program):
+    value_count = len(target_program.values)
+    op_count = len(target_program.ops)
+    valid_fact_ids = _valid_fact_ids(fact_program)
+    for expected_id, op in enumerate(target_program.ops):
+        if op.target_op_id != expected_id:
+            fail(
+                "TLXW_VERIFY_OP_ID",
+                STAGE,
+                f"target op id {op.target_op_id} does not match position {expected_id}",
+                target_op_id=op.target_op_id,
+            )
+        for target_value_id in (*op.operands, *op.results):
+            if target_value_id < 0 or target_value_id >= value_count:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_TARGET_VALUE",
+                    STAGE,
+                    f"target op {op.target_op_id} references missing "
+                    f"value {target_value_id}",
+                    target_op_id=op.target_op_id,
+                    target_value_id=target_value_id,
+                )
+        _verify_attrs(op)
+        for fact_id in op.fact_ids:
+            if fact_id not in valid_fact_ids:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_FACT",
+                    STAGE,
+                    f"target op {op.target_op_id} references missing fact {fact_id}",
+                    target_op_id=op.target_op_id,
+                    fact_id=fact_id,
+                )
+        if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
+            fail(
+                "TLXW_VERIFY_MISSING_FACT",
+                STAGE,
+                f"target op {op.target_op_id} ({op.kind}) requires fact provenance",
+                target_op_id=op.target_op_id,
+            )
+    _verify_region_op_ids(target_program, op_count)
+
+
+def _verify_attrs(op):
+    names = set()
+    for attr in op.attrs:
+        if attr.name in names:
+            fail(
+                "TLXW_VERIFY_DUPLICATE_ATTR",
+                STAGE,
+                f"target op {op.target_op_id} has duplicate attr {attr.name}",
+                target_op_id=op.target_op_id,
+            )
+        names.add(attr.name)
+        if not _is_schema_value(attr.value):
+            fail(
+                "TLXW_VERIFY_NON_SCHEMA_ATTR",
+                STAGE,
+                f"target op {op.target_op_id} attr {attr.name} is not schema data",
+                target_op_id=op.target_op_id,
+            )
+
+
+def _verify_region_op_ids(target_program, op_count):
+    for region in target_program.regions:
+        for target_op_id in region.op_ids:
+            if target_op_id < 0 or target_op_id >= op_count:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_REGION_OP",
+                    STAGE,
+                    f"target region {region.target_region_id} references "
+                    f"missing op {target_op_id}",
+                    target_op_id=target_op_id,
+                )
+
+
+def _verify_source_results_covered(source_program, target_program):
+    erased = set(target_program.erased_source_values)
+    for op in source_program.ops:
+        for source_value_id in op.results:
+            targets = target_program.source_value_targets.get(source_value_id, ())
+            if source_value_id in erased:
+                continue
+            if len(targets) != 1:
+                fail(
+                    "TLXW_VERIFY_SOURCE_RESULT_COVERAGE",
+                    STAGE,
+                    f"source result {source_value_id} has {len(targets)} "
+                    "target values",
+                    source_op_index=op.index,
+                    source_value_id=source_value_id,
+                )
+
+
+def _verify_memory_effects_tokenized(source_program, token_program):
+    effect_op_indices = {effect.op_index for effect in token_program.memory_effects}
+    for op in source_program.ops:
+        if op.name in {
+            "tt.load",
+            "tt.store",
+            "ttg.async_copy_global_to_local",
+            "amdg.buffer_load_to_local",
+            "ttg.local_load",
+            "ttg.local_store",
+        }:
+            if op.index not in effect_op_indices:
+                fail(
+                    "TLXW_VERIFY_UNTOKENIZED_MEMORY_EFFECT",
+                    STAGE,
+                    f"memory op {op.name} has no memory effect",
+                    source_op_index=op.index,
+                )
+
+
+def _valid_fact_ids(fact_program):
+    if fact_program is None:
+        return frozenset()
+    return frozenset(fact.fact_id for fact in fact_program.facts)
+
+
+def _is_schema_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, tuple):
+        return all(_is_schema_value(item) for item in value)
+    if isinstance(value, frozenset):
+        return all(_is_schema_value(item) for item in value)
+    return False

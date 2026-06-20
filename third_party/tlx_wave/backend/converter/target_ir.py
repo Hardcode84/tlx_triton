@@ -1,0 +1,200 @@
+"""Closed target-program schema for the TLX Wave converter."""
+
+from dataclasses import dataclass, field
+
+from .diagnostics import fail
+
+
+STAGE = "target_ir"
+
+
+@dataclass(frozen=True)
+class TargetType:
+    kind: str
+    representation: str
+    element_type: str | None = None
+    lane_width: int | None = None
+    component_count: int = 1
+
+
+@dataclass(frozen=True)
+class TargetValue:
+    target_value_id: int
+    type: TargetType
+    source_value_id: int | None = None
+    debug_name: str | None = None
+
+
+@dataclass(frozen=True)
+class TargetAttr:
+    name: str
+    value: object
+
+
+@dataclass(frozen=True)
+class TargetOp:
+    target_op_id: int
+    kind: str
+    operands: tuple[int, ...] = ()
+    results: tuple[int, ...] = ()
+    attrs: tuple[TargetAttr, ...] = ()
+    fact_ids: tuple[int, ...] = ()
+    layout_map_ids: tuple[int, ...] = ()
+    region_ids: tuple[int, ...] = ()
+    source_op_index: int | None = None
+
+
+@dataclass(frozen=True)
+class TargetRegion:
+    target_region_id: int
+    op_ids: tuple[int, ...] = ()
+    block_arg_ids: tuple[int, ...] = ()
+    yield_value_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TargetKernel:
+    name: str = "kernel"
+    target: str | None = None
+    num_ctas: int | None = None
+    num_warps: int | None = None
+    threads_per_warp: int | None = None
+    noinline: bool | None = None
+    arg_target_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TargetProgram:
+    values: tuple[TargetValue, ...]
+    ops: tuple[TargetOp, ...]
+    regions: tuple[TargetRegion, ...]
+    source_value_targets: dict[int, tuple[int, ...]]
+    erased_source_values: dict[int, str]
+    kernel: TargetKernel = field(default_factory=TargetKernel)
+
+    def target_values_for_source(self, source_value_id):
+        return self.source_value_targets.get(source_value_id, ())
+
+
+class TargetBuilder:
+    def __init__(self, kernel=None):
+        self.values = []
+        self.ops = []
+        self.regions = [TargetRegion(0)]
+        self.source_value_targets = {}
+        self.erased_source_values = {}
+        self.kernel = kernel or TargetKernel()
+
+    def add_value(self, target_type, *, source_value_id=None, debug_name=None):
+        value_id = len(self.values)
+        self.values.append(
+            TargetValue(
+                value_id,
+                target_type,
+                source_value_id,
+                debug_name,
+            )
+        )
+        if source_value_id is not None:
+            self.source_value_targets.setdefault(source_value_id, tuple())
+            self.source_value_targets[source_value_id] = (
+                *self.source_value_targets[source_value_id],
+                value_id,
+            )
+        return value_id
+
+    def erase_source_value(self, source_value_id, reason):
+        self.erased_source_values[source_value_id] = str(reason)
+
+    def set_kernel_arg_targets(self, target_value_ids):
+        self.kernel = TargetKernel(
+            self.kernel.name,
+            self.kernel.target,
+            self.kernel.num_ctas,
+            self.kernel.num_warps,
+            self.kernel.threads_per_warp,
+            self.kernel.noinline,
+            tuple(int(value_id) for value_id in target_value_ids),
+        )
+
+    def add_op(
+        self,
+        kind,
+        *,
+        operands=(),
+        results=(),
+        attrs=None,
+        fact_ids=(),
+        layout_map_ids=(),
+        region_ids=(),
+        source_op_index=None,
+    ):
+        op_id = len(self.ops)
+        self.ops.append(
+            TargetOp(
+                op_id,
+                str(kind),
+                tuple(int(operand) for operand in operands),
+                tuple(int(result) for result in results),
+                _attrs_tuple(attrs or {}, op_id),
+                tuple(int(fact_id) for fact_id in fact_ids),
+                tuple(int(layout_map_id) for layout_map_id in layout_map_ids),
+                tuple(int(region_id) for region_id in region_ids),
+                source_op_index,
+            )
+        )
+        self.regions[0] = TargetRegion(
+            0,
+            (*self.regions[0].op_ids, op_id),
+            self.regions[0].block_arg_ids,
+            self.regions[0].yield_value_ids,
+        )
+        return op_id
+
+    def build(self):
+        return TargetProgram(
+            tuple(self.values),
+            tuple(self.ops),
+            tuple(self.regions),
+            dict(self.source_value_targets),
+            dict(self.erased_source_values),
+            self.kernel,
+        )
+
+
+def target_type_from_converted(converted_type):
+    return TargetType(
+        converted_type.kind,
+        converted_type.representation,
+        converted_type.element_type,
+        converted_type.lane_width,
+        converted_type.component_count,
+    )
+
+
+def attrs_dict(op):
+    return {attr.name: attr.value for attr in op.attrs}
+
+
+def _attrs_tuple(attrs, target_op_id):
+    result = []
+    for name, value in sorted(attrs.items()):
+        if not _is_attr_value(value):
+            fail(
+                "TLXW_TARGET_NON_SCHEMA_ATTR",
+                STAGE,
+                f"target attr {name} has unsupported value {value!r}",
+                target_op_id=target_op_id,
+            )
+        result.append(TargetAttr(str(name), value))
+    return tuple(result)
+
+
+def _is_attr_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, tuple):
+        return all(_is_attr_value(item) for item in value)
+    if isinstance(value, frozenset):
+        return all(_is_attr_value(item) for item in value)
+    return False
