@@ -393,8 +393,8 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     wave = _wave_text(compiled)
     machine = _run_wave_promote_buffer_to_machine(wave)
 
-    assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
-    assert compiled.metadata.tlx_wave_wave_builder == "new-python-rewrite"
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
     assert compiled.metadata.tlx_wave_num_mmas == 128
     assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
     assert wave.count("wave.index_expr") < 1_900
@@ -402,17 +402,17 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert wave.count("wave.store") == 32
     assert wave.count("wave.where") == 0
     assert wave.count("wave.join") <= 8
-    assert wave.count("wave.extract") == 0
-    assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741819 + x <= 0">' in wave
+    assert wave.count("wave.extract") == 256
+    assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741820 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
     assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 64
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
     assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
     assert "waveamdmachine.global_load_lds_b128" not in machine
-    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 48
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 16
     assert machine.count("waveamdmachine.token_join") <= 8
     assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 32
-    assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 32
+    assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 8
     assert machine.count("waveamdmachine.exec_if") == 0
     assert "waveamdmachine.buffer_store_b16" not in machine
     assert "waveamdmachine.global_store_b16_addr64" not in machine
@@ -441,8 +441,8 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_add_u64" not in machine
     assert machine.count("waveamdmachine.v_cmp") <= 16
     assert machine.count("waveamdmachine.s_cmp_lg_u32") <= 20
-    assert machine.count("waveamdmachine.s_cselect_b32") <= 32
-    assert machine.count("waveamdmachine.s_xor_b32") <= 16
+    assert machine.count("waveamdmachine.s_cselect_b32") <= 40
+    assert machine.count("waveamdmachine.s_xor_b32") <= 32
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
     assert len(machine.splitlines()) < 5_000

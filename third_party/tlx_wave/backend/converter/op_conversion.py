@@ -35,65 +35,108 @@ class OpConversionView:
     operand_fact_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class MemdescInfo:
+    value_id: int
+    element_type: str | None
+    element_byte_width: int | None
+    shape: tuple[int, ...]
+    alloc_shape: tuple[int, ...]
+    allocation_bytes: int
+
+
+@dataclass(frozen=True)
+class ConversionInput:
+    kernel: target_ir.TargetKernel
+    kernel_arg_ids: tuple[int, ...]
+    top_region_id: int
+    ops: tuple
+    regions: tuple
+    num_warps: int
+    threads_per_warp: int
+    value_element_byte_widths: dict[int, int | None]
+    memdescs: dict[int, MemdescInfo]
+    constant_ints: dict[int, int]
+    fact_ids_by_op: dict[int, tuple[int, ...]]
+    token_nodes_by_op: dict[int, object]
+    token_groups_by_commit: dict[int, object]
+    token_groups_by_id: dict[int, object]
+    local_alloc_byte_offsets: dict[int, int]
+    static_memdesc_byte_offsets: dict[int, int]
+
+
 def convert_ops(source_program, type_layout_program, fact_program, token_program):
-    builder = target_ir.TargetBuilder(
-        target_ir.TargetKernel(
-            source_program.kernel.name,
-            source_program.kernel.target,
-            source_program.kernel.num_ctas,
-            source_program.kernel.num_warps,
-            source_program.kernel.threads_per_warp,
-            source_program.kernel.noinline,
-        )
-    )
-    fact_ids_by_op = _fact_ids_by_source_op(fact_program)
-    token_nodes_by_op = {node.op_index: node for node in token_program.nodes}
-    token_groups_by_commit = {
-        group.commit_op_index: group for group in token_program.groups
-    }
-    token_groups_by_id = {group.group_id: group for group in token_program.groups}
-    local_alloc_byte_offsets, _lds_size = _compute_local_alloc_layout(source_program)
-    static_memdesc_byte_offsets = _compute_static_memdesc_byte_offsets(
-        source_program,
-        local_alloc_byte_offsets,
-    )
-    _seed_kernel_arguments(builder, source_program, type_layout_program)
+    conversion_input = _build_conversion_input(source_program, fact_program, token_program)
+    builder = target_ir.TargetBuilder(conversion_input.kernel)
+    _seed_kernel_arguments(builder, conversion_input, type_layout_program)
 
     _convert_region(
         builder,
-        source_program,
+        conversion_input,
         type_layout_program,
         fact_program,
-        fact_ids_by_op,
-        token_nodes_by_op,
-        token_groups_by_commit,
-        token_groups_by_id,
-        local_alloc_byte_offsets,
-        static_memdesc_byte_offsets,
-        source_program.top_region_id,
+        conversion_input.top_region_id,
         allow_yield=False,
     )
 
     return builder.build()
 
 
+def _build_conversion_input(source_program, fact_program, token_program):
+    memdescs = _memdesc_infos(source_program)
+    constant_ints = _constant_ints(source_program)
+    local_alloc_byte_offsets, _lds_size = _compute_local_alloc_layout(
+        source_program.ops,
+        memdescs,
+    )
+    static_memdesc_byte_offsets = _compute_static_memdesc_byte_offsets(
+        source_program.ops,
+        memdescs,
+        constant_ints,
+        local_alloc_byte_offsets,
+    )
+    kernel = target_ir.TargetKernel(
+        source_program.kernel.name,
+        source_program.kernel.target,
+        source_program.kernel.num_ctas,
+        source_program.kernel.num_warps,
+        source_program.kernel.threads_per_warp,
+        source_program.kernel.noinline,
+    )
+    return ConversionInput(
+        kernel,
+        tuple(source_program.kernel.arg_ids),
+        int(source_program.top_region_id),
+        tuple(source_program.ops),
+        tuple(source_program.regions),
+        int(source_program.kernel.num_warps or 1),
+        int(source_program.kernel.threads_per_warp or 64),
+        {
+            value_id: value.type.element_byte_width
+            for value_id, value in source_program.values.items()
+        },
+        memdescs,
+        constant_ints,
+        _fact_ids_by_source_op(fact_program),
+        {node.op_index: node for node in token_program.nodes},
+        {group.commit_op_index: group for group in token_program.groups},
+        {group.group_id: group for group in token_program.groups},
+        local_alloc_byte_offsets,
+        static_memdesc_byte_offsets,
+    )
+
+
 def _convert_region(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
     fact_program,
-    fact_ids_by_op,
-    token_nodes_by_op,
-    token_groups_by_commit,
-    token_groups_by_id,
-    local_alloc_byte_offsets,
-    static_memdesc_byte_offsets,
     region_id,
     *,
     allow_yield,
 ):
-    for op_index in source_program.regions[region_id].op_indices:
-        op = source_program.ops[op_index]
+    for op_index in conversion_input.regions[region_id].op_indices:
+        op = conversion_input.ops[op_index]
         if op.name == "scf.yield":
             if not allow_yield:
                 fail(
@@ -105,15 +148,9 @@ def _convert_region(
             return op.operands
         _convert_source_op(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
             fact_program,
-            fact_ids_by_op,
-            token_nodes_by_op,
-            token_groups_by_commit,
-            token_groups_by_id,
-            local_alloc_byte_offsets,
-            static_memdesc_byte_offsets,
             op,
         )
     if allow_yield:
@@ -127,29 +164,17 @@ def _convert_region(
 
 def _convert_source_op(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
     fact_program,
-    fact_ids_by_op,
-    token_nodes_by_op,
-    token_groups_by_commit,
-    token_groups_by_id,
-    local_alloc_byte_offsets,
-    static_memdesc_byte_offsets,
     op,
 ):
     if op.name == "scf.if":
         _convert_if(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
             fact_program,
-            fact_ids_by_op,
-            token_nodes_by_op,
-            token_groups_by_commit,
-            token_groups_by_id,
-            local_alloc_byte_offsets,
-            static_memdesc_byte_offsets,
             op,
         )
         return
@@ -162,23 +187,21 @@ def _convert_source_op(
     if op.name == "ttg.local_alloc":
         _convert_local_alloc(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
-            local_alloc_byte_offsets,
             op,
         )
         return
     if op.name == "ttg.memdesc_index":
         _convert_memdesc_index(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
-            static_memdesc_byte_offsets,
             op,
         )
         return
     if op.name == "ttg.local_load":
-        _convert_local_load(builder, source_program, type_layout_program, op)
+        _convert_local_load(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "ttg.convert_layout":
         _convert_layout(builder, type_layout_program, op)
@@ -189,17 +212,16 @@ def _convert_source_op(
     if op.name == "amdg.buffer_load_to_local":
         _convert_buffer_load_to_local(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
             fact_program,
-            token_nodes_by_op,
             op,
         )
         return
     if op.name == "amdg.buffer_store":
         _convert_buffer_store(
             builder,
-            source_program,
+            conversion_input,
             type_layout_program,
             fact_program,
             op,
@@ -209,7 +231,7 @@ def _convert_source_op(
         _convert_async_commit_group(
             builder,
             type_layout_program,
-            token_groups_by_commit,
+            conversion_input.token_groups_by_commit,
             op,
         )
         return
@@ -217,8 +239,8 @@ def _convert_source_op(
         _convert_async_wait(
             builder,
             type_layout_program,
-            token_nodes_by_op,
-            token_groups_by_id,
+            conversion_input.token_nodes_by_op,
+            conversion_input.token_groups_by_id,
             op,
         )
         return
@@ -243,15 +265,15 @@ def _convert_source_op(
         operand_target_ids,
         result_target_ids,
         result_layout_map_ids,
-        fact_ids_by_op.get(op.index, ()),
+        conversion_input.fact_ids_by_op.get(op.index, ()),
         _operand_assume_fact_ids(fact_program, op),
     )
     converter(builder, view)
 
 
-def _seed_kernel_arguments(builder, source_program, type_layout_program):
+def _seed_kernel_arguments(builder, conversion_input, type_layout_program):
     arg_target_ids = []
-    for source_value_id in source_program.kernel.arg_ids:
+    for source_value_id in conversion_input.kernel_arg_ids:
         converted = type_layout_program.values[source_value_id]
         arg_target_ids.append(
             builder.add_value(
@@ -478,15 +500,9 @@ def _convert_program_id(builder, view):
 
 def _convert_if(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
     fact_program,
-    fact_ids_by_op,
-    token_nodes_by_op,
-    token_groups_by_commit,
-    token_groups_by_id,
-    local_alloc_byte_offsets,
-    static_memdesc_byte_offsets,
     op,
 ):
     if len(op.operands) != 1 or len(op.region_ids) != 2:
@@ -504,29 +520,17 @@ def _convert_if(
     )
     then_yields = _convert_region(
         builder,
-        source_program,
+        conversion_input,
         type_layout_program,
         fact_program,
-        fact_ids_by_op,
-        token_nodes_by_op,
-        token_groups_by_commit,
-        token_groups_by_id,
-        local_alloc_byte_offsets,
-        static_memdesc_byte_offsets,
         op.region_ids[0],
         allow_yield=True,
     )
     else_yields = _convert_region(
         builder,
-        source_program,
+        conversion_input,
         type_layout_program,
         fact_program,
-        fact_ids_by_op,
-        token_nodes_by_op,
-        token_groups_by_commit,
-        token_groups_by_id,
-        local_alloc_byte_offsets,
-        static_memdesc_byte_offsets,
         op.region_ids[1],
         allow_yield=True,
     )
@@ -551,9 +555,8 @@ def _convert_if(
 
 def _convert_local_alloc(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
-    local_alloc_byte_offsets,
     op,
 ):
     if len(op.results) != 1:
@@ -568,16 +571,15 @@ def _convert_local_alloc(
         op,
         type_layout_program,
     )
-    source_type = source_program.values[op.results[0]].type
-    shape = tuple(source_type.shape or source_type.alloc_shape)
-    allocation_bytes = _local_alloc_size_bytes(source_type, op.index, op.results[0])
+    memdesc = _memdesc_info(conversion_input, op.results[0], op)
+    shape = tuple(memdesc.shape or memdesc.alloc_shape)
     builder.add_op(
         "local_alloc",
         results=result_target_ids,
         attrs={
-            "allocation_bytes": allocation_bytes,
-            "byte_offset": int(local_alloc_byte_offsets[op.results[0]]),
-            "element_type": source_type.element_type,
+            "allocation_bytes": int(memdesc.allocation_bytes),
+            "byte_offset": int(conversion_input.local_alloc_byte_offsets[op.results[0]]),
+            "element_type": memdesc.element_type,
             "shape": tuple(int(dim) for dim in shape),
         },
         layout_map_ids=result_layout_map_ids,
@@ -587,9 +589,8 @@ def _convert_local_alloc(
 
 def _convert_memdesc_index(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
-    static_memdesc_byte_offsets,
     op,
 ):
     if len(op.operands) != 2 or len(op.results) != 1:
@@ -604,9 +605,11 @@ def _convert_memdesc_index(
         op,
         type_layout_program,
     )
-    source_type = source_program.values[op.results[0]].type
-    element_count = _product(source_type.alloc_shape or source_type.shape or (1,))
-    static_lds_byte_offset = static_memdesc_byte_offsets.get(op.results[0])
+    memdesc = _memdesc_info(conversion_input, op.results[0], op)
+    element_count = _product(memdesc.alloc_shape or memdesc.shape or (1,))
+    static_lds_byte_offset = conversion_input.static_memdesc_byte_offsets.get(
+        op.results[0]
+    )
     builder.add_op(
         "memdesc_index",
         operands=_operand_target_ids(builder, op),
@@ -622,10 +625,9 @@ def _convert_memdesc_index(
 
 def _convert_buffer_load_to_local(
     builder,
-    source_program,
+    conversion_input,
     type_layout_program,
     fact_program,
-    token_nodes_by_op,
     op,
 ):
     fields = _buffer_load_to_local_fields(op)
@@ -644,7 +646,7 @@ def _convert_buffer_load_to_local(
             source_op_index=op.index,
         )
     _require_default_cache(fields["cache"], op)
-    token_node = token_nodes_by_op.get(op.index)
+    token_node = conversion_input.token_nodes_by_op.get(op.index)
     if token_node is None or token_node.value_id not in op.results:
         fail(
             "TLXW_OP_BUFFER_ASYNC_TOKEN",
@@ -667,8 +669,8 @@ def _convert_buffer_load_to_local(
         _single_source_target(builder, fields["base_value_id"], op),
         _single_source_target(builder, fields["offset_value_id"], op),
     )
-    memdesc_type = source_program.values[fields["memdesc_value_id"]].type
-    if memdesc_type.element_byte_width is None:
+    memdesc = _memdesc_info(conversion_input, fields["memdesc_value_id"], op)
+    if memdesc.element_byte_width is None:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
@@ -686,21 +688,21 @@ def _convert_buffer_load_to_local(
             source_value_id=fields["offset_value_id"],
         )
     component_offsets = _local_component_base_offsets(
-        source_program,
+        conversion_input,
         type_layout_program,
         fields["memdesc_value_id"],
         int(offset_type.component_count),
-        int(offset_type.lane_width or source_program.kernel.threads_per_warp or 64),
+        int(offset_type.lane_width or conversion_input.threads_per_warp),
         op,
     )
     packet_plan = _buffer_load_to_local_packet_plan(
-        source_program,
+        conversion_input,
         type_layout_program,
         fact_program,
         fields["memdesc_value_id"],
         fields["offset_value_id"],
-        memdesc_type,
-        int(offset_type.lane_width or source_program.kernel.threads_per_warp or 64),
+        memdesc,
+        int(offset_type.lane_width or conversion_input.threads_per_warp),
         op,
     )
     if packet_plan is not None:
@@ -723,12 +725,10 @@ def _convert_buffer_load_to_local(
                 "destination_wave_stride_dwords": int(
                     packet_plan["destination_wave_stride_dwords"]
                 ),
-                "element_byte_width": int(memdesc_type.element_byte_width),
-                "element_type": memdesc_type.element_type,
+                "element_byte_width": int(memdesc.element_byte_width),
+                "element_type": memdesc.element_type,
                 "lane_width": int(
-                    offset_type.lane_width
-                    or source_program.kernel.threads_per_warp
-                    or 64
+                    offset_type.lane_width or conversion_input.threads_per_warp
                 ),
                 "mode": "dma_packet_lds",
                 "packet_bytes": int(packet_plan["packet_bytes"]),
@@ -739,14 +739,14 @@ def _convert_buffer_load_to_local(
                     _buffer_source_offset_upper(
                         range_fact.upper,
                         packet_plan["packet_bytes"],
-                        memdesc_type.element_byte_width,
+                        memdesc.element_byte_width,
                         op,
                     ),
                 ),
                 "source_offset_terms": tuple(packet_plan["source_offset_terms"]),
-                "source_rank": len(memdesc_type.shape),
+                "source_rank": len(memdesc.shape),
                 "source_scalar_count": len(scalar_target_ids),
-                "source_shape": tuple(int(dim) for dim in memdesc_type.shape),
+                "source_shape": tuple(int(dim) for dim in memdesc.shape),
             },
             fact_ids=(range_fact.fact_id,),
             layout_map_ids=result_layout_map_ids,
@@ -761,11 +761,9 @@ def _convert_buffer_load_to_local(
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(offset_type.component_count),
             "destination_component_offsets": tuple(component_offsets),
-            "element_type": memdesc_type.element_type,
+            "element_type": memdesc.element_type,
             "lane_width": int(
-                offset_type.lane_width
-                or source_program.kernel.threads_per_warp
-                or 64
+                offset_type.lane_width or conversion_input.threads_per_warp
             ),
             "mode": "scalarized_load_store",
             "range_bytes": int(range_fact.upper),
@@ -776,7 +774,7 @@ def _convert_buffer_load_to_local(
     )
 
 
-def _convert_buffer_store(builder, source_program, type_layout_program, fact_program, op):
+def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_program, op):
     fields = _buffer_store_fields(op)
     _require_default_cache(fields["cache"], op)
     range_fact = _pointer_byte_range_fact(fact_program, fields["base_value_id"], op)
@@ -804,9 +802,9 @@ def _convert_buffer_store(builder, source_program, type_layout_program, fact_pro
                 source_op_index=op.index,
             )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
-    element_byte_width = source_program.values[
+    element_byte_width = conversion_input.value_element_byte_widths.get(
         fields["value_value_id"]
-    ].type.element_byte_width
+    )
     if element_byte_width is None:
         fail(
             "TLXW_OP_BUFFER_STORE",
@@ -854,7 +852,7 @@ def _convert_buffer_store(builder, source_program, type_layout_program, fact_pro
     )
 
 
-def _convert_local_load(builder, source_program, type_layout_program, op):
+def _convert_local_load(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
             "TLXW_OP_LOCAL_LOAD",
@@ -878,8 +876,8 @@ def _convert_local_load(builder, source_program, type_layout_program, op):
             source_value_id=result_value_id,
         )
     memdesc_value_id = op.operands[0]
-    memdesc_type = source_program.values[memdesc_value_id].type
-    registers = _fragment_registers(memdesc_type.element_type, result_layout, op)
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
+    registers = _fragment_registers(memdesc.element_type, result_layout, op)
     parent = result_layout.properties.get("parent_properties", {})
     instr_shape = tuple(parent.get("instr_shape", ()))
     fragment_rows, fragment_columns = _operand_fragment_shape(instr_shape, op)
@@ -889,7 +887,7 @@ def _convert_local_load(builder, source_program, type_layout_program, op):
         type_layout_program,
     )
     load_plan = _fragment_local_load_plan(
-        source_program,
+        conversion_input,
         type_layout_program,
         memdesc_value_id,
         result_layout,
@@ -904,7 +902,7 @@ def _convert_local_load(builder, source_program, type_layout_program, op):
         attrs={
             "columns": int(fragment_columns),
             "component_count": int(result.type.component_count),
-            "element_type": memdesc_type.element_type,
+            "element_type": memdesc.element_type,
             "lane_width": int(result.type.lane_width or 64),
             "registers": int(registers),
             "role": int(result_layout.properties["op_idx"]),
@@ -1279,43 +1277,70 @@ def _pointer_byte_range_fact(fact_program, value_id, op):
     )
 
 
-def _compute_local_alloc_layout(source_program):
+def _memdesc_infos(source_program):
+    result = {}
+    for value_id, value in source_program.values.items():
+        if value.type.kind != "memdesc":
+            continue
+        result[value_id] = MemdescInfo(
+            value_id,
+            value.type.element_type,
+            value.type.element_byte_width,
+            tuple(value.type.shape),
+            tuple(value.type.alloc_shape),
+            _memdesc_size_bytes(value.type, value.owner_op_index, value_id),
+        )
+    return result
+
+
+def _constant_ints(source_program):
+    result = {}
+    for op in source_program.ops:
+        if op.name != "arith.constant" or len(op.results) != 1:
+            continue
+        literal = _constant_literal(
+            op.attrs.get("value"),
+            source_op_index=op.index,
+        )
+        if type(literal) is int:
+            result[op.results[0]] = literal
+    return result
+
+
+def _compute_local_alloc_layout(ops, memdescs):
     offsets = {}
     cursor = 0
-    for op in source_program.ops:
+    for op in ops:
         if op.name != "ttg.local_alloc" or not op.results:
             continue
         value_id = op.results[0]
-        size = _local_alloc_size_bytes(
-            source_program.values[value_id].type,
-            op.index,
-            value_id,
-        )
+        size = _memdesc_info_from_table(memdescs, value_id, op).allocation_bytes
         offsets[value_id] = cursor
         cursor = _align_to(cursor + size, 16)
     return offsets, cursor
 
 
-def _compute_static_memdesc_byte_offsets(source_program, local_alloc_byte_offsets):
+def _compute_static_memdesc_byte_offsets(
+    ops,
+    memdescs,
+    constant_ints,
+    local_alloc_byte_offsets,
+):
     offsets = dict(local_alloc_byte_offsets)
-    for op in source_program.ops:
+    for op in ops:
         if op.name != "ttg.memdesc_index" or len(op.operands) != 2 or len(op.results) != 1:
             continue
         base_offset = offsets.get(op.operands[0])
-        static_index = _direct_constant_int(source_program, op.operands[1])
+        static_index = constant_ints.get(op.operands[1])
         if base_offset is None or static_index is None:
             continue
-        slot_size = _memdesc_size_bytes(
-            source_program.values[op.results[0]].type,
-            op.index,
+        slot_size = _memdesc_info_from_table(
+            memdescs,
             op.results[0],
-        )
+            op,
+        ).allocation_bytes
         offsets[op.results[0]] = int(base_offset) + int(static_index) * int(slot_size)
     return offsets
-
-
-def _local_alloc_size_bytes(source_type, source_op_index, source_value_id):
-    return _memdesc_size_bytes(source_type, source_op_index, source_value_id)
 
 
 def _memdesc_size_bytes(source_type, source_op_index, source_value_id):
@@ -1330,6 +1355,23 @@ def _memdesc_size_bytes(source_type, source_op_index, source_value_id):
         )
     return _product(source_type.alloc_shape or source_type.shape or (1,)) * int(
         element_byte_width
+    )
+
+
+def _memdesc_info(conversion_input, value_id, op):
+    return _memdesc_info_from_table(conversion_input.memdescs, value_id, op)
+
+
+def _memdesc_info_from_table(memdescs, value_id, op):
+    memdesc = memdescs.get(value_id)
+    if memdesc is not None:
+        return memdesc
+    fail(
+        "TLXW_OP_MEMDESC_INFO",
+        STAGE,
+        f"expected memdesc metadata for value {value_id}",
+        source_op_index=op.index if op is not None else None,
+        source_value_id=value_id,
     )
 
 
@@ -1476,15 +1518,15 @@ def _require_default_cache(cache, op):
 
 
 def _local_component_base_offsets(
-    source_program,
+    conversion_input,
     type_layout_program,
     memdesc_value_id,
     component_count,
     lane_width,
     op,
 ):
-    memdesc_type = source_program.values[memdesc_value_id].type
-    total_elements = _product(memdesc_type.shape or memdesc_type.alloc_shape)
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
+    total_elements = _product(memdesc.shape or memdesc.alloc_shape)
     if int(component_count) * int(lane_width) != total_elements:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
@@ -1507,27 +1549,27 @@ def _local_component_base_offsets(
 
 
 def _buffer_load_to_local_packet_plan(
-    source_program,
+    conversion_input,
     type_layout_program,
     fact_program,
     memdesc_value_id,
     offset_value_id,
-    memdesc_type,
+    memdesc,
     lane_width,
     op,
 ):
     affine = fact_program.tensor_affine.get(offset_value_id)
     if affine is None:
         return None
-    shape = tuple(int(dim) for dim in memdesc_type.shape)
+    shape = tuple(int(dim) for dim in memdesc.shape)
     if tuple(affine.shape) != shape or not shape:
         return None
-    packet_bytes = _dma_packet_bytes_for_element(memdesc_type.element_byte_width)
+    packet_bytes = _dma_packet_bytes_for_element(memdesc.element_byte_width)
     if packet_bytes is None:
         return None
-    packet_elements = packet_bytes // int(memdesc_type.element_byte_width)
+    packet_elements = packet_bytes // int(memdesc.element_byte_width)
     total_elements = _product(shape)
-    wave_count = int(source_program.kernel.num_warps or 1)
+    wave_count = int(conversion_input.num_warps)
     if wave_count <= 0:
         return None
     elements_per_wave_packet = int(lane_width) * int(packet_elements)
@@ -1547,7 +1589,7 @@ def _buffer_load_to_local_packet_plan(
             component_count,
             elements_per_cta_packet,
             elements_per_wave_packet,
-            memdesc_type.element_byte_width,
+            memdesc.element_byte_width,
             wave_count,
             op,
         )
@@ -1885,7 +1927,7 @@ def _is_zero_literal(value):
 
 
 def _fragment_local_load_plan(
-    source_program,
+    conversion_input,
     type_layout_program,
     memdesc_value_id,
     result_layout,
@@ -1893,7 +1935,7 @@ def _fragment_local_load_plan(
     registers,
     op,
 ):
-    memdesc_type = source_program.values[memdesc_value_id].type
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
     layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
     layout = (
         None
@@ -1901,7 +1943,7 @@ def _fragment_local_load_plan(
         else type_layout_program.layouts[int(layout_id)]
     )
     transpose_plan = _b16_transpose_fragment_load_plan(
-        memdesc_type,
+        memdesc,
         layout,
         result_layout,
         component_count,
@@ -1911,7 +1953,7 @@ def _fragment_local_load_plan(
     if transpose_plan is not None:
         return transpose_plan
     swizzled_plan = _swizzled_fragment_load_plan(
-        memdesc_type,
+        memdesc,
         layout,
         result_layout,
         component_count,
@@ -1921,7 +1963,7 @@ def _fragment_local_load_plan(
     if swizzled_plan is not None:
         return swizzled_plan
     offset_plan = _fragment_component_dword_offsets(
-        source_program,
+        conversion_input,
         type_layout_program,
         memdesc_value_id,
         result_layout,
@@ -1939,7 +1981,7 @@ def _fragment_local_load_plan(
 
 
 def _b16_transpose_fragment_load_plan(
-    memdesc_type,
+    memdesc,
     layout,
     result_layout,
     component_count,
@@ -1955,20 +1997,20 @@ def _b16_transpose_fragment_load_plan(
         and int(result_layout.lane_width) == 64
         and int(registers) == 4
         and result_layout.element_type in {"f16", "bf16"}
-        and memdesc_type.element_type == result_layout.element_type
-        and int(memdesc_type.element_byte_width or 0) == 2
+        and memdesc.element_type == result_layout.element_type
+        and int(memdesc.element_byte_width or 0) == 2
     ):
         return None
     if not _is_supported_b16_transpose_layout(layout):
         return None
     tile_plan = _fragment_component_tile_offsets(
-        memdesc_type,
+        memdesc,
         result_layout,
         component_count,
         op,
     )
     source_shape = _dot_operand_source_shape(result_layout, instr_shape, op)
-    elements_per_lane = int(registers) * (4 // int(memdesc_type.element_byte_width))
+    elements_per_lane = int(registers) * (4 // int(memdesc.element_byte_width))
     if elements_per_lane != 8:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
@@ -1980,19 +2022,19 @@ def _b16_transpose_fragment_load_plan(
     for tile_offsets in tile_plan["component_tile_offsets"]:
         _validate_b16_transpose_packets(
             layout,
-            tuple(int(dim) for dim in memdesc_type.shape),
+            tuple(int(dim) for dim in memdesc.shape),
             source_shape,
             tile_offsets,
-            int(memdesc_type.element_byte_width),
+            int(memdesc.element_byte_width),
             int(result_layout.lane_width),
             elements_per_lane,
             op,
         )
     chunk_element_deltas = _b16_transpose_chunk_element_deltas(
         layout,
-        tuple(int(dim) for dim in memdesc_type.shape),
+        tuple(int(dim) for dim in memdesc.shape),
         tuple(tile_plan["component_tile_offsets"]),
-        int(memdesc_type.element_byte_width),
+        int(memdesc.element_byte_width),
         int(result_layout.lane_width),
         elements_per_lane,
         2,
@@ -2010,7 +2052,7 @@ def _b16_transpose_fragment_load_plan(
         "component_tile_offsets": tuple(tile_plan["component_tile_offsets"]),
         "elements_per_lane": int(elements_per_lane),
         "load_mode": "b16_transpose",
-        "memdesc_shape": tuple(int(dim) for dim in memdesc_type.shape),
+        "memdesc_shape": tuple(int(dim) for dim in memdesc.shape),
         "source_shape": tuple(source_shape),
         "warps_per_cta": tuple(tile_plan["warps_per_cta"]),
         "wave_tile_axis": tile_plan["wave_tile_axis"],
@@ -2022,7 +2064,7 @@ def _b16_transpose_fragment_load_plan(
 
 
 def _swizzled_fragment_load_plan(
-    memdesc_type,
+    memdesc,
     layout,
     result_layout,
     component_count,
@@ -2037,27 +2079,27 @@ def _swizzled_fragment_load_plan(
     instr_shape = tuple(parent.get("instr_shape", ()))
     if result_layout.element_type not in {"f16", "bf16"}:
         return None
-    if memdesc_type.element_type != result_layout.element_type:
+    if memdesc.element_type != result_layout.element_type:
         return None
-    if int(memdesc_type.element_byte_width or 0) != 2:
+    if int(memdesc.element_byte_width or 0) != 2:
         return None
     if not _is_supported_swizzled_layout(layout):
         return None
     tile_plan = _fragment_component_tile_offsets(
-        memdesc_type,
+        memdesc,
         result_layout,
         component_count,
         op,
     )
     source_shape = _dot_operand_source_shape(result_layout, instr_shape, op)
-    elements_per_lane = int(registers) * (4 // int(memdesc_type.element_byte_width))
+    elements_per_lane = int(registers) * (4 // int(memdesc.element_byte_width))
     for tile_offsets in tile_plan["component_tile_offsets"]:
         _validate_fragment_load_packets(
             layout,
-            tuple(int(dim) for dim in memdesc_type.shape),
+            tuple(int(dim) for dim in memdesc.shape),
             source_shape,
             tile_offsets,
-            int(memdesc_type.element_byte_width),
+            int(memdesc.element_byte_width),
             int(result_layout.lane_width),
             elements_per_lane,
             op,
@@ -2068,7 +2110,7 @@ def _swizzled_fragment_load_plan(
         "component_tile_offsets": tuple(tile_plan["component_tile_offsets"]),
         "elements_per_lane": int(elements_per_lane),
         "load_mode": "swizzled_fragment_load",
-        "memdesc_shape": tuple(int(dim) for dim in memdesc_type.shape),
+        "memdesc_shape": tuple(int(dim) for dim in memdesc.shape),
         "source_shape": tuple(source_shape),
         "warps_per_cta": tuple(tile_plan["warps_per_cta"]),
         "wave_tile_axis": tile_plan["wave_tile_axis"],
@@ -2076,8 +2118,8 @@ def _swizzled_fragment_load_plan(
     }
 
 
-def _fragment_component_tile_offsets(memdesc_type, result_layout, component_count, op):
-    shape = tuple(int(dim) for dim in memdesc_type.shape)
+def _fragment_component_tile_offsets(memdesc, result_layout, component_count, op):
+    shape = tuple(int(dim) for dim in memdesc.shape)
     op_idx = int(result_layout.properties["op_idx"])
     parent = result_layout.properties.get("parent_properties", {})
     instr_shape = tuple(parent.get("instr_shape", ()))
@@ -2560,7 +2602,7 @@ def _static_delinearize_row_major(linear, shape, op):
 
 
 def _fragment_component_dword_offsets(
-    source_program,
+    conversion_input,
     type_layout_program,
     memdesc_value_id,
     result_layout,
@@ -2568,8 +2610,8 @@ def _fragment_component_dword_offsets(
     registers,
     op,
 ):
-    memdesc_type = source_program.values[memdesc_value_id].type
-    if memdesc_type.element_byte_width is None:
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
+    if memdesc.element_byte_width is None:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
@@ -2583,7 +2625,7 @@ def _fragment_component_dword_offsets(
         if layout_id is None
         else type_layout_program.layouts[int(layout_id)]
     )
-    shape = tuple(int(dim) for dim in memdesc_type.shape)
+    shape = tuple(int(dim) for dim in memdesc.shape)
     op_idx = int(result_layout.properties["op_idx"])
     parent = result_layout.properties.get("parent_properties", {})
     instr_shape = tuple(parent.get("instr_shape", ()))
@@ -2659,7 +2701,7 @@ def _fragment_component_dword_offsets(
             )
         linear_offsets.append(int(linear))
         physical = _physical_element_offset(layout, linear, op)
-        byte_offset = physical * int(memdesc_type.element_byte_width)
+        byte_offset = physical * int(memdesc.element_byte_width)
         if byte_offset % 4:
             fail(
                 "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
@@ -2672,7 +2714,7 @@ def _fragment_component_dword_offsets(
     wave_tile_stride_dwords = _element_stride_to_dwords(
         layout,
         wave_tile_stride_elements,
-        int(memdesc_type.element_byte_width),
+        int(memdesc.element_byte_width),
         tuple(linear_offsets),
         op,
     )
@@ -2794,20 +2836,6 @@ def _require_identity_swizzled(layout, op):
         source_op_index=op.index,
         source_value_id=layout.value_id,
     )
-
-
-def _direct_constant_int(source_program, value_id):
-    source_value = source_program.values.get(value_id)
-    if source_value is None or source_value.owner_op_index is None:
-        return None
-    owner = source_program.ops[source_value.owner_op_index]
-    if owner.name != "arith.constant" or len(owner.results) != 1:
-        return None
-    literal = _constant_literal(
-        owner.attrs.get("value"),
-        source_op_index=owner.index,
-    )
-    return literal if type(literal) is int else None
 
 
 def _constant_literal(value, *, source_op_index=None):

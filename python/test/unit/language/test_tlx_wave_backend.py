@@ -322,6 +322,35 @@ def test_tlx_wave_converter_import_stage_boundary_is_static():
     assert "wave_bridge" not in converter_pipeline.__dict__
 
 
+def test_tlx_wave_converter_op_rewriters_do_not_accept_source_program():
+    tree = ast.parse(
+        Path(converter_op_conversion.__file__).read_text(),
+        filename=converter_op_conversion.__file__,
+    )
+    allowed_source_program_functions = {
+        "convert_ops",
+        "_build_conversion_input",
+        "_memdesc_infos",
+        "_constant_ints",
+    }
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name in allowed_source_program_functions:
+            continue
+        arg_names = [arg.arg for arg in node.args.args]
+        if "source_program" in arg_names:
+            offenders.append(f"{node.name}:argument")
+        if any(
+            isinstance(child, ast.Name) and child.id == "source_program"
+            for child in ast.walk(node)
+        ):
+            offenders.append(f"{node.name}:body")
+
+    assert not offenders
+
+
 def test_tlx_wave_converter_import_stage_builds_source_snapshot(tmp_path):
     local_func = """
   tt.func public @converter_import(
