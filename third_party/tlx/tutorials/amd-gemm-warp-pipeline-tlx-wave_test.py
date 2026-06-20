@@ -311,11 +311,13 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_status == "emitted_wave_ttgir_op_lowering"
     assert compiled.metadata.tlx_wave_num_mmas == 256
     assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
+    assert wave.count("wave.index_expr") < 1_900
     assert wave.count("wave.cast fpconvert") == 128
     assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741815 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
     assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 128
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 64
     assert machine.count("waveamdmachine.buffer_store_b32") == 128
     assert "waveamdmachine.global_store_b16_addr64" not in machine
     assert "waveamdmachine.s_addc_u32" not in machine

@@ -35,12 +35,18 @@ _DEPENDENCY_NAMES = (
     "_ixsimpl_mod_zero",
     "_ixsimpl_pointer_offset_expr",
     "_ixsimpl_predicate_equivalent",
+    "_assume_small_pointer_element_offset",
+    "_cached_index_expr",
+    "_cached_ptr_add",
     "_materialize_bounded_pointer_value",
     "_materialize_mask_value",
+    "_materialize_pointer_base_and_offset",
     "_maybe_splat",
     "_mfma32_accumulator_dim_exprs",
     "_mma_shape_for_result_value",
     "_product",
+    "_pointer_source_base_pointer_range",
+    "_pointer_source_element_offset_proves_nonnegative",
     "_require_lowered_value",
     "_same_blocked_encoding",
     "_store_dim_bindings",
@@ -770,22 +776,37 @@ def _emit_masked_bounded_component_store(
     after_token,
     w,
 ):
+    cache = state.get("materialize_cache")
+    base_source, base, offset = _materialize_pointer_base_and_offset(
+        builder,
+        pointer_source,
+        dim_bindings,
+        w,
+        cache=cache,
+    )
     if after_token is None:
         after_token = builder.token()
     # Keep pointer-range assumptions under the mask so inactive lanes do not
     # need to satisfy bounds that only hold for the actual store.
     with builder.where(mask, [w.mem_token_type()]) as where_op:
-        ptr = _materialize_bounded_pointer_value(
-            builder,
-            state,
-            pointer_source,
-            dim_bindings,
-            value_plan.element_byte_width,
-            access_byte_width,
-            value_plan.shape,
-            w,
-            assume_pointer_range=True,
-        )
+        if offset is None:
+            ptr = base
+        else:
+            bounded_offset = _assume_small_pointer_element_offset(
+                builder,
+                offset,
+                _pointer_source_base_pointer_range(base_source),
+                value_plan.element_byte_width,
+                _pointer_source_element_offset_proves_nonnegative(
+                    state,
+                    pointer_source,
+                    value_plan.shape,
+                    w,
+                ),
+                w,
+                access_byte_width=access_byte_width,
+            )
+            ptr = _cached_ptr_add(builder, base, bounded_offset)
         token = builder.store(value, ptr, after=after_token)
         builder.yield_([token])
     return where_op.results[0]
@@ -801,6 +822,7 @@ def _emit_fragment_store(
     after_token,
     w,
 ):
+    cache = state.get("materialize_cache")
     fragment = lowered.value
     frag = w.FragmentType(fragment.type)
     unpack_element_type = _fragment_store_unpack_element_type(store_plan)
@@ -828,7 +850,7 @@ def _emit_fragment_store(
             state, pointer_source, mask_source, store_plan, frag, component, w
         )
         dim_bindings, width = _store_dim_bindings(
-            builder, store_plan, lowered, w, component=component
+            builder, store_plan, lowered, w, component=component, cache=cache
         )
         access_byte_width = (
             int(store_plan.element_byte_width) * vector_width
@@ -842,6 +864,7 @@ def _emit_fragment_store(
                 dim_bindings,
                 w,
                 width,
+                cache=cache,
             )
             if mask_id is not None
             else None
@@ -880,6 +903,7 @@ def _emit_fragment_store(
                 store_plan.shape,
                 w,
                 assume_pointer_range=mask_id is None,
+                cache=cache,
             )
             token = _emit_component_store(builder, value, ptr, mask, token, w)
         component += vector_width
@@ -897,6 +921,7 @@ def _emit_fragment_local_store(
     after_token,
     w,
 ):
+    cache = state.get("materialize_cache")
     fragment = lowered.value
     frag = w.FragmentType(fragment.type)
     unpack_element_type = _fragment_store_unpack_element_type(store_plan)
@@ -904,7 +929,7 @@ def _emit_fragment_local_store(
     token = after_token
     for component in range(frag.registers):
         dim_bindings, width = _store_dim_bindings(
-            builder, store_plan, lowered, w, component=component
+            builder, store_plan, lowered, w, component=component, cache=cache
         )
         ptr = _emit_memdesc_ptr(
             builder,
@@ -938,10 +963,13 @@ def _fragment_store_tile_dim_bindings(
     tile_offsets,
     component,
     w,
+    cache=None,
 ):
     frag = w.FragmentType(fragment.type)
     def nonnegative_index_expr(expr, bindings):
-        return _assume_nonnegative(builder, builder.index_expr(expr, bindings), w)
+        return _assume_nonnegative(
+            builder, _cached_index_expr(builder, expr, bindings, cache), w
+        )
 
     if frag.registers == _GFX950_MMA32_INFO.acc_registers:
         if component < 0 or component >= frag.registers:
@@ -1091,6 +1119,7 @@ def _emit_mfma_fragment_tile_store(
     after_token,
     w,
 ):
+    cache = state.get("materialize_cache")
     if value_plan.element_type not in {"f32", "f16"}:
         raise ValueError(
             "tlx_wave bridge supports MFMA fragment stores only for f32/f16 "
@@ -1163,6 +1192,7 @@ def _emit_mfma_fragment_tile_store(
                     tile_offsets,
                     component,
                     w,
+                    cache=cache,
                 )
                 components_active = _fragment_store_tile_components_all_lanes_active(
                     value_plan,
@@ -1185,6 +1215,7 @@ def _emit_mfma_fragment_tile_store(
                         dim_bindings,
                         w,
                         width,
+                        cache=cache,
                     )
                     mask = _wave_mask_and(builder, mask, user_mask, w, width)
                 value = _extract_converted_fragment_store_value(
@@ -1221,6 +1252,7 @@ def _emit_mfma_fragment_tile_store(
                         value_plan.shape,
                         w,
                         assume_pointer_range=mask_id is None and components_active,
+                        cache=cache,
                     )
                     token = _emit_component_store(
                         builder,
@@ -1247,6 +1279,7 @@ def _emit_mfma_fragment_tile_local_store(
     after_token,
     w,
 ):
+    cache = state.get("materialize_cache")
     if value_plan.element_type not in {"f32", "f16"}:
         raise ValueError(
             "tlx_wave bridge supports MFMA fragment local stores only for f32/f16 "
@@ -1292,6 +1325,7 @@ def _emit_mfma_fragment_tile_local_store(
                     tile_offsets,
                     component,
                     w,
+                    cache=cache,
                 )
                 ptr = _emit_memdesc_ptr(
                     builder,

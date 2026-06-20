@@ -410,6 +410,84 @@ class _PointerAdd:
     offset: object
 
 
+def _ixsimpl_node_cache_key(expr):
+    node_ptr = getattr(expr, "node_ptr", None)
+    if node_ptr is not None:
+        return ("ixsimpl", int(node_ptr))
+    return ("object", id(expr))
+
+
+def _mlir_value_cache_key(value):
+    # Keep the MLIR Value wrapper alive as part of the key.  Using id(value)
+    # is not stable enough here because temporary wrappers can be collected
+    # during component-heavy lowering and their Python ids may be reused.
+    return value
+
+
+def _index_expr_cache_key(expr, bindings):
+    free_symbols = getattr(expr, "free_symbols", None)
+    if free_symbols is None:
+        symbols = tuple(bindings)
+    else:
+        symbols = tuple(symbol for symbol in free_symbols if symbol in bindings)
+    return (
+        "index_expr",
+        _ixsimpl_node_cache_key(expr),
+        tuple(
+            sorted(
+                [
+                    (
+                        _ixsimpl_node_cache_key(symbol),
+                        _mlir_value_cache_key(bindings[symbol]),
+                    )
+                    for symbol in symbols
+                ],
+                key=lambda item: item[0],
+            )
+        ),
+    )
+
+
+def _cached_index_expr(builder, expr, bindings, cache=None):
+    if cache is None:
+        return builder.index_expr(expr, bindings)
+    key = _index_expr_cache_key(expr, bindings)
+    value = cache.get(key)
+    if value is None:
+        value = builder.index_expr(expr, bindings)
+        cache[key] = value
+    return value
+
+
+def _cached_ptr_add(builder, base, offset, cache=None):
+    if cache is None:
+        return builder.ptr_add(base, offset)
+    key = ("ptr_add", _mlir_value_cache_key(base), _mlir_value_cache_key(offset))
+    value = cache.get(key)
+    if value is None:
+        value = builder.ptr_add(base, offset)
+        cache[key] = value
+    return value
+
+
+def _cached_binary(builder, kind, lhs, rhs, cache=None, *, nsw=False, nuw=False):
+    if cache is None:
+        return builder.binary(kind, lhs, rhs, nsw=nsw, nuw=nuw)
+    key = (
+        "binary",
+        kind,
+        _mlir_value_cache_key(lhs),
+        _mlir_value_cache_key(rhs),
+        bool(nsw),
+        bool(nuw),
+    )
+    value = cache.get(key)
+    if value is None:
+        value = builder.binary(kind, lhs, rhs, nsw=nsw, nuw=nuw)
+        cache[key] = value
+    return value
+
+
 def _is_deferred_index(source):
     if isinstance(source, _AssumedIndexBinding):
         return _is_deferred_index(source.value)
@@ -1152,9 +1230,13 @@ def _dim_binding_value(dim_bindings, binding, w):
     return value
 
 
-def _materialize_index_value(builder, source, dim_bindings, w, force_width=None):
+def _materialize_index_value(
+    builder, source, dim_bindings, w, force_width=None, cache=None
+):
     if isinstance(source, _AssumedIndexBinding):
-        value = _materialize_index_value(builder, source.value, dim_bindings, w)
+        value = _materialize_index_value(
+            builder, source.value, dim_bindings, w, cache=cache
+        )
         value = _assume_signed_integer_width(
             builder, value, source.bits, w, lower=source.lower
         )
@@ -1162,28 +1244,36 @@ def _materialize_index_value(builder, source, dim_bindings, w, force_width=None)
     if isinstance(source, _IndexExpr):
         if source.materialized is not None:
             value = _materialize_index_value(
-                builder, source.materialized, dim_bindings, w
+                builder, source.materialized, dim_bindings, w, cache=cache
             )
             return _maybe_splat(builder, value, force_width, w)
         bindings = {
-            symbol: _materialize_index_value(builder, value, dim_bindings, w)
+            symbol: _materialize_index_value(builder, value, dim_bindings, w, cache=cache)
             for symbol, value in source.bindings.items()
         }
-        value = builder.index_expr(source.expr, bindings)
+        value = _cached_index_expr(builder, source.expr, bindings, cache)
         return _maybe_splat(builder, value, force_width, w)
     if isinstance(source, _IndexBinary):
-        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
-        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
-        value = builder.binary(source.kind, lhs, rhs, nsw=source.nsw, nuw=source.nuw)
+        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w, cache=cache)
+        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w, cache=cache)
+        value = _cached_binary(
+            builder,
+            source.kind,
+            lhs,
+            rhs,
+            cache,
+            nsw=source.nsw,
+            nuw=source.nuw,
+        )
         return _maybe_splat(builder, value, force_width, w)
     if isinstance(source, _IndexSelectCompare):
-        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w)
-        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w)
+        lhs = _materialize_index_value(builder, source.lhs, dim_bindings, w, cache=cache)
+        rhs = _materialize_index_value(builder, source.rhs, dim_bindings, w, cache=cache)
         true_value = _materialize_index_value(
-            builder, source.true_value, dim_bindings, w
+            builder, source.true_value, dim_bindings, w, cache=cache
         )
         false_value = _materialize_index_value(
-            builder, source.false_value, dim_bindings, w
+            builder, source.false_value, dim_bindings, w, cache=cache
         )
         return _maybe_splat(
             builder,
@@ -1277,7 +1367,7 @@ def _true_mask(builder, w, width):
     return _mask_const(builder, w, width, True)
 
 
-def _materialize_mask_value(builder, source, dim_bindings, w, width):
+def _materialize_mask_value(builder, source, dim_bindings, w, width, cache=None):
     if isinstance(source, _MaskConst):
         return (
             _true_mask(builder, w, width)
@@ -1285,22 +1375,26 @@ def _materialize_mask_value(builder, source, dim_bindings, w, width):
             else _false_mask(builder, w, width)
         )
     if isinstance(source, _MaskAnd):
-        lhs = _materialize_mask_value(builder, source.lhs, dim_bindings, w, width)
-        rhs = _materialize_mask_value(builder, source.rhs, dim_bindings, w, width)
+        lhs = _materialize_mask_value(
+            builder, source.lhs, dim_bindings, w, width, cache=cache
+        )
+        rhs = _materialize_mask_value(
+            builder, source.rhs, dim_bindings, w, width, cache=cache
+        )
         return builder.select(lhs, rhs, _false_mask(builder, w, width))
     if isinstance(source, _MaskCompare):
         lhs = _materialize_index_value(
-            builder, source.lhs, dim_bindings, w, force_width=width
+            builder, source.lhs, dim_bindings, w, force_width=width, cache=cache
         )
         rhs = _materialize_index_value(
-            builder, source.rhs, dim_bindings, w, force_width=width
+            builder, source.rhs, dim_bindings, w, force_width=width, cache=cache
         )
         return _wave_cmpi(builder, source.predicate, lhs, rhs, w)
     return source
 
 
 def _materialize_component_mask_value(
-    builder, lowered, dim_bindings, w, width, context, component=0
+    builder, lowered, dim_bindings, w, width, context, component=0, cache=None
 ):
     if isinstance(lowered, _WaveValue):
         if lowered.kind == "mask_expr":
@@ -1310,6 +1404,7 @@ def _materialize_component_mask_value(
                 dim_bindings,
                 w,
                 width,
+                cache=cache,
             )
         if lowered.kind == "mask_tuple":
             if component < 0 or component >= len(lowered.value):
@@ -1323,21 +1418,28 @@ def _materialize_component_mask_value(
                 dim_bindings,
                 w,
                 width,
+                cache=cache,
             )
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: expected mask value, "
             f"got {lowered.kind}"
         )
-    return _materialize_mask_value(builder, lowered, dim_bindings, w, width)
+    return _materialize_mask_value(
+        builder, lowered, dim_bindings, w, width, cache=cache
+    )
 
 
-def _materialize_pointer_value(builder, source, dim_bindings, w):
+def _materialize_pointer_value(builder, source, dim_bindings, w, cache=None):
     if isinstance(source, _PointerBase):
         return source.value
     if isinstance(source, _PointerAdd):
-        base = _materialize_pointer_value(builder, source.base, dim_bindings, w)
-        offset = _materialize_index_value(builder, source.offset, dim_bindings, w)
-        return builder.ptr_add(base, offset)
+        base = _materialize_pointer_value(
+            builder, source.base, dim_bindings, w, cache=cache
+        )
+        offset = _materialize_index_value(
+            builder, source.offset, dim_bindings, w, cache=cache
+        )
+        return _cached_ptr_add(builder, base, offset, cache)
     return source
 
 
@@ -1406,7 +1508,7 @@ def _assume_small_pointer_element_offset(
     return builder.assume(offset, assumptions, name="x")
 
 
-def _add_index_values(builder, lhs, rhs, w):
+def _add_index_values(builder, lhs, rhs, w, cache=None):
     width = None
     for value in (lhs, rhs):
         if w.SimdType.isinstance(value.type):
@@ -1414,7 +1516,34 @@ def _add_index_values(builder, lhs, rhs, w):
             break
     lhs = _maybe_splat(builder, lhs, width, w)
     rhs = _maybe_splat(builder, rhs, width, w)
-    return builder.binary(w.BinaryKind.AddI, lhs, rhs)
+    return _cached_binary(builder, w.BinaryKind.AddI, lhs, rhs, cache)
+
+
+def _materialize_pointer_base_and_offset(
+    builder,
+    source,
+    dim_bindings,
+    w,
+    cache=None,
+):
+    base_source, offsets = _split_pointer_add_source(source)
+    base = _materialize_pointer_value(builder, base_source, dim_bindings, w, cache=cache)
+    if not offsets:
+        return base_source, base, None
+    offset = _materialize_index_value(
+        builder, offsets[0], dim_bindings, w, cache=cache
+    )
+    for next_offset in offsets[1:]:
+        offset = _add_index_values(
+            builder,
+            offset,
+            _materialize_index_value(
+                builder, next_offset, dim_bindings, w, cache=cache
+            ),
+            w,
+            cache=cache,
+        )
+    return base_source, base, offset
 
 
 def _tensor_dim_nonnegative_assumptions(shape, w):
@@ -1451,19 +1580,17 @@ def _materialize_bounded_pointer_value(
     w,
     *,
     assume_pointer_range=True,
+    cache=None,
 ):
-    base_source, offsets = _split_pointer_add_source(source)
-    if not offsets:
-        return _materialize_pointer_value(builder, source, dim_bindings, w)
-    base = _materialize_pointer_value(builder, base_source, dim_bindings, w)
-    offset = _materialize_index_value(builder, offsets[0], dim_bindings, w)
-    for next_offset in offsets[1:]:
-        offset = _add_index_values(
-            builder,
-            offset,
-            _materialize_index_value(builder, next_offset, dim_bindings, w),
-            w,
-        )
+    base_source, base, offset = _materialize_pointer_base_and_offset(
+        builder,
+        source,
+        dim_bindings,
+        w,
+        cache=cache,
+    )
+    if offset is None:
+        return base
     if assume_pointer_range:
         offset = _assume_small_pointer_element_offset(
             builder,
@@ -1479,7 +1606,7 @@ def _materialize_bounded_pointer_value(
             w,
             access_byte_width=access_byte_width,
         )
-    return builder.ptr_add(base, offset)
+    return _cached_ptr_add(builder, base, offset, cache)
 
 
 def _materialize_dma_source_pointer_value(
@@ -1492,19 +1619,17 @@ def _materialize_dma_source_pointer_value(
     inner_dim,
     packet_elements,
     w,
+    cache=None,
 ):
-    base_source, offsets = _split_pointer_add_source(source)
-    if not offsets:
-        return _materialize_pointer_value(builder, source, dim_bindings, w)
-    base = _materialize_pointer_value(builder, base_source, dim_bindings, w)
-    offset = _materialize_index_value(builder, offsets[0], dim_bindings, w)
-    for next_offset in offsets[1:]:
-        offset = _add_index_values(
-            builder,
-            offset,
-            _materialize_index_value(builder, next_offset, dim_bindings, w),
-            w,
-        )
+    base_source, base, offset = _materialize_pointer_base_and_offset(
+        builder,
+        source,
+        dim_bindings,
+        w,
+        cache=cache,
+    )
+    if offset is None:
+        return base
     offset = _assume_small_pointer_element_offset(
         builder,
         offset,
@@ -1521,7 +1646,7 @@ def _materialize_dma_source_pointer_value(
         w,
         access_byte_width=packet_elements * int(element_byte_width),
     )
-    return builder.ptr_add(base, offset)
+    return _cached_ptr_add(builder, base, offset, cache)
 
 
 def _wave_element_type(element_type, w, context):
@@ -1736,7 +1861,14 @@ def _blocked_layout_component_shape(shape, layout, context, lowering_name):
 
 
 def _blocked_layout_dim_bindings(
-    builder, value_plan, w, context, symbol_prefix, lowering_name, component=0
+    builder,
+    value_plan,
+    w,
+    context,
+    symbol_prefix,
+    lowering_name,
+    component=0,
+    cache=None,
 ):
     layout = _blocked_tensor_layout_info(value_plan, context, lowering_name)
     component_shape = _blocked_layout_component_shape(
@@ -1789,7 +1921,7 @@ def _blocked_layout_dim_bindings(
         coord_expr = (
             local_component + size_per_thread * tile_coord + covered * repeat_component
         )
-        coord = builder.index_expr(coord_expr, {thread_sym: thread})
+        coord = _cached_index_expr(builder, coord_expr, {thread_sym: thread}, cache)
         dim_bindings[_dim_symbol(w, dim)] = coord
         extent = builder.splat(
             builder.constant(w.index_type(), value_plan.shape[dim]),
@@ -1802,7 +1934,9 @@ def _blocked_layout_dim_bindings(
     return dim_bindings, width, active
 
 
-def _blocked_tensor_dim_bindings(builder, value_plan, w, context, component=0):
+def _blocked_tensor_dim_bindings(
+    builder, value_plan, w, context, component=0, cache=None
+):
     return _blocked_layout_dim_bindings(
         builder,
         value_plan,
@@ -1811,6 +1945,7 @@ def _blocked_tensor_dim_bindings(builder, value_plan, w, context, component=0):
         "tlx_tensor",
         "generic tensor lowering",
         component=component,
+        cache=cache,
     )
 
 
@@ -1831,7 +1966,15 @@ def _linear_layout_coord_exprs(layout, rank, register, lane, warp, w):
 
 
 def _linear_layout_dim_bindings(
-    builder, value_plan, layout, w, context, symbol_prefix, lowering_name, component=0
+    builder,
+    value_plan,
+    layout,
+    w,
+    context,
+    symbol_prefix,
+    lowering_name,
+    component=0,
+    cache=None,
 ):
     component_count = _linear_layout_component_count(layout)
     if component < 0 or component >= component_count:
@@ -1852,7 +1995,7 @@ def _linear_layout_dim_bindings(
     dim_bindings = {}
     active = None
     for dim in range(rank):
-        coord = builder.index_expr(coords[dim], {thread_sym: thread})
+        coord = _cached_index_expr(builder, coords[dim], {thread_sym: thread}, cache)
         dim_bindings[_dim_symbol(w, dim)] = coord
         extent = builder.splat(
             builder.constant(w.index_type(), value_plan.shape[dim]),
@@ -1874,6 +2017,7 @@ def _tensor_layout_dim_bindings(
     symbol_prefix,
     lowering_name,
     component=0,
+    cache=None,
 ):
     if isinstance(layout, _BlockedEncodingInfo):
         return _blocked_layout_dim_bindings(
@@ -1884,6 +2028,7 @@ def _tensor_layout_dim_bindings(
             symbol_prefix,
             lowering_name,
             component=component,
+            cache=cache,
         )
     if isinstance(layout, _LinearEncodingInfo):
         return _linear_layout_dim_bindings(
@@ -1895,6 +2040,7 @@ def _tensor_layout_dim_bindings(
             symbol_prefix,
             lowering_name,
             component=component,
+            cache=cache,
         )
     raise ValueError(
         f"tlx_wave bridge cannot lower {context}: unsupported tensor layout "
@@ -1903,7 +2049,7 @@ def _tensor_layout_dim_bindings(
 
 
 def _async_copy_source_dim_bindings(
-    builder, value_plan, layout, w, context, component=0
+    builder, value_plan, layout, w, context, component=0, cache=None
 ):
     return _tensor_layout_dim_bindings(
         builder,
@@ -1914,6 +2060,7 @@ def _async_copy_source_dim_bindings(
         "tlx_async_copy",
         "generic async copy lowering",
         component=component,
+        cache=cache,
     )
 
 
@@ -3284,6 +3431,7 @@ def _emit_memdesc_base_ptr(
     w,
     context,
 ):
+    cache = state.get("materialize_cache")
     if memdesc.kind == "allocation":
         if memdesc.value_id not in lds_layout.offsets:
             raise ValueError(
@@ -3344,8 +3492,11 @@ def _emit_memdesc_base_ptr(
                 f"byte offset {byte_offset} is not aligned to pointer element "
                 f"size {pointer_element_bytes}"
             )
-        offset = builder.index_expr(
-            w.sym_ctx.int_(byte_offset // pointer_element_bytes)
+        offset = _cached_index_expr(
+            builder,
+            w.sym_ctx.int_(byte_offset // pointer_element_bytes),
+            {},
+            cache,
         )
     return builder.ptr_add(base, offset)
 
@@ -3526,6 +3677,7 @@ def _emit_memdesc_ptr_for_type(
     w,
     context,
 ):
+    cache = state.get("materialize_cache")
     if pointer_element_bytes is None:
         raise ValueError(
             f"tlx_wave bridge cannot lower {context}: unknown pointer element "
@@ -3570,7 +3722,7 @@ def _emit_memdesc_ptr_for_type(
         )
         return builder.ptr_add(
             base,
-            _materialize_index_value(builder, offset, {}, w),
+            _materialize_index_value(builder, offset, {}, w, cache=cache),
             w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
         )
 
@@ -3627,7 +3779,7 @@ def _emit_memdesc_ptr_for_type(
         )
         return builder.ptr_add(
             base,
-            _materialize_index_value(builder, offset, {}, w),
+            _materialize_index_value(builder, offset, {}, w, cache=cache),
             w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
         )
 
@@ -3680,7 +3832,7 @@ def _emit_memdesc_ptr_for_type(
     )
     return builder.ptr_add(
         base,
-        _materialize_index_value(builder, offset, {}, w),
+        _materialize_index_value(builder, offset, {}, w, cache=cache),
         w.simd_ptr_type(pointer_element_type, w.shared_address_space(), width),
     )
 
@@ -5654,11 +5806,15 @@ def _mfma32_accumulator_dim_exprs(thread_sym, component, w):
     return row, col
 
 
-def _store_nonnegative_index_expr(builder, expr, bindings, w):
-    return _assume_nonnegative(builder, builder.index_expr(expr, bindings), w)
+def _store_nonnegative_index_expr(builder, expr, bindings, w, cache=None):
+    return _assume_nonnegative(
+        builder, _cached_index_expr(builder, expr, bindings, cache), w
+    )
 
 
-def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
+def _store_dim_bindings(
+    builder, value_plan, wave_value, w, component=0, cache=None
+):
     raw_value = _raw_wave_value(wave_value)
     if not value_plan.shape:
         raise ValueError(
@@ -5702,6 +5858,7 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
                     w.mod(coords[dim], value_plan.shape[dim]),
                     {thread_sym: thread},
                     w,
+                    cache=cache,
                 )
                 for dim in range(rank)
             },
@@ -5764,6 +5921,7 @@ def _store_dim_bindings(builder, value_plan, wave_value, w, component=0):
             w.mod(expr, extent),
             {thread_sym: thread},
             w,
+            cache=cache,
         )
     return dim_bindings, frag.wave_size
 
@@ -8633,6 +8791,7 @@ def _reject_unsupported_global_memory_attrs(op, context):
 def _emit_global_load_op(builder, op, state, w):
     values = state["values"]
     wave_values = state["wave_values"]
+    cache = state.get("materialize_cache")
     if len(op.operands) < 1 or len(op.results) != 1:
         raise ValueError("tlx_wave bridge expected tt.load with pointer and result")
     if len(op.operands) > 3:
@@ -8667,6 +8826,7 @@ def _emit_global_load_op(builder, op, state, w):
             "tlx_tensor",
             "generic tensor lowering",
             component=component,
+            cache=cache,
         )
         ptr = _materialize_bounded_pointer_value(
             builder,
@@ -8690,6 +8850,7 @@ def _emit_global_load_op(builder, op, state, w):
                 "generic tensor lowering",
                 component=component,
             ),
+            cache=cache,
         )
         mask = active
         if len(op.operands) > 1:
@@ -8705,6 +8866,7 @@ def _emit_global_load_op(builder, op, state, w):
                 width,
                 "tt.load mask",
                 component=component,
+                cache=cache,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -8745,6 +8907,7 @@ def _emit_global_load_op(builder, op, state, w):
 def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, stats):
     values = state["values"]
     wave_values = state["wave_values"]
+    cache = state.get("materialize_cache")
     if len(op.operands) < 2:
         raise ValueError(
             "tlx_wave bridge expected ttg.local_store with value and memdesc"
@@ -8874,6 +9037,7 @@ def _emit_generic_local_store_op(builder, op, state, memdescs, lds_layout, w, st
             "tlx_tensor",
             "generic tensor lowering",
             component=component,
+            cache=cache,
         )
         ptr = _emit_memdesc_ptr(
             builder,
@@ -8919,6 +9083,7 @@ def _emit_generic_local_load(
     w,
     stats,
 ):
+    cache = state.get("materialize_cache")
     _validate_generic_local_tensor(value, memdesc, "ttg.local_load")
     layout = _tensor_layout_info(
         value,
@@ -8943,6 +9108,7 @@ def _emit_generic_local_load(
             "tlx_tensor",
             "generic tensor lowering",
             component=component,
+            cache=cache,
         )
         ptr = _emit_memdesc_ptr(
             builder,
@@ -9106,6 +9272,7 @@ def _emit_local_load_op(
 def _emit_store_op(builder, op, state, w):
     values = state["values"]
     wave_values = state["wave_values"]
+    cache = state.get("materialize_cache")
     if len(op.operands) < 2:
         raise ValueError("tlx_wave bridge expected tt.store with pointer and value")
     _reject_unsupported_global_memory_attrs(op, "tt.store")
@@ -9217,6 +9384,7 @@ def _emit_store_op(builder, op, state, w):
                 "tlx_tensor",
                 "generic tensor lowering",
                 component=component,
+                cache=cache,
             )
             ptr = _materialize_bounded_pointer_value(
                 builder,
@@ -9240,6 +9408,7 @@ def _emit_store_op(builder, op, state, w):
                     "generic tensor lowering",
                     component=component,
                 ),
+                cache=cache,
             )
             mask = active
             if mask_id is not None:
@@ -9255,6 +9424,7 @@ def _emit_store_op(builder, op, state, w):
                     width,
                     "tt.store mask",
                     component=component,
+                    cache=cache,
                 )
                 mask = _wave_mask_and(builder, mask, user_mask, w, width)
             value = _materialize_tensor_data(
@@ -9442,18 +9612,26 @@ def _emit_raw_block(
                     operand_id,
                     f"{control_context or 'top-level'} scf.yield",
                 )
-                for operand_id in op.operands
+                    for operand_id in op.operands
+                )
+        previous_cache = state.get("materialize_cache")
+        state["materialize_cache"] = {}
+        try:
+            _emit_ordered_raw_op(
+                builder,
+                kernel,
+                raw_op,
+                state,
+                lds_layout,
+                w,
+                stats,
+                control_context=control_context,
             )
-        _emit_ordered_raw_op(
-            builder,
-            kernel,
-            raw_op,
-            state,
-            lds_layout,
-            w,
-            stats,
-            control_context=control_context,
-        )
+        finally:
+            if previous_cache is None:
+                state.pop("materialize_cache", None)
+            else:
+                state["materialize_cache"] = previous_cache
     return None
 
 

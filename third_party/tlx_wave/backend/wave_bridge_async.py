@@ -1136,6 +1136,7 @@ def _emit_dma_packet_ptrs(
     component,
     w,
 ):
+    cache = state.get("materialize_cache")
     packet_elements = _dma_packet_elements(address, packet_bytes)
     if packet_elements is None:
         raise ValueError(
@@ -1175,6 +1176,7 @@ def _emit_dma_packet_ptrs(
         len(address_plan.shape) - 1,
         packet_elements,
         w,
+        cache=cache,
     )
     destination_base = _emit_memdesc_base_ptr(
         builder,
@@ -1220,7 +1222,7 @@ def _emit_dma_packet_ptrs(
     destination_offset = _inline_index_expr_bindings(destination_offset, w)
     destination = builder.ptr_add(
         destination_base,
-        _materialize_index_value(builder, destination_offset, {}, w),
+        _materialize_index_value(builder, destination_offset, {}, w, cache=cache),
     )
     return source, destination, dim_bindings, width, active
 
@@ -1352,6 +1354,7 @@ def _emit_async_copy_via_load_store(
     w,
     stats,
 ):
+    cache = state.get("materialize_cache")
     if address_plan.shape != memdesc.shape:
         raise ValueError(
             "tlx_wave bridge cannot lower ttg.async_copy_global_to_local "
@@ -1384,6 +1387,7 @@ def _emit_async_copy_via_load_store(
             w,
             "ttg.async_copy_global_to_local source",
             component=component,
+            cache=cache,
         )
         source = _materialize_bounded_pointer_value(
             builder,
@@ -1402,6 +1406,7 @@ def _emit_async_copy_via_load_store(
                 "generic tensor lowering",
                 component=component,
             ),
+            cache=cache,
         )
         mask = active
         if mask_value is not None:
@@ -1413,6 +1418,7 @@ def _emit_async_copy_via_load_store(
                 width,
                 "ttg.async_copy_global_to_local mask",
                 component=component,
+                cache=cache,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -1480,6 +1486,7 @@ def _emit_async_copy_via_load_store(
 def _emit_async_copy(
     builder, state, kernel, address, lds_layout, after_token, w, stats
 ):
+    cache = state.get("materialize_cache")
     if address.memdesc_value_id is None:
         raise ValueError("tlx_wave bridge cannot lower async copy without LDS memdesc")
     memdescs = state["memdescs"]
@@ -1583,6 +1590,7 @@ def _emit_async_copy(
                 width,
                 "ttg.async_copy_global_to_local mask",
                 component=component,
+                cache=cache,
             )
             mask = _wave_mask_and(builder, mask, user_mask, w, width)
 
@@ -1602,5 +1610,3 @@ def _emit_async_copy(
             builder.yield_([component_token])
         token = where_op.results[0]
     return token
-
-
