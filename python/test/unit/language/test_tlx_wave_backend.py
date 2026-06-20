@@ -1,4 +1,5 @@
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -52,6 +53,7 @@ pytestmark = pytest.mark.skipif(
 
 GFX942_WAVE = GPUTarget("tlx_wave", "gfx942", 64)
 GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
+_TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
 
 
 def _asm_text(compiled, artifact):
@@ -59,6 +61,35 @@ def _asm_text(compiled, artifact):
     if isinstance(text, bytes):
         text = text.decode("utf-8")
     return text
+
+
+def _require_tlx_wave_runtime_target():
+    torch = pytest.importorskip("torch")
+    try:
+        active_driver = triton.runtime.driver.active
+        device = active_driver.get_current_device()
+        properties = active_driver.utils.get_device_properties(device)
+    except Exception as exc:
+        pytest.skip(f"requires an active HIP runtime for TLX Wave launch tests: {exc}")
+    arch = str(properties.get("arch", "")).split(":")[0]
+    if arch not in _TLX_WAVE_RUNTIME_ARCHES:
+        pytest.skip(
+            "requires physical gfx942/gfx950 hardware for TLX Wave launch "
+            f"tests, got {arch or 'unknown'}"
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("requires torch.cuda/ROCm for TLX Wave launch tests")
+    return torch, arch
+
+
+@contextmanager
+def _active_tlx_wave_driver():
+    previous_driver = triton.runtime.driver.active
+    triton.runtime.driver.set_active(tlx_wave_driver.TLXWaveDriver())
+    try:
+        yield
+    finally:
+        triton.runtime.driver.set_active(previous_driver)
 
 
 def test_tlx_wave_converter_import_stage_boundary_is_static():
@@ -1186,6 +1217,30 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+
+
+def test_tlx_wave_runtime_launches_no_memory_kernel():
+    torch, _arch = _require_tlx_wave_runtime_target()
+
+    with _active_tlx_wave_driver():
+        _tlx_wave_stage_only_kernel[(1,)]()
+        torch.cuda.synchronize()
+
+
+def test_tlx_wave_runtime_launches_masked_global_memory_kernel():
+    torch, _arch = _require_tlx_wave_runtime_target()
+    block = 64
+    n = 37
+    x = torch.arange(block, device="cuda", dtype=torch.float32)
+    y = torch.full((block,), -1.0, device="cuda", dtype=torch.float32)
+    expected = torch.full_like(y, -1.0)
+    expected[:n] = x[:n] + 1.0
+
+    with _active_tlx_wave_driver():
+        _tlx_wave_add_one_kernel[(1,)](x, y, n, BLOCK=block)
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(y, expected)
 
 
 def test_tlx_wave_converter_pipeline_lowers_program_id(tmp_path):
