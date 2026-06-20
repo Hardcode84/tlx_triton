@@ -13,11 +13,13 @@ _ASYNC_COPY_OPS = frozenset(
 _TOKEN_CONTROL_OPS = frozenset({"ttg.async_commit_group", "ttg.async_wait"})
 _TOKEN_OPS = _ASYNC_COPY_OPS | _TOKEN_CONTROL_OPS
 _MEMORY_OPS = _ASYNC_COPY_OPS | frozenset(
-    {"amdg.buffer_store", "tt.load", "tt.store", "ttg.local_load", "ttg.local_store"}
-)
-_UNSUPPORTED_MEMORY_OPS = frozenset(
     {
         "amdg.buffer_load",
+        "amdg.buffer_store",
+        "tt.load",
+        "tt.store",
+        "ttg.local_load",
+        "ttg.local_store",
     }
 )
 
@@ -94,14 +96,6 @@ def build_token_program(source_program, type_layout_program):
     committed_groups = []
 
     for op in source_program.ops:
-        if op.name in _UNSUPPORTED_MEMORY_OPS:
-            fail(
-                "TLXW_TOKEN_UNTOKENIZED_MEMORY_EFFECT",
-                STAGE,
-                f"memory op {op.name} has no token/effect conversion yet",
-                source_op_index=op.index,
-            )
-
         token_node_id = None
         if _needs_token_node(source_program, op):
             node, group, open_async_tokens, committed_groups = _build_token_node(
@@ -400,6 +394,22 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 prior_effect_ids,
             ),
         )
+    if op.name == "amdg.buffer_load":
+        fields = _buffer_load_fields(op)
+        return (
+            _memory_effect(
+                source_program,
+                op,
+                "read",
+                "buffer",
+                fields["base_value_id"],
+                fields["offset_value_id"],
+                None,
+                fields["mask_value_id"],
+                token_node_id,
+                prior_effect_ids,
+            ),
+        )
     if op.name == "amdg.buffer_store":
         fields = _buffer_store_fields(op)
         return (
@@ -489,6 +499,43 @@ def _memory_effect(
         "unknown",
         tuple(prior_effect_ids),
     )
+
+
+def _buffer_load_fields(op):
+    segments = _operand_segments(op, 5, None)
+    _require_operand_count(op, segments)
+    if segments[0] != 1 or segments[1] != 1:
+        fail(
+            "TLXW_TOKEN_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            "amdg.buffer_load requires base pointer and offsets operands",
+            source_op_index=op.index,
+        )
+    if segments[2] not in (0, 1):
+        fail(
+            "TLXW_TOKEN_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            "amdg.buffer_load supports at most one stride operand",
+            source_op_index=op.index,
+        )
+    if segments[3] not in (0, 1) or segments[4] not in (0, 1):
+        fail(
+            "TLXW_TOKEN_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            "amdg.buffer_load supports at most one mask and one other operand",
+            source_op_index=op.index,
+        )
+    offset_index = int(segments[0])
+    stride_index = offset_index + int(segments[1])
+    mask_index = stride_index + int(segments[2])
+    other_index = mask_index + int(segments[3])
+    return {
+        "base_value_id": _operand_or_none(op, 0),
+        "offset_value_id": _operand_or_none(op, offset_index),
+        "stride_value_id": _operand_or_none(op, stride_index) if segments[2] else None,
+        "mask_value_id": _operand_or_none(op, mask_index) if segments[3] else None,
+        "other_value_id": _operand_or_none(op, other_index) if segments[4] else None,
+    }
 
 
 def _waited_group_ids(committed_groups, keep_count):

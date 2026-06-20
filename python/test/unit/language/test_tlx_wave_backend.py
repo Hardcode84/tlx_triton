@@ -547,6 +547,70 @@ def test_tlx_wave_converter_token_stage_records_buffer_store_effect():
     assert effect.cache_modifier == "none"
 
 
+def test_tlx_wave_converter_token_stage_records_buffer_load_effect():
+    result_type = converter_source_ir.SourceType(
+        "tensor<64xf32>",
+        "tensor",
+        shape=(64,),
+        element_type="f32",
+    )
+    pointer_type = converter_source_ir.SourceType(
+        "!tt.ptr<f32>",
+        "pointer",
+        pointee_type="f32",
+        address_space=1,
+    )
+    offset_type = converter_source_ir.SourceType(
+        "tensor<64xi32>",
+        "tensor",
+        shape=(64,),
+        element_type="i32",
+    )
+    mask_type = converter_source_ir.SourceType(
+        "tensor<64xi1>",
+        "tensor",
+        shape=(64,),
+        element_type="i1",
+    )
+    program = converter_source_ir.SourceProgram(
+        converter_source_ir.KernelInfo("buffer_load_effect"),
+        (
+            converter_source_ir.SourceOp(
+                0,
+                "amdg.buffer_load",
+                operands=(1, 2, 3, 4),
+                results=(5,),
+                attrs={
+                    "cache": 1,
+                    "operandSegmentSizes": (1, 1, 0, 1, 1),
+                },
+            ),
+        ),
+        {
+            1: converter_source_ir.SourceValue(1, pointer_type, producer_name="arg0"),
+            2: converter_source_ir.SourceValue(2, offset_type, producer_name="arg1"),
+            3: converter_source_ir.SourceValue(3, mask_type, producer_name="arg2"),
+            4: converter_source_ir.SourceValue(4, result_type, producer_name="arg3"),
+            5: converter_source_ir.SourceValue(5, result_type, producer_name="load"),
+        },
+        (converter_source_ir.SourceRegion(0, (0,)),),
+        0,
+    )
+
+    token_program = converter_tokens.build_token_program(program, None)
+
+    (effect,) = token_program.memory_effects
+    assert (effect.op_name, effect.kind, effect.address_space) == (
+        "amdg.buffer_load",
+        "read",
+        "buffer",
+    )
+    assert effect.address_value_id == 1
+    assert effect.offset_value_id == 2
+    assert effect.value_value_id is None
+    assert effect.mask_value_id == 3
+
+
 def test_tlx_wave_converter_token_stage_reports_malformed_segments():
     pointer_type = converter_source_ir.SourceType(
         "!tt.ptr<f16>",
@@ -734,6 +798,47 @@ def test_tlx_wave_converter_preserves_explicit_arith_overflow_flags(tmp_path):
     assert converter_target_ir.attrs_dict(binary_op)["nsw"] is True
     assert "wave.binary addi" in output.emitted_module.text
     assert "overflow<nsw>" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_float_add() attributes {noinline = false} {
+    %lhs = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    %rhs = arith.constant dense<2.000000e+00> : tensor<64xf32, #blocked>
+    %sum = arith.addf %lhs, %rhs : tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    float_op = next(op for op in output.target_program.ops if op.kind == "float_binary")
+    assert converter_target_ir.attrs_dict(float_op)["operation"] == "addf"
+    assert "wave.fadd" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_scalar_float_add(tmp_path):
+    local_func = """
+  tt.func public @converter_scalar_float_add(%arg0: f32, %arg1: f32) attributes {noinline = false} {
+    %sum = arith.addf %arg0, %arg1 : f32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_FLOAT_BINARY"
+    assert diagnostic.stage == "op_conversion"
+    assert diagnostic.no_fallback is True
     del ctx
 
 
@@ -1052,6 +1157,37 @@ def test_tlx_wave_backend_compile_uses_staged_converter():
     assert "gpu.module @kernels" not in binary_module
 
 
+def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
+    src = ASTSource(
+        fn=_tlx_wave_add_one_kernel,
+        signature={
+            "x": "*fp32",
+            "y": "*fp32",
+            "n": "i32",
+            "BLOCK": "constexpr",
+        },
+        constexprs={"BLOCK": 64},
+        attrs={
+            (0,): [["tt.pointer_range", 32]],
+            (1,): [["tt.pointer_range", 32]],
+        },
+    )
+
+    compiled = triton_compile(src, target=GFX950_WAVE)
+    wave_artifact = _asm_text(compiled, "wave")
+    hsaco = compiled.asm["hsaco"]
+
+    assert "wave.where" in wave_artifact
+    assert "wave.fadd" in wave_artifact
+    assert "wave.load" in wave_artifact
+    assert "wave.store" in wave_artifact
+    assert "waveamd.make_buffer" in wave_artifact
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+
+
 def test_tlx_wave_converter_pipeline_lowers_program_id(tmp_path):
     local_func = """
   tt.func public @converter_program_id() attributes {noinline = false} {
@@ -1253,7 +1389,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     attrs = converter_target_ir.attrs_dict(store_op)
     assert attrs["has_mask"] is True
     assert attrs["mask_mode"] == "select_oob_offset"
-    assert attrs["inactive_offset"] == 2147483647
+    assert attrs["inactive_offset"] == 1073741824
     assert attrs["offset_range"] == (0, 1073741823)
     assert "wave.where" not in output.emitted_module.text
     assert output.emitted_module.text.count("wave.ptr_add") == 2
@@ -1262,6 +1398,79 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.buffer_store_b16" in machine
     assert "waveamdmachine.exec_if" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_masked_buffer_load(
+      %arg0: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range], %mask, %other {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    amdg.buffer_store %loaded, %arg1[%range], %mask {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op,) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
+    attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["has_mask"] is True
+    assert attrs["has_other"] is True
+    assert attrs["mask_mode"] == "exec_where"
+    assert attrs["inactive_offset"] == 536870912
+    assert attrs["offset_range"] == (0, 536870911)
+    assert output.emitted_module.text.count("waveamd.make_buffer") == 2
+    assert output.emitted_module.text.count("wave.load") == 1
+    assert "wave.where" in output.emitted_module.text
+    assert "wave.select" in output.emitted_module.text
+
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "waveamdmachine.buffer_load_b32" in machine
+    assert "waveamdmachine.buffer_store_b32" in machine
+    assert "waveamdmachine.exec_if" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_masked_small_buffer_load(
+      %arg0: !tt.ptr<f32> {tt.pointer_range = 3 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %one = arith.constant dense<1> : tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %one : tensor<64xi32, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range], %mask, %other {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op,) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
+    attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["offset_range"] == (0, 0)
+    assert attrs["inactive_offset"] == 1
+    wave = output.emitted_module.text
+    assert wave.index("wave.where") < wave.index("wave.assume") < wave.index("wave.load")
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_b32" in machine
     del ctx
 
 
@@ -1473,6 +1682,14 @@ def test_tlx_wave_converter_pipeline_lowers_blocked_broadcast(tmp_path):
 def _tlx_wave_stage_only_kernel():
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
+
+
+@triton.jit
+def _tlx_wave_add_one_kernel(x, y, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    vals = tl.load(x + offs, mask=mask, other=0.0)
+    tl.store(y + offs, vals + 1.0, mask=mask)
 
 
 def _minimal_ttgir(

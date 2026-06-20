@@ -67,6 +67,9 @@ def _emit_target_op(state, op):
     if op.kind == "binary":
         _emit_binary(state, op)
         return
+    if op.kind == "float_binary":
+        _emit_float_binary(state, op)
+        return
     if op.kind == "cmpi":
         _emit_cmpi(state, op)
         return
@@ -123,6 +126,9 @@ def _emit_target_op(state, op):
         return
     if op.kind == "buffer_store":
         _emit_buffer_store(state, op)
+        return
+    if op.kind == "buffer_load":
+        _emit_buffer_load(state, op)
         return
     if op.kind == "async_commit_group":
         _emit_async_commit_group(state, op)
@@ -243,6 +249,42 @@ def _emit_binary(state, op):
                     rhs_component,
                     nsw=bool(attrs.get("nsw", False)),
                     nuw=bool(attrs.get("nuw", False)),
+                ),
+            )
+            for lhs_component, rhs_component in zip(lhs_components, rhs_components)
+        )
+    )
+
+
+def _emit_float_binary(state, op):
+    attrs = target_ir.attrs_dict(op)
+    operation = attrs["operation"]
+    builders = {
+        "addf": state.builder.fadd,
+        "subf": state.builder.fsub,
+        "mulf": state.builder.fmul,
+    }
+    emit = builders.get(operation)
+    if emit is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_FLOAT_BINARY",
+            STAGE,
+            f"unsupported float binary operation {operation}",
+            target_op_id=op.target_op_id,
+        )
+    lhs, rhs = _operand_values(state, op, 2)
+    result_id = _single_result(op)
+    count = _component_count(state, result_id)
+    lhs_components, rhs_components = _broadcast_components((lhs, rhs), count, op)
+    reused = []
+    state.values[result_id] = _pack_components(
+        tuple(
+            _reuse_component_result(
+                reused,
+                (lhs_component, rhs_component),
+                lambda lhs_component=lhs_component, rhs_component=rhs_component: emit(
+                    lhs_component,
+                    rhs_component,
                 ),
             )
             for lhs_component, rhs_component in zip(lhs_components, rhs_components)
@@ -1456,6 +1498,118 @@ def _emit_buffer_store(state, op):
             )
         with state.builder.where(mask_components[index]):
             state.builder.store(value_component, ptr)
+
+
+def _emit_buffer_load(state, op):
+    attrs = target_ir.attrs_dict(op)
+    operand_count = 2 + int(bool(attrs["has_mask"])) + int(bool(attrs["has_other"]))
+    operands = _operand_values(state, op, operand_count)
+    source_base, offsets = operands[:2]
+    operand_index = 2
+    masks = None
+    if attrs["has_mask"]:
+        masks = operands[operand_index]
+        operand_index += 1
+    other = operands[operand_index] if attrs["has_other"] else None
+    offset_components = _as_components(offsets)
+    mask_components = None if masks is None else _as_components(masks)
+    other_components = None if other is None else _as_components(other)
+    component_count = int(attrs["component_count"])
+    if len(offset_components) != component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_load offset component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    if mask_components is not None and len(mask_components) != component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_load mask component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    if other_components is not None and len(other_components) not in (1, component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_load other component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    result_id = _single_result(op)
+    result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
+    lane_width = int(attrs["lane_width"])
+    mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
+    range_bytes = state.builder.constant(state.dsl.i32(), int(attrs["range_bytes"]))
+    buffer_base = state.builder.make_buffer(
+        source_base,
+        range_bytes,
+        result_type=state.dsl.buffer_ptr_type(element_type),
+    )
+    ptr_type = state.dsl.simd_ptr_type(
+        element_type,
+        state.dsl.buffer_address_space(),
+        lane_width,
+    )
+    loaded_components = []
+    for index, offset_component in enumerate(offset_components):
+        if mask_components is None:
+            offset_component = _assume_value_range(
+                state,
+                offset_component,
+                attrs.get("offset_range"),
+                op,
+            )
+            ptr = state.builder.ptr_add(
+                buffer_base,
+                offset_component,
+                result_type=ptr_type,
+            )
+            loaded, _token = state.builder.load(ptr, result_type)
+        else:
+            if mask_mode != "exec_where":
+                fail(
+                    "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
+                    STAGE,
+                    f"unsupported buffer_load mask mode {mask_mode}",
+                    target_op_id=op.target_op_id,
+                )
+            with state.builder.where(mask_components[index], [result_type]) as where:
+                active_offset = _assume_value_range(
+                    state,
+                    offset_component,
+                    attrs.get("offset_range"),
+                    op,
+                )
+                ptr = state.builder.ptr_add(
+                    buffer_base,
+                    active_offset,
+                    result_type=ptr_type,
+                )
+                loaded, _token = state.builder.load(ptr, result_type)
+                state.builder.yield_([loaded])
+            loaded = where.results[0]
+            if other_components is not None:
+                other_component = (
+                    other_components[0]
+                    if len(other_components) == 1
+                    else other_components[index]
+                )
+                loaded = state.builder.select(
+                    mask_components[index],
+                    loaded,
+                    other_component,
+                )
+        if other_components is not None and mask_components is None:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_OTHER",
+                STAGE,
+                "buffer_load other requires a mask",
+                target_op_id=op.target_op_id,
+            )
+        loaded_components.append(loaded)
+    state.values[result_id] = _pack_components(tuple(loaded_components))
 
 
 def _scalar_constant(state, scalar_type, element_type, literal, op):

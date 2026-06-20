@@ -5,7 +5,9 @@ from .diagnostics import fail
 
 STAGE = "verification"
 
-_PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_store"})
+_PROOF_DEPENDENT_OPS = frozenset(
+    {"assume", "buffer_load_to_local", "buffer_load", "buffer_store"}
+)
 
 
 def verify_target_program(
@@ -136,7 +138,9 @@ def _verify_memory_effects_tokenized(source_program, token_program):
             "tt.load",
             "tt.store",
             "ttg.async_copy_global_to_local",
+            "amdg.buffer_load",
             "amdg.buffer_load_to_local",
+            "amdg.buffer_store",
             "ttg.local_load",
             "ttg.local_store",
         }:

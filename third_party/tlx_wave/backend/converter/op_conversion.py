@@ -22,6 +22,12 @@ _BINARY_OPS = {
     "arith.remui": "remui",
 }
 
+_FLOAT_BINARY_OPS = {
+    "arith.addf": "addf",
+    "arith.subf": "subf",
+    "arith.mulf": "mulf",
+}
+
 
 @dataclass(frozen=True)
 class OpConversionView:
@@ -218,6 +224,15 @@ def _convert_source_op(
             op,
         )
         return
+    if op.name == "amdg.buffer_load":
+        _convert_buffer_load(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
     if op.name == "amdg.buffer_store":
         _convert_buffer_store(
             builder,
@@ -331,6 +346,8 @@ def _converter_for_op(op_name):
         return _convert_constant
     if op_name in _BINARY_OPS:
         return _convert_binary
+    if op_name in _FLOAT_BINARY_OPS:
+        return _convert_float_binary
     if op_name == "arith.cmpi":
         return _convert_cmpi
     if op_name == "arith.minsi":
@@ -387,6 +404,38 @@ def _convert_binary(builder, view):
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
+
+
+def _convert_float_binary(builder, view):
+    result_type = builder.values[view.result_target_ids[0]].type
+    for target_value_id in (*view.operand_target_ids, *view.result_target_ids):
+        target_type = builder.values[target_value_id].type
+        if not _supports_float_binary_type(view.op_name, target_type, result_type):
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_BINARY",
+                STAGE,
+                f"{view.op_name} requires supported Wave SIMD float operands",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+    builder.add_op(
+        "float_binary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"operation": _FLOAT_BINARY_OPS[view.op_name]},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _supports_float_binary_type(op_name, target_type, result_type):
+    if target_type.representation not in {"simd", "simd_tuple"}:
+        return False
+    if target_type.element_type != result_type.element_type:
+        return False
+    if op_name == "arith.subf":
+        return target_type.element_type == "f32"
+    return target_type.element_type in {"f16", "f32"}
 
 
 def _convert_cmpi(builder, view):
@@ -774,6 +823,115 @@ def _convert_buffer_load_to_local(
     )
 
 
+def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_program, op):
+    fields = _buffer_load_fields(op)
+    _require_default_cache(fields["cache"], op)
+    if fields["stride_value_id"] is not None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load stride operand is not converted yet",
+            source_op_index=op.index,
+        )
+    if fields["other_value_id"] is not None and fields["mask_value_id"] is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load other operand requires a mask operand",
+            source_op_index=op.index,
+        )
+    range_fact = _pointer_byte_range_fact(fact_program, fields["base_value_id"], op)
+    loaded = type_layout_program.values[op.results[0]]
+    offsets = type_layout_program.values[fields["offset_value_id"]]
+    if int(loaded.type.component_count) != int(offsets.type.component_count):
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load result and offset components must match",
+            source_op_index=op.index,
+        )
+    operands = [
+        _single_source_target(builder, fields["base_value_id"], op),
+        _single_source_target(builder, fields["offset_value_id"], op),
+    ]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) != int(loaded.type.component_count):
+            fail(
+                "TLXW_OP_BUFFER_LOAD",
+                STAGE,
+                "amdg.buffer_load mask and result components must match",
+                source_op_index=op.index,
+            )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    if fields["other_value_id"] is not None:
+        other = type_layout_program.values[fields["other_value_id"]]
+        if int(other.type.component_count) not in (
+            1,
+            int(loaded.type.component_count),
+        ):
+            fail(
+                "TLXW_OP_BUFFER_LOAD",
+                STAGE,
+                "amdg.buffer_load other must be scalar or match result components",
+                source_op_index=op.index,
+            )
+        operands.append(_single_source_target(builder, fields["other_value_id"], op))
+    element_byte_width = conversion_input.value_element_byte_widths.get(op.results[0])
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load requires known result element byte width",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    access_element_count = int(fields["contiguity"] or 1)
+    if access_element_count <= 0:
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load contiguity must be positive",
+            source_op_index=op.index,
+        )
+    access_bytes = int(element_byte_width) * access_element_count
+    has_mask = fields["mask_value_id"] is not None
+    has_other = fields["other_value_id"] is not None
+    offset_upper = _buffer_source_offset_upper(
+        range_fact.upper,
+        access_bytes,
+        element_byte_width,
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "buffer_load",
+        operands=tuple(operands),
+        results=result_target_ids,
+        attrs={
+            "access_element_count": access_element_count,
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": int(loaded.type.component_count),
+            "element_byte_width": int(element_byte_width),
+            "element_type": loaded.type.element_type,
+            "has_mask": has_mask,
+            "has_other": has_other,
+            "inactive_offset": int(offset_upper) + 1,
+            "lane_width": int(loaded.type.lane_width or offsets.type.lane_width or 64),
+            "mask_mode": "exec_where" if has_mask else "none",
+            "offset_range": (0, int(offset_upper)),
+            "range_bytes": int(range_fact.upper),
+        },
+        fact_ids=(range_fact.fact_id,),
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
 def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_program, op):
     fields = _buffer_store_fields(op)
     _require_default_cache(fields["cache"], op)
@@ -823,6 +981,12 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
         )
     access_bytes = int(element_byte_width) * access_element_count
     has_mask = fields["mask_value_id"] is not None
+    offset_upper = _buffer_source_offset_upper(
+        range_fact.upper,
+        access_bytes,
+        element_byte_width,
+        op,
+    )
     builder.add_op(
         "buffer_store",
         operands=tuple(operands),
@@ -833,18 +997,10 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "element_byte_width": int(element_byte_width),
             "element_type": value.type.element_type,
             "has_mask": has_mask,
-            "inactive_offset": int(range_fact.upper),
+            "inactive_offset": int(offset_upper) + 1,
             "lane_width": int(value.type.lane_width or offsets.type.lane_width or 64),
             "mask_mode": "select_oob_offset" if has_mask else "none",
-            "offset_range": (
-                0,
-                _buffer_source_offset_upper(
-                    range_fact.upper,
-                    access_bytes,
-                    element_byte_width,
-                    op,
-                ),
-            ),
+            "offset_range": (0, int(offset_upper)),
             "range_bytes": int(range_fact.upper),
         },
         fact_ids=(range_fact.fact_id,),
@@ -1435,6 +1591,45 @@ def _buffer_load_to_local_fields(op):
     }
 
 
+def _buffer_load_fields(op):
+    segments = _operand_segments(op, 5, None)
+    if int(segments[0]) != 1 or int(segments[1]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load requires base pointer and offsets operands",
+            source_op_index=op.index,
+        )
+    if int(segments[2]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load supports at most one stride operand",
+            source_op_index=op.index,
+        )
+    if int(segments[3]) not in (0, 1) or int(segments[4]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load supports at most one mask and one other operand",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    offset_index = int(segments[0])
+    stride_index = offset_index + int(segments[1])
+    mask_index = stride_index + int(segments[2])
+    other_index = mask_index + int(segments[3])
+    return {
+        "base_value_id": op.operands[0],
+        "offset_value_id": op.operands[offset_index],
+        "stride_value_id": op.operands[stride_index] if int(segments[2]) else None,
+        "mask_value_id": op.operands[mask_index] if int(segments[3]) else None,
+        "other_value_id": op.operands[other_index] if int(segments[4]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
+    }
+
+
 def _buffer_store_fields(op):
     segments = _operand_segments(op, 5, None)
     if int(segments[0]) != 1 or int(segments[1]) != 1 or int(segments[2]) != 1:
@@ -1511,8 +1706,7 @@ def _require_default_cache(cache, op):
     fail(
         "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
         STAGE,
-        "Wave lowering does not support amdg.buffer_load_to_local "
-        f"cacheModifier={cache}",
+        f"Wave lowering does not support {op.name} cacheModifier={cache}",
         source_op_index=op.index,
     )
 
@@ -1689,15 +1883,15 @@ def _buffer_source_offset_upper(range_upper_bytes, packet_bytes, element_byte_wi
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "amdg.buffer_load_to_local source offset range requires "
-            "positive packet and element byte widths",
+            f"{op.name} source offset range requires positive access and "
+            "element byte widths",
             source_op_index=op.index,
         )
     if range_upper_bytes < packet_bytes - 1:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "amdg.buffer_load_to_local packet exceeds source pointer range",
+            f"{op.name} access exceeds source pointer range",
             source_op_index=op.index,
         )
     return (range_upper_bytes - packet_bytes + 1) // element_byte_width
