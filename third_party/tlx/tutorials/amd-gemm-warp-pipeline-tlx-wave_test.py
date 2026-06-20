@@ -206,7 +206,7 @@ def _run_wave_to_amdgpu_asm(wave_artifact):
     assert opt.returncode == 0, opt.stderr or opt.stdout
     asm = subprocess.run(
         [str(wave_translate), "--wave-to-amdgpu-asm", "-"],
-        input=opt.stdout,
+        input=_machine_text_for_wave_translate(opt.stdout),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -214,6 +214,29 @@ def _run_wave_to_amdgpu_asm(wave_artifact):
     )
     assert asm.returncode == 0, asm.stderr or asm.stdout
     return asm.stdout, opt.stderr
+
+
+def _machine_text_for_wave_translate(machine):
+    # wave-translate does not register the GPU dialect, while the executable
+    # handoff shape keeps kernels inside gpu.module. For ASM inspection, feed
+    # the already-lowered kernel funcs in the top-level module shape the
+    # translator accepts.
+    lines = machine.splitlines()
+    try:
+        start = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "gpu.module @kernels {"
+        )
+    except StopIteration:
+        return machine
+    end = None
+    for index in range(len(lines) - 2, start, -1):
+        if lines[index] == "  }":
+            end = index
+            break
+    assert end is not None, machine
+    return "\n".join(lines[:start] + lines[start + 1 : end] + lines[end + 1 :]) + "\n"
 
 
 def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
@@ -225,6 +248,8 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     wave = _wave_text(compiled)
     machine = _run_wave_promote_buffer_to_machine(wave)
 
+    assert "gpu.module @kernels" in wave
+    assert "gpu.kernel" in wave
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
     assert compiled.metadata.tlx_wave_num_mmas == 128

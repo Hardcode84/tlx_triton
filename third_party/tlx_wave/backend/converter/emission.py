@@ -38,18 +38,25 @@ def emit_wave_module(target_program, fact_program=None):
             _wave_type(dsl, target_program.values[target_value_id].type)
             for target_value_id in kernel.arg_target_ids
         ]
-        with module_builder.function(
-            kernel.name,
-            arg_types,
-            kernel=True,
-            lds_size=lds_size or None,
-            attrs=_function_attrs(dsl, ir, kernel),
-        ) as builder:
-            state = _EmissionState(dsl, ir, builder, target_program, fact_program, {})
-            for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
-                state.values[target_value_id] = arg
-            for op in target_program.ops:
-                _emit_target_op(state, op)
+        with module_builder.gpu_module("kernels") as gpu_module:
+            with gpu_module.kernel(
+                kernel.name,
+                arg_types,
+                lds_size=lds_size or None,
+                attrs=_function_attrs(dsl, ir, kernel),
+            ) as builder:
+                state = _EmissionState(
+                    dsl,
+                    ir,
+                    builder,
+                    target_program,
+                    fact_program,
+                    {},
+                )
+                for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
+                    state.values[target_value_id] = arg
+                for op in target_program.ops:
+                    _emit_target_op(state, op)
         return EmittedWaveModule(str(module_builder), lds_size)
 
 

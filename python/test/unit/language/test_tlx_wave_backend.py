@@ -933,6 +933,8 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
 
     assert "@converter_emit" in emitted.text
     assert "tlx_wave.new_converter" in emitted.text
+    assert "gpu.module @kernels" in emitted.text
+    assert "gpu.kernel" in emitted.text
     assert "wave.binary" in emitted.text
     assert "wave.assume" in emitted.text
     assert "wave.ptr_add" in emitted.text
@@ -959,6 +961,8 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
     )
 
     assert "tlx_wave.new_converter" in wave_artifact
+    assert "gpu.module @kernels" in wave_artifact
+    assert "gpu.kernel" in wave_artifact
     assert "wave_bridge" not in wave_artifact
     assert metadata["name"] == "backend_wave_stage"
     assert metadata["tlx_wave_status"] == "emitted_wave_staged_converter"
@@ -980,6 +984,8 @@ def test_tlx_wave_backend_compile_uses_staged_converter():
     wave_artifact = _asm_text(compiled, "wave")
 
     assert "tlx_wave.new_converter" in wave_artifact
+    assert "gpu.module @kernels" in wave_artifact
+    assert "gpu.kernel" in wave_artifact
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_bridge_stage == "staged-converter"
     assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
@@ -987,6 +993,9 @@ def test_tlx_wave_backend_compile_uses_staged_converter():
     assert compiled.metadata.tlx_wave_num_kernel_args == 0
     assert compiled.metadata.tlx_wave_plan_num_ops >= 1
     _run_wave_verify(wave_artifact)
+    binary_module = _run_wave_compile_kernels(wave_artifact)
+    assert "gpu.binary @kernels" in binary_module
+    assert "gpu.module @kernels" not in binary_module
 
 
 def test_tlx_wave_converter_pipeline_lowers_program_id(tmp_path):
@@ -1485,6 +1494,29 @@ def _run_waveamd_to_machine(wave_artifact):
 def _run_wave_verify(wave_artifact):
     result = subprocess.run(
         [wave_bridge_tools._wave_opt(), "-", "--verify-diagnostics"],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
+def _run_wave_compile_kernels(wave_artifact):
+    result = subprocess.run(
+        [
+            wave_bridge_tools._wave_opt(),
+            "-",
+            "--waveamd-to-machine",
+            "--waveamd-abi-lowering",
+            "--waveamd-reg-alloc",
+            "--waveamd-insert-hazard-waits",
+            "--waveamd-resource-info",
+            "--waveamd-metadata",
+            "--wave-compile-kernels=features=",
+        ],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,

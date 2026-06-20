@@ -177,7 +177,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     def hash(self):
-        return f"{self.target}:stage5-staged-converter"
+        return f"{self.target}:stage6-staged-converter-gpu-module"
 
 
 def _validate_staged_converter_output(output, options):
