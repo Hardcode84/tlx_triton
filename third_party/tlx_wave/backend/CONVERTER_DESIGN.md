@@ -1,12 +1,11 @@
 # TLX Wave Converter Design
 
 This document defines the replacement TLX Wave converter architecture. The
-current bridge stack is not the base for this work. The old bridge may remain
-as an explicitly selected legacy mode only. Once the new converter is selected
-for a compile, every unsupported case must return a diagnostic and must not
-fall through to any old bridge or text-emitter path. The new converter must not
-inherit old bridge control flow, mutable planning model, text emission, or
-terminal-op graph reconstruction.
+current bridge stack is not the base for this work. The old bridge modules have
+been removed from the production backend; every unsupported case must return a
+diagnostic and must not fall through to any old bridge or text-emitter path. The
+new converter must not inherit old bridge control flow, mutable planning model,
+text emission, or terminal-op graph reconstruction.
 
 ## Goals
 
@@ -24,7 +23,7 @@ terminal-op graph reconstruction.
 ## Non-Goals
 
 - No compatibility with `_BridgePlan` or `wave_bridge_plan.py`.
-- No new features in the old `wave_bridge_emit.py` path.
+- No compatibility fallback through the old bridge/text-emitter stack.
 - No handwritten Wave IR text.
 - No best-effort fallback from the new converter to a text emitter.
 - No emitter-side producer/consumer graph analysis.
@@ -733,14 +732,10 @@ Required end-to-end matrix:
 
 1. Freeze the existing bridge.
 
-   Do not add features to `wave_bridge_emit.py`, `wave_bridge_plan.py`,
-   `wave_bridge_text_emit.py`, or the current structural rewrite except for
-   emergency correctness fixes.
-
-   The frozen set also includes helper modules that are configured by old bridge
-   private state. An emergency correctness fix must be narrowly scoped, must not
-   add new supported cases, and must include a regression test. New converter
-   modules must be testable with old bridge/text fallback disabled.
+   The old bridge modules are removed. Do not resurrect `wave_bridge_emit.py`,
+   `wave_bridge_plan.py`, `wave_bridge_text_emit.py`, or the interim structural
+   rewrite. Shared tool discovery/verification helpers may remain outside the
+   converter, but must not contain lowering logic.
 
 2. Implement source import and type/layout conversion.
 
@@ -767,12 +762,9 @@ Required end-to-end matrix:
 
 7. Remove old fallback.
 
-   Once the new converter handles the required kernels, delete the text emitter
-   path and stop importing old bridge helpers from new tests.
-
-   The removal gate is a CI mode that makes old bridge/text fallback unavailable
-   and still lowers the required unit and tutorial kernels through the
-   structural target-IR path.
+   The text-emitter and old bridge fallback are gone. The removal gate is that
+   the staged converter still lowers the required unit and tutorial kernels
+   through the structural target-IR path with no legacy escape hatch.
 
 ## Review Checklist
 

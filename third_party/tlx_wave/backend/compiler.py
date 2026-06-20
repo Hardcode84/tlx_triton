@@ -1,4 +1,3 @@
-import os
 from typing import Any
 
 from triton import knobs
@@ -6,21 +5,8 @@ from triton._C.libtriton import amd, ir, passes, tlx
 import triton.backends.amd.compiler as amd_compiler
 from triton.backends.compiler import GPUTarget, Language
 
-from . import wave_bridge
 from .converter import pipeline as converter_pipeline
 from .wave_bridge_tools import _verify_wave_module, _wave_opt
-
-
-_LEGACY_BRIDGE_ENV = "TRITON_TLX_WAVE_LEGACY_BRIDGE"
-
-
-def _use_legacy_bridge():
-    return os.environ.get(_LEGACY_BRIDGE_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 
 def _module_has_new_bridge_blocker(mod):
@@ -172,9 +158,6 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @staticmethod
     def make_wave(src, metadata, options):
-        if _use_legacy_bridge():
-            return wave_bridge.stop_before_wave_lowering(src, metadata, options)
-
         output = converter_pipeline.convert_ttgir_to_wave(src)
         _validate_staged_converter_output(output, options)
 
@@ -194,8 +177,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     def hash(self):
-        bridge_mode = "legacy" if _use_legacy_bridge() else "staged"
-        return f"{self.target}:stage4-staged-converter:{bridge_mode}"
+        return f"{self.target}:stage5-staged-converter"
 
 
 def _validate_staged_converter_output(output, options):
