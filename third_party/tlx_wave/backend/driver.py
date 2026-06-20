@@ -13,10 +13,21 @@ class _TLXWaveUtils:
         return getattr(self._hip_utils, name)
 
     def load_binary(self, name, kernel, shared, device):
-        raise RuntimeError(
-            "tlx_wave produced HSACO, but executable loading is not wired yet. "
-            "Inspect compiled.asm['wave'] and compiled.asm['hsaco'] for the current handoff."
-        )
+        if not isinstance(kernel, (bytes, bytearray, memoryview)):
+            raise RuntimeError(
+                "tlx_wave expected HSACO bytes for executable loading, got "
+                f"{type(kernel).__name__}. Inspect compiled.asm['wave'] and "
+                "compiled.asm['hsaco'] to verify the compiler pipeline reached "
+                "the hsaco stage."
+            )
+        kernel = bytes(kernel)
+        if not kernel.startswith(b"\x7fELF"):
+            raise RuntimeError(
+                "tlx_wave expected an ELF HSACO object for executable loading. "
+                "The cached artifact is not executable; inspect compiled.asm['wave'] "
+                "and compiled.asm['hsaco']."
+            )
+        return self._hip_utils.load_binary(name, kernel, shared, device)
 
 
 class TLXWaveDriver(amd_driver.HIPDriver):

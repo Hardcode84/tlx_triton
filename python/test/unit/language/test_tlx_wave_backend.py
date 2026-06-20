@@ -14,6 +14,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile, make_
 
 if "tlx_wave" in backends:
     from triton.backends.tlx_wave import compiler as tlx_wave_compiler
+    from triton.backends.tlx_wave import driver as tlx_wave_driver
     from triton.backends.tlx_wave import wave_bridge_tools
     from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import canonicalize as converter_canonicalize
@@ -29,6 +30,7 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import verifier as converter_verifier
 else:
     tlx_wave_compiler = None
+    tlx_wave_driver = None
     wave_bridge_tools = None
     converter_diagnostics = None
     converter_canonicalize = None
@@ -991,6 +993,36 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
+
+
+def test_tlx_wave_driver_load_binary_delegates_hsaco():
+    calls = []
+
+    class FakeHIPUtils:
+        def load_binary(self, name, kernel, shared, device):
+            calls.append((name, kernel, shared, device))
+            return "module", "function", 10, 0, 1024
+
+    utils = tlx_wave_driver._TLXWaveUtils(FakeHIPUtils())
+
+    result = utils.load_binary("kernel_name", b"\x7fELFpayload", 128, 0)
+
+    assert result == ("module", "function", 10, 0, 1024)
+    assert calls == [("kernel_name", b"\x7fELFpayload", 128, 0)]
+
+
+def test_tlx_wave_driver_load_binary_rejects_wave_text():
+    class FakeHIPUtils:
+        def load_binary(self, name, kernel, shared, device):
+            raise AssertionError("non-HSACO artifact should not reach HIP")
+
+    utils = tlx_wave_driver._TLXWaveUtils(FakeHIPUtils())
+
+    with pytest.raises(RuntimeError, match="expected HSACO bytes"):
+        utils.load_binary("kernel_name", "gpu.module @kernels {}", 0, 0)
+
+    with pytest.raises(RuntimeError, match="expected an ELF HSACO object"):
+        utils.load_binary("kernel_name", b"gpu.module @kernels {}", 0, 0)
 
 
 def test_tlx_wave_backend_compile_uses_staged_converter():
