@@ -775,6 +775,7 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
     }
     assume_op = next(op for op in target.ops if op.kind == "assume")
     assert assume_op.fact_ids
+    assert assume_op.fact_target_ids
     range_op = next(op for op in target.ops if op.kind == "make_range")
     assert converter_target_ir.attrs_dict(range_op) == {"end": 64, "start": 0}
     assert not any(
@@ -809,8 +810,45 @@ def test_tlx_wave_converter_materializes_operand_assumes_before_arithmetic(tmp_p
         and converter_target_ir.attrs_dict(op)["operation"] == "addi"
     )
     assert add_op.fact_ids
+    assert add_op.fact_target_ids == (output.target_program.kernel.arg_target_ids[0],)
     wave = output.emitted_module.text
     assert wave.index("wave.assume %arg0") < wave.index("wave.binary addi")
+    del ctx
+
+
+def test_tlx_wave_converter_emits_facts_without_source_provenance(tmp_path):
+    local_func = """
+  tt.func public @converter_stripped_facts(%arg0: i32) attributes {noinline = false} {
+    %c255 = arith.constant 255 : i32
+    %sum = arith.addi %arg0, %c255 : i32
+    %zero = arith.constant 0 : i32
+    %positive = arith.cmpi sgt, %arg0, %zero : i32
+    llvm.intr.assume %positive : i1
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    stripped_values = tuple(
+        converter_target_ir.TargetValue(value.target_value_id, value.type)
+        for value in output.target_program.values
+    )
+    stripped_target = converter_target_ir.TargetProgram(
+        stripped_values,
+        output.target_program.ops,
+        output.target_program.regions,
+        {},
+        {},
+        output.target_program.kernel,
+    )
+
+    stripped_emitted = converter_emission.emit_wave_module(
+        stripped_target,
+        output.fact_program,
+    )
+
+    assert stripped_emitted.text == output.emitted_module.text
     del ctx
 
 
@@ -1020,6 +1058,74 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact():
     assert diagnostic.code == "TLXW_VERIFY_MISSING_FACT"
     assert diagnostic.stage == "verification"
     assert diagnostic.target_op_id == 0
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_missing_fact_target():
+    scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
+    target = converter_target_ir.TargetProgram(
+        (
+            converter_target_ir.TargetValue(0, scalar_i32, source_value_id=0),
+        ),
+        (
+            converter_target_ir.TargetOp(
+                0,
+                "assume",
+                fact_ids=(0,),
+            ),
+        ),
+        (converter_target_ir.TargetRegion(0, (0,)),),
+        {0: (0,)},
+        {},
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "range", 0, "sge", lower=0),),
+        {0: (0,)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target, fact_program=fact_program)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_FACT_TARGET_COUNT"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_op_id == 0
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_incompatible_fact_target():
+    scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
+    target = converter_target_ir.TargetProgram(
+        (
+            converter_target_ir.TargetValue(0, scalar_i32, source_value_id=0),
+            converter_target_ir.TargetValue(1, scalar_i32, source_value_id=1),
+        ),
+        (
+            converter_target_ir.TargetOp(
+                0,
+                "assume",
+                fact_ids=(0,),
+                fact_target_ids=(1,),
+            ),
+        ),
+        (converter_target_ir.TargetRegion(0, (0,)),),
+        {0: (0,), 1: (1,)},
+        {},
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "range", 0, "sge", lower=0),),
+        {0: (0,)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target, fact_program=fact_program)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_FACT_TARGET"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_op_id == 0
+    assert diagnostic.target_value_id == 1
+    assert diagnostic.fact_id == 0
     assert diagnostic.no_fallback is True
 
 

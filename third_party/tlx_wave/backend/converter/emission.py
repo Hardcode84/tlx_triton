@@ -345,6 +345,13 @@ def _emit_assume(state, op):
 def _materialize_fact_ids(state, op):
     if not op.fact_ids:
         return
+    if len(op.fact_target_ids) != len(op.fact_ids):
+        fail(
+            "TLXW_EMIT_FACT_TARGET_COUNT",
+            STAGE,
+            "fact materialization requires one target value per fact",
+            target_op_id=op.target_op_id,
+        )
     if state.fact_program is None:
         fail(
             "TLXW_EMIT_MISSING_FACT_PROGRAM",
@@ -353,7 +360,7 @@ def _materialize_fact_ids(state, op):
             target_op_id=op.target_op_id,
         )
     facts = {fact.fact_id: fact for fact in state.fact_program.facts}
-    for fact_id in op.fact_ids:
+    for fact_id, target_value_id in zip(op.fact_ids, op.fact_target_ids):
         fact = facts.get(fact_id)
         if fact is None:
             fail(
@@ -363,18 +370,6 @@ def _materialize_fact_ids(state, op):
                 target_op_id=op.target_op_id,
                 fact_id=fact_id,
             )
-        target_ids = state.target_program.target_values_for_source(
-            fact.subject_value_id
-        )
-        if len(target_ids) != 1:
-            fail(
-                "TLXW_EMIT_FACT_TARGET",
-                STAGE,
-                f"fact {fact_id} subject has target values {target_ids}",
-                target_op_id=op.target_op_id,
-                fact_id=fact_id,
-            )
-        target_value_id = target_ids[0]
         value = _require_value(state, target_value_id, op)
         assumptions = _range_assumptions(state.dsl, fact)
         if assumptions:

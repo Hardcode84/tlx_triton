@@ -38,7 +38,9 @@ class OpConversionView:
     result_target_ids: tuple[int, ...]
     result_layout_map_ids: tuple[int, ...]
     fact_ids: tuple[int, ...]
+    fact_target_ids: tuple[int, ...]
     operand_fact_ids: tuple[int, ...]
+    operand_fact_target_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -273,6 +275,8 @@ def _convert_source_op(
         op,
         type_layout_program,
     )
+    fact_ids = conversion_input.fact_ids_by_op.get(op.index, ())
+    operand_fact_ids = _operand_assume_fact_ids(fact_program, op)
     view = OpConversionView(
         op.index,
         op.name,
@@ -280,8 +284,10 @@ def _convert_source_op(
         operand_target_ids,
         result_target_ids,
         result_layout_map_ids,
-        conversion_input.fact_ids_by_op.get(op.index, ()),
-        _operand_assume_fact_ids(fact_program, op),
+        fact_ids,
+        _fact_target_ids(builder, fact_program, fact_ids, op),
+        operand_fact_ids,
+        _fact_target_ids(builder, fact_program, operand_fact_ids, op),
     )
     converter(builder, view)
 
@@ -401,6 +407,7 @@ def _convert_binary(builder, view):
         results=view.result_target_ids,
         attrs=attrs,
         fact_ids=view.operand_fact_ids,
+        fact_target_ids=view.operand_fact_target_ids,
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
@@ -470,6 +477,7 @@ def _convert_assume(builder, view):
         "assume",
         operands=view.operand_target_ids,
         fact_ids=view.fact_ids,
+        fact_target_ids=view.fact_target_ids,
         source_op_index=view.op_index,
     )
 
@@ -713,9 +721,10 @@ def _convert_buffer_load_to_local(
         op,
         type_layout_program,
     )
+    base_target_id = _single_source_target(builder, fields["base_value_id"], op)
     operands = (
         _single_source_target(builder, fields["memdesc_value_id"], op),
-        _single_source_target(builder, fields["base_value_id"], op),
+        base_target_id,
         _single_source_target(builder, fields["offset_value_id"], op),
     )
     memdesc = _memdesc_info(conversion_input, fields["memdesc_value_id"], op)
@@ -798,6 +807,7 @@ def _convert_buffer_load_to_local(
                 "source_shape": tuple(int(dim) for dim in memdesc.shape),
             },
             fact_ids=(range_fact.fact_id,),
+            fact_target_ids=(base_target_id,),
             layout_map_ids=result_layout_map_ids,
             source_op_index=op.index,
         )
@@ -818,6 +828,7 @@ def _convert_buffer_load_to_local(
             "range_bytes": int(range_fact.upper),
         },
         fact_ids=(range_fact.fact_id,),
+        fact_target_ids=(base_target_id,),
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
@@ -850,8 +861,9 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "amdg.buffer_load result and offset components must match",
             source_op_index=op.index,
         )
+    base_target_id = _single_source_target(builder, fields["base_value_id"], op)
     operands = [
-        _single_source_target(builder, fields["base_value_id"], op),
+        base_target_id,
         _single_source_target(builder, fields["offset_value_id"], op),
     ]
     if fields["mask_value_id"] is not None:
@@ -927,6 +939,7 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "range_bytes": int(range_fact.upper),
         },
         fact_ids=(range_fact.fact_id,),
+        fact_target_ids=(base_target_id,),
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
@@ -945,9 +958,10 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "amdg.buffer_store value and offset components must match",
             source_op_index=op.index,
         )
+    base_target_id = _single_source_target(builder, fields["base_value_id"], op)
     operands = [
         _single_source_target(builder, fields["value_value_id"], op),
-        _single_source_target(builder, fields["base_value_id"], op),
+        base_target_id,
         _single_source_target(builder, fields["offset_value_id"], op),
     ]
     if fields["mask_value_id"] is not None:
@@ -1004,6 +1018,7 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "range_bytes": int(range_fact.upper),
         },
         fact_ids=(range_fact.fact_id,),
+        fact_target_ids=(base_target_id,),
         source_op_index=op.index,
     )
 
@@ -1402,6 +1417,46 @@ def _fact_ids_by_source_op(fact_program):
         result.setdefault(fact.source_op_index, tuple())
         result[fact.source_op_index] = (*result[fact.source_op_index], fact.fact_id)
     return result
+
+
+def _fact_target_ids(builder, fact_program, fact_ids, op):
+    target_ids = []
+    for fact_id in fact_ids:
+        try:
+            fact = fact_program.facts[fact_id]
+        except IndexError:
+            fail(
+                "TLXW_OP_UNKNOWN_FACT",
+                STAGE,
+                f"op references missing fact {fact_id}",
+                source_op_index=op.index,
+                fact_id=fact_id,
+            )
+        target_ids.append(_fact_target_id(builder, fact, op))
+    return tuple(target_ids)
+
+
+def _fact_target_id(builder, fact, op):
+    targets = builder.source_value_targets.get(fact.subject_value_id)
+    if not targets:
+        fail(
+            "TLXW_OP_FACT_TARGET",
+            STAGE,
+            f"fact {fact.fact_id} subject has no converted target value",
+            source_op_index=op.index,
+            source_value_id=fact.subject_value_id,
+            fact_id=fact.fact_id,
+        )
+    if len(targets) != 1:
+        fail(
+            "TLXW_OP_FACT_TARGET",
+            STAGE,
+            f"fact {fact.fact_id} subject maps to multiple target values {targets}",
+            source_op_index=op.index,
+            source_value_id=fact.subject_value_id,
+            fact_id=fact.fact_id,
+        )
+    return targets[0]
 
 
 def _operand_assume_fact_ids(fact_program, op):

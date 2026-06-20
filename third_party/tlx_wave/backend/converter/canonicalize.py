@@ -34,6 +34,7 @@ def _share_div_rem_pairs(target_program):
             tuple(updates.get("results", op.results)),
             _attrs_tuple(updates.get("attrs", target_ir.attrs_dict(op))),
             tuple(updates.get("fact_ids", op.fact_ids)),
+            tuple(updates.get("fact_target_ids", op.fact_target_ids)),
             tuple(updates.get("layout_map_ids", op.layout_map_ids)),
             tuple(updates.get("region_ids", op.region_ids)),
             updates.get("source_op_index", op.source_op_index),
@@ -83,6 +84,7 @@ def _share_div_rem_pairs(target_program):
             results=(product_value_id,),
             attrs={**binary_attrs, "operation": "muli"},
             fact_ids=(),
+            fact_target_ids=(),
             layout_map_ids=(),
         )
         append_op(

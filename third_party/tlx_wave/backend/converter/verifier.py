@@ -41,7 +41,7 @@ def _verify_target_value_ids(target_program):
 def _verify_ops(target_program, fact_program):
     value_count = len(target_program.values)
     op_count = len(target_program.ops)
-    valid_fact_ids = _valid_fact_ids(fact_program)
+    facts_by_id = _facts_by_id(fact_program)
     for expected_id, op in enumerate(target_program.ops):
         if op.target_op_id != expected_id:
             fail(
@@ -61,8 +61,26 @@ def _verify_ops(target_program, fact_program):
                     target_value_id=target_value_id,
                 )
         _verify_attrs(op)
+        if len(op.fact_target_ids) != len(op.fact_ids):
+            fail(
+                "TLXW_VERIFY_FACT_TARGET_COUNT",
+                STAGE,
+                f"target op {op.target_op_id} has {len(op.fact_ids)} facts "
+                f"but {len(op.fact_target_ids)} fact targets",
+                target_op_id=op.target_op_id,
+            )
+        for target_value_id in op.fact_target_ids:
+            if target_value_id < 0 or target_value_id >= value_count:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_FACT_TARGET",
+                    STAGE,
+                    f"target op {op.target_op_id} references missing fact "
+                    f"target value {target_value_id}",
+                    target_op_id=op.target_op_id,
+                    target_value_id=target_value_id,
+                )
         for fact_id in op.fact_ids:
-            if fact_id not in valid_fact_ids:
+            if fact_id not in facts_by_id:
                 fail(
                     "TLXW_VERIFY_UNKNOWN_FACT",
                     STAGE,
@@ -70,6 +88,13 @@ def _verify_ops(target_program, fact_program):
                     target_op_id=op.target_op_id,
                     fact_id=fact_id,
                 )
+        for fact_id, target_value_id in zip(op.fact_ids, op.fact_target_ids):
+            _verify_fact_target_compatible(
+                target_program,
+                op,
+                facts_by_id[fact_id],
+                target_value_id,
+            )
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
             fail(
                 "TLXW_VERIFY_MISSING_FACT",
@@ -78,6 +103,34 @@ def _verify_ops(target_program, fact_program):
                 target_op_id=op.target_op_id,
             )
     _verify_region_op_ids(target_program, op_count)
+
+
+def _verify_fact_target_compatible(target_program, op, fact, target_value_id):
+    value = target_program.values[target_value_id]
+    if value.source_value_id is not None:
+        if value.source_value_id == fact.subject_value_id:
+            return
+        fail(
+            "TLXW_VERIFY_FACT_TARGET",
+            STAGE,
+            f"fact {fact.fact_id} applies to source value "
+            f"{fact.subject_value_id}, not target value {target_value_id}",
+            target_op_id=op.target_op_id,
+            target_value_id=target_value_id,
+            fact_id=fact.fact_id,
+        )
+    source_targets = target_program.source_value_targets.get(fact.subject_value_id)
+    if source_targets is None or target_value_id in source_targets:
+        return
+    fail(
+        "TLXW_VERIFY_FACT_TARGET",
+        STAGE,
+        f"fact {fact.fact_id} target value {target_value_id} is not mapped "
+        f"from source value {fact.subject_value_id}",
+        target_op_id=op.target_op_id,
+        target_value_id=target_value_id,
+        fact_id=fact.fact_id,
+    )
 
 
 def _verify_attrs(op):
@@ -153,10 +206,10 @@ def _verify_memory_effects_tokenized(source_program, token_program):
                 )
 
 
-def _valid_fact_ids(fact_program):
+def _facts_by_id(fact_program):
     if fact_program is None:
-        return frozenset()
-    return frozenset(fact.fact_id for fact in fact_program.facts)
+        return {}
+    return {fact.fact_id: fact for fact in fact_program.facts}
 
 
 def _is_schema_value(value):

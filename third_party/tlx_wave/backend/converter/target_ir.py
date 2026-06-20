@@ -39,6 +39,7 @@ class TargetOp:
     results: tuple[int, ...] = ()
     attrs: tuple[TargetAttr, ...] = ()
     fact_ids: tuple[int, ...] = ()
+    fact_target_ids: tuple[int, ...] = ()
     layout_map_ids: tuple[int, ...] = ()
     region_ids: tuple[int, ...] = ()
     source_op_index: int | None = None
@@ -71,9 +72,6 @@ class TargetProgram:
     source_value_targets: dict[int, tuple[int, ...]]
     erased_source_values: dict[int, str]
     kernel: TargetKernel = field(default_factory=TargetKernel)
-
-    def target_values_for_source(self, source_value_id):
-        return self.source_value_targets.get(source_value_id, ())
 
 
 class TargetBuilder:
@@ -125,6 +123,7 @@ class TargetBuilder:
         results=(),
         attrs=None,
         fact_ids=(),
+        fact_target_ids=(),
         layout_map_ids=(),
         region_ids=(),
         source_op_index=None,
@@ -138,6 +137,7 @@ class TargetBuilder:
                 tuple(int(result) for result in results),
                 _attrs_tuple(attrs or {}, op_id),
                 tuple(int(fact_id) for fact_id in fact_ids),
+                tuple(int(target_id) for target_id in fact_target_ids),
                 tuple(int(layout_map_id) for layout_map_id in layout_map_ids),
                 tuple(int(region_id) for region_id in region_ids),
                 source_op_index,
