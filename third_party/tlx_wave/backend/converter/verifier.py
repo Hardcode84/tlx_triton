@@ -95,6 +95,8 @@ def _verify_ops(target_program, fact_program):
                 facts_by_id[fact_id],
                 target_value_id,
             )
+        if op.kind == "layout_convert":
+            _verify_layout_convert_fact_policy(op)
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
             fail(
                 "TLXW_VERIFY_MISSING_FACT",
@@ -103,6 +105,26 @@ def _verify_ops(target_program, fact_program):
                 target_op_id=op.target_op_id,
             )
     _verify_region_op_ids(target_program, op_count)
+
+
+def _verify_layout_convert_fact_policy(op):
+    attrs = _attrs_dict(op)
+    policy = attrs.get("fact_policy")
+    if policy not in {"preserve_equivalent", "invalidate_layout_sensitive"}:
+        fail(
+            "TLXW_VERIFY_LAYOUT_FACT_POLICY",
+            STAGE,
+            "layout_convert requires an explicit fact_policy",
+            target_op_id=op.target_op_id,
+        )
+    if policy == "invalidate_layout_sensitive" and op.fact_ids:
+        fail(
+            "TLXW_VERIFY_LAYOUT_FACT_POLICY",
+            STAGE,
+            "layout_convert that invalidates layout-sensitive facts must not "
+            "carry fact ids",
+            target_op_id=op.target_op_id,
+        )
 
 
 def _verify_fact_target_compatible(target_program, op, fact, target_value_id):
@@ -151,6 +173,10 @@ def _verify_attrs(op):
                 f"target op {op.target_op_id} attr {attr.name} is not schema data",
                 target_op_id=op.target_op_id,
             )
+
+
+def _attrs_dict(op):
+    return {attr.name: attr.value for attr in op.attrs}
 
 
 def _verify_region_op_ids(target_program, op_count):

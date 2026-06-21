@@ -464,6 +464,35 @@ def test_tlx_wave_converter_fact_stage_does_not_infer_overflowing_mul(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_fact_stage_invalidates_convert_layout_affine(tmp_path):
+    preamble = """
+#blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_fact_layout_invalidation() attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
+    %converted = ttg.convert_layout %range : tensor<128xi32, #blocked0> -> tensor<128xi32, #blocked1>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    fact_program = converter_facts.analyze_facts(source, converted)
+
+    convert_op = next(op for op in source.ops if op.name == "ttg.convert_layout")
+    source_value_id = convert_op.operands[0]
+    result_value_id = convert_op.results[0]
+    assert converted.values[source_value_id].layout_map_id != converted.values[
+        result_value_id
+    ].layout_map_id
+    assert source_value_id in fact_program.tensor_affine
+    assert result_value_id not in fact_program.tensor_affine
+    assert converter_facts.facts_for_value(fact_program, result_value_id) == ()
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_builds_async_groups_and_effects(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -1385,6 +1414,63 @@ def test_tlx_wave_converter_verifier_rejects_incompatible_fact_target():
     assert diagnostic.target_op_id == 0
     assert diagnostic.target_value_id == 1
     assert diagnostic.fact_id == 0
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_layout_convert_without_fact_policy():
+    builder = converter_target_ir.TargetBuilder()
+    tensor = converter_target_ir.TargetType("tensor", "simd", "f32", 64, 1)
+    operand = builder.add_value(tensor, source_value_id=0)
+    result = builder.add_value(tensor, source_value_id=1)
+    builder.add_op(
+        "layout_convert",
+        operands=(operand,),
+        results=(result,),
+        attrs={"mode": "alias", "result_component_count": 1},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_LAYOUT_FACT_POLICY"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_op_id == 0
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts():
+    builder = converter_target_ir.TargetBuilder()
+    tensor = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
+    operand = builder.add_value(tensor, source_value_id=0)
+    result = builder.add_value(tensor, source_value_id=1)
+    builder.add_op(
+        "layout_convert",
+        operands=(operand,),
+        results=(result,),
+        attrs={
+            "fact_policy": "invalidate_layout_sensitive",
+            "mode": "same_lane_register_remap",
+            "result_component_count": 1,
+        },
+        fact_ids=(0,),
+        fact_target_ids=(operand,),
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "range", 0, "signed_width", lower=0),),
+        {0: (0,)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(
+            builder.build(),
+            fact_program=fact_program,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_LAYOUT_FACT_POLICY"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_op_id == 0
     assert diagnostic.no_fallback is True
 
 
@@ -2324,6 +2410,7 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "cta_exchange_register_remap"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["result_component_count"] == 256
     assert attrs["source_component_count"] == 64
     assert attrs["source_registers_per_component"] == 4
@@ -2366,6 +2453,7 @@ def test_tlx_wave_converter_lowers_same_lane_mfma_to_blocked_remap(tmp_path):
     (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "same_lane_register_remap"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["source_indices"] == (0, 0, 0, 0)
     assert attrs["source_element_indices"] == (0, 1, 2, 3)
     assert output.emitted_module.text.count("wave.extract") == 4
@@ -2392,6 +2480,7 @@ def test_tlx_wave_converter_lowers_cross_lane_mfma_to_blocked_remap(tmp_path):
     (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "cross_lane_register_remap"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["source_indices"] == (0, 0, 0, 0)
     assert attrs["source_element_indices"] == (0, 1, 2, 3)
     assert attrs["source_lane_map_kind"] == "transpose"

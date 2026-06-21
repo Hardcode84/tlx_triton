@@ -1809,6 +1809,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     if _same_layout_alias(operand, result, operand_layout, result_layout):
         mode = "alias"
         attrs = {
+            "fact_policy": "preserve_equivalent",
             "group_size": 1,
             "mode": mode,
             "result_component_count": int(result.type.component_count),
@@ -1827,6 +1828,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 source_value_id=operand.value_id,
             )
         attrs = {
+            "fact_policy": "invalidate_layout_sensitive",
             "result_component_count": int(result.type.component_count),
             **register_remap,
         }
@@ -1846,6 +1848,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         mode = "component_group_first"
         group_size = int(operand.type.component_count) // int(result.type.component_count)
         attrs = {
+            "fact_policy": "invalidate_layout_sensitive",
             "group_size": int(group_size),
             "mode": mode,
             "result_component_count": int(result.type.component_count),
