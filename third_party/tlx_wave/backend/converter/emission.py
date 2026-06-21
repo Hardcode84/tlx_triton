@@ -27,6 +27,7 @@ class _EmissionState:
     target_program: target_ir.TargetProgram
     fact_program: object | None
     values: dict[int, object]
+    scratch_token: object | None = None
 
 
 def emit_wave_module(target_program, fact_program=None):
@@ -559,6 +560,7 @@ def _emit_for_loop(state, op):
         )
 
     outer_values = dict(state.values)
+    outer_scratch_token = state.scratch_token
     with state.builder.for_loop(
         lower,
         upper,
@@ -599,6 +601,7 @@ def _emit_for_loop(state, op):
                 target_op_id=op.target_op_id,
             )
     state.values = outer_values
+    state.scratch_token = outer_scratch_token
 
     if len(op.results) != init_arg_count:
         fail(
@@ -1702,12 +1705,174 @@ def _emit_layout_convert(state, op):
             )
         )
         return
+    if mode == "cta_exchange_register_remap":
+        result_count = int(attrs["result_component_count"])
+        registers_per_component = int(attrs["source_registers_per_component"])
+        if len(components) != int(attrs["source_component_count"]):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "layout_convert CTA exchange source component count does not "
+                "match attrs",
+                target_op_id=op.target_op_id,
+            )
+        result_id = _single_result(op)
+        target_type = state.target_program.values[result_id].type
+        result_type = _wave_type(state.dsl, target_type)
+        lane_width = int(target_type.lane_width or 64)
+        element_type = _scalar_type(state.dsl, target_type.element_type)
+        cta_thread_count = int(attrs["cta_thread_count"])
+        if cta_thread_count % lane_width:
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "CTA exchange thread count must be a multiple of lane width",
+                target_op_id=op.target_op_id,
+            )
+        exchange_groups = tuple(attrs["exchange_groups"])
+        scratch_base = state.builder.lds_base(
+            element_type,
+            offset=int(attrs["scratch_byte_offset"]),
+        )
+        ptr_type = state.dsl.simd_ptr_type(
+            element_type,
+            state.dsl.shared_address_space(),
+            lane_width,
+        )
+        workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+        result_components = [None] * result_count
+        extracted = {}
+
+        def scalar_component(component_index, element_index):
+            key = (int(component_index), int(element_index))
+            if key in extracted:
+                return extracted[key]
+            component = components[int(component_index)]
+            if registers_per_component == 1:
+                if int(element_index) != 0:
+                    fail(
+                        "TLXW_EMIT_LAYOUT_REMAP",
+                        STAGE,
+                        "scalar CTA exchange remap requested a non-zero "
+                        "element index",
+                        target_op_id=op.target_op_id,
+                    )
+                extracted[key] = component
+                return component
+            if str(component.type).startswith("!waveamd.fragment"):
+                fail(
+                    "TLXW_EMIT_LAYOUT_REMAP",
+                    STAGE,
+                    "layout_convert CTA exchange cannot extract directly "
+                    "from a WaveAMD fragment; fragment unpack is required",
+                    target_op_id=op.target_op_id,
+                )
+            extracted[key] = state.dsl.wave.ExtractOp(
+                result_type,
+                component,
+                int(element_index),
+            ).result
+            return extracted[key]
+
+        group_dependency = state.scratch_token
+        for group in exchange_groups:
+            source_slots, result_indices, load_bases, load_coefficients = group
+            store_tokens = []
+            for slot_index, source_slot in enumerate(source_slots):
+                source_slot = int(source_slot)
+                store_offset = workitem
+                base_offset = int(slot_index) * cta_thread_count
+                if base_offset:
+                    store_offset = _simd_binary_const(
+                        state,
+                        "addi",
+                        store_offset,
+                        base_offset,
+                        lane_width,
+                    )
+                ptr = state.builder.ptr_add(
+                    scratch_base,
+                    store_offset,
+                    result_type=ptr_type,
+                )
+                value = scalar_component(
+                    source_slot // registers_per_component,
+                    source_slot % registers_per_component,
+                )
+                store_tokens.append(
+                    state.builder.store(value, ptr, after=group_dependency)
+                )
+            barrier_token = state.builder.barrier(*store_tokens)
+            load_tokens = []
+            for result_index, load_base, coefficients in zip(
+                result_indices,
+                load_bases,
+                load_coefficients,
+            ):
+                load_offset = _bit_affine_thread_offset(
+                    state,
+                    workitem,
+                    load_base,
+                    coefficients,
+                    lane_width,
+                )
+                ptr = state.builder.ptr_add(
+                    scratch_base,
+                    load_offset,
+                    result_type=ptr_type,
+                )
+                loaded, load_token = state.builder.load(
+                    ptr,
+                    result_type,
+                    after=barrier_token,
+                )
+                result_components[int(result_index)] = loaded
+                load_tokens.append(load_token)
+            group_dependency = state.builder.barrier(*load_tokens)
+        state.scratch_token = group_dependency
+        missing = [
+            index for index, component in enumerate(result_components) if component is None
+        ]
+        if missing:
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "CTA exchange remap did not populate every result component",
+                target_op_id=op.target_op_id,
+            )
+        state.values[result_id] = _pack_components(tuple(result_components))
+        return
     fail(
         "TLXW_EMIT_UNSUPPORTED_LAYOUT_CONVERT",
         STAGE,
         f"unsupported layout_convert mode {mode}",
         target_op_id=op.target_op_id,
     )
+
+
+def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
+    lane_width = int(lane_width)
+    result = state.builder.splat(
+        state.builder.constant(state.dsl.i32(), int(base)),
+        state.dsl.i32(),
+        lane_width,
+    )
+    for bit, coefficient in enumerate(coefficients):
+        coefficient = int(coefficient)
+        if coefficient == 0:
+            continue
+        bit_value = _simd_binary_const(state, "divui", workitem, 1 << bit, lane_width)
+        bit_value = _simd_binary_const(state, "remui", bit_value, 2, lane_width)
+        if coefficient != 1:
+            bit_value = _simd_binary_const(
+                state,
+                "muli",
+                bit_value,
+                coefficient,
+                lane_width,
+            )
+        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, bit_value)
+    return result
 
 
 def _layout_convert_source_lane(state, attrs, component, op):
@@ -2309,10 +2474,15 @@ def _product(values):
 def _target_lds_size(target_program):
     size = 0
     for op in target_program.ops:
-        if op.kind != "local_alloc":
-            continue
         attrs = target_ir.attrs_dict(op)
-        end = int(attrs.get("byte_offset", 0)) + int(attrs.get("allocation_bytes", 0))
+        if op.kind == "local_alloc":
+            end = int(attrs.get("byte_offset", 0)) + int(attrs.get("allocation_bytes", 0))
+        elif op.kind == "layout_convert" and "scratch_allocation_bytes" in attrs:
+            end = int(attrs.get("scratch_byte_offset", 0)) + int(
+                attrs.get("scratch_allocation_bytes", 0)
+            )
+        else:
+            continue
         size = max(size, end)
     return _align_to(size, 16)
 

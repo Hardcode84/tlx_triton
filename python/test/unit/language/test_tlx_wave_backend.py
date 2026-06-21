@@ -2319,13 +2319,30 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     converted_result = converted.values[convert_layout_op.results[0]]
     assert converted_result.type.component_count == 256
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "requires cross-warp movement" in str(diagnostic)
-    assert "CTA-local layout remap" in str(diagnostic)
+    (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "cta_exchange_register_remap"
+    assert attrs["result_component_count"] == 256
+    assert attrs["source_component_count"] == 64
+    assert attrs["source_registers_per_component"] == 4
+    assert attrs["cta_thread_count"] == 256
+    assert attrs["scratch_element_count"] == 2048
+    assert attrs["scratch_byte_offset"] == 0
+    assert attrs["scratch_allocation_bytes"] == 4096
+    assert len(attrs["exchange_groups"]) == 32
+    first_group = attrs["exchange_groups"][0]
+    assert first_group[0] == (0, 4, 8, 12, 16, 20, 24, 28)
+    assert first_group[1] == (0, 4, 8, 12, 16, 20, 24, 28)
+    assert first_group[2] == (0, 16, 8, 24, 128, 144, 136, 152)
+    assert first_group[3][0] == (32, 64, 256, 512, 1024, 1, 2, 4)
+    assert output.emitted_module.lds_size == 4096
+    assert output.emitted_module.text.count("wave.store") == 256
+    assert output.emitted_module.text.count("wave.barrier") == 64
+    assert output.emitted_module.text.count("wave.load") == 256
+    assert "wave.wait" not in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 

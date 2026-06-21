@@ -74,6 +74,7 @@ class ConversionInput:
     token_groups_by_id: dict[int, object]
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
     local_alloc_byte_offsets: dict[int, int]
+    lds_size: int
     static_memdesc_byte_offsets: dict[int, int]
 
 
@@ -97,7 +98,7 @@ def convert_ops(source_program, type_layout_program, fact_program, token_program
 def _build_conversion_input(source_program, fact_program, token_program):
     memdescs = _memdesc_infos(source_program)
     constant_ints = _constant_ints(source_program)
-    local_alloc_byte_offsets, _lds_size = _compute_local_alloc_layout(
+    local_alloc_byte_offsets, lds_size = _compute_local_alloc_layout(
         source_program.ops,
         memdescs,
     )
@@ -135,6 +136,7 @@ def _build_conversion_input(source_program, fact_program, token_program):
         {group.group_id: group for group in token_program.groups},
         {},
         local_alloc_byte_offsets,
+        int(lds_size),
         static_memdesc_byte_offsets,
     )
 
@@ -226,7 +228,7 @@ def _convert_source_op(
         _convert_local_load(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "ttg.convert_layout":
-        _convert_layout(builder, type_layout_program, op)
+        _convert_layout(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "tt.dot":
         _convert_dot(builder, type_layout_program, op)
@@ -1772,7 +1774,7 @@ def _convert_fragment_truncf(builder, type_layout_program, op):
     )
 
 
-def _convert_layout(builder, type_layout_program, op):
+def _convert_layout(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
             "TLXW_OP_CONVERT_LAYOUT",
@@ -1828,6 +1830,12 @@ def _convert_layout(builder, type_layout_program, op):
             "result_component_count": int(result.type.component_count),
             **register_remap,
         }
+        attrs = _add_layout_remap_scratch_attrs(
+            attrs,
+            conversion_input,
+            result,
+            op,
+        )
     elif (
         operand_layout is not None
         and result_layout is not None
@@ -1858,6 +1866,38 @@ def _convert_layout(builder, type_layout_program, op):
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+
+
+def _add_layout_remap_scratch_attrs(attrs, conversion_input, result, op):
+    if attrs.get("mode") != "cta_exchange_register_remap":
+        return attrs
+    element_byte_width = conversion_input.value_element_byte_widths.get(
+        result.value_id
+    )
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "CTA exchange layout remap requires a known element byte width",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    scratch_elements = int(attrs["scratch_element_count"])
+    if scratch_elements <= 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "CTA exchange layout remap produced an empty scratch allocation",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    scratch_byte_offset = _align_to(conversion_input.lds_size, 16)
+    scratch_bytes = _align_to(scratch_elements * int(element_byte_width), 16)
+    return {
+        **attrs,
+        "scratch_allocation_bytes": int(scratch_bytes),
+        "scratch_byte_offset": int(scratch_byte_offset),
+    }
 
 
 def _same_layout_alias(operand, result, operand_layout, result_layout):

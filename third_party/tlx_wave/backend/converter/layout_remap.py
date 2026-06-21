@@ -70,11 +70,8 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         operand.value_id,
     )
 
-    source_indices = []
-    source_element_indices = []
-    source_lane_maps = []
-    for result_register in range(result_register_count):
-        slot, source_lane_map = _source_register_for_result_slot(
+    result_sources = tuple(
+        _sources_for_result_slot(
             result_layout_ll,
             result_register,
             source_by_coord,
@@ -83,26 +80,36 @@ def register_remap(operand, result, operand_layout, result_layout, op):
             op,
             result.value_id,
         )
-        source_indices.append(slot // source_registers_per_component)
-        source_element_indices.append(slot % source_registers_per_component)
-        source_lane_maps.append(source_lane_map)
+        for result_register in range(result_register_count)
+    )
 
-    lane_map_attrs = _classify_source_lane_maps(
-        source_lane_maps,
+    simple_remap = _simple_register_remap(
+        result_sources,
         lane_width,
+        cta_warp_count,
+        source_registers_per_component,
         op,
         result.value_id,
     )
+    if simple_remap is not None:
+        return {
+            "source_component_count": int(operand.type.component_count),
+            "source_registers_per_component": int(source_registers_per_component),
+            **simple_remap,
+        }
 
+    exchange_remap = _cta_exchange_register_remap(
+        result_sources,
+        lane_width,
+        cta_warp_count,
+        op,
+        result.value_id,
+    )
     return {
-        "mode": "cross_lane_register_remap"
-        if lane_map_attrs is not None
-        else "same_lane_register_remap",
+        "mode": "cta_exchange_register_remap",
         "source_component_count": int(operand.type.component_count),
-        "source_element_indices": tuple(source_element_indices),
-        "source_indices": tuple(source_indices),
         "source_registers_per_component": int(source_registers_per_component),
-        **(lane_map_attrs or {}),
+        **exchange_remap,
     }
 
 
@@ -137,7 +144,7 @@ def _source_slots_by_coord(
     return source_by_coord
 
 
-def _source_register_for_result_slot(
+def _sources_for_result_slot(
     result_layout,
     result_register,
     source_by_coord,
@@ -146,12 +153,8 @@ def _source_register_for_result_slot(
     op,
     result_value_id,
 ):
-    registers = []
-    lane_maps = []
-    needs_cross_warp = False
+    sources = []
     for result_warp in range(int(cta_warp_count)):
-        wave_registers = []
-        wave_lane_map = []
         for lane in range(int(lane_width)):
             coords = layouts.linear_layout_coords(
                 result_layout,
@@ -169,39 +172,194 @@ def _source_register_for_result_slot(
                     source_op_index=op.index,
                     source_value_id=result_value_id,
                 )
-            source_warp, source_lane, source_register = source
-            if source_warp != result_warp:
-                needs_cross_warp = True
-            wave_registers.append(source_register)
-            wave_lane_map.append(source_lane)
-        registers.extend(wave_registers)
-        lane_maps.append(tuple(int(lane) for lane in wave_lane_map))
+            sources.append(tuple(int(value) for value in source))
+    return tuple(sources)
 
-    if needs_cross_warp:
-        _reject_cross_warp(op, result_value_id)
-    first_source = registers[0]
-    if not all(source == first_source for source in registers):
+
+def _simple_register_remap(
+    result_sources,
+    lane_width,
+    cta_warp_count,
+    source_registers_per_component,
+    op,
+    result_value_id,
+):
+    source_indices = []
+    source_element_indices = []
+    source_lane_maps = []
+    for sources in result_sources:
+        if len(sources) != int(cta_warp_count) * int(lane_width):
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "MFMA to blocked convert_layout produced a malformed "
+                "source map",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+        lane_maps = []
+        registers = []
+        for result_warp in range(int(cta_warp_count)):
+            wave_lane_map = []
+            for lane in range(int(lane_width)):
+                source_warp, source_lane, source_register = sources[
+                    result_warp * int(lane_width) + lane
+                ]
+                if source_warp != result_warp:
+                    return None
+                registers.append(source_register)
+                wave_lane_map.append(source_lane)
+            lane_maps.append(tuple(int(lane) for lane in wave_lane_map))
+
+        first_source = registers[0]
+        if not all(source == first_source for source in registers):
+            return None
+        first_lane_map = lane_maps[0]
+        if not all(lane_map == first_lane_map for lane_map in lane_maps):
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "MFMA to blocked convert_layout requires a wave-varying source "
+                "lane map; explicit CTA-wave remap support is required",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+        if all(source_lane == lane for lane, source_lane in enumerate(first_lane_map)):
+            source_lane_map = None
+        else:
+            source_lane_map = first_lane_map
+        source_indices.append(first_source // int(source_registers_per_component))
+        source_element_indices.append(first_source % int(source_registers_per_component))
+        source_lane_maps.append(source_lane_map)
+
+    lane_map_attrs = _classify_source_lane_maps(
+        source_lane_maps,
+        lane_width,
+        op,
+        result_value_id,
+    )
+    return {
+        "mode": "cross_lane_register_remap"
+        if lane_map_attrs is not None
+        else "same_lane_register_remap",
+        "source_element_indices": tuple(source_element_indices),
+        "source_indices": tuple(source_indices),
+        **(lane_map_attrs or {}),
+    }
+
+
+def _cta_exchange_register_remap(
+    result_sources,
+    lane_width,
+    cta_warp_count,
+    op,
+    result_value_id,
+):
+    cta_thread_count = int(lane_width) * int(cta_warp_count)
+    groups = {}
+    max_group_slots = 0
+    for result_index, sources in enumerate(result_sources):
+        if len(sources) != cta_thread_count:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "MFMA to blocked convert_layout produced a malformed "
+                "CTA source map",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+        source_slots = tuple(sorted({int(source[2]) for source in sources}))
+        if not source_slots:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "MFMA to blocked convert_layout produced an empty "
+                "CTA source map",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+        max_group_slots = max(max_group_slots, len(source_slots))
+        source_slot_indices = {
+            source_slot: index for index, source_slot in enumerate(source_slots)
+        }
+        load_offsets = []
+        for source_warp, source_lane, source_register in sources:
+            load_offsets.append(
+                source_slot_indices[int(source_register)] * cta_thread_count
+                + int(source_warp) * int(lane_width)
+                + int(source_lane)
+            )
+        base, coefficients = _fit_bit_affine_offsets(
+            load_offsets,
+            cta_thread_count,
+            op,
+            result_value_id,
+        )
+        groups.setdefault(source_slots, []).append(
+            (int(result_index), int(base), tuple(int(value) for value in coefficients))
+        )
+
+    exchange_groups = []
+    for source_slots, result_entries in groups.items():
+        exchange_groups.append(
+            (
+                tuple(int(slot) for slot in source_slots),
+                tuple(int(entry[0]) for entry in result_entries),
+                tuple(int(entry[1]) for entry in result_entries),
+                tuple(
+                    tuple(int(value) for value in entry[2])
+                    for entry in result_entries
+                ),
+            )
+        )
+    return {
+        "cta_thread_count": int(cta_thread_count),
+        "exchange_groups": tuple(exchange_groups),
+        "scratch_element_count": int(max_group_slots) * int(cta_thread_count),
+    }
+
+
+def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id):
+    load_offsets = tuple(int(offset) for offset in load_offsets)
+    if len(load_offsets) != int(cta_thread_count):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout maps one result component to "
-            "different source registers across lanes or waves",
+            "MFMA to blocked convert_layout produced a malformed CTA "
+            "exchange load map",
             source_op_index=op.index,
             source_value_id=result_value_id,
         )
-    first_lane_map = lane_maps[0]
-    if not all(lane_map == first_lane_map for lane_map in lane_maps):
+    if int(cta_thread_count) <= 0 or int(cta_thread_count) & (
+        int(cta_thread_count) - 1
+    ):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout requires a wave-varying source "
-            "lane map; explicit CTA-wave remap support is required",
+            "MFMA to blocked convert_layout CTA exchange requires a "
+            "power-of-two CTA thread count",
             source_op_index=op.index,
             source_value_id=result_value_id,
         )
-    if all(source_lane == lane for lane, source_lane in enumerate(first_lane_map)):
-        return first_source, None
-    return first_source, first_lane_map
+    base = load_offsets[0]
+    coefficients = []
+    for bit in range(int(cta_thread_count).bit_length() - 1):
+        coefficients.append(load_offsets[1 << bit] - base)
+    for thread in range(int(cta_thread_count)):
+        expected = base
+        for bit, coefficient in enumerate(coefficients):
+            if thread & (1 << bit):
+                expected += int(coefficient)
+        if load_offsets[thread] != expected:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "MFMA to blocked convert_layout requires a non-bit-affine "
+                "CTA exchange load map",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+    return int(base), tuple(int(value) for value in coefficients)
 
 
 def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id):
@@ -283,17 +441,6 @@ def _lane_width_factors(lane_width):
     for factor in range(2, lane_width):
         if lane_width % factor == 0:
             yield factor
-
-
-def _reject_cross_warp(op, source_value_id):
-    fail(
-        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-        STAGE,
-        "MFMA to blocked convert_layout requires cross-warp movement; "
-        "Wave does not expose a CTA-local layout remap operation yet",
-        source_op_index=op.index,
-        source_value_id=source_value_id,
-    )
 
 
 def _distributed_linear_layout(layout, op):
