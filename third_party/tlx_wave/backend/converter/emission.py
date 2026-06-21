@@ -372,6 +372,53 @@ def _emit_make_range(state, op):
             components.append(value)
         state.values[result_id] = _pack_components(tuple(components))
         return
+    if attrs.get("coordinate_mode") == "layout_coordinates":
+        shape = tuple(int(value) for value in attrs["coordinate_shape"])
+        component_bases = tuple(
+            tuple(int(value) for value in bases)
+            for bases in attrs["component_coordinate_bases"]
+        )
+        workitem_coefficients = tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in attrs["workitem_coordinate_coefficients"]
+        )
+        if len(component_bases) != _component_count(state, result_id):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "make_range coordinate bases do not match result component count",
+                target_op_id=op.target_op_id,
+            )
+        if any(len(bases) != len(shape) for bases in component_bases):
+            fail(
+                "TLXW_EMIT_BAD_COORDINATES",
+                STAGE,
+                "make_range component coordinate rank does not match shape",
+                target_op_id=op.target_op_id,
+            )
+        if any(len(coefficients) != len(shape) for coefficients in workitem_coefficients):
+            fail(
+                "TLXW_EMIT_BAD_COORDINATES",
+                STAGE,
+                "make_range workitem coordinate rank does not match shape",
+                target_op_id=op.target_op_id,
+            )
+        for component_base in component_bases:
+            coords = tuple(
+                _bit_affine_thread_offset(
+                    state,
+                    workitem,
+                    int(base),
+                    tuple(coefficients[dim] for coefficients in workitem_coefficients),
+                    width,
+                )
+                for dim, base in enumerate(component_base)
+            )
+            value = _linearize_coordinates(state, coords, shape, width)
+            value = _add_simd_const(state, value, start, element_type, width)
+            components.append(value)
+        state.values[result_id] = _pack_components(tuple(components))
+        return
     if attrs.get("coordinate_mode") not in (None, "flat"):
         fail(
             "TLXW_EMIT_UNSUPPORTED_MAKE_RANGE",
@@ -390,6 +437,27 @@ def _emit_make_range(state, op):
         )
         components.append(value)
     state.values[result_id] = _pack_components(tuple(components))
+
+
+def _linearize_coordinates(state, coords, shape, lane_width):
+    if len(coords) != len(shape):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "coordinate count does not match shape rank",
+        )
+    result = state.builder.splat(
+        state.builder.constant(state.dsl.i32(), 0),
+        state.dsl.i32(),
+        int(lane_width),
+    )
+    for dim, coord in enumerate(coords):
+        stride = _product(shape[dim + 1 :])
+        term = coord
+        if int(stride) != 1:
+            term = _simd_binary_const(state, "muli", term, int(stride), lane_width)
+        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+    return result
 
 
 def _add_simd_const(state, value, constant, element_type, width):

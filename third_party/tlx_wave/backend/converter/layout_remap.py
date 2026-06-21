@@ -683,12 +683,4 @@ def _distributed_linear_layout(layout, op):
 
 
 def _layout_warp_count(layout):
-    if layout.kind == "linear":
-        return 1 << len(tuple(layout.properties.get("warp_bases", ())))
-    warps_per_cta = tuple(
-        int(value) for value in layout.properties.get("warps_per_cta", ())
-    )
-    result = 1
-    for value in warps_per_cta:
-        result *= max(1, int(value))
-    return result
+    return layouts.layout_warp_count(layout)

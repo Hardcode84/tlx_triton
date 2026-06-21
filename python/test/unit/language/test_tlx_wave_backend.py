@@ -23,6 +23,7 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import domains as converter_domains
     from triton.backends.tlx_wave.converter import emission as converter_emission
     from triton.backends.tlx_wave.converter import facts as converter_facts
+    from triton.backends.tlx_wave.converter import coordinates as converter_coordinates
     from triton.backends.tlx_wave.converter import op_conversion as converter_op_conversion
     from triton.backends.tlx_wave.converter import pipeline as converter_pipeline
     from triton.backends.tlx_wave.converter import source_import as converter_source_import
@@ -40,6 +41,7 @@ else:
     converter_domains = None
     converter_emission = None
     converter_facts = None
+    converter_coordinates = None
     converter_op_conversion = None
     converter_pipeline = None
     converter_source_import = None
@@ -2382,6 +2384,138 @@ def test_tlx_wave_converter_lowers_linear_make_range_with_block_basis(
     (result_id,) = range_op.results
     assert output.target_program.values[result_id].type.component_count == 1
     assert "wave.workitem_id" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [], lane = [[32], [16], [8], [4], [2], [1]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_bit_affine_linear_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (range_op,) = [op for op in output.target_program.ops if op.kind == "make_range"]
+    attrs = converter_target_ir.attrs_dict(range_op)
+    assert attrs["coordinate_mode"] == "layout_coordinates"
+    assert attrs["coordinate_shape"] == (64,)
+    assert attrs["component_coordinate_bases"] == ((0,),)
+    assert attrs["workitem_coordinate_coefficients"] == (
+        (32,),
+        (16,),
+        (8,),
+        (4,),
+        (2,),
+        (1,),
+    )
+    assert "wave.binary shrui" in output.emitted_module.text
+    assert "wave.binary andi" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+"""
+    local_func = """
+  tt.func public @converter_rank2_coordinate_layout() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<8x8xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    constant_op = next(op for op in source.ops if op.name == "arith.constant")
+    value = converted.values[constant_op.results[0]]
+    layout = converted.layouts[value.layout_map_id]
+
+    plan = converter_coordinates.layout_coordinate_plan(
+        layout,
+        value.type.component_count,
+        value.type.lane_width,
+        1,
+        constant_op,
+        value.value_id,
+    )
+
+    assert plan.shape == (8, 8)
+    assert plan.component_bases == ((0, 0),)
+    assert plan.workitem_coefficients == (
+        (1, 0),
+        (2, 0),
+        (4, 0),
+        (0, 1),
+        (0, 2),
+        (0, 4),
+    )
+
+    target = converter_target_ir.TargetProgram(
+        (
+            converter_target_ir.TargetValue(
+                0,
+                converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1),
+            ),
+        ),
+        (
+            converter_target_ir.TargetOp(
+                0,
+                "make_range",
+                results=(0,),
+                attrs=(
+                    converter_target_ir.TargetAttr("start", 0),
+                    converter_target_ir.TargetAttr("end", 64),
+                    converter_target_ir.TargetAttr("coordinate_mode", "layout_coordinates"),
+                    converter_target_ir.TargetAttr("coordinate_shape", plan.shape),
+                    converter_target_ir.TargetAttr(
+                        "component_coordinate_bases",
+                        plan.component_bases,
+                    ),
+                    converter_target_ir.TargetAttr(
+                        "workitem_coordinate_coefficients",
+                        plan.workitem_coefficients,
+                    ),
+                ),
+            ),
+        ),
+        (converter_target_ir.TargetRegion(0, (0,)),),
+        {},
+        {},
+    )
+    emitted = converter_emission.emit_wave_module(target)
+
+    assert "wave.binary shrui" in emitted.text
+    assert "wave.binary andi" in emitted.text
+    assert "wave.binary muli" in emitted.text
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [], lane = [[0], [0], [0], [0], [0], [0]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_non_injective_linear_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_MAKE_RANGE_LAYOUT"
+    text = str(diagnostic)
+    assert "non-injective over physical lanes" in text
+    assert "bases={'register': (), 'lane': ((0,), (0,), (0,), (0,), (0,), (0,))" in text
     del ctx
 
 

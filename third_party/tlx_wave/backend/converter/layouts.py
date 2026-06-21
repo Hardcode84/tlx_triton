@@ -276,6 +276,25 @@ def linear_layout_coords(linear, register, lane, *, warp):
     return tuple(int(coords[f"dim{dim}"]) for dim in range(len(coords)))
 
 
+def linear_layout_bases(linear, in_dim):
+    for name, bases in linear.bases:
+        if name == in_dim:
+            return tuple(tuple(int(value) for value in basis) for basis in bases)
+    return ()
+
+
+def layout_warp_count(layout):
+    if layout.kind == "linear":
+        return 1 << len(tuple(layout.properties.get("warp_bases", ())))
+    warps_per_cta = tuple(
+        int(value) for value in layout.properties.get("warps_per_cta", ())
+    )
+    result = 1
+    for value in warps_per_cta:
+        result *= max(1, int(value))
+    return result
+
+
 def mfma_registers_per_component(
     layout,
     *,

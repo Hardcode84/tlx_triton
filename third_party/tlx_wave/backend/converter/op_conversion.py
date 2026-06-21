@@ -6,6 +6,7 @@ import re
 from .diagnostics import fail
 from . import domains
 from . import layouts
+from . import coordinates
 from . import layout_remap
 from . import target_ir
 
@@ -520,114 +521,44 @@ def _make_range_coordinate_attrs(type_layout_program, op):
     if result.layout_map_id is None:
         return {}
     layout = type_layout_program.layouts[int(result.layout_map_id)]
-    if layout.kind not in {"blocked", "linear"} or len(layout.shape) != 1:
+    if layout.kind not in {"blocked", "linear"}:
         return {}
-    linear = layouts.distributed_linear_layout(
+    lane_width = int(result.type.lane_width or layout.lane_width)
+    warp_count = _layout_warp_count(layout)
+    plan = coordinates.layout_coordinate_plan(
         layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    if not linear.is_injective():
-        return {}
-    component_count = layouts.linear_layout_in_dim_size(linear, "register")
-    if int(result.type.component_count) != int(component_count):
-        fail(
-            "TLXW_OP_MAKE_RANGE",
-            STAGE,
-            "tt.make_range result component model does not match its "
-            "distributed layout register count",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    bases, stride = _affine_workitem_range(
-        linear,
-        component_count,
-        int(result.type.lane_width or layout.lane_width),
-        _layout_warp_count(layout),
+        int(result.type.component_count),
+        lane_width,
+        warp_count,
         op,
         result.value_id,
     )
-    if _is_default_flat_make_range(bases, stride, int(result.type.lane_width or 64)):
+    if coordinates.is_default_flat_make_range(plan, lane_width):
         return {}
+    affine = coordinates.is_flat_affine_make_range(plan, lane_width, warp_count)
+    if affine is not None:
+        bases, stride = affine
+        return {
+            "coordinate_mode": "affine_workitem",
+            "component_bases": tuple(int(base) for base in bases),
+            "workitem_stride": int(stride),
+        }
     return {
-        "coordinate_mode": "affine_workitem",
-        "component_bases": tuple(int(base) for base in bases),
-        "workitem_stride": int(stride),
+        "coordinate_mode": "layout_coordinates",
+        "coordinate_shape": tuple(int(dim) for dim in plan.shape),
+        "component_coordinate_bases": tuple(
+            tuple(int(value) for value in bases)
+            for bases in plan.component_bases
+        ),
+        "workitem_coordinate_coefficients": tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in plan.workitem_coefficients
+        ),
     }
 
 
-def _affine_workitem_range(
-    linear,
-    component_count,
-    lane_width,
-    warp_count,
-    op,
-    source_value_id,
-):
-    bases = []
-    workitem_stride = None
-    warp_count = max(1, int(warp_count))
-    lane_width = int(lane_width)
-    for component in range(int(component_count)):
-        base = layouts.linear_layout_coords(linear, component, 0, warp=0)[0]
-        if lane_width > 1:
-            stride = layouts.linear_layout_coords(linear, component, 1, warp=0)[0] - base
-        elif warp_count > 1:
-            stride = (
-                layouts.linear_layout_coords(linear, component, 0, warp=1)[0] - base
-            ) // lane_width
-        else:
-            stride = 0
-        if workitem_stride is None:
-            workitem_stride = int(stride)
-        elif workitem_stride != int(stride):
-            fail(
-                "TLXW_OP_MAKE_RANGE_LAYOUT",
-                STAGE,
-                "tt.make_range layout needs per-component workitem strides; "
-                "explicit coordinate remap support is required",
-                source_op_index=op.index,
-                source_value_id=source_value_id,
-            )
-        for warp in range(warp_count):
-            for lane in range(lane_width):
-                expected = base + (warp * lane_width + lane) * int(stride)
-                actual = layouts.linear_layout_coords(
-                    linear,
-                    component,
-                    lane,
-                    warp=warp,
-                )[0]
-                if actual != expected:
-                    fail(
-                        "TLXW_OP_MAKE_RANGE_LAYOUT",
-                        STAGE,
-                        "tt.make_range layout is not affine in flat "
-                        "workitem_id; explicit coordinate materialization "
-                        "support is required",
-                        source_op_index=op.index,
-                        source_value_id=source_value_id,
-                    )
-        bases.append(int(base))
-    return tuple(bases), int(workitem_stride or 0)
-
-
-def _is_default_flat_make_range(bases, stride, lane_width):
-    if int(stride) != 1:
-        return False
-    return tuple(int(base) for base in bases) == tuple(
-        component * int(lane_width) for component in range(len(bases))
-    )
-
-
 def _layout_warp_count(layout):
-    warps_per_cta = tuple(
-        int(value) for value in layout.properties.get("warps_per_cta", ())
-    )
-    result = 1
-    for value in warps_per_cta:
-        result *= max(1, int(value))
-    return result
+    return layouts.layout_warp_count(layout)
 
 
 def _convert_splat(builder, view):
