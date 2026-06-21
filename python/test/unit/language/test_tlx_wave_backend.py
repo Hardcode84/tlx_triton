@@ -164,6 +164,7 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.DOMAIN_NAMES == (
         "arithmetic_control",
         "memory_dma",
+        "generic_memory",
         "local_memory_layout",
         "mfma_fragment",
         "store_epilogue",
@@ -178,6 +179,8 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.source_domains_for_op("amdg.buffer_load_to_local") == (
         "memory_dma",
     )
+    assert converter_domains.source_domains_for_op("tt.load") == ("generic_memory",)
+    assert converter_domains.source_domains_for_op("tt.store") == ("generic_memory",)
     assert converter_domains.source_domains_for_op("rocdl.sched.barrier") == (
         "arithmetic_control",
     )
@@ -185,6 +188,8 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
         "local_memory_layout"
     )
     assert converter_domains.target_domain_for_op("mma") == "mfma_fragment"
+    assert converter_domains.target_domain_for_op("load") == "generic_memory"
+    assert converter_domains.target_domain_for_op("store") == "generic_memory"
     assert converter_domains.target_domain_for_op("buffer_store") == "store_epilogue"
     assert (
         converter_op_conversion._SUPPORTED_SOURCE_OPS
@@ -1266,7 +1271,7 @@ def _target_div_rem_program(operations):
     )
 
 
-def test_tlx_wave_converter_op_stage_rejects_unsupported_memory_op():
+def test_tlx_wave_converter_op_stage_lowers_generic_load():
     pointer_type = converter_source_ir.SourceType(
         "tensor<64x!tt.ptr<f32>>",
         "tensor",
@@ -1311,14 +1316,20 @@ def test_tlx_wave_converter_op_stage_rejects_unsupported_memory_op():
     facts = converter_facts.analyze_facts(program, converted)
     tokens = converter_tokens.build_token_program(program, converted)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_op_conversion.convert_ops(program, converted, facts, tokens)
+    target = converter_op_conversion.convert_ops(program, converted, facts, tokens)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED"
-    assert diagnostic.stage == "op_conversion"
-    assert diagnostic.source_op_index == 0
-    assert diagnostic.no_fallback is True
+    (load_op,) = target.ops
+    assert load_op.kind == "load"
+    assert load_op.operands == (0,)
+    assert load_op.results == (1,)
+    assert converter_target_ir.attrs_dict(load_op) == {
+        "component_count": 1,
+        "element_type": "f32",
+        "has_mask": False,
+        "has_other": False,
+        "lane_width": 64,
+        "mask_mode": "none",
+    }
 
 
 def test_tlx_wave_converter_verifier_rejects_missing_fact():
@@ -3033,6 +3044,52 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     del ctx
 
 
+def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_raw_load_store(
+      %arg0: !tt.ptr<f32>,
+      %arg1: !tt.ptr<f32>,
+      %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %src_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %dst_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %src_ptr = tt.addptr %src_base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %dst_ptr = tt.addptr %dst_base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %loaded = tt.load %src_ptr, %mask, %other : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.store %dst_ptr, %loaded, %mask : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op,) = [op for op in output.target_program.ops if op.kind == "load"]
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "store"]
+    load_attrs = converter_target_ir.attrs_dict(load_op)
+    store_attrs = converter_target_ir.attrs_dict(store_op)
+    assert load_attrs["has_mask"] is True
+    assert load_attrs["has_other"] is True
+    assert load_attrs["mask_mode"] == "exec_where"
+    assert store_attrs["has_mask"] is True
+    assert store_attrs["mask_mode"] == "exec_where"
+    wave = output.emitted_module.text
+    assert "waveamd.make_buffer" not in wave
+    assert wave.count("wave.load") == 1
+    assert wave.count("wave.store") == 1
+    assert wave.count("wave.where") == 2
+    assert "wave.select" in wave
+    binary_module = _run_wave_compile_kernels(wave)
+    assert "gpu.binary @kernels" in binary_module
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(
     tmp_path,
 ):
@@ -3332,6 +3389,33 @@ def test_tlx_wave_converter_pipeline_lowers_same_representation_expand_dims(tmp_
         "return",
     ]
     assert "tt.expand_dims" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_pointer_splat_expand_dims(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #blocked}>
+"""
+    local_func = """
+  tt.func public @converter_pointer_expand_dims(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #slice>
+    %expanded = tt.expand_dims %base {axis = 0 : i32} : tensor<64x!tt.ptr<f32>, #slice> -> tensor<1x64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops] == [
+        "splat",
+        "expand_dims",
+        "return",
+    ]
+    assert "tt.expand_dims" not in output.emitted_module.text
+    assert "wave.splat" in output.emitted_module.text
+    assert "!wave.simd<!wave.ptr<#wave.global" in output.emitted_module.text
     del ctx
 
 

@@ -80,6 +80,17 @@ LOWERING_DOMAINS = (
         ),
     ),
     LoweringDomain(
+        "generic_memory",
+        (
+            "tt.load",
+            "tt.store",
+        ),
+        (
+            "load",
+            "store",
+        ),
+    ),
+    LoweringDomain(
         "local_memory_layout",
         (
             "ttg.local_alloc",

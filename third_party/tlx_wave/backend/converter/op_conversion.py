@@ -261,6 +261,12 @@ def _convert_source_op(
             op,
         )
         return
+    if op.name == "tt.load":
+        _convert_load(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "tt.store":
+        _convert_store(builder, conversion_input, type_layout_program, op)
+        return
     if op.name == "ttg.async_commit_group":
         _convert_async_commit_group(
             builder,
@@ -1484,6 +1490,181 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
     )
 
 
+def _convert_load(builder, conversion_input, type_layout_program, op):
+    del conversion_input
+    fields = _load_fields(op)
+    _require_default_tt_memory_attrs(op)
+    pointer = type_layout_program.values[fields["pointer_value_id"]]
+    loaded = type_layout_program.values[op.results[0]]
+    if pointer.type.representation not in {"per_lane_pointer", "pointer_tuple"}:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load requires a tensor pointer operand",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    if loaded.type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load requires a tensor result",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    if pointer.type.element_type != loaded.type.element_type:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer/result element types must match",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    component_count = int(loaded.type.component_count)
+    if int(pointer.type.component_count) != component_count:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer/result component counts must match",
+            source_op_index=op.index,
+        )
+    operands = [_single_source_target(builder, fields["pointer_value_id"], op)]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load mask must be scalar or match result components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    if fields["other_value_id"] is not None:
+        if fields["mask_value_id"] is None:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other operand requires a mask operand",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        other = type_layout_program.values[fields["other_value_id"]]
+        if other.type.representation not in {"scalar", "simd", "simd_tuple"}:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other requires a scalar or tensor value operand",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if other.type.element_type != loaded.type.element_type:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other/result element types must match",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if int(other.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other must be scalar or match result components",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        operands.append(_single_source_target(builder, fields["other_value_id"], op))
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "load",
+        operands=tuple(operands),
+        results=result_target_ids,
+        attrs={
+            "component_count": component_count,
+            "element_type": loaded.type.element_type,
+            "has_mask": fields["mask_value_id"] is not None,
+            "has_other": fields["other_value_id"] is not None,
+            "lane_width": int(loaded.type.lane_width or pointer.type.lane_width or 64),
+            "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_store(builder, conversion_input, type_layout_program, op):
+    del conversion_input
+    fields = _store_fields(op)
+    _require_default_tt_memory_attrs(op)
+    pointer = type_layout_program.values[fields["pointer_value_id"]]
+    value = type_layout_program.values[fields["value_value_id"]]
+    if pointer.type.representation not in {"per_lane_pointer", "pointer_tuple"}:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store requires a tensor pointer operand",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    if value.type.representation not in {"scalar", "simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store requires a scalar or tensor value operand",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    if pointer.type.element_type != value.type.element_type:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store pointer/value element types must match",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    component_count = int(pointer.type.component_count)
+    if int(value.type.component_count) not in (1, component_count):
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store value must be scalar or match pointer components",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    operands = [
+        _single_source_target(builder, fields["pointer_value_id"], op),
+        _single_source_target(builder, fields["value_value_id"], op),
+    ]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_STORE",
+                STAGE,
+                "tt.store mask must be scalar or match pointer components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    builder.add_op(
+        "store",
+        operands=tuple(operands),
+        attrs={
+            "component_count": component_count,
+            "element_type": pointer.type.element_type,
+            "has_mask": fields["mask_value_id"] is not None,
+            "lane_width": int(pointer.type.lane_width or value.type.lane_width or 64),
+            "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+        },
+        source_op_index=op.index,
+    )
+
+
 def _convert_local_load(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
@@ -1989,6 +2170,8 @@ _SPECIALIZED_SOURCE_OPS = frozenset(
         "amdg.buffer_load_to_local",
         "amdg.buffer_load",
         "amdg.buffer_store",
+        "tt.load",
+        "tt.store",
         "ttg.local_load",
         "ttg.convert_layout",
         "tt.dot",
@@ -2250,6 +2433,50 @@ def _buffer_load_to_local_fields(op):
     }
 
 
+def _load_fields(op):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_LOAD",
+            STAGE,
+            "tt.load requires one result",
+            source_op_index=op.index,
+        )
+    if len(op.operands) not in (1, 2, 3):
+        fail(
+            "TLXW_OP_MALFORMED_LOAD",
+            STAGE,
+            "tt.load requires pointer plus optional mask/other operands",
+            source_op_index=op.index,
+        )
+    return {
+        "pointer_value_id": op.operands[0],
+        "mask_value_id": op.operands[1] if len(op.operands) >= 2 else None,
+        "other_value_id": op.operands[2] if len(op.operands) >= 3 else None,
+    }
+
+
+def _store_fields(op):
+    if op.results:
+        fail(
+            "TLXW_OP_MALFORMED_STORE",
+            STAGE,
+            "tt.store must not produce results",
+            source_op_index=op.index,
+        )
+    if len(op.operands) not in (2, 3):
+        fail(
+            "TLXW_OP_MALFORMED_STORE",
+            STAGE,
+            "tt.store requires pointer, value, and optional mask operands",
+            source_op_index=op.index,
+        )
+    return {
+        "pointer_value_id": op.operands[0],
+        "value_value_id": op.operands[1],
+        "mask_value_id": op.operands[2] if len(op.operands) == 3 else None,
+    }
+
+
 def _buffer_load_fields(op):
     segments = _operand_segments(op, 5, None)
     if int(segments[0]) != 1 or int(segments[1]) != 1:
@@ -2368,6 +2595,59 @@ def _require_default_cache(cache, op):
         f"Wave lowering does not support {op.name} cacheModifier={cache}",
         source_op_index=op.index,
     )
+
+
+def _require_default_tt_memory_attrs(op):
+    cache = op.attrs.get("cache")
+    if cache is not None and int(cache) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+            STAGE,
+            f"Wave lowering does not support {op.name} cache={cache}",
+            source_op_index=op.index,
+        )
+    cache_modifier = _attr_text(op.attrs.get("cacheModifier"))
+    if cache_modifier not in {"", "none", "#tt.cache_modifier<none>"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+            STAGE,
+            f"Wave lowering does not support {op.name} cacheModifier={cache_modifier}",
+            source_op_index=op.index,
+        )
+    evict = op.attrs.get("evict")
+    if evict is not None and int(evict) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_EVICTION_POLICY",
+            STAGE,
+            f"Wave lowering does not support {op.name} evict={evict}",
+            source_op_index=op.index,
+        )
+    eviction_policy = _attr_text(op.attrs.get("evictionPolicy"))
+    if eviction_policy not in {"", "none", "evict_normal", "#tt.eviction_policy<normal>"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_EVICTION_POLICY",
+            STAGE,
+            f"Wave lowering does not support {op.name} evictionPolicy={eviction_policy}",
+            source_op_index=op.index,
+        )
+    if _attr_bool(op.attrs.get("isVolatile")):
+        fail(
+            "TLXW_OP_UNSUPPORTED_VOLATILE",
+            STAGE,
+            f"Wave lowering does not support volatile {op.name}",
+            source_op_index=op.index,
+        )
+
+
+def _attr_text(value):
+    if value is None:
+        return ""
+    return str(value).strip().strip('"')
+
+
+def _attr_bool(value):
+    text = _attr_text(value).lower()
+    return text in {"true", "1"}
 
 
 def _local_component_store_plan(

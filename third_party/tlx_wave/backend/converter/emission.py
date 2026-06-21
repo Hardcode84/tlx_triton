@@ -1,6 +1,6 @@
 """Structural Wave emission for verified target programs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 import warnings
@@ -27,6 +27,7 @@ class _EmissionState:
     target_program: target_ir.TargetProgram
     fact_program: object | None
     values: dict[int, object]
+    uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
     scratch_token: object | None = None
 
 
@@ -505,18 +506,25 @@ def _emit_splat(state, op):
         _splat_element_type(state.dsl, target_type),
         int(target_type.lane_width or 64),
     )
+    component_count = _component_count(state, result_id)
     state.values[result_id] = _pack_components(
-        tuple(splat for _ in range(_component_count(state, result_id)))
+        tuple(splat for _ in range(component_count))
     )
+    if target_type.representation in {"per_lane_pointer", "pointer_tuple"}:
+        state.uniform_pointer_bases[result_id] = tuple(
+            operand for _ in range(component_count)
+        )
 
 
 def _emit_broadcast(state, op):
     operand = _operand_values(state, op, 1)[0]
+    operand_id = op.operands[0]
     result_id = _single_result(op)
     target_count = _component_count(state, result_id)
     source_components = _as_components(operand)
     if target_count == len(source_components):
         state.values[result_id] = operand
+        _propagate_uniform_pointer_bases(state, operand_id, result_id)
         return
     if target_count % len(source_components) != 0:
         fail(
@@ -533,28 +541,49 @@ def _emit_broadcast(state, op):
         for source_component in source_components
         for component in (source_component,) * repeat
     )
+    source_bases = state.uniform_pointer_bases.get(operand_id)
+    if source_bases is not None:
+        state.uniform_pointer_bases[result_id] = tuple(
+            base
+            for source_base in source_bases
+            for base in (source_base,) * repeat
+        )
 
 
 def _emit_addptr(state, op):
     base, offset = _operand_values(state, op, 2)
+    base_id = op.operands[0]
     result_id = _single_result(op)
     count = _component_count(state, result_id)
     base_components, offset_components = _broadcast_components((base, offset), count, op)
+    uniform_base_components = state.uniform_pointer_bases.get(base_id)
+    if uniform_base_components is not None and len(uniform_base_components) != count:
+        uniform_base_components = None
     result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
     state.values[result_id] = _pack_components(
         tuple(
             state.builder.ptr_add(
-                base_component,
+                _ptr_add_base_component(
+                    state,
+                    base_component,
+                    offset_component,
+                    uniform_base_components[index]
+                    if uniform_base_components is not None
+                    else None,
+                ),
                 offset_component,
                 result_type=result_type,
             )
-            for base_component, offset_component in zip(base_components, offset_components)
+            for index, (base_component, offset_component) in enumerate(
+                zip(base_components, offset_components)
+            )
         )
     )
 
 
 def _emit_expand_dims(state, op):
     operand = _operand_values(state, op, 1)[0]
+    operand_id = op.operands[0]
     result_id = _single_result(op)
     result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
     components = _as_components(operand)
@@ -575,6 +604,19 @@ def _emit_expand_dims(state, op):
             target_value_id=result_id,
         )
     state.values[result_id] = operand
+    _propagate_uniform_pointer_bases(state, operand_id, result_id)
+
+
+def _ptr_add_base_component(state, base_component, offset_component, uniform_base):
+    if uniform_base is not None and _is_simd_value(state.dsl, offset_component):
+        return uniform_base
+    return base_component
+
+
+def _propagate_uniform_pointer_bases(state, source_id, result_id):
+    source_bases = state.uniform_pointer_bases.get(source_id)
+    if source_bases is not None:
+        state.uniform_pointer_bases[result_id] = source_bases
 
 
 def _emit_program_id(state, op):
@@ -2366,6 +2408,147 @@ def _emit_buffer_load(state, op):
     state.values[result_id] = _pack_components(tuple(loaded_components))
 
 
+def _emit_store(state, op):
+    attrs = target_ir.attrs_dict(op)
+    operand_count = 3 if attrs["has_mask"] else 2
+    operands = _operand_values(state, op, operand_count)
+    ptrs, values = operands[:2]
+    masks = operands[2] if attrs["has_mask"] else None
+    component_count = int(attrs["component_count"])
+    ptr_components = _as_components(ptrs)
+    value_components = _broadcast_component(values, component_count, op)
+    splat_cache = []
+    value_components = tuple(
+        _memory_simd_component(
+            state,
+            value_component,
+            attrs["element_type"],
+            int(attrs["lane_width"]),
+            op,
+            splat_cache,
+        )
+        for value_component in value_components
+    )
+    mask_components = None
+    if masks is not None:
+        mask_components = _broadcast_component(masks, component_count, op)
+    if len(ptr_components) != component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "store pointer component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
+    for index, (ptr_component, value_component) in enumerate(
+        zip(ptr_components, value_components)
+    ):
+        if mask_components is None:
+            state.builder.store(value_component, ptr_component)
+            continue
+        if mask_mode != "exec_where":
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_STORE_MASK",
+                STAGE,
+                f"unsupported store mask mode {mask_mode}",
+                target_op_id=op.target_op_id,
+            )
+        with state.builder.where(mask_components[index]):
+            state.builder.store(value_component, ptr_component)
+
+
+def _emit_load(state, op):
+    attrs = target_ir.attrs_dict(op)
+    operand_count = 1 + int(bool(attrs["has_mask"])) + int(bool(attrs["has_other"]))
+    operands = _operand_values(state, op, operand_count)
+    ptrs = operands[0]
+    operand_index = 1
+    masks = None
+    if attrs["has_mask"]:
+        masks = operands[operand_index]
+        operand_index += 1
+    other = operands[operand_index] if attrs["has_other"] else None
+    component_count = int(attrs["component_count"])
+    ptr_components = _as_components(ptrs)
+    mask_components = None
+    if masks is not None:
+        mask_components = _broadcast_component(masks, component_count, op)
+    other_components = None
+    if other is not None:
+        other_components = _broadcast_component(other, component_count, op)
+        splat_cache = []
+        other_components = tuple(
+            _memory_simd_component(
+                state,
+                other_component,
+                attrs["element_type"],
+                int(attrs["lane_width"]),
+                op,
+                splat_cache,
+            )
+            for other_component in other_components
+        )
+    if len(ptr_components) != component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "load pointer component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    if other_components is not None and mask_components is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_LOAD_OTHER",
+            STAGE,
+            "load other requires a mask",
+            target_op_id=op.target_op_id,
+        )
+    result_id = _single_result(op)
+    result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
+    mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
+    loaded_components = []
+    for index, ptr_component in enumerate(ptr_components):
+        if mask_components is None:
+            loaded, _token = state.builder.load(ptr_component, result_type)
+        else:
+            if mask_mode != "exec_where":
+                fail(
+                    "TLXW_EMIT_UNSUPPORTED_LOAD_MASK",
+                    STAGE,
+                    f"unsupported load mask mode {mask_mode}",
+                    target_op_id=op.target_op_id,
+                )
+            with state.builder.where(mask_components[index], [result_type]) as where:
+                loaded, _token = state.builder.load(ptr_component, result_type)
+                state.builder.yield_([loaded])
+            loaded = where.results[0]
+            if other_components is not None:
+                loaded = state.builder.select(
+                    mask_components[index],
+                    loaded,
+                    other_components[index],
+                )
+        loaded_components.append(loaded)
+    state.values[result_id] = _pack_components(tuple(loaded_components))
+
+
+def _memory_simd_component(state, value, element_type, lane_width, op, splat_cache):
+    if _is_simd_value(state.dsl, value):
+        return value
+    scalar_type = _scalar_type(state.dsl, element_type)
+    if str(value.type) != str(scalar_type):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_MEMORY_VALUE",
+            STAGE,
+            f"memory value has type {value.type}, expected {scalar_type}",
+            target_op_id=op.target_op_id,
+        )
+    return _reuse_component_result(
+        splat_cache,
+        (value,),
+        lambda: state.builder.splat(value, scalar_type, int(lane_width)),
+    )
+
+
 _TARGET_EMITTERS = {
     "constant": _emit_constant,
     "binary": _emit_binary,
@@ -2391,6 +2574,8 @@ _TARGET_EMITTERS = {
     "layout_convert": _emit_layout_convert,
     "buffer_store": _emit_buffer_store,
     "buffer_load": _emit_buffer_load,
+    "store": _emit_store,
+    "load": _emit_load,
     "token": _emit_token,
     "async_commit_group": _emit_async_commit_group,
     "async_wait": _emit_async_wait,
