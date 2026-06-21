@@ -1621,7 +1621,7 @@ def _emit_layout_convert(state, op):
             tuple(components[index * group_size] for index in range(result_count))
         )
         return
-    if mode == "same_lane_register_remap":
+    if mode in {"same_lane_register_remap", "cross_lane_register_remap"}:
         result_count = int(attrs["result_component_count"])
         source_indices = tuple(int(index) for index in attrs["source_indices"])
         source_element_indices = tuple(
@@ -1661,6 +1661,14 @@ def _emit_layout_convert(state, op):
                     )
                 extracted[key] = component
                 return component
+            if str(component.type).startswith("!waveamd.fragment"):
+                fail(
+                    "TLXW_EMIT_LAYOUT_REMAP",
+                    STAGE,
+                    "layout_convert register remap cannot extract directly "
+                    "from a WaveAMD fragment; fragment unpack is required",
+                    target_op_id=op.target_op_id,
+                )
             extracted[key] = state.dsl.wave.ExtractOp(
                 result_type,
                 component,
@@ -1668,9 +1676,25 @@ def _emit_layout_convert(state, op):
             ).result
             return extracted[key]
 
+        source_lane = None
+
+        def remapped_component(component_index, element_index):
+            component = scalar_component(component_index, element_index)
+            if mode == "same_lane_register_remap":
+                return component
+            nonlocal source_lane
+            if source_lane is None:
+                source_lane = _layout_convert_source_lane(
+                    state,
+                    attrs,
+                    component,
+                    op,
+                )
+            return _shuffle_component(state, component, source_lane, op)
+
         state.values[result_id] = _pack_components(
             tuple(
-                scalar_component(component_index, element_index)
+                remapped_component(component_index, element_index)
                 for component_index, element_index in zip(
                     source_indices,
                     source_element_indices,
@@ -1684,6 +1708,80 @@ def _emit_layout_convert(state, op):
         f"unsupported layout_convert mode {mode}",
         target_op_id=op.target_op_id,
     )
+
+
+def _layout_convert_source_lane(state, attrs, component, op):
+    simd = _require_shuffle_simd(state, component, op)
+    lane_width = int(simd.width)
+    lane = state.builder.lane_id(state.dsl.i32(), lane_width)
+    kind = attrs.get("source_lane_map_kind")
+    if kind == "affine":
+        stride = int(attrs["source_lane_affine_stride"])
+        base = int(attrs["source_lane_affine_base"])
+        if stride == 0:
+            lane = state.builder.splat(
+                state.builder.constant(state.dsl.i32(), base),
+                state.dsl.i32(),
+                lane_width,
+            )
+        else:
+            if stride != 1:
+                lane = _simd_binary_const(state, "muli", lane, stride, lane_width)
+            if base:
+                lane = _simd_binary_const(state, "addi", lane, base, lane_width)
+        return lane
+    if kind == "transpose":
+        inner = int(attrs["source_lane_transpose_inner"])
+        outer = int(attrs["source_lane_transpose_outer"])
+        minor = _simd_binary_const(state, "remui", lane, inner, lane_width)
+        major = _simd_binary_const(state, "divui", lane, inner, lane_width)
+        minor = _simd_binary_const(state, "muli", minor, outer, lane_width)
+        return state.builder.binary(_binary_kind(state.dsl, "addi"), minor, major)
+    fail(
+        "TLXW_EMIT_LAYOUT_REMAP",
+        STAGE,
+        f"unsupported layout_convert source lane map {kind!r}",
+        target_op_id=op.target_op_id,
+    )
+
+
+def _shuffle_component(state, component, source_lane, op):
+    _require_shuffle_simd(state, component, op)
+    return state.ir.Operation.create(
+        "wave.shuffle",
+        results=[component.type],
+        operands=[component, source_lane],
+    ).results[0]
+
+
+def _require_shuffle_simd(state, component, op):
+    try:
+        simd = state.dsl.SimdType(component.type)
+    except Exception:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "layout_convert shuffle requires a Wave SIMD component",
+            target_op_id=op.target_op_id,
+        )
+    element_type = str(simd.element_type)
+    if element_type.startswith("vector<") or element_type not in {
+        "i8",
+        "i16",
+        "i32",
+        "index",
+        "f16",
+        "bf16",
+        "f32",
+    }:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "layout_convert shuffle supports only b32-compatible scalar "
+            f"SIMD payloads, got {component.type}",
+            target_op_id=op.target_op_id,
+        )
+    return simd
 
 
 def _emit_buffer_store(state, op):

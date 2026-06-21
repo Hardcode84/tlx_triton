@@ -1797,7 +1797,7 @@ def _convert_layout(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
-    register_remap = layout_remap.same_lane_register_remap(
+    register_remap = layout_remap.register_remap(
         operand,
         result,
         operand_layout,
@@ -1812,9 +1812,19 @@ def _convert_layout(builder, type_layout_program, op):
             "result_component_count": int(result.type.component_count),
         }
     elif register_remap is not None:
-        mode = "same_lane_register_remap"
+        if (
+            operand.type.representation in {"fragment", "fragment_tuple"}
+            and operand.type.element_type == "f32"
+        ):
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "fragment-backed f32 MFMA convert_layout requires an "
+                "explicit fragment unpack before register remap",
+                source_op_index=op.index,
+                source_value_id=operand.value_id,
+            )
         attrs = {
-            "mode": mode,
             "result_component_count": int(result.type.component_count),
             **register_remap,
         }
