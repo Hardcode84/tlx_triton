@@ -2385,6 +2385,199 @@ def test_tlx_wave_converter_lowers_linear_make_range_with_block_basis(
     del ctx
 
 
+def test_tlx_wave_converter_lowers_blocked_to_linear_same_lane_payloads(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_blocked_to_linear_payloads(%arg0: !tt.ptr<f32>) attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %converted_value = ttg.convert_layout %value : tensor<64xf32, #blocked> -> tensor<64xf32, #linear>
+    %true = arith.constant true
+    %mask = tt.splat %true : i1 -> tensor<64xi1, #blocked>
+    %converted_mask = ttg.convert_layout %mask : tensor<64xi1, #blocked> -> tensor<64xi1, #linear>
+    %base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %converted_ptr = ttg.convert_layout %base : tensor<64x!tt.ptr<f32>, #blocked> -> tensor<64x!tt.ptr<f32>, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    assert len(convert_ops) == 3
+    for convert_op in convert_ops:
+        attrs = converter_target_ir.attrs_dict(convert_op)
+        assert attrs["mode"] == "same_lane_register_remap"
+        assert attrs["fact_policy"] == "invalidate_layout_sensitive"
+        assert attrs["source_component_count"] == 1
+        assert attrs["source_indices"] == (0,)
+        assert attrs["source_element_indices"] == (0,)
+        assert attrs["source_registers_per_component"] == 1
+    assert "wave.shuffle" not in output.emitted_module.text
+    assert "wave.extract" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_blocked_component_reorder(tmp_path):
+    preamble = """
+#source = #ttg.blocked<{sizePerThread = [2, 2, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 1, 1], order = [2, 1, 0]}>
+#result = #ttg.blocked<{sizePerThread = [2, 2, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 1, 1], order = [2, 0, 1]}>
+"""
+    local_func = """
+  tt.func public @converter_blocked_component_reorder() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<2x2x64xi32, #source>
+    %converted = ttg.convert_layout %value : tensor<2x2x64xi32, #source> -> tensor<2x2x64xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "same_lane_register_remap"
+    assert attrs["source_component_count"] == 4
+    assert attrs["source_indices"] == (0, 2, 1, 3)
+    assert attrs["source_element_indices"] == (0, 0, 0, 0)
+    assert "wave.shuffle" not in output.emitted_module.text
+    assert "wave.extract" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_blocked_cross_lane_transpose(tmp_path):
+    preamble = """
+#source = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#result = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+"""
+    local_func = """
+  tt.func public @converter_blocked_cross_lane_transpose() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<8x8xi32, #source>
+    %converted = ttg.convert_layout %value : tensor<8x8xi32, #source> -> tensor<8x8xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "cross_lane_register_remap"
+    assert attrs["source_lane_map_kind"] == "transpose"
+    assert attrs["source_lane_transpose_inner"] == 8
+    assert attrs["source_lane_transpose_outer"] == 8
+    assert attrs["source_lane_map"][:10] == (0, 8, 16, 24, 32, 40, 48, 56, 1, 9)
+    assert output.emitted_module.text.count("wave.shuffle") == 1
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert machine.count("waveamdmachine.ds_bpermute_b32") == 1
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
+    preamble = """
+#source = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+#result = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_linear_alias() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<64xi32, #source>
+    %converted = ttg.convert_layout %value : tensor<64xi32, #source> -> tensor<64xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "alias"
+    assert attrs["fact_policy"] == "preserve_equivalent"
+    assert "wave.shuffle" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_multi_warp_linear_remap(tmp_path):
+    preamble = """
+#source = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 0]], block = []}>
+#result = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[0, 1]], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_multi_warp_linear_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<128x2xi32, #source>
+    %converted = ttg.convert_layout %value : tensor<128x2xi32, #source> -> tensor<128x2xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=2, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert (
+        "linear to linear convert_layout result coordinate is not covered by "
+        "the source distributed layout"
+    ) in str(diagnostic)
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_non_affine_linear_lane_remap(tmp_path):
+    preamble = """
+#source = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+#result = #ttg.linear<{register = [], lane = [[32], [16], [8], [4], [2], [1]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_non_affine_linear_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<64xi32, #source>
+    %converted = ttg.convert_layout %value : tensor<64xi32, #source> -> tensor<64xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "linear to linear convert_layout requires a non-affine source lane map" in str(
+        diagnostic
+    )
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_slice_parent_layout_remap(tmp_path):
+    preamble = """
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#slice0 = #ttg.slice<{dim = 0, parent = #parent}>
+#slice1 = #ttg.slice<{dim = 1, parent = #parent}>
+"""
+    local_func = """
+  tt.func public @converter_slice_parent_layout_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<64xi32, #slice0>
+    %converted = ttg.convert_layout %value : tensor<64xi32, #slice0> -> tensor<64xi32, #slice1>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "slice to slice convert_layout requires parent layout movement support" in str(
+        diagnostic
+    )
+    del ctx
+
+
 def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>

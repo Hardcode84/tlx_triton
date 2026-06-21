@@ -6,6 +6,18 @@ from . import layouts
 
 STAGE = "op_conversion"
 
+_DISTRIBUTED_REMAP_KINDS = frozenset({"blocked", "linear"})
+_DISTRIBUTED_REMAP_REPRESENTATIONS = frozenset(
+    {
+        "mask",
+        "mask_tuple",
+        "per_lane_pointer",
+        "pointer_tuple",
+        "simd",
+        "simd_tuple",
+    }
+)
+
 
 def register_remap(operand, result, operand_layout, result_layout, op):
     if operand_layout is None or result_layout is None:
@@ -113,6 +125,151 @@ def register_remap(operand, result, operand_layout, result_layout, op):
     }
 
 
+def distributed_remap(operand, result, operand_layout, result_layout, op):
+    if operand_layout is None or result_layout is None:
+        return None
+    if operand_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
+        return None
+    if result_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
+        return None
+    if operand.type.element_type != result.type.element_type:
+        return None
+    if operand.type.kind != result.type.kind:
+        return None
+    if operand.type.representation not in _DISTRIBUTED_REMAP_REPRESENTATIONS:
+        return None
+    if result.type.representation not in _DISTRIBUTED_REMAP_REPRESENTATIONS:
+        return None
+
+    source_layout = _distributed_linear_layout(operand_layout, op)
+    result_layout_ll = _distributed_linear_layout(result_layout, op)
+    description = (
+        f"{operand_layout.kind} to {result_layout.kind} convert_layout"
+    )
+    _require_injective_layout(
+        source_layout,
+        op,
+        operand.value_id,
+        f"{description} source layout",
+    )
+    _require_injective_layout(
+        result_layout_ll,
+        op,
+        result.value_id,
+        f"{description} result layout",
+    )
+    source_register_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    result_register_count = layouts.linear_layout_in_dim_size(
+        result_layout_ll,
+        "register",
+    )
+    if int(operand.type.component_count) != source_register_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} source component model does not match the "
+            "distributed register layout",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    if int(result.type.component_count) != result_register_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} result component model does not match the "
+            "distributed register layout",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    cta_warp_count = max(
+        _layout_warp_count(operand_layout),
+        _layout_warp_count(result_layout),
+    )
+    source_by_coord = _source_slots_by_coord(
+        source_layout,
+        source_register_count,
+        lane_width,
+        cta_warp_count,
+        op,
+        operand.value_id,
+        description=description,
+    )
+    result_sources = tuple(
+        _sources_for_result_slot(
+            result_layout_ll,
+            result_register,
+            source_by_coord,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description=description,
+        )
+        for result_register in range(result_register_count)
+    )
+    remap = _simple_register_remap(
+        result_sources,
+        lane_width,
+        cta_warp_count,
+        1,
+        op,
+        result.value_id,
+        description=description,
+    )
+    if remap is None:
+        _reject_distributed_movement(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description,
+        )
+    if remap["mode"] == "cross_lane_register_remap" and result.type.representation not in {
+        "simd",
+        "simd_tuple",
+    }:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} requires cross-lane movement for "
+            f"{result.type.representation}; only Wave SIMD payloads can be "
+            "shuffled",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    return {
+        "source_component_count": int(operand.type.component_count),
+        "source_registers_per_component": 1,
+        **remap,
+    }
+
+
+def reject_unsupported_pair(operand_layout, result_layout, op):
+    operand_kind = "none" if operand_layout is None else operand_layout.kind
+    result_kind = "none" if result_layout is None else result_layout.kind
+    if operand_kind in {"slice", "dot_operand"} or result_kind in {"slice", "dot_operand"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{operand_kind} to {result_kind} convert_layout requires parent "
+            "layout movement support",
+            source_op_index=op.index,
+        )
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        f"{operand_kind} to {result_kind} convert_layout has unknown "
+        "movement class",
+        source_op_index=op.index,
+    )
+
+
 def _source_slots_by_coord(
     source_layout,
     source_register_count,
@@ -120,6 +277,8 @@ def _source_slots_by_coord(
     cta_warp_count,
     op,
     source_value_id,
+    *,
+    description="MFMA convert_layout",
 ):
     source_by_coord = {}
     for source_warp in range(int(cta_warp_count)):
@@ -135,7 +294,7 @@ def _source_slots_by_coord(
                     fail(
                         "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                         STAGE,
-                        "MFMA convert_layout source layout is not injective "
+                        f"{description} source layout is not injective "
                         "within the CTA distributed map",
                         source_op_index=op.index,
                         source_value_id=source_value_id,
@@ -152,6 +311,8 @@ def _sources_for_result_slot(
     cta_warp_count,
     op,
     result_value_id,
+    *,
+    description="MFMA to blocked convert_layout",
 ):
     sources = []
     for result_warp in range(int(cta_warp_count)):
@@ -167,7 +328,7 @@ def _sources_for_result_slot(
                 fail(
                     "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                     STAGE,
-                    "MFMA to blocked convert_layout result coordinate is not "
+                    f"{description} result coordinate is not "
                     "covered by the source distributed layout",
                     source_op_index=op.index,
                     source_value_id=result_value_id,
@@ -183,6 +344,8 @@ def _simple_register_remap(
     source_registers_per_component,
     op,
     result_value_id,
+    *,
+    description="MFMA to blocked convert_layout",
 ):
     source_indices = []
     source_element_indices = []
@@ -192,7 +355,7 @@ def _simple_register_remap(
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
-                "MFMA to blocked convert_layout produced a malformed "
+                f"{description} produced a malformed "
                 "source map",
                 source_op_index=op.index,
                 source_value_id=result_value_id,
@@ -219,7 +382,7 @@ def _simple_register_remap(
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
-                "MFMA to blocked convert_layout requires a wave-varying source "
+                f"{description} requires a wave-varying source "
                 "lane map; explicit CTA-wave remap support is required",
                 source_op_index=op.index,
                 source_value_id=result_value_id,
@@ -237,6 +400,7 @@ def _simple_register_remap(
         lane_width,
         op,
         result_value_id,
+        description=description,
     )
     return {
         "mode": "cross_lane_register_remap"
@@ -319,6 +483,58 @@ def _cta_exchange_register_remap(
     }
 
 
+def _reject_distributed_movement(
+    result_sources,
+    lane_width,
+    cta_warp_count,
+    op,
+    result_value_id,
+    description,
+):
+    for sources in result_sources:
+        for result_warp in range(int(cta_warp_count)):
+            for lane in range(int(lane_width)):
+                source_warp, _source_lane, _source_register = sources[
+                    result_warp * int(lane_width) + lane
+                ]
+                if int(source_warp) != int(result_warp):
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                        STAGE,
+                        f"{description} requires cross-warp movement",
+                        source_op_index=op.index,
+                        source_value_id=result_value_id,
+                    )
+        source_registers = {int(source[2]) for source in sources}
+        if len(source_registers) > 1:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                f"{description} requires per-lane source component selection",
+                source_op_index=op.index,
+                source_value_id=result_value_id,
+            )
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        f"{description} has unknown movement class",
+        source_op_index=op.index,
+        source_value_id=result_value_id,
+    )
+
+
+def _require_injective_layout(linear, op, source_value_id, description):
+    if linear.is_injective():
+        return
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        f"{description} is non-injective",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+
+
 def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id):
     load_offsets = tuple(int(offset) for offset in load_offsets)
     if len(load_offsets) != int(cta_thread_count):
@@ -362,7 +578,14 @@ def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id)
     return int(base), tuple(int(value) for value in coefficients)
 
 
-def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id):
+def _classify_source_lane_maps(
+    source_lane_maps,
+    lane_width,
+    op,
+    result_value_id,
+    *,
+    description="MFMA to blocked convert_layout",
+):
     concrete_maps = [lane_map for lane_map in source_lane_maps if lane_map is not None]
     if not concrete_maps:
         return None
@@ -371,7 +594,7 @@ def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout requires per-component source "
+            f"{description} requires per-component source "
             "lane maps; explicit lane-map remap support is required",
             source_op_index=op.index,
             source_value_id=result_value_id,
@@ -380,7 +603,7 @@ def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout produced a malformed source "
+            f"{description} produced a malformed source "
             "lane map",
             source_op_index=op.index,
             source_value_id=result_value_id,
@@ -389,7 +612,7 @@ def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout produced an out-of-range source "
+            f"{description} produced an out-of-range source "
             "lane map",
             source_op_index=op.index,
             source_value_id=result_value_id,
@@ -399,7 +622,7 @@ def _classify_source_lane_maps(source_lane_maps, lane_width, op, result_value_id
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout requires a non-affine source "
+            f"{description} requires a non-affine source "
             "lane map; Wave shuffle emission only supports affine and "
             "2-D transpose lane maps",
             source_op_index=op.index,
@@ -460,6 +683,8 @@ def _distributed_linear_layout(layout, op):
 
 
 def _layout_warp_count(layout):
+    if layout.kind == "linear":
+        return 1 << len(tuple(layout.properties.get("warp_bases", ())))
     warps_per_cta = tuple(
         int(value) for value in layout.properties.get("warps_per_cta", ())
     )
