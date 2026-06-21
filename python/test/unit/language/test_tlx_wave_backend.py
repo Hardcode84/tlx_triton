@@ -1,6 +1,7 @@
 import ast
 from contextlib import contextmanager
 from pathlib import Path
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -1667,6 +1668,258 @@ def test_tlx_wave_converter_pipeline_lowers_pure_value_if(tmp_path):
         "return",
     ]
     assert "wave.select" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_dynamic_for_with_iter_args(tmp_path):
+    local_func = """
+  tt.func public @converter_dynamic_for(%arg0: i32, %arg1: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg0 step %c1_i32 iter_args(%acc = %arg1) -> (i32)  : i32 {
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops] == [
+        "constant",
+        "constant",
+        "binary",
+        "for_loop",
+        "return",
+    ]
+    for_op = next(op for op in output.target_program.ops if op.kind == "for_loop")
+    assert len(for_op.region_ids) == 1
+    assert len(output.target_program.regions[for_op.region_ids[0]].block_arg_ids) == 2
+    assert "scf.for" in output.emitted_module.text
+    assert "iter_args" in output.emitted_module.text
+    assert "scf.yield" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_nested_dynamic_for_with_iter_args(
+    tmp_path,
+):
+    local_func = """
+  tt.func public @converter_nested_dynamic_for(
+      %arg0: i32,
+      %arg1: i32,
+      %arg2: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg0 step %c1_i32 iter_args(%outer_acc = %arg2) -> (i32)  : i32 {
+      %inner = scf.for %j = %c0_i32 to %arg1 step %c1_i32 iter_args(%inner_acc = %outer_acc) -> (i32)  : i32 {
+        %ij = arith.addi %i, %j : i32
+        %next_inner = arith.addi %inner_acc, %ij : i32
+        scf.yield %next_inner : i32
+      }
+      %next_outer = arith.addi %inner, %i : i32
+      scf.yield %next_outer : i32
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    for_ops = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    assert len(for_ops) == 2
+    assert len(output.target_program.regions) == 3
+    assert len(output.target_program.regions[for_ops[0].region_ids[0]].block_arg_ids) == 2
+    assert len(output.target_program.regions[for_ops[1].region_ids[0]].block_arg_ids) == 2
+    assert output.emitted_module.text.count("scf.for") == 2
+    assert output.emitted_module.text.count("scf.yield") == 2
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_async_token_across_dynamic_for(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_async_for(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_group = ttg.async_commit_group tokens %warmup
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body_group = ttg.async_commit_group tokens %body
+      %wait = ttg.async_wait {num = 1 : i32}
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    body_dma = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local" and op.source_op_index is not None
+    ][1]
+    attrs = converter_target_ir.attrs_dict(body_dma)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["issue_dependency_count"] == 1
+    wave = output.emitted_module.text
+    loop_match = re.search(
+        r"scf\.for .*iter_args\(.*(?P<token_arg>%arg\d+) = %[^\)]*"
+        r"\) -> \(.*!wave\.mem\.token\)",
+        wave,
+    )
+    assert loop_match is not None
+    token_arg = loop_match.group("token_arg")
+    loop_body = wave[loop_match.end() :]
+    assert "waveamd.dma_load_lds" in loop_body
+    assert f"after {token_arg}" in loop_body
+    assert f"wave.wait {token_arg}" in loop_body
+    assert loop_body.index(f"after {token_arg}") < loop_body.index(
+        f"wave.wait {token_arg}"
+    )
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_loop_issued_async_token_to_final_wait(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_async_for_final_wait(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body_group = ttg.async_commit_group tokens %body
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops].count("token") == 1
+    (dma_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(dma_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["issue_dependency_count"] == 0
+    wave = output.emitted_module.text
+    loop_match = re.search(
+        r"scf\.for .*iter_args\(.*(?P<token_arg>%arg\d+) = %[^\)]*"
+        r"\) -> \(.*!wave\.mem\.token\)",
+        wave,
+    )
+    assert loop_match is not None
+    loop_body = wave[loop_match.end() :]
+    assert f"after {loop_match.group('token_arg')}" not in loop_body
+    assert re.search(r"}\n\s+wave\.wait %\d+#\d+ : !wave\.mem\.token", wave)
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_async_tokens_through_nested_for(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_nested_async_for(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg2: i32,
+      %arg3: i32) attributes {noinline = false} {
+    %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup_a = amdg.buffer_load_to_local %arg0[%range] into %alloc_a : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_b = amdg.buffer_load_to_local %arg1[%range] into %alloc_b : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_group = ttg.async_commit_group tokens %warmup_a, %warmup_b
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg2 step %c1_i32 iter_args(%outer_acc = %c0_i32) -> (i32)  : i32 {
+      %inner = scf.for %j = %c0_i32 to %arg3 step %c1_i32 iter_args(%inner_acc = %outer_acc) -> (i32)  : i32 {
+        %body_a = amdg.buffer_load_to_local %arg0[%range] into %alloc_a : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+        %body_b = amdg.buffer_load_to_local %arg1[%range] into %alloc_b : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+        %body_group = ttg.async_commit_group tokens %body_a, %body_b
+        %wait = ttg.async_wait {num = 1 : i32}
+        %ij = arith.addi %i, %j : i32
+        %next_inner = arith.addi %inner_acc, %ij : i32
+        scf.yield %next_inner : i32
+      }
+      scf.yield %inner : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    for_ops = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    assert len(for_ops) == 2
+    dma_ops = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local" and op.source_op_index is not None
+    ]
+    assert len(dma_ops) == 4
+    assert [
+        converter_target_ir.attrs_dict(op)["issue_dependency_count"]
+        for op in dma_ops
+    ] == [0, 0, 1, 1]
+    wave = output.emitted_module.text
+    loop_matches = list(
+        re.finditer(
+            r"scf\.for .*iter_args\(.*(?P<token_arg>%arg\d+) = %[^\)]*"
+            r"\) -> \(.*!wave\.mem\.token\)",
+            wave,
+        )
+    )
+    assert len(loop_matches) == 2
+    inner_token_arg = loop_matches[-1].group("token_arg")
+    inner_body = wave[loop_matches[-1].end() :]
+    assert inner_body.count(f"after {inner_token_arg}") == 2
+    assert inner_body.count(f"wave.wait {inner_token_arg}") == 1
+    assert inner_body.index(f"after {inner_token_arg}") < inner_body.index(
+        f"wave.wait {inner_token_arg}"
+    )
+    assert wave.count("waveamd.dma_load_lds") == 4
+    assert wave.count("scf.for") == 2
     del ctx
 
 

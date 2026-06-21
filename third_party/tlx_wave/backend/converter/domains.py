@@ -41,6 +41,7 @@ LOWERING_DOMAINS = (
             "tt.expand_dims",
             "tt.get_program_id",
             "rocdl.sched.barrier",
+            "scf.for",
             "scf.if",
             "tt.return",
         ),
@@ -57,6 +58,7 @@ LOWERING_DOMAINS = (
             "addptr",
             "expand_dims",
             "program_id",
+            "for_loop",
             "select",
             "return",
         ),
@@ -72,6 +74,7 @@ LOWERING_DOMAINS = (
         (
             "buffer_load_to_local",
             "buffer_load",
+            "token",
             "async_commit_group",
             "async_wait",
         ),

@@ -1,6 +1,6 @@
 """Stateless source-op to target-program conversion."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 
 from .diagnostics import fail
@@ -70,6 +70,7 @@ class ConversionInput:
     token_nodes_by_op: dict[int, object]
     token_groups_by_commit: dict[int, object]
     token_groups_by_id: dict[int, object]
+    async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
     local_alloc_byte_offsets: dict[int, int]
     static_memdesc_byte_offsets: dict[int, int]
 
@@ -130,6 +131,7 @@ def _build_conversion_input(source_program, fact_program, token_program):
         {node.op_index: node for node in token_program.nodes},
         {group.commit_op_index: group for group in token_program.groups},
         {group.group_id: group for group in token_program.groups},
+        {},
         local_alloc_byte_offsets,
         static_memdesc_byte_offsets,
     )
@@ -178,6 +180,15 @@ def _convert_source_op(
     fact_program,
     op,
 ):
+    if op.name == "scf.for":
+        _convert_for(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
     if op.name == "scf.if":
         _convert_if(
             builder,
@@ -588,6 +599,339 @@ def _convert_if(
         )
 
 
+def _convert_for(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    if len(op.region_ids) != 1 or len(op.operands) < 3:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FOR",
+            STAGE,
+            "scf.for conversion requires lower, upper, step, and one body region",
+            source_op_index=op.index,
+        )
+    data_init_arg_count = len(op.operands) - 3
+    if len(op.results) != data_init_arg_count:
+        fail(
+            "TLXW_OP_FOR_RESULT_MISMATCH",
+            STAGE,
+            "scf.for result count must match iter_args count",
+            source_op_index=op.index,
+        )
+    source_region = conversion_input.regions[op.region_ids[0]]
+    if len(source_region.block_arg_ids) != 1 + data_init_arg_count:
+        fail(
+            "TLXW_OP_FOR_REGION_ARGS",
+            STAGE,
+            "scf.for body must have induction variable plus iter_arg block args",
+            source_op_index=op.index,
+        )
+
+    token_carries = _loop_token_carries(conversion_input, op)
+    source_loop_operands = _operand_target_ids(builder, op)
+    token_init_target_ids = tuple(
+        _loop_token_init_target_id(
+            builder,
+            type_layout_program,
+            op,
+            carry,
+        )
+        for carry in token_carries
+    )
+    loop_operands = (*source_loop_operands, *token_init_target_ids)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    token_result_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(
+                type_layout_program.values[carry["yield_source_value_id"]].type
+            ),
+            debug_name=f"loop_token_result_{op.index}_{index}",
+        )
+        for index, carry in enumerate(token_carries)
+    )
+    result_target_ids = (*result_target_ids, *token_result_target_ids)
+    block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(
+                type_layout_program.values[source_value_id].type
+            ),
+            source_value_id=source_value_id,
+            debug_name=f"r{op.region_ids[0]}_arg{index}",
+        )
+        for index, source_value_id in enumerate(source_region.block_arg_ids)
+    )
+    token_block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(
+                type_layout_program.values[carry["yield_source_value_id"]].type
+            ),
+            debug_name=f"loop_token_arg_{op.index}_{index}",
+        )
+        for index, carry in enumerate(token_carries)
+    )
+    block_arg_target_ids = (*block_arg_target_ids, *token_block_arg_target_ids)
+    target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
+    token_issue_dependency_pairs = _loop_token_carry_issue_dependencies(
+        token_carries,
+        token_block_arg_target_ids,
+    )
+    issue_dependencies = _loop_async_issue_dependencies(
+        conversion_input,
+        tuple(carry for carry, _token_block_arg_target_id in token_issue_dependency_pairs),
+        tuple(token_block_arg_target_id for _carry, token_block_arg_target_id in token_issue_dependency_pairs),
+    )
+    body_conversion_input = replace(
+        conversion_input,
+        async_issue_dependency_target_ids_by_op={
+            **conversion_input.async_issue_dependency_target_ids_by_op,
+            **issue_dependencies,
+        },
+    )
+    saved_token_targets = _replace_source_targets(
+        builder,
+        tuple(
+            (carry["init_source_value_id"], token_block_arg_target_id)
+            for carry, token_block_arg_target_id in zip(
+                token_carries,
+                token_block_arg_target_ids,
+            )
+            if carry.get("init_source_value_id") is not None
+        ),
+    )
+    with builder.insertion_region(target_region_id):
+        try:
+            yielded_source_values = _convert_region(
+                builder,
+                body_conversion_input,
+                type_layout_program,
+                fact_program,
+                op.region_ids[0],
+                allow_yield=True,
+            )
+        finally:
+            _restore_source_targets(builder, saved_token_targets)
+    if len(yielded_source_values) != data_init_arg_count:
+        fail(
+            "TLXW_OP_FOR_YIELD_MISMATCH",
+            STAGE,
+            "scf.for yield count must match iter_args count",
+            source_op_index=op.index,
+        )
+    yielded_target_ids = tuple(
+        _single_source_target(builder, source_value_id, op)
+        for source_value_id in yielded_source_values
+    )
+    yielded_token_target_ids = tuple(
+        _single_source_target(builder, carry["yield_source_value_id"], op)
+        for carry in token_carries
+    )
+    builder.set_region_yields(
+        target_region_id,
+        (*yielded_target_ids, *yielded_token_target_ids),
+    )
+    builder.add_op(
+        "for_loop",
+        operands=loop_operands,
+        results=result_target_ids,
+        attrs={
+            "init_arg_count": data_init_arg_count + len(token_carries),
+            "source_result_count": data_init_arg_count,
+        },
+        layout_map_ids=result_layout_map_ids,
+        region_ids=(target_region_id,),
+        source_op_index=op.index,
+    )
+    _replace_source_targets(
+        builder,
+        tuple(
+            (carry["yield_source_value_id"], token_result_target_id)
+            for carry, token_result_target_id in zip(
+                token_carries,
+                token_result_target_ids,
+            )
+        ),
+    )
+
+
+def _loop_token_carries(conversion_input, op):
+    body_op_indices = _region_op_indices_recursive(conversion_input, op.region_ids[0])
+    waited_external_tokens = []
+    for node in conversion_input.token_nodes_by_op.values():
+        if node.op_index not in body_op_indices or node.op_name != "ttg.async_wait":
+            continue
+        for group_id in node.waited_group_ids:
+            group = conversion_input.token_groups_by_id[group_id]
+            if group.commit_op_index in body_op_indices or group.token_value_id is None:
+                continue
+            waited_external_tokens.append(group.token_value_id)
+    committed_body_tokens = tuple(
+        group.token_value_id
+        for group in sorted(
+            conversion_input.token_groups_by_commit.values(),
+            key=lambda group: group.commit_op_index,
+        )
+        if group.commit_op_index in body_op_indices and group.token_value_id is not None
+    )
+    waited_external_tokens = _dedupe_preserving_order(waited_external_tokens)
+    externally_waited_body_tokens = _externally_waited_body_tokens(
+        conversion_input,
+        body_op_indices,
+    )
+    if waited_external_tokens:
+        if len(waited_external_tokens) != 1 or len(committed_body_tokens) != 1:
+            fail(
+                "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
+                STAGE,
+                "scf.for async token carry supports one external waited group "
+                "and one body commit group",
+                source_op_index=op.index,
+            )
+        return (
+            {
+                "init_source_value_id": waited_external_tokens[0],
+                "yield_source_value_id": committed_body_tokens[0],
+                "add_issue_dependency": True,
+            },
+        )
+    return tuple(
+        {
+            "init_source_value_id": None,
+            "yield_source_value_id": body_token,
+            "add_issue_dependency": False,
+        }
+        for body_token in externally_waited_body_tokens
+    )
+
+
+def _externally_waited_body_tokens(conversion_input, body_op_indices):
+    body_tokens = []
+    for node in sorted(
+        conversion_input.token_nodes_by_op.values(),
+        key=lambda node: node.op_index,
+    ):
+        if node.op_index in body_op_indices or node.op_name != "ttg.async_wait":
+            continue
+        for group_id in node.waited_group_ids:
+            group = conversion_input.token_groups_by_id[group_id]
+            if group.commit_op_index not in body_op_indices or group.token_value_id is None:
+                continue
+            body_tokens.append(group.token_value_id)
+    return _dedupe_preserving_order(body_tokens)
+
+
+def _loop_token_init_target_id(builder, type_layout_program, op, carry):
+    init_source_value_id = carry.get("init_source_value_id")
+    if init_source_value_id is not None:
+        return _single_source_target(builder, init_source_value_id, op)
+    yield_source_value_id = carry["yield_source_value_id"]
+    token_target_id = builder.add_value(
+        target_ir.target_type_from_converted(
+            type_layout_program.values[yield_source_value_id].type
+        ),
+        debug_name=f"loop_token_init_{op.index}",
+    )
+    builder.add_op(
+        "token",
+        results=(token_target_id,),
+        source_op_index=op.index,
+    )
+    return token_target_id
+
+
+def _loop_token_carry_issue_dependencies(token_carries, token_block_arg_target_ids):
+    return tuple(
+        (carry, token_block_arg_target_id)
+        for carry, token_block_arg_target_id in zip(
+            token_carries,
+            token_block_arg_target_ids,
+        )
+        if carry.get("add_issue_dependency", True)
+    )
+
+
+def _loop_async_issue_dependencies(
+    conversion_input,
+    token_carries,
+    token_block_arg_target_ids,
+):
+    dependencies_by_op = {}
+    for carry, token_block_arg_target_id in zip(token_carries, token_block_arg_target_ids):
+        body_group = _token_group_by_value_id(
+            conversion_input,
+            carry["yield_source_value_id"],
+        )
+        if body_group is None:
+            continue
+        for member_token_id in body_group.member_token_ids:
+            member_node = _token_node_by_value_id(conversion_input, member_token_id)
+            if member_node is None:
+                continue
+            existing = dependencies_by_op.setdefault(member_node.op_index, tuple())
+            dependencies_by_op[member_node.op_index] = (
+                *existing,
+                int(token_block_arg_target_id),
+            )
+    return dependencies_by_op
+
+
+def _token_group_by_value_id(conversion_input, value_id):
+    for group in conversion_input.token_groups_by_commit.values():
+        if group.token_value_id == value_id:
+            return group
+    return None
+
+
+def _token_node_by_value_id(conversion_input, value_id):
+    for node in conversion_input.token_nodes_by_op.values():
+        if node.value_id == value_id:
+            return node
+    return None
+
+
+def _region_op_indices_recursive(conversion_input, region_id):
+    result = []
+    for op_index in conversion_input.regions[region_id].op_indices:
+        result.append(op_index)
+        for child_region_id in conversion_input.ops[op_index].region_ids:
+            result.extend(_region_op_indices_recursive(conversion_input, child_region_id))
+    return frozenset(result)
+
+
+def _replace_source_targets(builder, replacements):
+    saved = {}
+    for source_value_id, target_value_id in replacements:
+        source_value_id = int(source_value_id)
+        saved[source_value_id] = builder.source_value_targets.get(source_value_id)
+        builder.source_value_targets[source_value_id] = (int(target_value_id),)
+    return saved
+
+
+def _restore_source_targets(builder, saved):
+    for source_value_id, targets in saved.items():
+        if targets is None:
+            builder.source_value_targets.pop(source_value_id, None)
+        else:
+            builder.source_value_targets[source_value_id] = targets
+
+
+def _dedupe_preserving_order(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return tuple(result)
+
+
 def _convert_local_alloc(
     builder,
     conversion_input,
@@ -700,10 +1044,14 @@ def _convert_buffer_load_to_local(
         type_layout_program,
     )
     base_target_id = _single_source_target(builder, fields["base_value_id"], op)
+    issue_dependency_target_ids = (
+        conversion_input.async_issue_dependency_target_ids_by_op.get(op.index, ())
+    )
     operands = (
         _single_source_target(builder, fields["memdesc_value_id"], op),
         base_target_id,
         _single_source_target(builder, fields["offset_value_id"], op),
+        *issue_dependency_target_ids,
     )
     memdesc = _memdesc_info(conversion_input, fields["memdesc_value_id"], op)
     if memdesc.element_byte_width is None:
@@ -748,7 +1096,7 @@ def _convert_buffer_load_to_local(
         )
         builder.add_op(
             "buffer_load_to_local",
-            operands=(operands[0], operands[1], *scalar_target_ids),
+            operands=(operands[0], operands[1], *scalar_target_ids, *issue_dependency_target_ids),
             results=result_target_ids,
             attrs={
                 "cache_modifier": int(fields["cache"] or 1),
@@ -783,6 +1131,7 @@ def _convert_buffer_load_to_local(
                 "source_rank": len(memdesc.shape),
                 "source_scalar_count": len(scalar_target_ids),
                 "source_shape": tuple(int(dim) for dim in memdesc.shape),
+                "issue_dependency_count": len(issue_dependency_target_ids),
             },
             fact_ids=(range_fact.fact_id,),
             fact_target_ids=(base_target_id,),
@@ -804,6 +1153,7 @@ def _convert_buffer_load_to_local(
             ),
             "mode": "scalarized_load_store",
             "range_bytes": int(range_fact.upper),
+            "issue_dependency_count": len(issue_dependency_target_ids),
         },
         fact_ids=(range_fact.fact_id,),
         fact_target_ids=(base_target_id,),
@@ -1407,6 +1757,7 @@ _SPECIALIZED_SOURCE_OPS = frozenset(
     {
         "arith.truncf",
         "rocdl.sched.barrier",
+        "scf.for",
         "scf.if",
         "ttg.local_alloc",
         "ttg.memdesc_index",

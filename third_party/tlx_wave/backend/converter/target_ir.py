@@ -1,5 +1,6 @@
 """Closed target-program schema for the TLX Wave converter."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from .diagnostics import fail
@@ -79,9 +80,14 @@ class TargetBuilder:
         self.values = []
         self.ops = []
         self.regions = [TargetRegion(0)]
+        self._region_stack = [0]
         self.source_value_targets = {}
         self.erased_source_values = {}
         self.kernel = kernel or TargetKernel()
+
+    @property
+    def current_region_id(self):
+        return self._region_stack[-1]
 
     def add_value(self, target_type, *, source_value_id=None, debug_name=None):
         value_id = len(self.values)
@@ -115,6 +121,41 @@ class TargetBuilder:
             tuple(int(value_id) for value_id in target_value_ids),
         )
 
+    def add_region(self, *, block_arg_ids=()):
+        region_id = len(self.regions)
+        self.regions.append(
+            TargetRegion(
+                region_id,
+                (),
+                tuple(int(value_id) for value_id in block_arg_ids),
+                (),
+            )
+        )
+        return region_id
+
+    @contextmanager
+    def insertion_region(self, region_id):
+        if region_id < 0 or region_id >= len(self.regions):
+            fail(
+                "TLXW_TARGET_UNKNOWN_REGION",
+                STAGE,
+                f"unknown target region {region_id}",
+            )
+        self._region_stack.append(int(region_id))
+        try:
+            yield
+        finally:
+            self._region_stack.pop()
+
+    def set_region_yields(self, region_id, yield_value_ids):
+        region = self.regions[region_id]
+        self.regions[region_id] = TargetRegion(
+            region.target_region_id,
+            region.op_ids,
+            region.block_arg_ids,
+            tuple(int(value_id) for value_id in yield_value_ids),
+        )
+
     def add_op(
         self,
         kind,
@@ -143,11 +184,13 @@ class TargetBuilder:
                 source_op_index,
             )
         )
-        self.regions[0] = TargetRegion(
-            0,
-            (*self.regions[0].op_ids, op_id),
-            self.regions[0].block_arg_ids,
-            self.regions[0].yield_value_ids,
+        region_id = self.current_region_id
+        region = self.regions[region_id]
+        self.regions[region_id] = TargetRegion(
+            region.target_region_id,
+            (*region.op_ids, op_id),
+            region.block_arg_ids,
+            region.yield_value_ids,
         )
         return op_id
 

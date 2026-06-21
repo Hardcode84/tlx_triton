@@ -56,9 +56,34 @@ def emit_wave_module(target_program, fact_program=None):
                 )
                 for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
                     state.values[target_value_id] = arg
-                for op in target_program.ops:
-                    _emit_target_op(state, op)
+                _emit_region(state, 0)
         return EmittedWaveModule(str(module_builder), lds_size)
+
+
+def _emit_region(state, region_id):
+    try:
+        region = state.target_program.regions[region_id]
+    except IndexError:
+        fail(
+            "TLXW_EMIT_UNKNOWN_REGION",
+            STAGE,
+            f"unknown target region {region_id}",
+        )
+    for target_op_id in region.op_ids:
+        try:
+            op = state.target_program.ops[target_op_id]
+        except IndexError:
+            fail(
+                "TLXW_EMIT_UNKNOWN_REGION_OP",
+                STAGE,
+                f"target region {region_id} references missing op {target_op_id}",
+                target_op_id=target_op_id,
+            )
+        _emit_target_op(state, op)
+    return tuple(
+        _require_value(state, target_value_id, None)
+        for target_value_id in region.yield_value_ids
+    )
 
 
 def _emit_target_op(state, op):
@@ -448,7 +473,147 @@ def _emit_select(state, op):
                 false_components,
             )
         )
+        )
+
+
+def _emit_for_loop(state, op):
+    attrs = target_ir.attrs_dict(op)
+    if len(op.region_ids) != 1:
+        fail(
+            "TLXW_EMIT_FOR_REGION_COUNT",
+            STAGE,
+            "for_loop target op requires exactly one region",
+            target_op_id=op.target_op_id,
+        )
+    init_arg_count = int(attrs["init_arg_count"])
+    if len(op.operands) != 3 + init_arg_count:
+        fail(
+            "TLXW_EMIT_FOR_OPERAND_COUNT",
+            STAGE,
+            "for_loop operand count must be lower, upper, step, and init args",
+            target_op_id=op.target_op_id,
+        )
+    lower, upper, step = tuple(
+        _require_value(state, target_value_id, op)
+        for target_value_id in op.operands[:3]
     )
+    init_target_ids = op.operands[3:]
+    init_values = tuple(_require_value(state, target_value_id, op) for target_value_id in init_target_ids)
+    flat_init_values, init_component_counts = _flatten_packed_values(init_values)
+    region = state.target_program.regions[op.region_ids[0]]
+    if len(region.block_arg_ids) != 1 + init_arg_count:
+        fail(
+            "TLXW_EMIT_FOR_BLOCK_ARGS",
+            STAGE,
+            "for_loop region block args must match induction plus init args",
+            target_op_id=op.target_op_id,
+        )
+    if not flat_init_values and op.results:
+        fail(
+            "TLXW_EMIT_FOR_RESULT_COUNT",
+            STAGE,
+            "result-bearing for_loop requires init args",
+            target_op_id=op.target_op_id,
+        )
+
+    outer_values = dict(state.values)
+    with state.builder.for_loop(
+        lower,
+        upper,
+        step,
+        init_args=flat_init_values,
+        nonzero_trip=bool(attrs.get("nonzero_trip", False)),
+    ) as loop:
+        if flat_init_values:
+            induction_value = loop.induction_variable
+            flat_iter_values = tuple(loop.inner_iter_args)
+        else:
+            induction_value = loop
+            flat_iter_values = ()
+        _bind_loop_region_args(
+            state,
+            region.block_arg_ids,
+            induction_value,
+            flat_iter_values,
+            init_component_counts,
+            op,
+        )
+        yielded_values = _emit_region(state, op.region_ids[0])
+        flat_yield_values, yield_component_counts = _flatten_packed_values(yielded_values)
+        if tuple(yield_component_counts) != tuple(init_component_counts):
+            fail(
+                "TLXW_EMIT_FOR_YIELD_COMPONENTS",
+                STAGE,
+                "for_loop yielded component shape must match init args",
+                target_op_id=op.target_op_id,
+            )
+        if flat_init_values:
+            state.builder.yield_(flat_yield_values)
+        elif flat_yield_values:
+            fail(
+                "TLXW_EMIT_FOR_UNEXPECTED_YIELD",
+                STAGE,
+                "for_loop without init args must not yield values",
+                target_op_id=op.target_op_id,
+            )
+    state.values = outer_values
+
+    if len(op.results) != init_arg_count:
+        fail(
+            "TLXW_EMIT_FOR_RESULT_COUNT",
+            STAGE,
+            "for_loop result count must match init args",
+            target_op_id=op.target_op_id,
+        )
+    if op.results:
+        flat_results = tuple(loop.results)
+        if len(flat_results) != len(flat_init_values):
+            fail(
+                "TLXW_EMIT_FOR_RESULT_COMPONENTS",
+                STAGE,
+                "for_loop result component count must match init args",
+                target_op_id=op.target_op_id,
+            )
+        cursor = 0
+        for result_id, component_count in zip(op.results, init_component_counts):
+            state.values[result_id] = _pack_components(
+                flat_results[cursor : cursor + component_count]
+            )
+            cursor += component_count
+
+
+def _flatten_packed_values(values):
+    flat_values = []
+    component_counts = []
+    for value in values:
+        components = _as_components(value)
+        component_counts.append(len(components))
+        flat_values.extend(components)
+    return tuple(flat_values), tuple(component_counts)
+
+
+def _bind_loop_region_args(
+    state,
+    block_arg_ids,
+    induction_value,
+    flat_iter_values,
+    init_component_counts,
+    op,
+):
+    state.values[block_arg_ids[0]] = induction_value
+    cursor = 0
+    for block_arg_id, component_count in zip(block_arg_ids[1:], init_component_counts):
+        state.values[block_arg_id] = _pack_components(
+            flat_iter_values[cursor : cursor + component_count]
+        )
+        cursor += component_count
+    if cursor != len(flat_iter_values):
+        fail(
+            "TLXW_EMIT_FOR_BLOCK_COMPONENTS",
+            STAGE,
+            "for_loop iter block arg component count does not match init args",
+            target_op_id=op.target_op_id,
+        )
 
 
 def _emit_local_alloc(state, op):
@@ -492,11 +657,13 @@ def _emit_memdesc_index(state, op):
 
 def _emit_buffer_load_to_local(state, op):
     attrs = target_ir.attrs_dict(op)
+    issue_dependency_count = int(attrs.get("issue_dependency_count", 0))
     if attrs["mode"] == "dma_packet_lds":
         scalar_count = int(attrs["source_scalar_count"])
-        operands = _operand_values(state, op, 2 + scalar_count)
+        operands = _operand_values(state, op, 2 + scalar_count + issue_dependency_count)
         dest_base, source_base = operands[:2]
-        scalar_values = operands[2:]
+        scalar_values = operands[2 : 2 + scalar_count]
+        issue_dependencies = operands[2 + scalar_count :]
         element_type = _scalar_type(state.dsl, attrs["element_type"])
         lane_width = int(attrs["lane_width"])
         range_bytes = state.builder.constant(state.dsl.i32(), int(attrs["range_bytes"]))
@@ -512,11 +679,14 @@ def _emit_buffer_load_to_local(state, op):
             dest_base,
             buffer_base,
             scalar_values,
+            issue_dependencies,
             element_type,
             lane_width,
         )
         return
-    dest_base, source_base, offsets = _operand_values(state, op, 3)
+    operands = _operand_values(state, op, 3 + issue_dependency_count)
+    dest_base, source_base, offsets = operands[:3]
+    issue_dependencies = operands[3:]
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     lane_width = int(attrs["lane_width"])
     destination_offsets = tuple(int(value) for value in attrs["destination_component_offsets"])
@@ -553,6 +723,7 @@ def _emit_buffer_load_to_local(state, op):
             buffer_base,
             offset_components,
             destination_offsets,
+            issue_dependencies,
             element_type,
             lane_width,
         )
@@ -564,7 +735,7 @@ def _emit_buffer_load_to_local(state, op):
             f"unsupported amdg.buffer_load_to_local mode {attrs['mode']}",
             target_op_id=op.target_op_id,
         )
-    dependency = state.builder.token()
+    dependency = _memory_dependency_token(state, issue_dependencies)
     component_tokens = []
     lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
     value_type = state.dsl.simd_type(element_type, lane_width)
@@ -620,6 +791,7 @@ def _emit_buffer_load_to_local_packet_dma(
     dest_base,
     buffer_base,
     scalar_values,
+    issue_dependencies,
     element_type,
     lane_width,
 ):
@@ -656,7 +828,7 @@ def _emit_buffer_load_to_local_packet_dma(
             (0, max(0, int(component_thread_count) - 1)),
             op,
         )
-    dependency = state.builder.token()
+    dependency = _memory_dependency_token(state, issue_dependencies)
     component_tokens = []
     for component, destination_offset in enumerate(destination_offsets):
         coords = _packet_coordinate_values(
@@ -721,6 +893,7 @@ def _emit_buffer_load_to_local_dma(
     buffer_base,
     offset_components,
     destination_offsets,
+    issue_dependencies,
     element_type,
     lane_width,
 ):
@@ -732,7 +905,7 @@ def _emit_buffer_load_to_local_dma(
             "amdg.buffer_load_to_local DMA requires a positive packet byte width",
             target_op_id=op.target_op_id,
         )
-    dependency = state.builder.token()
+    dependency = _memory_dependency_token(state, issue_dependencies)
     component_tokens = []
     source_ptr_type = state.dsl.simd_ptr_type(
         element_type,
@@ -777,6 +950,10 @@ def _emit_async_commit_group(state, op):
         state.values[_single_result(op)] = token
 
 
+def _emit_token(state, op):
+    state.values[_single_result(op)] = state.builder.token()
+
+
 def _join_memory_tokens(state, tokens):
     tokens = tuple(tokens)
     if not tokens:
@@ -784,6 +961,13 @@ def _join_memory_tokens(state, tokens):
     if len(tokens) == 1:
         return tokens[0]
     return state.builder.join(*tokens)
+
+
+def _memory_dependency_token(state, tokens):
+    tokens = tuple(tokens)
+    if not tokens:
+        return state.builder.token()
+    return _join_memory_tokens(state, tokens)
 
 
 def _emit_async_wait(state, op):
@@ -1532,6 +1716,7 @@ _TARGET_EMITTERS = {
     "addptr": _emit_addptr,
     "expand_dims": _emit_expand_dims,
     "program_id": _emit_program_id,
+    "for_loop": _emit_for_loop,
     "select": _emit_select,
     "local_alloc": _emit_local_alloc,
     "memdesc_index": _emit_memdesc_index,
@@ -1543,6 +1728,7 @@ _TARGET_EMITTERS = {
     "layout_convert": _emit_layout_convert,
     "buffer_store": _emit_buffer_store,
     "buffer_load": _emit_buffer_load,
+    "token": _emit_token,
     "async_commit_group": _emit_async_commit_group,
     "async_wait": _emit_async_wait,
     "return": _emit_return,
@@ -1907,11 +2093,13 @@ def _operand_values(state, op, count):
 
 def _require_value(state, target_value_id, op):
     if target_value_id not in state.values:
+        op_kind = "<region-yield>" if op is None else op.kind
+        op_id = None if op is None else op.target_op_id
         fail(
             "TLXW_EMIT_UNBOUND_VALUE",
             STAGE,
-            f"target value {target_value_id} is not bound before {op.kind}",
-            target_op_id=op.target_op_id,
+            f"target value {target_value_id} is not bound before {op_kind}",
+            target_op_id=op_id,
             target_value_id=target_value_id,
         )
     return state.values[target_value_id]

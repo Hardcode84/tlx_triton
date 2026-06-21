@@ -4,6 +4,8 @@ from . import target_ir
 
 
 def canonicalize_target_program(target_program):
+    if len(target_program.regions) != 1:
+        return target_program
     return _share_div_rem_pairs(target_program)
 
 

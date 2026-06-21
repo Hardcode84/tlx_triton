@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass
 class Diagnostic(Exception):
     code: str
     stage: str
@@ -58,4 +58,3 @@ def fail(
         fact_id=fact_id,
         layout_map_id=layout_map_id,
     )
-
