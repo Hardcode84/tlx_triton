@@ -61,6 +61,73 @@ pip install -r python/requirements.txt # build-time dependencies
 pip install -e .
 ```
 
+# TLX Wave backend
+
+This tree includes an experimental `tlx_wave` backend for lowering Triton/TLX
+kernels through the Wave submodule. It is intended for AMD wave64 targets and
+currently accepts `gfx942` and `gfx950`.
+
+The editable Python build includes the in-tree `tlx_wave` backend. Make sure the
+Wave submodule is present, then build Triton normally:
+
+```shell
+git submodule update --init --recursive third_party/wave
+pip install -r python/requirements.txt
+pip install -e .
+```
+
+The Triton build drives the Wave submodule build when `tlx_wave` is enabled. It
+uses the LLVM/MLIR commit pinned by `third_party/wave/llvm-commit.txt`, installed
+under `third_party/wave/build/llvm-install`, and builds MLIR Python bindings for
+Wave. Keep this Wave-pinned LLVM separate from Triton's LLVM. In particular, do
+not point Wave at Triton's `LLVM_SYSPATH` or an ambient `LLVM_INSTALL_DIR`.
+
+For offline builds, build the Wave-pinned LLVM/MLIR install first:
+
+```shell
+env -u LLVM_INSTALL_DIR -u LLVM_DIR -u MLIR_DIR -u Clang_DIR -u LLD_DIR \
+  python third_party/wave/build_tools/build_llvm.py \
+    --python-bindings \
+    --wave-build-dir third_party/wave/build/wave-build
+```
+
+For standalone Wave-tool debugging, rebuild the Wave CLI tools against that
+install:
+
+```shell
+cmake -S third_party/wave -B third_party/wave/build/wave-build -G Ninja \
+  -DLLVM_INSTALL_DIR="$PWD/third_party/wave/build/llvm-install" \
+  -DWAVE_ENABLE_PYTHON_BINDINGS=ON
+cmake --build third_party/wave/build/wave-build \
+  --target wave-opt wave-translate
+```
+
+The backend discovers the default standalone Wave build automatically. If you use
+a non-default Wave build, point Triton at it explicitly:
+
+```shell
+export TRITON_WAVE_TOOLS_DIR=/path/to/wave-build/bin
+export TRITON_WAVE_PYTHONPATH=/path/to/wave-build/python_packages/wave_mlir
+```
+
+To select the backend for normal `tl.jit` launches, run with:
+
+```shell
+export TRITON_DEFAULT_BACKEND=tlx_wave
+```
+
+Runtime launches require an active HIP runtime on supported hardware
+(`gfx942`/`gfx950`). Compile-only tests can run from the source tree without
+matching hardware by using the in-tree backend discovery path:
+
+```shell
+PYTHONPATH=python TRITON_BACKENDS_IN_TREE=1 \
+  pytest -s --tb=short python/test/unit/language/test_tlx_wave_backend.py
+
+PYTHONPATH=python TRITON_BACKENDS_IN_TREE=1 \
+  pytest -s --tb=short third_party/tlx/tutorials/amd-gemm-warp-pipeline-tlx-wave_test.py
+```
+
 # Building with a custom LLVM
 
 Triton uses LLVM to generate code for GPUs and CPUs.  Normally, the Triton build
@@ -112,11 +179,9 @@ says:
          LLVM_SYSPATH=$LLVM_BUILD_DIR \
          pip install -e .
 
-   When enabling the `tlx_wave` backend, keep Wave's LLVM separate from
-   Triton's LLVM. The Wave submodule builds against the commit pinned in
-   `third_party/wave/llvm-commit.txt` using
-   `python third_party/wave/build_tools/build_llvm.py --python-bindings`;
-   do not point Wave at `LLVM_SYSPATH`.
+   When using the `tlx_wave` backend, keep Wave's LLVM separate from Triton's
+   LLVM. See [TLX Wave backend](#tlx-wave-backend); do not point Wave at
+   `LLVM_SYSPATH`.
 
 </details>
 
