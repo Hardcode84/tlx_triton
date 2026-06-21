@@ -684,9 +684,19 @@ def _emit_buffer_load_to_local(state, op):
             lane_width,
         )
         return
-    operands = _operand_values(state, op, 3 + issue_dependency_count)
+    has_mask = bool(attrs.get("has_mask", False))
+    operands = _operand_values(
+        state,
+        op,
+        3 + int(has_mask) + issue_dependency_count,
+    )
     dest_base, source_base, offsets = operands[:3]
-    issue_dependencies = operands[3:]
+    operand_index = 3
+    masks = None
+    if has_mask:
+        masks = operands[operand_index]
+        operand_index += 1
+    issue_dependencies = operands[operand_index:]
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     lane_width = int(attrs["lane_width"])
     destination_offsets = tuple(int(value) for value in attrs["destination_component_offsets"])
@@ -708,6 +718,9 @@ def _emit_buffer_load_to_local(state, op):
             "not match target op attrs",
             target_op_id=op.target_op_id,
         )
+    mask_components = None
+    if masks is not None:
+        mask_components = _broadcast_component(masks, expected_components, op)
     range_bytes = state.builder.constant(state.dsl.i32(), int(attrs["range_bytes"]))
     buffer_base = state.builder.make_buffer(
         source_base,
@@ -739,6 +752,7 @@ def _emit_buffer_load_to_local(state, op):
     component_tokens = []
     lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
     value_type = state.dsl.simd_type(element_type, lane_width)
+    mask_mode = attrs.get("mask_mode", "exec_where" if has_mask else "none")
     source_ptr_type = state.dsl.simd_ptr_type(
         element_type,
         state.dsl.buffer_address_space(),
@@ -749,10 +763,13 @@ def _emit_buffer_load_to_local(state, op):
         state.dsl.shared_address_space(),
         lane_width,
     )
-    for offset_component, destination_base_offset in zip(
-        offset_components,
-        destination_offsets,
-    ):
+    def emit_component_load_store(offset_component, destination_base_offset):
+        offset_component = _assume_value_range(
+            state,
+            offset_component,
+            attrs.get("offset_range"),
+            op,
+        )
         source_ptr = state.builder.ptr_add(
             buffer_base,
             offset_component,
@@ -780,7 +797,33 @@ def _emit_buffer_load_to_local(state, op):
             dest_offset,
             result_type=dest_ptr_type,
         )
-        component_tokens.append(state.builder.store(loaded, dest_ptr, after=load_token))
+        return state.builder.store(loaded, dest_ptr, after=load_token)
+
+    for index, (offset_component, destination_base_offset) in enumerate(
+        zip(offset_components, destination_offsets)
+    ):
+        if mask_components is None:
+            component_tokens.append(
+                emit_component_load_store(offset_component, destination_base_offset)
+            )
+            continue
+        if mask_mode != "exec_where":
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC_MASK",
+                STAGE,
+                f"unsupported buffer_load_to_local mask mode {mask_mode}",
+                target_op_id=op.target_op_id,
+            )
+        with state.builder.where(
+            mask_components[index],
+            [state.dsl.mem_token_type()],
+        ) as where:
+            store_token = emit_component_load_store(
+                offset_component,
+                destination_base_offset,
+            )
+            state.builder.yield_([store_token])
+        component_tokens.append(where.results[0])
     state.values[_single_result(op)] = _join_memory_tokens(state, component_tokens)
 
 

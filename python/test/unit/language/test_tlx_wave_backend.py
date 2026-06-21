@@ -2049,6 +2049,147 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_lowers_masked_dma_eligible_buffer_load_to_local_fallback(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_masked_buffer_load_to_local(%arg0: !tt.ptr<f16> {tt.pointer_range = 2 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %one = arith.constant dense<1> : tensor<512xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %one : tensor<512xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %mask into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["has_mask"] is True
+    assert attrs["mask_mode"] == "exec_where"
+    assert attrs["offset_range"] == (0, 0)
+    wave = output.emitted_module.text
+    assert "waveamd.dma_load_lds" not in wave
+    assert "wave.load" in wave
+    assert "wave.store" in wave
+    assert "wave.where" in wave
+    assert wave.index("wave.where") < wave.index("wave.assume") < wave.index("wave.load")
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_b16" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_masked_scalar_buffer_load_to_local(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %limit = arith.constant dense<32> : tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit : tensor<64xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %mask into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["has_mask"] is True
+    assert attrs["component_count"] == 1
+    wave = output.emitted_module.text
+    assert "waveamd.dma_load_lds" not in wave
+    assert wave.count("wave.load") == 1
+    assert wave.count("wave.store") == 1
+    assert "wave.where" in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_b16" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_buffer_load_to_local_other_fallback(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_buffer_load_to_local_other(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %true = arith.constant dense<true> : tensor<64xi1, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %true other = %other into %alloc : <f16>[tensor<64xi32, #blocked>] tensor<64xf16, #blocked> -> <64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC"
+    assert "other fallback is not converted yet" in str(diagnostic)
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_buffer_load_to_local_cache_modifier(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_buffer_load_to_local_cache(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %true = arith.constant dense<true> : tensor<64xi1, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %true cacheModifier = cv into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER"
+    assert "cacheModifier=" in str(diagnostic)
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_joins_independent_dma_packets(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>

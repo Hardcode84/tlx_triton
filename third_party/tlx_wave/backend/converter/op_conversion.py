@@ -1010,11 +1010,11 @@ def _convert_buffer_load_to_local(
     op,
 ):
     fields = _buffer_load_to_local_fields(op)
-    if fields["mask_value_id"] is not None or fields["other_value_id"] is not None:
+    if fields["other_value_id"] is not None:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "amdg.buffer_load_to_local mask/other fallback is not converted yet",
+            "amdg.buffer_load_to_local other fallback is not converted yet",
             source_op_index=op.index,
         )
     if fields["stride_value_id"] is not None:
@@ -1047,12 +1047,11 @@ def _convert_buffer_load_to_local(
     issue_dependency_target_ids = (
         conversion_input.async_issue_dependency_target_ids_by_op.get(op.index, ())
     )
-    operands = (
+    operands = [
         _single_source_target(builder, fields["memdesc_value_id"], op),
         base_target_id,
         _single_source_target(builder, fields["offset_value_id"], op),
-        *issue_dependency_target_ids,
-    )
+    ]
     memdesc = _memdesc_info(conversion_input, fields["memdesc_value_id"], op)
     if memdesc.element_byte_width is None:
         fail(
@@ -1071,6 +1070,20 @@ def _convert_buffer_load_to_local(
             source_op_index=op.index,
             source_value_id=fields["offset_value_id"],
         )
+    has_mask = fields["mask_value_id"] is not None
+    if has_mask:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) not in (1, int(offset_type.component_count)):
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "amdg.buffer_load_to_local mask must be scalar or match "
+                "offset components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    operands.extend(issue_dependency_target_ids)
     component_offsets = _local_component_base_offsets(
         conversion_input,
         type_layout_program,
@@ -1079,16 +1092,18 @@ def _convert_buffer_load_to_local(
         int(offset_type.lane_width or conversion_input.threads_per_warp),
         op,
     )
-    packet_plan = _buffer_load_to_local_packet_plan(
-        conversion_input,
-        type_layout_program,
-        fact_program,
-        fields["memdesc_value_id"],
-        fields["offset_value_id"],
-        memdesc,
-        int(offset_type.lane_width or conversion_input.threads_per_warp),
-        op,
-    )
+    packet_plan = None
+    if not has_mask:
+        packet_plan = _buffer_load_to_local_packet_plan(
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            fields["memdesc_value_id"],
+            fields["offset_value_id"],
+            memdesc,
+            int(offset_type.lane_width or conversion_input.threads_per_warp),
+            op,
+        )
     if packet_plan is not None:
         scalar_target_ids = tuple(
             _single_source_target(builder, source_value_id, op)
@@ -1139,18 +1154,28 @@ def _convert_buffer_load_to_local(
             source_op_index=op.index,
         )
         return
+    scalar_offset_upper = _buffer_source_offset_upper(
+        range_fact.upper,
+        memdesc.element_byte_width,
+        memdesc.element_byte_width,
+        op,
+    )
     builder.add_op(
         "buffer_load_to_local",
-        operands=operands,
+        operands=tuple(operands),
         results=result_target_ids,
         attrs={
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(offset_type.component_count),
             "destination_component_offsets": tuple(component_offsets),
+            "element_byte_width": int(memdesc.element_byte_width),
             "element_type": memdesc.element_type,
+            "has_mask": has_mask,
             "lane_width": int(
                 offset_type.lane_width or conversion_input.threads_per_warp
             ),
+            "mask_mode": "exec_where" if has_mask else "none",
+            "offset_range": (0, int(scalar_offset_upper)),
             "mode": "scalarized_load_store",
             "range_bytes": int(range_fact.upper),
             "issue_dependency_count": len(issue_dependency_target_ids),
