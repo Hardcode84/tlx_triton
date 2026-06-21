@@ -65,6 +65,20 @@ def _asm_text(compiled, artifact):
     return text
 
 
+def _tlx_wave_physical_arch(properties):
+    return str(properties.get("arch", "")).split(":")[0]
+
+
+def _tlx_wave_runtime_skip_reason(arch):
+    supported = "/".join(sorted(_TLX_WAVE_RUNTIME_ARCHES))
+    return (
+        f"requires physical {supported} hardware for TLX Wave launch tests, "
+        f"got {arch or 'unknown'}; this is a runtime launch guard, not a "
+        "Wave HSACO generation failure. Compile-only TLX Wave tests may target "
+        "gfx942/gfx950 without matching local hardware."
+    )
+
+
 def _require_tlx_wave_runtime_target():
     torch = pytest.importorskip("torch")
     try:
@@ -73,12 +87,9 @@ def _require_tlx_wave_runtime_target():
         properties = active_driver.utils.get_device_properties(device)
     except Exception as exc:
         pytest.skip(f"requires an active HIP runtime for TLX Wave launch tests: {exc}")
-    arch = str(properties.get("arch", "")).split(":")[0]
+    arch = _tlx_wave_physical_arch(properties)
     if arch not in _TLX_WAVE_RUNTIME_ARCHES:
-        pytest.skip(
-            "requires physical gfx942/gfx950 hardware for TLX Wave launch "
-            f"tests, got {arch or 'unknown'}"
-        )
+        pytest.skip(_tlx_wave_runtime_skip_reason(arch))
     if not torch.cuda.is_available():
         pytest.skip("requires torch.cuda/ROCm for TLX Wave launch tests")
     return torch, arch
@@ -1315,6 +1326,18 @@ def test_tlx_wave_driver_load_binary_rejects_wave_text():
 
     with pytest.raises(RuntimeError, match="expected an ELF HSACO object"):
         utils.load_binary("kernel_name", b"gpu.module @kernels {}", 0, 0)
+
+
+def test_tlx_wave_runtime_skip_reason_is_test_only_targeting_policy():
+    assert _TLX_WAVE_RUNTIME_ARCHES == {"gfx942", "gfx950"}
+    assert _tlx_wave_physical_arch({"arch": "gfx1100:sramecc+:xnack-"}) == "gfx1100"
+
+    reason = _tlx_wave_runtime_skip_reason("gfx1100")
+
+    assert "physical gfx942/gfx950 hardware" in reason
+    assert "runtime launch guard" in reason
+    assert "not a Wave HSACO generation failure" in reason
+    assert "Compile-only TLX Wave tests may target gfx942/gfx950" in reason
 
 
 def test_tlx_wave_backend_compile_uses_staged_converter():
