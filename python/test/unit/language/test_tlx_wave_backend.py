@@ -2244,6 +2244,83 @@ def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(
     del ctx
 
 
+def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 2, order = [0, 1]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_masked_swizzled_scalarized_dma(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x8xf16, #shared, #smem, mutable>
+    %zero = arith.constant dense<0> : tensor<8x8xi32, #blocked>
+    %mask = arith.constant dense<true> : tensor<8x8xi1, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%zero] mask = %mask into %alloc : <f16>[tensor<8x8xi32, #blocked>] -> <8x8xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["destination_offset_mode"] == "layout_coordinates"
+    assert attrs["destination_coordinate_shape"] == (8, 8)
+    assert attrs["destination_shared_layout"] == "swizzled"
+    assert attrs["destination_swizzled_order"] == (0, 1)
+    assert attrs["destination_swizzled_vec"] == 2
+    assert "destination_component_offsets" not in attrs
+    wave = output.emitted_module.text
+    assert "waveamd.dma_load_lds" not in wave
+    assert wave.count("wave.load") == 1
+    assert wave.count("wave.store") == 1
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_b16" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_unsupported_scalarized_swizzled_layout(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_rejects_swizzled_scalarized_dma(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x8xf16, #shared, #smem, mutable>
+    %zero = arith.constant dense<0> : tensor<8x8xi32, #blocked>
+    %mask = arith.constant dense<true> : tensor<8x8xi1, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%zero] mask = %mask into %alloc : <f16>[tensor<8x8xi32, #blocked>] -> <8x8xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_LOCAL_LOAD"
+    message = str(diagnostic)
+    assert "order=(0, 1)" in message
+    assert "vec=4" in message
+    assert "per_phase=1" in message
+    assert "max_phase=4" in message
+    del ctx
+
+
 def test_tlx_wave_converter_rejects_buffer_load_to_local_other_fallback(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>

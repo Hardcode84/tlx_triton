@@ -837,7 +837,6 @@ def _emit_buffer_load_to_local(state, op):
     issue_dependencies = operands[operand_index:]
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     lane_width = int(attrs["lane_width"])
-    destination_offsets = tuple(int(value) for value in attrs["destination_component_offsets"])
     expected_components = int(attrs["component_count"])
     offset_components = _as_components(offsets)
     if len(offset_components) != expected_components:
@@ -848,12 +847,50 @@ def _emit_buffer_load_to_local(state, op):
             "match target op attrs",
             target_op_id=op.target_op_id,
         )
-    if len(destination_offsets) != expected_components:
+    destination_offset_mode = attrs.get("destination_offset_mode", "affine")
+    if destination_offset_mode == "affine":
+        destination_offsets = tuple(
+            int(value) for value in attrs["destination_component_offsets"]
+        )
+        if len(destination_offsets) != expected_components:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "amdg.buffer_load_to_local destination component offsets do "
+                "not match target op attrs",
+                target_op_id=op.target_op_id,
+            )
+    elif destination_offset_mode == "layout_coordinates":
+        destination_shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
+        destination_component_bases = tuple(
+            tuple(int(value) for value in bases)
+            for bases in attrs["destination_component_coordinate_bases"]
+        )
+        destination_workitem_coefficients = tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in attrs["destination_workitem_coordinate_coefficients"]
+        )
+        if (
+            len(destination_component_bases) != expected_components
+            or any(len(bases) != len(destination_shape) for bases in destination_component_bases)
+            or any(
+                len(coefficients) != len(destination_shape)
+                for coefficients in destination_workitem_coefficients
+            )
+        ):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "amdg.buffer_load_to_local coordinate destination offsets "
+                "do not match target op attrs",
+                target_op_id=op.target_op_id,
+            )
+    else:
         fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "amdg.buffer_load_to_local destination component offsets do "
-            "not match target op attrs",
+            "unsupported amdg.buffer_load_to_local destination offset mode "
+            f"{destination_offset_mode}",
             target_op_id=op.target_op_id,
         )
     mask_components = None
@@ -889,13 +926,15 @@ def _emit_buffer_load_to_local(state, op):
     dependency = _memory_dependency_token(state, issue_dependencies)
     component_tokens = []
     workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
-    lane_offset = _local_destination_lane_offset(
-        state,
-        workitem,
-        lane_width,
-        int(attrs.get("destination_lane_stride_elements", 1)),
-        int(attrs.get("destination_wave_stride_elements", 0)),
-    )
+    lane_offset = None
+    if destination_offset_mode == "affine":
+        lane_offset = _local_destination_lane_offset(
+            state,
+            workitem,
+            lane_width,
+            int(attrs.get("destination_lane_stride_elements", 1)),
+            int(attrs.get("destination_wave_stride_elements", 0)),
+        )
     value_type = state.dsl.simd_type(element_type, lane_width)
     mask_mode = attrs.get("mask_mode", "exec_where" if has_mask else "none")
     source_ptr_type = state.dsl.simd_ptr_type(
@@ -908,7 +947,47 @@ def _emit_buffer_load_to_local(state, op):
         state.dsl.shared_address_space(),
         lane_width,
     )
-    def emit_component_load_store(offset_component, destination_base_offset):
+    def component_destination_offset(component_index):
+        if destination_offset_mode == "affine":
+            dest_offset = lane_offset
+            destination_base_offset = destination_offsets[component_index]
+            if destination_base_offset:
+                base_offset = state.builder.splat(
+                    state.builder.constant(
+                        state.dsl.i32(),
+                        destination_base_offset,
+                    ),
+                    state.dsl.i32(),
+                    lane_width,
+                )
+                dest_offset = state.builder.binary(
+                    state.dsl.BinaryKind.AddI,
+                    dest_offset,
+                    base_offset,
+                )
+            return dest_offset
+        coords = tuple(
+            _bit_linear_thread_coordinate(
+                state,
+                workitem,
+                int(base),
+                tuple(
+                    coefficients[dim]
+                    for coefficients in destination_workitem_coefficients
+                ),
+                lane_width,
+            )
+            for dim, base in enumerate(destination_component_bases[component_index])
+        )
+        return _shared_destination_element_offset(
+            state,
+            attrs,
+            coords,
+            destination_shape,
+            lane_width,
+        )
+
+    def emit_component_load_store(component_index, offset_component):
         offset_component = _assume_value_range(
             state,
             offset_component,
@@ -925,18 +1004,7 @@ def _emit_buffer_load_to_local(state, op):
             value_type,
             after=dependency,
         )
-        dest_offset = lane_offset
-        if destination_base_offset:
-            base_offset = state.builder.splat(
-                state.builder.constant(state.dsl.i32(), destination_base_offset),
-                state.dsl.i32(),
-                lane_width,
-            )
-            dest_offset = state.builder.binary(
-                state.dsl.BinaryKind.AddI,
-                dest_offset,
-                base_offset,
-            )
+        dest_offset = component_destination_offset(component_index)
         dest_ptr = state.builder.ptr_add(
             dest_base,
             dest_offset,
@@ -944,12 +1012,10 @@ def _emit_buffer_load_to_local(state, op):
         )
         return state.builder.store(loaded, dest_ptr, after=load_token)
 
-    for index, (offset_component, destination_base_offset) in enumerate(
-        zip(offset_components, destination_offsets)
-    ):
+    for index, offset_component in enumerate(offset_components):
         if mask_components is None:
             component_tokens.append(
-                emit_component_load_store(offset_component, destination_base_offset)
+                emit_component_load_store(index, offset_component)
             )
             continue
         if mask_mode != "exec_where":
@@ -964,8 +1030,8 @@ def _emit_buffer_load_to_local(state, op):
             [state.dsl.mem_token_type()],
         ) as where:
             store_token = emit_component_load_store(
+                index,
                 offset_component,
-                destination_base_offset,
             )
             state.builder.yield_([store_token])
         component_tokens.append(where.results[0])
@@ -994,6 +1060,74 @@ def _local_destination_lane_offset(
     wave_offset = _scalar_binary_const_i32(state, "muli", wave_id, wave_stride)
     wave_offset = state.builder.splat(wave_offset, state.dsl.i32(), lane_width)
     return state.builder.binary(state.dsl.BinaryKind.AddI, lane, wave_offset)
+
+
+def _shared_destination_element_offset(state, attrs, coords, shape, lane_width):
+    layout = attrs.get("destination_shared_layout", "dense")
+    if layout == "dense":
+        return _linearize_coordinates(state, coords, shape, lane_width)
+    if layout == "padded":
+        logical = _linearize_coordinates(state, coords, shape, lane_width)
+        encoded = logical
+        intervals = tuple(int(value) for value in attrs["destination_padded_intervals"])
+        paddings = tuple(int(value) for value in attrs["destination_padded_paddings"])
+        for interval, padding in zip(intervals, paddings):
+            term = _simd_binary_const(state, "divui", logical, interval, lane_width)
+            if padding != 1:
+                term = _simd_binary_const(state, "muli", term, padding, lane_width)
+            encoded = state.builder.binary(state.dsl.BinaryKind.AddI, encoded, term)
+        return encoded
+    if layout == "swizzled":
+        order = tuple(int(value) for value in attrs["destination_swizzled_order"])
+        minor_dim = int(order[0])
+        major_dim = int(order[1])
+        minor_extent = int(shape[minor_dim])
+        vec = int(attrs["destination_swizzled_vec"])
+        per_phase = int(attrs["destination_swizzled_per_phase"])
+        max_phase = int(attrs["destination_swizzled_max_phase"])
+        major = coords[major_dim]
+        minor = coords[minor_dim]
+        phase = _simd_binary_const(state, "divui", major, per_phase, lane_width)
+        phase = _simd_binary_const(state, "remui", phase, max_phase, lane_width)
+        minor_group = _simd_binary_const(state, "divui", minor, vec, lane_width)
+        minor_inner = _simd_binary_const(state, "remui", minor, vec, lane_width)
+        swizzled_minor = state.builder.binary(
+            state.dsl.BinaryKind.XOrI,
+            minor_group,
+            phase,
+        )
+        if vec != 1:
+            swizzled_minor = _simd_binary_const(
+                state,
+                "muli",
+                swizzled_minor,
+                vec,
+                lane_width,
+            )
+        swizzled_minor = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            swizzled_minor,
+            minor_inner,
+        )
+        major_offset = major
+        if minor_extent != 1:
+            major_offset = _simd_binary_const(
+                state,
+                "muli",
+                major_offset,
+                minor_extent,
+                lane_width,
+            )
+        return state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            major_offset,
+            swizzled_minor,
+        )
+    fail(
+        "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        f"unsupported scalarized shared destination layout {layout}",
+    )
 
 
 def _emit_buffer_load_to_local_packet_dma(

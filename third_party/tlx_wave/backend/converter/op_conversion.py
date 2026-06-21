@@ -1235,15 +1235,7 @@ def _convert_buffer_load_to_local(
         attrs={
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(offset_type.component_count),
-            "destination_component_offsets": tuple(
-                destination_plan["component_offsets"]
-            ),
-            "destination_lane_stride_elements": int(
-                destination_plan["lane_stride_elements"]
-            ),
-            "destination_wave_stride_elements": int(
-                destination_plan["wave_stride_elements"]
-            ),
+            **_local_component_store_plan_attrs(destination_plan),
             "element_byte_width": int(memdesc.element_byte_width),
             "element_type": memdesc.element_type,
             "has_mask": has_mask,
@@ -1260,6 +1252,46 @@ def _convert_buffer_load_to_local(
         fact_target_ids=(base_target_id,),
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
+    )
+
+
+def _local_component_store_plan_attrs(destination_plan):
+    offset_mode = destination_plan["offset_mode"]
+    if offset_mode == "affine":
+        return {
+            "destination_offset_mode": "affine",
+            "destination_component_offsets": tuple(
+                destination_plan["component_offsets"]
+            ),
+            "destination_lane_stride_elements": int(
+                destination_plan["lane_stride_elements"]
+            ),
+            "destination_wave_stride_elements": int(
+                destination_plan["wave_stride_elements"]
+            ),
+        }
+    if offset_mode == "layout_coordinates":
+        return {
+            "destination_offset_mode": "layout_coordinates",
+            "destination_coordinate_shape": tuple(
+                int(dim) for dim in destination_plan["coordinate_shape"]
+            ),
+            "destination_component_coordinate_bases": tuple(
+                tuple(int(value) for value in bases)
+                for bases in destination_plan["component_coordinate_bases"]
+            ),
+            "destination_workitem_coordinate_coefficients": tuple(
+                tuple(int(value) for value in coefficients)
+                for coefficients in destination_plan[
+                    "workitem_coordinate_coefficients"
+                ]
+            ),
+            **destination_plan["shared_layout_attrs"],
+        }
+    fail(
+        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        f"unsupported scalarized destination offset mode {offset_mode}",
     )
 
 
@@ -2399,78 +2431,159 @@ def _local_component_store_plan(
             source_op_index=op.index,
             source_value_id=offset_value_id,
         )
+    component_wave_offsets = []
+    for component in range(int(component_count)):
+        component_offsets = []
+        for wave in range(wave_count):
+            component_offsets.append(
+                tuple(
+                    _local_physical_offset_for_distributed_slot(
+                        memdesc_layout,
+                        shape,
+                        memdesc.element_byte_width,
+                        linear,
+                        component,
+                        lane,
+                        wave,
+                        op,
+                        offset_value_id,
+                    )
+                    for lane in range(int(lane_width))
+                )
+            )
+        component_wave_offsets.append(tuple(component_offsets))
+    affine_plan = _try_affine_local_component_store_plan(
+        component_wave_offsets,
+        int(lane_width),
+        wave_count,
+    )
+    if affine_plan is not None:
+        return affine_plan
+    return _coordinate_local_component_store_plan(
+        offset_layout,
+        memdesc_layout,
+        shape,
+        int(component_count),
+        int(lane_width),
+        wave_count,
+        op,
+        offset_value_id,
+    )
+
+
+def _try_affine_local_component_store_plan(
+    component_wave_offsets,
+    lane_width,
+    wave_count,
+):
     component_offsets = []
     lane_stride = None
     wave_stride = None
-    for component in range(int(component_count)):
+    for wave_offsets_by_lane in component_wave_offsets:
         wave_offsets = []
-        for wave in range(wave_count):
-            lane_offsets = tuple(
-                _local_physical_offset_for_distributed_slot(
-                    memdesc_layout,
-                    shape,
-                    memdesc.element_byte_width,
-                    linear,
-                    component,
-                    lane,
-                    wave,
-                    op,
-                    offset_value_id,
-                )
-                for lane in range(int(lane_width))
-            )
+        for lane_offsets in wave_offsets_by_lane:
             base = int(lane_offsets[0])
-            current_lane_stride = 0 if int(lane_width) == 1 else int(lane_offsets[1]) - base
-            for lane, offset in enumerate(lane_offsets):
-                if int(offset) != base + lane * current_lane_stride:
-                    fail(
-                        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                        STAGE,
-                        "scalarized amdg.buffer_load_to_local destination "
-                        "lanes must form an affine physical stride",
-                        source_op_index=op.index,
-                        source_value_id=offset_value_id,
-                    )
+            current_lane_stride = (
+                0 if int(lane_width) == 1 else int(lane_offsets[1]) - base
+            )
+            if any(
+                int(offset) != base + lane * current_lane_stride
+                for lane, offset in enumerate(lane_offsets)
+            ):
+                return None
             if lane_stride is None:
                 lane_stride = current_lane_stride
             elif lane_stride != current_lane_stride:
-                fail(
-                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                    STAGE,
-                    "scalarized amdg.buffer_load_to_local destination lane "
-                    "stride must be identical for all components and waves",
-                    source_op_index=op.index,
-                    source_value_id=offset_value_id,
-                )
+                return None
             wave_offsets.append(base)
         component_offsets.append(wave_offsets[0])
-        current_wave_stride = 0 if wave_count == 1 else int(wave_offsets[1]) - int(wave_offsets[0])
-        for wave, offset in enumerate(wave_offsets):
-            if int(offset) != int(wave_offsets[0]) + wave * current_wave_stride:
-                fail(
-                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                    STAGE,
-                    "scalarized amdg.buffer_load_to_local destination waves "
-                    "must form an affine physical stride",
-                    source_op_index=op.index,
-                    source_value_id=offset_value_id,
-                )
+        current_wave_stride = (
+            0 if wave_count == 1 else int(wave_offsets[1]) - int(wave_offsets[0])
+        )
+        if any(
+            int(offset) != int(wave_offsets[0]) + wave * current_wave_stride
+            for wave, offset in enumerate(wave_offsets)
+        ):
+            return None
         if wave_stride is None:
             wave_stride = current_wave_stride
         elif wave_stride != current_wave_stride:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "scalarized amdg.buffer_load_to_local destination wave "
-                "stride must be identical for all components",
-                source_op_index=op.index,
-                source_value_id=offset_value_id,
-            )
+            return None
     return {
+        "offset_mode": "affine",
         "component_offsets": tuple(int(offset) for offset in component_offsets),
         "lane_stride_elements": int(lane_stride if lane_stride is not None else 1),
         "wave_stride_elements": int(wave_stride or 0),
     }
+
+
+def _coordinate_local_component_store_plan(
+    offset_layout,
+    memdesc_layout,
+    shape,
+    component_count,
+    lane_width,
+    wave_count,
+    op,
+    offset_value_id,
+):
+    plan = coordinates.layout_coordinate_plan(
+        offset_layout,
+        int(component_count),
+        int(lane_width),
+        int(wave_count),
+        op,
+        offset_value_id,
+    )
+    return {
+        "offset_mode": "layout_coordinates",
+        "coordinate_shape": tuple(int(dim) for dim in plan.shape),
+        "component_coordinate_bases": tuple(
+            tuple(int(value) for value in bases) for bases in plan.component_bases
+        ),
+        "workitem_coordinate_coefficients": tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in plan.workitem_coefficients
+        ),
+        "shared_layout_attrs": _scalarized_shared_layout_attrs(
+            memdesc_layout,
+            shape,
+            op,
+        ),
+    }
+
+
+def _scalarized_shared_layout_attrs(layout, shape, op):
+    if layout is None or layout.kind in {"none", "linear"}:
+        return {"destination_shared_layout": "dense"}
+    if layout.kind == "swizzled_shared":
+        order, vec, per_phase, max_phase = _swizzled_shared_parameters(
+            layout,
+            shape,
+            op,
+        )
+        return {
+            "destination_shared_layout": "swizzled",
+            "destination_swizzled_order": tuple(int(dim) for dim in order),
+            "destination_swizzled_vec": int(vec),
+            "destination_swizzled_per_phase": int(per_phase),
+            "destination_swizzled_max_phase": int(max_phase),
+        }
+    if layout.kind == "padded_shared":
+        intervals, paddings = _padded_shared_parameters(layout, op)
+        return {
+            "destination_shared_layout": "padded",
+            "destination_padded_intervals": tuple(int(value) for value in intervals),
+            "destination_padded_paddings": tuple(int(value) for value in paddings),
+        }
+    fail(
+        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        f"amdg.buffer_load_to_local destination layout {layout.kind} "
+        "is not converted yet",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
 
 
 def _local_physical_offset_for_distributed_slot(
@@ -3511,58 +3624,125 @@ def _static_linear_offset(shape, coords):
 
 
 def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
-    if len(shape) != 2 or tuple(layout.properties.get("order", ())) != (1, 0):
-        fail(
-            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "only rank-2 order=[1,0] swizzled shared layout is supported",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    cols = int(shape[1])
-    vec = int(layout.properties["vec"])
-    if cols % vec:
-        fail(
-            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            f"swizzled shared columns {cols} are not divisible by vec={vec}",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    row = int(coords[0])
-    col = int(coords[1])
-    phase = (row // int(layout.properties["per_phase"])) % int(
-        layout.properties["max_phase"]
+    order, vec, per_phase, max_phase = _swizzled_shared_parameters(
+        layout,
+        shape,
+        op,
     )
-    swizzled_col = ((col // vec) ^ phase) * vec + (col % vec)
-    if swizzled_col >= cols:
+    minor_dim = int(order[0])
+    major_dim = int(order[1])
+    minor_extent = int(shape[minor_dim])
+    major = int(coords[major_dim])
+    minor = int(coords[minor_dim])
+    phase = (major // per_phase) % max_phase
+    swizzled_minor = ((minor // vec) ^ phase) * vec + (minor % vec)
+    if swizzled_minor >= minor_extent:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
-            f"swizzled column {swizzled_col} exceeds extent {cols}",
+            f"swizzled shared minor coordinate {swizzled_minor} exceeds "
+            f"extent {minor_extent}; {_swizzled_shared_description(layout)}",
             source_op_index=op.index,
             source_value_id=layout.value_id,
         )
-    return (row * cols + swizzled_col) * int(element_byte_width)
+    return (major * minor_extent + swizzled_minor) * int(element_byte_width)
 
 
 def _static_padded_byte_offset(layout, shape, coords, element_byte_width, op):
+    intervals, paddings = _padded_shared_parameters(layout, op)
+    linear = _static_linear_offset(shape, coords)
+    encoded = linear
+    for interval, padding in zip(intervals, paddings):
+        encoded += (linear // int(interval)) * int(padding)
+    return encoded * int(element_byte_width)
+
+
+def _swizzled_shared_parameters(layout, shape, op):
+    order = tuple(layout.properties.get("order", ()))
+    if len(shape) != 2 or order not in {(1, 0), (0, 1)}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "static swizzled shared LDS offsets support only rank-2 "
+            f"order=[1,0] or order=[0,1]; got {_swizzled_shared_description(layout)}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    vec = int(layout.properties["vec"])
+    per_phase = int(layout.properties["per_phase"])
+    max_phase = int(layout.properties["max_phase"])
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "swizzled shared layout requires positive "
+            f"vec/per_phase/max_phase; got {_swizzled_shared_description(layout)}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    minor_extent = int(shape[int(order[0])])
+    if minor_extent % vec:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"swizzled shared minor extent {minor_extent} is not divisible "
+            f"by vec={vec}; {_swizzled_shared_description(layout)}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    return order, vec, per_phase, max_phase
+
+
+def _padded_shared_parameters(layout, op):
     if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0,), ()}:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
-            f"unsupported padded shared order {layout.properties.get('order')}",
+            f"unsupported padded shared order; {_padded_shared_description(layout)}",
             source_op_index=op.index,
             source_value_id=layout.value_id,
         )
-    linear = _static_linear_offset(shape, coords)
-    encoded = linear
-    for interval, padding in zip(
-        layout.properties.get("intervals", ()),
-        layout.properties.get("paddings", ()),
-    ):
-        encoded += (linear // int(interval)) * int(padding)
-    return encoded * int(element_byte_width)
+    intervals = tuple(int(value) for value in layout.properties.get("intervals", ()))
+    paddings = tuple(int(value) for value in layout.properties.get("paddings", ()))
+    if len(intervals) != len(paddings):
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "padded shared layout requires matching interval/padding "
+            f"counts; {_padded_shared_description(layout)}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    if any(interval <= 0 for interval in intervals):
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "padded shared intervals must be positive; "
+            f"{_padded_shared_description(layout)}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    return intervals, paddings
+
+
+def _swizzled_shared_description(layout):
+    props = layout.properties
+    return (
+        f"order={tuple(props.get('order', ()))}, "
+        f"vec={int(props.get('vec', 0))}, "
+        f"per_phase={int(props.get('per_phase', 0))}, "
+        f"max_phase={int(props.get('max_phase', 0))}"
+    )
+
+
+def _padded_shared_description(layout):
+    props = layout.properties
+    paddings = tuple(int(value) for value in props.get("paddings", ()))
+    return (
+        f"order={tuple(props.get('order', ()))}, "
+        f"intervals={tuple(int(value) for value in props.get('intervals', ()))}, "
+        f"paddings={paddings}"
+    )
 
 
 def _static_delinearize_row_major(linear, shape, op):
