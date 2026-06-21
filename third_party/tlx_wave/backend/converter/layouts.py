@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from triton._C.libtriton.linear_layout import LinearLayout
+
 from .diagnostics import fail
 
 
@@ -25,7 +27,13 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         return None
     attr = source_type.encoding_attr
     kind, properties = _layout_kind_and_properties(attr, value_id)
-    component_count = _layout_component_count(source_type, kind, properties, lane_width)
+    component_count = _layout_component_count(
+        source_type,
+        kind,
+        properties,
+        lane_width,
+        value_id,
+    )
     return LayoutMap(
         layout_map_id,
         value_id,
@@ -102,14 +110,19 @@ def _layout_kind_and_properties(attr, value_id):
     )
 
 
-def _layout_component_count(source_type, kind, properties, lane_width):
-    if kind == "blocked" and len(source_type.shape) == 1:
-        size_per_thread = properties.get("size_per_thread", ())
-        if len(size_per_thread) == 1 and int(size_per_thread[0]) > 1:
-            element_count = _product(source_type.shape)
-            elements_per_thread = int(size_per_thread[0])
-            if element_count <= int(lane_width) * elements_per_thread:
-                return elements_per_thread
+def _layout_component_count(source_type, kind, properties, lane_width, value_id):
+    if kind in {"blocked", "linear"}:
+        linear = distributed_linear_layout_from_parts(
+            kind,
+            source_type.shape,
+            properties,
+            lane_width,
+            source_value_id=value_id,
+        )
+        if linear.is_injective():
+            return linear_layout_in_dim_size(linear, "register")
+        element_count = _product(source_type.shape)
+        return max(1, _ceil_div(element_count, int(lane_width)))
     if kind == "dot_operand":
         parent_properties = properties.get("parent_properties", {})
         instr_shape = parent_properties.get("instr_shape", ())
@@ -146,6 +159,398 @@ def _layout_component_count(source_type, kind, properties, lane_width):
         return 1
     element_count = _product(source_type.shape)
     return max(1, _ceil_div(element_count, int(lane_width)))
+
+
+def distributed_register_count(
+    kind,
+    shape,
+    properties,
+    lane_width,
+    *,
+    stage=STAGE,
+    source_op_index=None,
+    source_value_id=None,
+):
+    linear = distributed_linear_layout_from_parts(
+        kind,
+        shape,
+        properties,
+        lane_width,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+    return linear_layout_in_dim_size(linear, "register")
+
+
+def distributed_linear_layout(
+    layout,
+    *,
+    stage=STAGE,
+    source_op_index=None,
+):
+    return distributed_linear_layout_from_parts(
+        layout.kind,
+        layout.shape,
+        layout.properties,
+        layout.lane_width,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=layout.value_id,
+    )
+
+
+def distributed_linear_layout_from_parts(
+    kind,
+    shape,
+    properties,
+    lane_width,
+    *,
+    stage=STAGE,
+    source_op_index=None,
+    source_value_id=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    if kind == "blocked":
+        return _blocked_linear_layout(
+            shape,
+            properties,
+            stage=stage,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if kind == "linear":
+        return _linear_encoding_layout(
+            shape,
+            properties,
+            stage=stage,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if kind == "amd_mfma":
+        return _mfma_linear_layout(
+            shape,
+            properties,
+            lane_width,
+            stage=stage,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    _layout_fail(
+        "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+        stage,
+        f"layout {kind} does not have a distributed register map",
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def linear_layout_in_dim_size(linear, dim):
+    for in_dim, bases in linear.bases:
+        if in_dim == dim:
+            return 1 << len(bases)
+    return 1
+
+
+def linear_layout_out_dim_size(linear, dim, *, stage=STAGE):
+    for out_dim, size in linear.out_dims:
+        if out_dim == dim:
+            return int(size)
+    _layout_fail(
+        "TLXW_TYPE_MALFORMED_LAYOUT",
+        stage,
+        f"linear layout is missing output dimension {dim}",
+    )
+
+
+def linear_layout_coords(linear, register, lane, *, warp):
+    available = {
+        "block": 0,
+        "register": int(register),
+        "lane": int(lane),
+        "warp": int(warp),
+    }
+    coords = linear.apply(
+        {name: available[name] for name in linear.get_in_dim_names()}
+    )
+    return tuple(int(coords[f"dim{dim}"]) for dim in range(len(coords)))
+
+
+def mfma_registers_per_component(
+    layout,
+    *,
+    stage=STAGE,
+    source_op_index=None,
+):
+    instr_shape = tuple(int(value) for value in layout.properties.get("instr_shape", ()))
+    if instr_shape == (16, 16, 32):
+        return 4
+    if instr_shape == (32, 32, 16):
+        return 16
+    _layout_fail(
+        "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+        stage,
+        f"unsupported MFMA register count for instrShape={instr_shape}",
+        source_op_index=source_op_index,
+        source_value_id=layout.value_id,
+    )
+
+
+def _blocked_linear_layout(
+    shape,
+    properties,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    rank = len(shape)
+    size_per_thread = tuple(int(value) for value in properties["size_per_thread"])
+    threads_per_warp = tuple(int(value) for value in properties["threads_per_warp"])
+    warps_per_cta = tuple(int(value) for value in properties["warps_per_cta"])
+    order = tuple(int(value) for value in properties["order"])
+    if not (
+        len(size_per_thread)
+        == len(threads_per_warp)
+        == len(warps_per_cta)
+        == len(order)
+        == rank
+    ):
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "blocked layout requires rank-matched metadata",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    linear = (
+        _identity_standard_nd("register", size_per_thread, order)
+        * _identity_standard_nd("lane", threads_per_warp, order)
+        * _identity_standard_nd("warp", warps_per_cta, order)
+    )
+    return _ensure_layout_matches_shape(
+        linear,
+        shape,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def _linear_encoding_layout(
+    shape,
+    properties,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    rank = len(shape)
+    out_dims = [f"dim{dim}" for dim in range(rank)]
+    bases = [
+        ("register", [list(basis) for basis in properties.get("register_bases", ())]),
+        ("lane", [list(basis) for basis in properties.get("lane_bases", ())]),
+        ("warp", [list(basis) for basis in properties.get("warp_bases", ())]),
+        ("block", [list(basis) for basis in properties.get("block_bases", ())]),
+    ]
+    for in_dim, in_bases in bases:
+        for basis in in_bases:
+            if len(basis) != rank:
+                _layout_fail(
+                    "TLXW_TYPE_MALFORMED_LAYOUT",
+                    stage,
+                    f"linear layout {in_dim} basis rank does not match tensor rank",
+                    source_op_index=source_op_index,
+                    source_value_id=source_value_id,
+                )
+    return LinearLayout.from_bases(bases, out_dims, list(shape), False)
+
+
+def _mfma_linear_layout(
+    shape,
+    properties,
+    lane_width,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    if len(shape) != 2:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "MFMA distributed layout currently requires rank-2 tensors",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    instr_shape = tuple(int(value) for value in properties.get("instr_shape", ()))
+    if instr_shape not in {(16, 16, 32), (32, 32, 16)}:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            f"unsupported MFMA instruction shape {instr_shape}",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if not bool(properties.get("is_transposed", False)):
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "non-transposed MFMA distributed layout is not implemented yet",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    element_bit_width = int(properties.get("element_bit_width", 32))
+    height = 1 if element_bit_width == 64 else 4
+    m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
+    warp_size = int(lane_width)
+    tiles = (m_dim * n_dim) // (warp_size * height)
+    if tiles <= 0:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "MFMA distributed layout requires at least one register tile",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    dim_m = "dim0"
+    dim_n = "dim1"
+    linear = LinearLayout.identity_1d(height, "register", dim_n)
+    linear *= (
+        LinearLayout.identity_1d(m_dim, "lane", dim_m)
+        * LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n)
+    )
+    linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
+    tiles_per_warp = tuple(int(value) for value in properties.get("tiles_per_warp", ()))
+    if len(tiles_per_warp) < 2:
+        tiles_per_warp = (1, 1)
+    warps_per_cta = tuple(int(value) for value in properties.get("warps_per_cta", ()))
+    if len(warps_per_cta) != 2:
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "MFMA distributed layout requires rank-2 warpsPerCTA metadata",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    tiles_per_warp_m = max(1, int(tiles_per_warp[0]))
+    tiles_per_warp_n = max(1, int(tiles_per_warp[1]))
+    warps_per_cta_m = max(1, int(warps_per_cta[0]))
+    warps_per_cta_n = max(1, int(warps_per_cta[1]))
+    linear *= LinearLayout.identity_1d(tiles_per_warp_n, "register", dim_n)
+    linear *= LinearLayout.identity_1d(warps_per_cta_n, "warp", dim_n)
+    n_remainder = shape[1] // (n_dim * warps_per_cta_n * tiles_per_warp_n)
+    linear *= LinearLayout.identity_1d(max(1, n_remainder), "register", dim_n)
+    linear *= LinearLayout.identity_1d(tiles_per_warp_m, "register", dim_m)
+    linear *= LinearLayout.identity_1d(warps_per_cta_m, "warp", dim_m)
+    return _ensure_layout_matches_shape(
+        linear,
+        shape,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def _identity_standard_nd(in_dim, shape, order):
+    linear = LinearLayout()
+    for dim in order:
+        linear *= LinearLayout.identity_1d(int(shape[dim]), in_dim, f"dim{dim}")
+    return linear
+
+
+def _ensure_layout_matches_shape(
+    linear,
+    shape,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    shape_by_dim = {f"dim{dim}": int(size) for dim, size in enumerate(shape)}
+    linear = _ensure_layout_not_smaller_than(
+        linear,
+        shape_by_dim,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+    return _ensure_layout_not_larger_than(linear, shape_by_dim)
+
+
+def _ensure_layout_not_smaller_than(
+    linear,
+    shape_by_dim,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    for dim, desired_size in shape_by_dim.items():
+        actual_size = linear_layout_out_dim_size(linear, dim, stage=stage)
+        if desired_size > actual_size:
+            if desired_size % actual_size:
+                _layout_fail(
+                    "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+                    stage,
+                    "layout remap requires non-integral shape extension",
+                    source_op_index=source_op_index,
+                    source_value_id=source_value_id,
+                )
+            linear *= LinearLayout.identity_1d(
+                desired_size // actual_size,
+                "register",
+                dim,
+            )
+    return linear
+
+
+def _ensure_layout_not_larger_than(linear, shape_by_dim):
+    out_dims = []
+    out_sizes = []
+    for dim, size in linear.out_dims:
+        resized = min(int(size), int(shape_by_dim[dim]))
+        out_dims.append(dim)
+        out_sizes.append(resized)
+    bases = []
+    for in_dim, in_bases in linear.bases:
+        rewritten = []
+        for basis in in_bases:
+            basis = [int(value) for value in basis]
+            was_zero = all(value == 0 for value in basis)
+            for index, value in enumerate(tuple(basis)):
+                if value >= out_sizes[index]:
+                    basis[index] = 0
+            is_zero = all(value == 0 for value in basis)
+            if in_dim == "register":
+                if was_zero or not is_zero:
+                    rewritten.append(basis)
+            else:
+                rewritten.append(basis)
+        bases.append((in_dim, rewritten))
+    return LinearLayout.from_bases(
+        bases,
+        out_dims,
+        out_sizes,
+        False,
+    )
+
+
+def _layout_fail(
+    code,
+    stage,
+    message,
+    *,
+    source_op_index=None,
+    source_value_id=None,
+):
+    fail(
+        code,
+        stage,
+        message,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
 
 
 def _attr_bool(attr, method):

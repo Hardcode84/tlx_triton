@@ -1,8 +1,7 @@
 """Structural layout-remap helpers for TLX Wave conversion."""
 
-from triton._C.libtriton.linear_layout import LinearLayout
-
 from .diagnostics import fail
+from . import layouts
 
 
 STAGE = "op_conversion"
@@ -20,11 +19,18 @@ def same_lane_register_remap(operand, result, operand_layout, result_layout, op)
 
     source_layout = _distributed_linear_layout(operand_layout, op)
     result_layout_ll = _distributed_linear_layout(result_layout, op)
-    source_register_count = _linear_layout_in_dim_size(source_layout, "register")
-    result_register_count = _linear_layout_in_dim_size(result_layout_ll, "register")
-    source_registers_per_component = _mfma_registers_per_component(
+    source_register_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    result_register_count = layouts.linear_layout_in_dim_size(
+        result_layout_ll,
+        "register",
+    )
+    source_registers_per_component = layouts.mfma_registers_per_component(
         operand_layout,
-        op,
+        stage=STAGE,
+        source_op_index=op.index,
     )
     source_scalar_count = (
         int(operand.type.component_count) * source_registers_per_component
@@ -51,63 +57,33 @@ def same_lane_register_remap(operand, result, operand_layout, result_layout, op)
         )
 
     lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
-    source_by_lane_coord = {}
-    for source_register in range(source_register_count):
-        for lane in range(lane_width):
-            coords = _linear_layout_coords(
-                source_layout,
-                source_register,
-                lane,
-                warp=0,
-            )
-            key = (lane, coords)
-            if key in source_by_lane_coord:
-                fail(
-                    "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-                    STAGE,
-                    "MFMA convert_layout source layout is not injective "
-                    "within a wave",
-                    source_op_index=op.index,
-                    source_value_id=operand.value_id,
-                )
-            source_by_lane_coord[key] = source_register
+    cta_warp_count = max(
+        _layout_warp_count(operand_layout),
+        _layout_warp_count(result_layout),
+    )
+    source_by_coord = _source_slots_by_coord(
+        source_layout,
+        source_register_count,
+        lane_width,
+        cta_warp_count,
+        op,
+        operand.value_id,
+    )
 
     source_indices = []
     source_element_indices = []
     for result_register in range(result_register_count):
-        lane_sources = []
-        for lane in range(lane_width):
-            coords = _linear_layout_coords(
-                result_layout_ll,
-                result_register,
-                lane,
-                warp=0,
-            )
-            source_register = source_by_lane_coord.get((lane, coords))
-            if source_register is None:
-                fail(
-                    "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-                    STAGE,
-                    "MFMA to blocked convert_layout requires cross-lane or "
-                    "cross-warp movement; the TLX Wave converter only lowers "
-                    "same-lane register remaps",
-                    source_op_index=op.index,
-                    source_value_id=result.value_id,
-                )
-            lane_sources.append(source_register)
-        first_source = lane_sources[0]
-        if any(source != first_source for source in lane_sources):
-            fail(
-                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-                STAGE,
-                "MFMA to blocked convert_layout maps one result component "
-                "to different source registers in different lanes; Wave "
-                "cross-lane remap support is required",
-                source_op_index=op.index,
-                source_value_id=result.value_id,
-            )
-        source_indices.append(first_source // source_registers_per_component)
-        source_element_indices.append(first_source % source_registers_per_component)
+        slot = _same_lane_source_register_for_result_slot(
+            result_layout_ll,
+            result_register,
+            source_by_coord,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+        )
+        source_indices.append(slot // source_registers_per_component)
+        source_element_indices.append(slot % source_registers_per_component)
 
     return {
         "source_component_count": int(operand.type.component_count),
@@ -117,229 +93,138 @@ def same_lane_register_remap(operand, result, operand_layout, result_layout, op)
     }
 
 
-def _distributed_linear_layout(layout, op):
-    if layout.kind == "blocked":
-        return _blocked_linear_layout(layout, op)
-    if layout.kind == "amd_mfma":
-        return _mfma_linear_layout(layout, op)
-    fail(
-        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-        STAGE,
-        f"layout {layout.kind} is not converted through linear-layout remap",
-        source_op_index=op.index,
-        source_value_id=layout.value_id,
-    )
+def _source_slots_by_coord(
+    source_layout,
+    source_register_count,
+    lane_width,
+    cta_warp_count,
+    op,
+    source_value_id,
+):
+    source_by_coord = {}
+    for source_warp in range(int(cta_warp_count)):
+        for source_register in range(int(source_register_count)):
+            for lane in range(int(lane_width)):
+                coords = layouts.linear_layout_coords(
+                    source_layout,
+                    source_register,
+                    lane,
+                    warp=source_warp,
+                )
+                if coords in source_by_coord:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                        STAGE,
+                        "MFMA convert_layout source layout is not injective "
+                        "within the CTA distributed map",
+                        source_op_index=op.index,
+                        source_value_id=source_value_id,
+                    )
+                source_by_coord[coords] = (source_warp, lane, source_register)
+    return source_by_coord
 
 
-def _blocked_linear_layout(layout, op):
-    shape = tuple(int(dim) for dim in layout.shape)
-    rank = len(shape)
-    size_per_thread = tuple(int(value) for value in layout.properties["size_per_thread"])
-    threads_per_warp = tuple(
-        int(value) for value in layout.properties["threads_per_warp"]
-    )
-    warps_per_cta = tuple(int(value) for value in layout.properties["warps_per_cta"])
-    order = tuple(int(value) for value in layout.properties["order"])
-    if not (
-        len(size_per_thread)
-        == len(threads_per_warp)
-        == len(warps_per_cta)
-        == len(order)
-        == rank
-    ):
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "blocked convert_layout requires rank-matched layout metadata",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    linear = (
-        _identity_standard_nd("register", size_per_thread, order)
-        * _identity_standard_nd("lane", threads_per_warp, order)
-        * _identity_standard_nd("warp", warps_per_cta, order)
-    )
-    return _ensure_layout_matches_shape(linear, shape)
-
-
-def _mfma_linear_layout(layout, op):
-    shape = tuple(int(dim) for dim in layout.shape)
-    if len(shape) != 2:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "MFMA convert_layout remap currently requires rank-2 tensors",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    instr_shape = tuple(int(value) for value in layout.properties.get("instr_shape", ()))
-    if instr_shape not in {(16, 16, 32), (32, 32, 16)}:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            f"unsupported MFMA convert_layout instruction shape {instr_shape}",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    if not bool(layout.properties.get("is_transposed", False)):
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "non-transposed MFMA convert_layout remap is not implemented yet",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    element_bit_width = int(layout.properties.get("element_bit_width", 32))
-    height = 1 if element_bit_width == 64 else 4
-    m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
-    warp_size = int(layout.lane_width)
-    tiles = (m_dim * n_dim) // (warp_size * height)
-    if tiles <= 0:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "MFMA convert_layout requires at least one register tile",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    dim_m = "dim0"
-    dim_n = "dim1"
-    linear = LinearLayout.identity_1d(height, "register", dim_n)
-    linear *= (
-        LinearLayout.identity_1d(m_dim, "lane", dim_m)
-        * LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n)
-    )
-    linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
-    tiles_per_warp = tuple(
-        int(value) for value in layout.properties.get("tiles_per_warp", ())
-    )
-    if len(tiles_per_warp) < 2:
-        tiles_per_warp = (1, 1)
-    warps_per_cta = tuple(
-        int(value) for value in layout.properties.get("warps_per_cta", ())
-    )
-    if len(warps_per_cta) != 2:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "MFMA convert_layout requires rank-2 warpsPerCTA metadata",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-    tiles_per_warp_m = max(1, int(tiles_per_warp[0]))
-    tiles_per_warp_n = max(1, int(tiles_per_warp[1]))
-    warps_per_cta_m = max(1, int(warps_per_cta[0]))
-    warps_per_cta_n = max(1, int(warps_per_cta[1]))
-    linear *= LinearLayout.identity_1d(tiles_per_warp_n, "register", dim_n)
-    linear *= LinearLayout.identity_1d(warps_per_cta_n, "warp", dim_n)
-    n_remainder = shape[1] // (n_dim * warps_per_cta_n * tiles_per_warp_n)
-    linear *= LinearLayout.identity_1d(max(1, n_remainder), "register", dim_n)
-    linear *= LinearLayout.identity_1d(tiles_per_warp_m, "register", dim_m)
-    linear *= LinearLayout.identity_1d(warps_per_cta_m, "warp", dim_m)
-    return _ensure_layout_matches_shape(linear, shape)
-
-
-def _identity_standard_nd(in_dim, shape, order):
-    linear = LinearLayout()
-    for dim in order:
-        linear *= LinearLayout.identity_1d(int(shape[dim]), in_dim, f"dim{dim}")
-    return linear
-
-
-def _ensure_layout_matches_shape(linear, shape):
-    shape_by_dim = {f"dim{dim}": int(size) for dim, size in enumerate(shape)}
-    linear = _ensure_layout_not_smaller_than(linear, shape_by_dim)
-    return _ensure_layout_not_larger_than(linear, shape_by_dim)
-
-
-def _ensure_layout_not_smaller_than(linear, shape_by_dim):
-    for dim, desired_size in shape_by_dim.items():
-        actual_size = _linear_layout_out_dim_size(linear, dim)
-        if desired_size > actual_size:
-            if desired_size % actual_size:
+def _same_lane_source_register_for_result_slot(
+    result_layout,
+    result_register,
+    source_by_coord,
+    lane_width,
+    cta_warp_count,
+    op,
+    result_value_id,
+):
+    sources = []
+    needs_cross_lane = False
+    needs_cross_warp = False
+    for result_warp in range(int(cta_warp_count)):
+        for lane in range(int(lane_width)):
+            coords = layouts.linear_layout_coords(
+                result_layout,
+                result_register,
+                lane,
+                warp=result_warp,
+            )
+            source = source_by_coord.get(coords)
+            if source is None:
                 fail(
                     "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                     STAGE,
-                    "layout remap requires non-integral shape extension",
+                    "MFMA to blocked convert_layout result coordinate is not "
+                    "covered by the source distributed layout",
+                    source_op_index=op.index,
+                    source_value_id=result_value_id,
                 )
-            linear *= LinearLayout.identity_1d(
-                desired_size // actual_size,
-                "register",
-                dim,
-            )
-    return linear
+            source_warp, source_lane, source_register = source
+            if source_warp != result_warp:
+                needs_cross_warp = True
+            elif source_lane != lane:
+                needs_cross_lane = True
+            sources.append(source_register)
 
-
-def _ensure_layout_not_larger_than(linear, shape_by_dim):
-    out_dims = []
-    out_sizes = []
-    for dim, size in linear.out_dims:
-        resized = min(int(size), int(shape_by_dim[dim]))
-        out_dims.append(dim)
-        out_sizes.append(resized)
-    bases = []
-    for in_dim, in_bases in linear.bases:
-        rewritten = []
-        for basis in in_bases:
-            basis = [int(value) for value in basis]
-            was_zero = all(value == 0 for value in basis)
-            for index, value in enumerate(tuple(basis)):
-                if value >= out_sizes[index]:
-                    basis[index] = 0
-            is_zero = all(value == 0 for value in basis)
-            if in_dim == "register":
-                if was_zero or not is_zero:
-                    rewritten.append(basis)
-            else:
-                rewritten.append(basis)
-        bases.append((in_dim, rewritten))
-    return LinearLayout.from_bases(
-        bases,
-        out_dims,
-        out_sizes,
-        False,
-    )
-
-
-def _linear_layout_in_dim_size(linear, dim):
-    for in_dim, bases in linear.bases:
-        if in_dim == dim:
-            return 1 << len(bases)
-    return 1
-
-
-def _linear_layout_out_dim_size(linear, dim):
-    for out_dim, size in linear.out_dims:
-        if out_dim == dim:
-            return int(size)
+    first_source = sources[0]
+    if all(source == first_source for source in sources):
+        if needs_cross_warp:
+            _reject_cross_warp(op, result_value_id)
+        if needs_cross_lane:
+            _reject_cross_lane(op, result_value_id)
+        return first_source
+    if needs_cross_warp:
+        _reject_cross_warp(op, result_value_id)
+    if needs_cross_lane:
+        _reject_cross_lane(op, result_value_id)
     fail(
         "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
         STAGE,
-        f"linear layout is missing output dimension {dim}",
-    )
-
-
-def _linear_layout_coords(linear, register, lane, *, warp):
-    coords = linear.apply(
-        {
-            "register": int(register),
-            "lane": int(lane),
-            "warp": int(warp),
-        }
-    )
-    return tuple(int(coords[f"dim{dim}"]) for dim in range(len(coords)))
-
-
-def _mfma_registers_per_component(layout, op):
-    instr_shape = tuple(int(value) for value in layout.properties.get("instr_shape", ()))
-    if instr_shape == (16, 16, 32):
-        return 4
-    if instr_shape == (32, 32, 16):
-        return 16
-    fail(
-        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-        STAGE,
-        f"unsupported MFMA register count for instrShape={instr_shape}",
+        "MFMA to blocked convert_layout maps one result component to "
+        "different source registers across lanes or waves",
         source_op_index=op.index,
-        source_value_id=layout.value_id,
+        source_value_id=result_value_id,
     )
+
+
+def _reject_cross_lane(op, source_value_id):
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        "MFMA to blocked convert_layout requires cross-lane movement; "
+        "Wave cross-lane remap support is required",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+
+
+def _reject_cross_warp(op, source_value_id):
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        "MFMA to blocked convert_layout requires cross-warp movement; "
+        "Wave does not expose a CTA-local layout remap operation yet",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+
+
+def _distributed_linear_layout(layout, op):
+    if layout.kind not in {"blocked", "linear", "amd_mfma"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"layout {layout.kind} is not converted through linear-layout remap",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    return layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+
+
+def _layout_warp_count(layout):
+    warps_per_cta = tuple(
+        int(value) for value in layout.properties.get("warps_per_cta", ())
+    )
+    result = 1
+    for value in warps_per_cta:
+        result *= max(1, int(value))
+    return result

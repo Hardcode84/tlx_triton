@@ -344,21 +344,62 @@ def _emit_make_range(state, op):
     target_type = state.target_program.values[result_id].type
     width = int(target_type.lane_width or 64)
     element_type = _scalar_type(state.dsl, target_type.element_type)
-    lane = state.builder.workitem_id(0, element_type, width)
+    workitem = state.builder.workitem_id(0, element_type, width)
     start = int(attrs["start"])
     components = []
-    for component in range(_component_count(state, result_id)):
-        component_start = start + component * width
-        value = lane
-        if component_start:
-            start_value = state.builder.splat(
-                state.builder.constant(element_type, component_start),
+    if attrs.get("coordinate_mode") == "affine_workitem":
+        component_bases = tuple(int(value) for value in attrs["component_bases"])
+        stride = int(attrs["workitem_stride"])
+        if len(component_bases) != _component_count(state, result_id):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "make_range component bases do not match result component count",
+                target_op_id=op.target_op_id,
+            )
+        for component_base in component_bases:
+            value = workitem
+            if stride != 1:
+                value = _simd_binary_const(state, "muli", value, stride, width)
+            value = _add_simd_const(
+                state,
+                value,
+                start + int(component_base),
                 element_type,
                 width,
             )
-            value = state.builder.binary(state.dsl.BinaryKind.AddI, lane, start_value)
+            components.append(value)
+        state.values[result_id] = _pack_components(tuple(components))
+        return
+    if attrs.get("coordinate_mode") not in (None, "flat"):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_MAKE_RANGE",
+            STAGE,
+            f"unsupported make_range coordinate mode {attrs['coordinate_mode']}",
+            target_op_id=op.target_op_id,
+        )
+    for component in range(_component_count(state, result_id)):
+        component_start = start + component * width
+        value = _add_simd_const(
+            state,
+            workitem,
+            component_start,
+            element_type,
+            width,
+        )
         components.append(value)
     state.values[result_id] = _pack_components(tuple(components))
+
+
+def _add_simd_const(state, value, constant, element_type, width):
+    if not int(constant):
+        return value
+    start_value = state.builder.splat(
+        state.builder.constant(element_type, int(constant)),
+        element_type,
+        int(width),
+    )
+    return state.builder.binary(state.dsl.BinaryKind.AddI, value, start_value)
 
 
 def _emit_splat(state, op):
@@ -751,7 +792,14 @@ def _emit_buffer_load_to_local(state, op):
         )
     dependency = _memory_dependency_token(state, issue_dependencies)
     component_tokens = []
-    lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    lane_offset = _local_destination_lane_offset(
+        state,
+        workitem,
+        lane_width,
+        int(attrs.get("destination_lane_stride_elements", 1)),
+        int(attrs.get("destination_wave_stride_elements", 0)),
+    )
     value_type = state.dsl.simd_type(element_type, lane_width)
     mask_mode = attrs.get("mask_mode", "exec_where" if has_mask else "none")
     source_ptr_type = state.dsl.simd_ptr_type(
@@ -781,7 +829,7 @@ def _emit_buffer_load_to_local(state, op):
             value_type,
             after=dependency,
         )
-        dest_offset = lane
+        dest_offset = lane_offset
         if destination_base_offset:
             base_offset = state.builder.splat(
                 state.builder.constant(state.dsl.i32(), destination_base_offset),
@@ -790,7 +838,7 @@ def _emit_buffer_load_to_local(state, op):
             )
             dest_offset = state.builder.binary(
                 state.dsl.BinaryKind.AddI,
-                lane,
+                dest_offset,
                 base_offset,
             )
         dest_ptr = state.builder.ptr_add(
@@ -826,6 +874,30 @@ def _emit_buffer_load_to_local(state, op):
             state.builder.yield_([store_token])
         component_tokens.append(where.results[0])
     state.values[_single_result(op)] = _join_memory_tokens(state, component_tokens)
+
+
+def _local_destination_lane_offset(
+    state,
+    workitem,
+    lane_width,
+    lane_stride,
+    wave_stride,
+):
+    lane_width = int(lane_width)
+    lane_stride = int(lane_stride)
+    wave_stride = int(wave_stride)
+    if wave_stride == 0:
+        if lane_stride == 1:
+            return workitem
+        return _simd_binary_const(state, "muli", workitem, lane_stride, lane_width)
+    lane = _simd_binary_const(state, "remui", workitem, lane_width, lane_width)
+    if lane_stride != 1:
+        lane = _simd_binary_const(state, "muli", lane, lane_stride, lane_width)
+    wave_first = state.builder.read_first(workitem)
+    wave_id = _scalar_binary_const_i32(state, "divui", wave_first, lane_width)
+    wave_offset = _scalar_binary_const_i32(state, "muli", wave_id, wave_stride)
+    wave_offset = state.builder.splat(wave_offset, state.dsl.i32(), lane_width)
+    return state.builder.binary(state.dsl.BinaryKind.AddI, lane, wave_offset)
 
 
 def _emit_buffer_load_to_local_packet_dma(

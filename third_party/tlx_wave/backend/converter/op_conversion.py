@@ -5,6 +5,7 @@ import re
 
 from .diagnostics import fail
 from . import domains
+from . import layouts
 from . import layout_remap
 from . import target_ir
 
@@ -277,6 +278,9 @@ def _convert_source_op(
     if op.name == "rocdl.sched.barrier":
         _convert_sched_barrier(op)
         return
+    if op.name == "tt.make_range":
+        _convert_make_range(builder, type_layout_program, op)
+        return
     converter = _converter_for_op(op.name)
     if converter is None:
         fail(
@@ -482,17 +486,146 @@ def _arith_overflow_flags(view):
     return "nsw" in text, "nuw" in text
 
 
-def _convert_make_range(builder, view):
+def _convert_make_range(builder, type_layout_program, op):
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    attrs = {
+        "start": _int_attr(op.attrs, "start"),
+        "end": _int_attr(op.attrs, "end"),
+    }
+    attrs.update(_make_range_coordinate_attrs(type_layout_program, op))
     builder.add_op(
         "make_range",
-        results=view.result_target_ids,
-        attrs={
-            "start": _int_attr(view.attrs, "start"),
-            "end": _int_attr(view.attrs, "end"),
-        },
-        layout_map_ids=view.result_layout_map_ids,
-        source_op_index=view.op_index,
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
     )
+
+
+def _make_range_coordinate_attrs(type_layout_program, op):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_MAKE_RANGE",
+            STAGE,
+            "tt.make_range requires one result",
+            source_op_index=op.index,
+        )
+    result = type_layout_program.values[op.results[0]]
+    if result.layout_map_id is None:
+        return {}
+    layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if layout.kind not in {"blocked", "linear"} or len(layout.shape) != 1:
+        return {}
+    linear = layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    if not linear.is_injective():
+        return {}
+    component_count = layouts.linear_layout_in_dim_size(linear, "register")
+    if int(result.type.component_count) != int(component_count):
+        fail(
+            "TLXW_OP_MAKE_RANGE",
+            STAGE,
+            "tt.make_range result component model does not match its "
+            "distributed layout register count",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    bases, stride = _affine_workitem_range(
+        linear,
+        component_count,
+        int(result.type.lane_width or layout.lane_width),
+        _layout_warp_count(layout),
+        op,
+        result.value_id,
+    )
+    if _is_default_flat_make_range(bases, stride, int(result.type.lane_width or 64)):
+        return {}
+    return {
+        "coordinate_mode": "affine_workitem",
+        "component_bases": tuple(int(base) for base in bases),
+        "workitem_stride": int(stride),
+    }
+
+
+def _affine_workitem_range(
+    linear,
+    component_count,
+    lane_width,
+    warp_count,
+    op,
+    source_value_id,
+):
+    bases = []
+    workitem_stride = None
+    warp_count = max(1, int(warp_count))
+    lane_width = int(lane_width)
+    for component in range(int(component_count)):
+        base = layouts.linear_layout_coords(linear, component, 0, warp=0)[0]
+        if lane_width > 1:
+            stride = layouts.linear_layout_coords(linear, component, 1, warp=0)[0] - base
+        elif warp_count > 1:
+            stride = (
+                layouts.linear_layout_coords(linear, component, 0, warp=1)[0] - base
+            ) // lane_width
+        else:
+            stride = 0
+        if workitem_stride is None:
+            workitem_stride = int(stride)
+        elif workitem_stride != int(stride):
+            fail(
+                "TLXW_OP_MAKE_RANGE_LAYOUT",
+                STAGE,
+                "tt.make_range layout needs per-component workitem strides; "
+                "explicit coordinate remap support is required",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+        for warp in range(warp_count):
+            for lane in range(lane_width):
+                expected = base + (warp * lane_width + lane) * int(stride)
+                actual = layouts.linear_layout_coords(
+                    linear,
+                    component,
+                    lane,
+                    warp=warp,
+                )[0]
+                if actual != expected:
+                    fail(
+                        "TLXW_OP_MAKE_RANGE_LAYOUT",
+                        STAGE,
+                        "tt.make_range layout is not affine in flat "
+                        "workitem_id; explicit coordinate materialization "
+                        "support is required",
+                        source_op_index=op.index,
+                        source_value_id=source_value_id,
+                    )
+        bases.append(int(base))
+    return tuple(bases), int(workitem_stride or 0)
+
+
+def _is_default_flat_make_range(bases, stride, lane_width):
+    if int(stride) != 1:
+        return False
+    return tuple(int(base) for base in bases) == tuple(
+        component * int(lane_width) for component in range(len(bases))
+    )
+
+
+def _layout_warp_count(layout):
+    warps_per_cta = tuple(
+        int(value) for value in layout.properties.get("warps_per_cta", ())
+    )
+    result = 1
+    for value in warps_per_cta:
+        result *= max(1, int(value))
+    return result
 
 
 def _convert_splat(builder, view):
@@ -1085,14 +1218,6 @@ def _convert_buffer_load_to_local(
             )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     operands.extend(issue_dependency_target_ids)
-    component_offsets = _local_component_base_offsets(
-        conversion_input,
-        type_layout_program,
-        fields["memdesc_value_id"],
-        int(offset_type.component_count),
-        int(offset_type.lane_width or conversion_input.threads_per_warp),
-        op,
-    )
     packet_plan = None
     if not has_mask:
         packet_plan = _buffer_load_to_local_packet_plan(
@@ -1155,6 +1280,15 @@ def _convert_buffer_load_to_local(
             source_op_index=op.index,
         )
         return
+    destination_plan = _local_component_store_plan(
+        conversion_input,
+        type_layout_program,
+        fields["memdesc_value_id"],
+        fields["offset_value_id"],
+        int(offset_type.component_count),
+        int(offset_type.lane_width or conversion_input.threads_per_warp),
+        op,
+    )
     scalar_offset_upper = _buffer_source_offset_upper(
         range_fact.upper,
         memdesc.element_byte_width,
@@ -1168,7 +1302,15 @@ def _convert_buffer_load_to_local(
         attrs={
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(offset_type.component_count),
-            "destination_component_offsets": tuple(component_offsets),
+            "destination_component_offsets": tuple(
+                destination_plan["component_offsets"]
+            ),
+            "destination_lane_stride_elements": int(
+                destination_plan["lane_stride_elements"]
+            ),
+            "destination_wave_stride_elements": int(
+                destination_plan["wave_stride_elements"]
+            ),
             "element_byte_width": int(memdesc.element_byte_width),
             "element_type": memdesc.element_type,
             "has_mask": has_mask,
@@ -1662,7 +1804,7 @@ def _convert_layout(builder, type_layout_program, op):
         result_layout,
         op,
     )
-    if int(operand.type.component_count) == int(result.type.component_count):
+    if _same_layout_alias(operand, result, operand_layout, result_layout):
         mode = "alias"
         attrs = {
             "group_size": 1,
@@ -1705,6 +1847,21 @@ def _convert_layout(builder, type_layout_program, op):
         attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
+    )
+
+
+def _same_layout_alias(operand, result, operand_layout, result_layout):
+    if int(operand.type.component_count) != int(result.type.component_count):
+        return False
+    if operand.type.element_type != result.type.element_type:
+        return False
+    if operand_layout is None or result_layout is None:
+        return operand_layout is result_layout
+    return (
+        operand_layout.kind == result_layout.kind
+        and tuple(operand_layout.shape) == tuple(result_layout.shape)
+        and operand_layout.element_type == result_layout.element_type
+        and operand_layout.properties == result_layout.properties
     )
 
 
@@ -1789,7 +1946,6 @@ _SIMPLE_OP_CONVERTERS = {
     "arith.cmpi": _convert_cmpi,
     "arith.minsi": _convert_minsi,
     "llvm.intr.assume": _convert_assume,
-    "tt.make_range": _convert_make_range,
     "tt.splat": _convert_splat,
     "tt.addptr": _convert_addptr,
     "tt.broadcast": _convert_broadcast,
@@ -1804,6 +1960,7 @@ _SPECIALIZED_SOURCE_OPS = frozenset(
         "rocdl.sched.barrier",
         "scf.for",
         "scf.if",
+        "tt.make_range",
         "ttg.local_alloc",
         "ttg.memdesc_index",
         "amdg.buffer_load_to_local",
@@ -2190,35 +2347,192 @@ def _require_default_cache(cache, op):
     )
 
 
-def _local_component_base_offsets(
+def _local_component_store_plan(
     conversion_input,
     type_layout_program,
     memdesc_value_id,
+    offset_value_id,
     component_count,
     lane_width,
     op,
 ):
     memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
-    total_elements = _product(memdesc.shape or memdesc.alloc_shape)
-    if int(component_count) * int(lane_width) != total_elements:
+    shape = tuple(int(dim) for dim in (memdesc.shape or memdesc.alloc_shape))
+    total_elements = _product(shape)
+    wave_count = max(1, int(conversion_input.num_warps))
+    if int(component_count) * int(lane_width) * wave_count != total_elements:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
             "scalarized amdg.buffer_load_to_local currently requires "
-            "all-active full components",
+            "all-active full per-wave components",
             source_op_index=op.index,
             source_value_id=memdesc_value_id,
         )
-    layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
-    layout = (
+    memdesc_layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    memdesc_layout = (
         None
-        if layout_id is None
-        else type_layout_program.layouts[int(layout_id)]
+        if memdesc_layout_id is None
+        else type_layout_program.layouts[int(memdesc_layout_id)]
     )
-    return tuple(
-        _physical_component_offset(layout, component * int(lane_width), lane_width, op)
-        for component in range(int(component_count))
+    offset_layout_id = type_layout_program.values[offset_value_id].layout_map_id
+    offset_layout = (
+        None
+        if offset_layout_id is None
+        else type_layout_program.layouts[int(offset_layout_id)]
     )
+    if (
+        offset_layout is None
+        or offset_layout.kind not in {"blocked", "linear"}
+        or len(offset_layout.shape) != len(shape)
+    ):
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local requires a structural "
+            "distributed offset layout for local destination mapping",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    linear = layouts.distributed_linear_layout(
+        offset_layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    if not linear.is_injective():
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local requires an injective "
+            "offset layout for local destination mapping",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    component_offsets = []
+    lane_stride = None
+    wave_stride = None
+    for component in range(int(component_count)):
+        wave_offsets = []
+        for wave in range(wave_count):
+            lane_offsets = tuple(
+                _local_physical_offset_for_distributed_slot(
+                    memdesc_layout,
+                    shape,
+                    memdesc.element_byte_width,
+                    linear,
+                    component,
+                    lane,
+                    wave,
+                    op,
+                    offset_value_id,
+                )
+                for lane in range(int(lane_width))
+            )
+            base = int(lane_offsets[0])
+            current_lane_stride = 0 if int(lane_width) == 1 else int(lane_offsets[1]) - base
+            for lane, offset in enumerate(lane_offsets):
+                if int(offset) != base + lane * current_lane_stride:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                        STAGE,
+                        "scalarized amdg.buffer_load_to_local destination "
+                        "lanes must form an affine physical stride",
+                        source_op_index=op.index,
+                        source_value_id=offset_value_id,
+                    )
+            if lane_stride is None:
+                lane_stride = current_lane_stride
+            elif lane_stride != current_lane_stride:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                    STAGE,
+                    "scalarized amdg.buffer_load_to_local destination lane "
+                    "stride must be identical for all components and waves",
+                    source_op_index=op.index,
+                    source_value_id=offset_value_id,
+                )
+            wave_offsets.append(base)
+        component_offsets.append(wave_offsets[0])
+        current_wave_stride = 0 if wave_count == 1 else int(wave_offsets[1]) - int(wave_offsets[0])
+        for wave, offset in enumerate(wave_offsets):
+            if int(offset) != int(wave_offsets[0]) + wave * current_wave_stride:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                    STAGE,
+                    "scalarized amdg.buffer_load_to_local destination waves "
+                    "must form an affine physical stride",
+                    source_op_index=op.index,
+                    source_value_id=offset_value_id,
+                )
+        if wave_stride is None:
+            wave_stride = current_wave_stride
+        elif wave_stride != current_wave_stride:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "scalarized amdg.buffer_load_to_local destination wave "
+                "stride must be identical for all components",
+                source_op_index=op.index,
+                source_value_id=offset_value_id,
+            )
+    return {
+        "component_offsets": tuple(int(offset) for offset in component_offsets),
+        "lane_stride_elements": int(lane_stride if lane_stride is not None else 1),
+        "wave_stride_elements": int(wave_stride or 0),
+    }
+
+
+def _local_physical_offset_for_distributed_slot(
+    memdesc_layout,
+    shape,
+    element_byte_width,
+    distributed_layout,
+    component,
+    lane,
+    wave,
+    op,
+    source_value_id,
+):
+    coords = layouts.linear_layout_coords(
+        distributed_layout,
+        int(component),
+        int(lane),
+        warp=int(wave),
+    )
+    if len(coords) != len(shape):
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "distributed offset layout rank does not match local memdesc rank",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    for coord, extent in zip(coords, shape):
+        if int(coord) < 0 or int(coord) >= int(extent):
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "distributed offset layout maps a component outside the "
+                "local memdesc shape",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+    byte_offset = _static_shared_byte_offset(
+        memdesc_layout,
+        shape,
+        coords,
+        int(element_byte_width),
+        op,
+    )
+    if int(byte_offset) % int(element_byte_width):
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "local destination physical byte offset is not element aligned",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    return int(byte_offset) // int(element_byte_width)
 
 
 def _buffer_load_to_local_packet_plan(
@@ -2910,13 +3224,14 @@ def _is_supported_swizzled_layout(layout):
 
 
 def _is_identity_swizzled_layout(layout):
+    order = tuple(layout.properties.get("order", ())) if layout is not None else ()
     return (
         layout is not None
         and layout.kind == "swizzled_shared"
         and int(layout.properties.get("vec", 0)) == 1
         and int(layout.properties.get("per_phase", 0)) == 1
         and int(layout.properties.get("max_phase", 0)) == 1
-        and tuple(layout.properties.get("order", ())) == (1, 0)
+        and order in {(1, 0), (0,), ()}
     )
 
 
@@ -3163,6 +3478,8 @@ def _static_shared_byte_offset(layout, shape, coords, element_byte_width, op):
     if layout is None or layout.kind in {"none", "linear"}:
         return _static_linear_offset(shape, coords) * int(element_byte_width)
     if layout.kind == "swizzled_shared":
+        if _is_identity_swizzled_layout(layout):
+            return _static_linear_offset(shape, coords) * int(element_byte_width)
         return _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op)
     if layout.kind == "padded_shared":
         return _static_padded_byte_offset(layout, shape, coords, element_byte_width, op)
@@ -3239,7 +3556,7 @@ def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
 
 
 def _static_padded_byte_offset(layout, shape, coords, element_byte_width, op):
-    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), ()}:
+    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0,), ()}:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
             STAGE,

@@ -2242,6 +2242,63 @@ def test_tlx_wave_converter_pipeline_joins_independent_dma_packets(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_lowers_mult_warp_blocked_make_range_structurally(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_mult_warp_blocked_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 4096 : i32, start = 0 : i32} : tensor<4096xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (range_op,) = [op for op in output.target_program.ops if op.kind == "make_range"]
+    attrs = converter_target_ir.attrs_dict(range_op)
+    (result_id,) = range_op.results
+    result_type = output.target_program.values[result_id].type
+    assert result_type.component_count == 8
+    assert attrs["coordinate_mode"] == "affine_workitem"
+    assert attrs["component_bases"] == tuple(range(8))
+    assert attrs["workitem_stride"] == 8
+    assert "wave.binary muli" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_linear_make_range_with_block_basis(
+    tmp_path,
+):
+    preamble = """
+#linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [[64]]}>
+"""
+    local_func = """
+  tt.func public @converter_linear_range_block_basis() attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_ctas=2,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (range_op,) = [op for op in output.target_program.ops if op.kind == "make_range"]
+    (result_id,) = range_op.results
+    assert output.target_program.values[result_id].type.component_count == 1
+    assert "wave.workitem_id" in output.emitted_module.text
+    del ctx
+
+
 def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -2256,14 +2313,19 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
   }
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    convert_layout_op = next(op for op in source.ops if op.name == "ttg.convert_layout")
+    converted_result = converted.values[convert_layout_op.results[0]]
+    assert converted_result.type.component_count == 256
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
         converter_pipeline.convert_ttgir_to_wave(mod)
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "warp-aware result component model" in str(diagnostic)
-    assert "per-wave register layout has 256" in str(diagnostic)
+    assert "requires cross-warp movement" in str(diagnostic)
+    assert "CTA-local layout remap" in str(diagnostic)
     del ctx
 
 
@@ -2435,6 +2497,43 @@ def test_tlx_wave_converter_pipeline_groups_mult_warp_padded_dma(tmp_path):
     assert "wave.binary shrui" in output.emitted_module.text
     assert "wave.binary muli" in output.emitted_module.text
     assert "c264_i32" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_scalarized_masked_dma_preserves_rank1_padded_offsets(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#shared = #ttg.padded_shared<[512:+16] {order = [0], shape = [4096]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_masked_padded_scalarized_dma(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<4096xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 4096 : i32, start = 0 : i32} : tensor<4096xi32, #blocked>
+    %limit = arith.constant dense<4096> : tensor<4096xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit : tensor<4096xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %mask into %alloc : <f16>[tensor<4096xi32, #blocked>] -> <4096xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["component_count"] == 8
+    assert attrs["destination_component_offsets"] == tuple(range(8))
+    assert attrs["destination_lane_stride_elements"] == 8
+    assert attrs["destination_wave_stride_elements"] == 528
+    assert output.emitted_module.text.count("wave.store") == 8
     del ctx
 
 
