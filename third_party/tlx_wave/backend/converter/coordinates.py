@@ -123,6 +123,11 @@ def is_flat_affine_make_range(plan, lane_width, warp_count):
     ):
         return None
     bases = tuple(int(base[0]) for base in plan.component_bases)
+    coefficients = tuple(
+        int(coefficient[0]) for coefficient in plan.workitem_coefficients
+    )
+    if not _xor_masks_are_additive(bases, coefficients):
+        return None
     if not bases:
         return (), stride
     return bases, stride
@@ -234,8 +239,24 @@ def _coords_from_plan(component_base, workitem_coefficients, workitem):
         if not (int(workitem) & (1 << bit)):
             continue
         for dim, coefficient in enumerate(coefficients):
-            coords[dim] += int(coefficient)
+            coords[dim] ^= int(coefficient)
     return tuple(coords)
+
+
+def _xor_masks_are_additive(bases, coefficients):
+    occupied = 0
+    for coefficient in coefficients:
+        coefficient = int(coefficient)
+        if coefficient < 0:
+            return False
+        if occupied & coefficient:
+            return False
+        occupied |= coefficient
+    for base in bases:
+        base = int(base)
+        if base < 0 or (base & occupied):
+            return False
+    return True
 
 
 def _basis_pattern(layout):

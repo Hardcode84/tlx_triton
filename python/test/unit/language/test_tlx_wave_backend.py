@@ -2419,6 +2419,81 @@ def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_lowers_replicated_generic_linear_make_range(tmp_path):
+    preamble = """
+#linear = #ttg.generic_linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [0]], warp = [[64], [128]], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_replicated_generic_linear_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    range_op = next(op for op in source.ops if op.name == "tt.make_range")
+    value = converted.values[range_op.results[0]]
+    layout = converted.layouts[value.layout_map_id]
+
+    assert value.type.component_count == 4
+    assert layout.properties["coordinate_domain"]["coverage"] == "replicated"
+    assert layout.properties["coordinate_domain"]["covered_elements"] == 256
+    assert layout.properties["coordinate_domain"]["duplicate_slots"] > 0
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (target_range_op,) = [
+        op for op in output.target_program.ops if op.kind == "make_range"
+    ]
+    attrs = converter_target_ir.attrs_dict(target_range_op)
+    assert attrs["coordinate_mode"] == "layout_coordinates"
+    assert attrs["component_coordinate_bases"] == ((0,), (1,), (2,), (3,))
+    assert attrs["workitem_coordinate_coefficients"] == (
+        (4,),
+        (8,),
+        (16,),
+        (32,),
+        (64,),
+        (0,),
+        (64,),
+        (128,),
+    )
+    assert "wave.binary xori" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_overlapping_xor_basis_out_of_affine_path(tmp_path):
+    preamble = """
+#linear = #ttg.generic_linear<{register = [[1]], lane = [[3], [6], [12], [24], [48], [96]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_overlapping_xor_linear_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (range_op,) = [op for op in output.target_program.ops if op.kind == "make_range"]
+    attrs = converter_target_ir.attrs_dict(range_op)
+    assert attrs["coordinate_mode"] == "layout_coordinates"
+    assert attrs["component_coordinate_bases"] == ((0,), (1,))
+    assert attrs["workitem_coordinate_coefficients"] == (
+        (3,),
+        (6,),
+        (12,),
+        (24,),
+        (48,),
+        (96,),
+    )
+    assert "wave.binary xori" in output.emitted_module.text
+    assert attrs.get("workitem_stride") is None
+    del ctx
+
+
 def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -2512,9 +2587,10 @@ def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
         converter_pipeline.convert_ttgir_to_wave(mod)
 
     diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_MAKE_RANGE_LAYOUT"
+    assert diagnostic.code == "TLXW_TYPE_UNSUPPORTED_LAYOUT"
+    assert diagnostic.stage == "type_layout"
     text = str(diagnostic)
-    assert "non-injective over physical lanes" in text
+    assert "unsupported distributed layout coordinate domain duplicate_partial" in text
     assert "bases={'register': (), 'lane': ((0,), (0,), (0,), (0,), (0,), (0,))" in text
     del ctx
 
@@ -2637,8 +2713,8 @@ def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
 
 def test_tlx_wave_converter_rejects_multi_warp_linear_remap(tmp_path):
     preamble = """
-#source = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 0]], block = []}>
-#result = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[0, 1]], block = []}>
+#source = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 0]], block = []}>
+#result = #ttg.generic_linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 1]], block = []}>
 """
     local_func = """
   tt.func public @converter_multi_warp_linear_remap() attributes {noinline = false} {
@@ -2654,10 +2730,9 @@ def test_tlx_wave_converter_rejects_multi_warp_linear_remap(tmp_path):
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert (
-        "linear to linear convert_layout result coordinate is not covered by "
-        "the source distributed layout"
-    ) in str(diagnostic)
+    assert "linear to linear convert_layout requires per-lane source component selection" in str(
+        diagnostic
+    )
     del ctx
 
 

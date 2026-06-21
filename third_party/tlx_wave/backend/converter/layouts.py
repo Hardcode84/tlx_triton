@@ -27,13 +27,31 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         return None
     attr = source_type.encoding_attr
     kind, properties = _layout_kind_and_properties(attr, value_id)
-    component_count = _layout_component_count(
-        source_type,
-        kind,
-        properties,
-        lane_width,
-        value_id,
-    )
+    if kind in {"blocked", "linear"}:
+        coordinate_domain = _layout_coordinate_domain(
+            kind,
+            source_type.shape,
+            properties,
+            lane_width,
+            value_id,
+        )
+        _require_supported_coordinate_domain(
+            kind,
+            source_type.shape,
+            properties,
+            coordinate_domain,
+            value_id,
+        )
+        properties = {**properties, "coordinate_domain": coordinate_domain}
+        component_count = int(coordinate_domain["component_count"])
+    else:
+        component_count = _layout_component_count(
+            source_type,
+            kind,
+            properties,
+            lane_width,
+            value_id,
+        )
     return LayoutMap(
         layout_map_id,
         value_id,
@@ -112,17 +130,21 @@ def _layout_kind_and_properties(attr, value_id):
 
 def _layout_component_count(source_type, kind, properties, lane_width, value_id):
     if kind in {"blocked", "linear"}:
-        linear = distributed_linear_layout_from_parts(
+        coordinate_domain = _layout_coordinate_domain(
             kind,
             source_type.shape,
             properties,
             lane_width,
             source_value_id=value_id,
         )
-        if linear.is_injective():
-            return linear_layout_in_dim_size(linear, "register")
-        element_count = _product(source_type.shape)
-        return max(1, _ceil_div(element_count, int(lane_width)))
+        _require_supported_coordinate_domain(
+            kind,
+            source_type.shape,
+            properties,
+            coordinate_domain,
+            value_id,
+        )
+        return int(coordinate_domain["component_count"])
     if kind == "dot_operand":
         parent_properties = properties.get("parent_properties", {})
         instr_shape = parent_properties.get("instr_shape", ())
@@ -146,6 +168,28 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
                 k_tiles = _ceil_div(int(source_type.shape[0]), int(instr_shape[2]))
                 return n_tiles * k_tiles
         return 1
+    if kind == "slice":
+        parent_kind = properties.get("parent_kind")
+        parent_properties = properties.get("parent_properties", {})
+        if parent_kind in {"blocked", "linear"}:
+            dim = int(properties.get("dim", 0))
+            parent_shape = list(int(value) for value in source_type.shape)
+            if dim < 0 or dim > len(parent_shape):
+                _layout_fail(
+                    "TLXW_TYPE_MALFORMED_LAYOUT",
+                    STAGE,
+                    "slice layout dimension is outside the parent rank",
+                    source_value_id=value_id,
+                )
+            parent_shape.insert(dim, 1)
+            linear = distributed_linear_layout_from_parts(
+                parent_kind,
+                tuple(parent_shape),
+                parent_properties,
+                lane_width,
+                source_value_id=value_id,
+            )
+            return linear_layout_in_dim_size(linear, "register")
     if kind == "amd_mfma":
         instr_shape = properties.get("instr_shape", ())
         warps_per_cta = properties.get("warps_per_cta", ())
@@ -293,6 +337,110 @@ def layout_warp_count(layout):
     for value in warps_per_cta:
         result *= max(1, int(value))
     return result
+
+
+def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_id):
+    linear = distributed_linear_layout_from_parts(
+        kind,
+        shape,
+        properties,
+        lane_width,
+        source_value_id=source_value_id,
+    )
+    component_count = linear_layout_in_dim_size(linear, "register")
+    warp_count = _layout_warp_count_from_parts(kind, properties)
+    block_count = linear_layout_in_dim_size(linear, "block")
+    shape = tuple(int(dim) for dim in shape)
+    total_elements = _product(shape)
+    seen = set()
+    duplicate_slots = 0
+    out_of_bounds_slots = 0
+    for component in range(int(component_count)):
+        for warp in range(int(warp_count)):
+            for lane in range(int(lane_width)):
+                coords = linear_layout_coords(linear, component, lane, warp=warp)
+                if len(coords) != len(shape) or any(
+                    int(coord) < 0 or int(coord) >= int(extent)
+                    for coord, extent in zip(coords, shape)
+                ):
+                    out_of_bounds_slots += 1
+                    continue
+                if coords in seen:
+                    duplicate_slots += 1
+                seen.add(coords)
+    physical_slots = int(component_count) * int(lane_width) * int(warp_count)
+    if int(block_count) <= 0 or total_elements % int(block_count):
+        coverage = "block_mismatch"
+        local_elements = total_elements
+    else:
+        local_elements = total_elements // int(block_count)
+        if out_of_bounds_slots:
+            coverage = "out_of_bounds"
+        elif len(seen) == local_elements and duplicate_slots == 0:
+            coverage = "exact"
+        elif len(seen) == local_elements:
+            coverage = "replicated"
+        elif duplicate_slots:
+            coverage = "duplicate_partial"
+        else:
+            coverage = "partial"
+    return {
+        "coverage": coverage,
+        "component_count": int(component_count),
+        "covered_elements": int(len(seen)),
+        "duplicate_slots": int(duplicate_slots),
+        "local_elements": int(local_elements),
+        "physical_slots": int(physical_slots),
+        "out_of_bounds_slots": int(out_of_bounds_slots),
+        "block_count": int(block_count),
+    }
+
+
+def _require_supported_coordinate_domain(
+    kind,
+    shape,
+    properties,
+    coordinate_domain,
+    source_value_id,
+):
+    if coordinate_domain["coverage"] in {"exact", "replicated"}:
+        return
+    _layout_fail(
+        "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+        STAGE,
+        "unsupported distributed layout coordinate domain "
+        f"{coordinate_domain['coverage']}; kind={kind} shape={tuple(shape)} "
+        f"domain={coordinate_domain} bases={_basis_pattern(kind, properties)}",
+        source_value_id=source_value_id,
+    )
+
+
+def _layout_warp_count_from_parts(kind, properties):
+    if kind == "linear":
+        return 1 << len(tuple(properties.get("warp_bases", ())))
+    warps_per_cta = tuple(int(value) for value in properties.get("warps_per_cta", ()))
+    result = 1
+    for value in warps_per_cta:
+        result *= max(1, int(value))
+    return result
+
+
+def _basis_pattern(kind, properties):
+    if kind == "linear":
+        return {
+            "register": tuple(properties.get("register_bases", ())),
+            "lane": tuple(properties.get("lane_bases", ())),
+            "warp": tuple(properties.get("warp_bases", ())),
+            "block": tuple(properties.get("block_bases", ())),
+        }
+    if kind == "blocked":
+        return {
+            "size_per_thread": tuple(properties.get("size_per_thread", ())),
+            "threads_per_warp": tuple(properties.get("threads_per_warp", ())),
+            "warps_per_cta": tuple(properties.get("warps_per_cta", ())),
+            "order": tuple(properties.get("order", ())),
+        }
+    return dict(properties)
 
 
 def mfma_registers_per_component(

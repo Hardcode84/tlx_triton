@@ -405,7 +405,7 @@ def _emit_make_range(state, op):
             )
         for component_base in component_bases:
             coords = tuple(
-                _bit_affine_thread_offset(
+                _bit_linear_thread_coordinate(
                     state,
                     workitem,
                     int(base),
@@ -457,6 +457,31 @@ def _linearize_coordinates(state, coords, shape, lane_width):
         if int(stride) != 1:
             term = _simd_binary_const(state, "muli", term, int(stride), lane_width)
         result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+    return result
+
+
+def _bit_linear_thread_coordinate(state, workitem, base, coefficients, lane_width):
+    lane_width = int(lane_width)
+    result = state.builder.splat(
+        state.builder.constant(state.dsl.i32(), int(base)),
+        state.dsl.i32(),
+        lane_width,
+    )
+    for bit, coefficient in enumerate(coefficients):
+        coefficient = int(coefficient)
+        if coefficient == 0:
+            continue
+        bit_value = _simd_binary_const(state, "divui", workitem, 1 << bit, lane_width)
+        bit_value = _simd_binary_const(state, "remui", bit_value, 2, lane_width)
+        if coefficient != 1:
+            bit_value = _simd_binary_const(
+                state,
+                "muli",
+                bit_value,
+                coefficient,
+                lane_width,
+            )
+        result = state.builder.binary(state.dsl.BinaryKind.XOrI, result, bit_value)
     return result
 
 
