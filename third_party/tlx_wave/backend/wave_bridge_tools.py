@@ -9,56 +9,13 @@ import warnings
 from pathlib import Path
 
 
-_WAVE_HSACO_PIPELINE = (
-    "--wavemeta-specialize",
-    "--canonicalize",
-    "--wave-normalize-pointer-offsets",
-    "--wave-generate-index-exprs",
-    "--wave-promote-global-to-buffer",
-    "--wave-combine-pointer-offsets",
-    "--wave-simplify-index-exprs",
-    "--wave-coalesce-memory",
-    "--canonicalize",
-    "--cse",
-    "--wave-form-packed-math",
-    "--canonicalize",
-    "--cse",
-    "--wave-normalize-pointer-offsets",
-    "--wave-generate-index-exprs",
-    "--wave-combine-pointer-offsets",
-    "--wave-simplify-index-exprs",
-    "--wave-promote-global-to-buffer",
-    "--wave-extract-loop-strides",
-    "--waveamd-dma-zero-fill",
-    "--loop-invariant-code-motion",
-    "--canonicalize",
-    "--wave-expand-integer-div-rem",
-    "--waveamd-to-machine",
-    "--canonicalize",
-    "--cse",
-    "--loop-invariant-code-motion",
-    "--waveamd-abi-lowering",
-    "--waveamd-decompose-mem-tuples",
-    "--waveamd-narrow-wide-int",
-    "--waveamd-form-fused-int",
-    "--waveamd-machine-cleanup",
-    "--canonicalize",
-    "--cse",
-    "--loop-invariant-code-motion",
-    "--cse",
-    "--waveamd-clear-regalloc-assignments",
-    "--waveamd-preserve-hw-regs",
-    "--canonicalize",
-    "--cse",
-    "--waveamd-reg-alloc",
-    "--waveamd-decompose-mem-tuples",
-    "--waveamd-pack-vgpr-zero-moves",
-    "--waveamd-insert-ticket-waits",
-    "--waveamd-insert-hazard-waits",
-    "--waveamd-resource-info",
-    "--waveamd-metadata",
-    "--wave-compile-kernels=features=",
+_WAVE_PIPELINE_FILE = "pipelines.mlir"
+_WAVE_PIPELINE_REL = Path("share") / "wave-mlir" / "pipelines" / _WAVE_PIPELINE_FILE
+_WAVE_PIPELINE_SOURCE = (
+    Path("third_party") / "wave" / "lib" / "Target" / "Wave" / "pipelines" / _WAVE_PIPELINE_FILE
 )
+_WAVE_MACHINE_PIPELINE_ENTRY = "waveamd_backend"
+_WAVE_HSACO_PIPELINE_ENTRY = "compile_kernels"
 
 
 def _repo_root():
@@ -108,6 +65,20 @@ def _candidate_wave_tool_paths(tool_name, override=None):
 
     for wave_build_dir in _wave_build_dirs():
         yield wave_build_dir / "bin" / tool_name
+
+
+def _candidate_wave_pipeline_paths(wave_opt=None):
+    override = os.environ.get("TRITON_WAVE_PIPELINES")
+    if override:
+        yield Path(override)
+
+    if wave_opt:
+        yield Path(wave_opt).resolve().parent.parent / _WAVE_PIPELINE_REL
+
+    for wave_build_dir in _wave_build_dirs():
+        yield wave_build_dir / _WAVE_PIPELINE_REL
+
+    yield _repo_root() / _WAVE_PIPELINE_SOURCE
 
 
 def _candidate_wave_opt_paths():
@@ -192,6 +163,18 @@ def _wave_opt():
     return _wave_tool("wave-opt", override_env="TRITON_WAVE_OPT")
 
 
+def _wave_pipelines_mlir(wave_opt=None):
+    for path in _existing_paths(_candidate_wave_pipeline_paths(wave_opt)):
+        return path
+    candidates = "\n  ".join(str(path) for path in _candidate_wave_pipeline_paths(wave_opt))
+    raise RuntimeError(
+        "tlx_wave requires Wave's transform pipeline library from the third_party/wave "
+        "submodule build or source tree. Build the Wave submodule, or set "
+        f"TRITON_WAVE_PIPELINES to {_WAVE_PIPELINE_FILE}. "
+        f"Checked pipeline candidates:\n  {candidates}"
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _file_sha256(path):
     digest = hashlib.sha256()
@@ -203,6 +186,42 @@ def _file_sha256(path):
 
 def _wave_opt_sha256():
     return _file_sha256(_wave_opt())
+
+
+def _wave_pipelines_sha256():
+    wave_opt = _wave_opt()
+    return _file_sha256(_wave_pipelines_mlir(wave_opt))
+
+
+def _wave_transform_pipeline(entry_point, wave_opt=None, chip=None):
+    pipelines = _wave_pipelines_mlir(wave_opt)
+    passes = []
+    if chip:
+        chip = str(chip).split(":", maxsplit=1)[0]
+        passes.append(f"wave-set-target-attr{{chip={chip}}}")
+    passes.extend(
+        [
+            f"transform-preload-library{{transform-library-paths={pipelines}}}",
+            f"transform-interpreter{{entry-point={entry_point}}}",
+        ]
+    )
+    return (
+        "builtin.module("
+        + ",".join(passes)
+        + ")"
+    )
+
+
+def _wave_machine_pipeline_args(wave_opt=None, chip=None):
+    return (
+        f"--pass-pipeline={_wave_transform_pipeline(_WAVE_MACHINE_PIPELINE_ENTRY, wave_opt, chip)}",
+    )
+
+
+def _wave_hsaco_pipeline_args(wave_opt=None, chip=None):
+    return (
+        f"--pass-pipeline={_wave_transform_pipeline(_WAVE_HSACO_PIPELINE_ENTRY, wave_opt, chip)}",
+    )
 
 
 def _verify_wave_module(wave_text, wave_opt):
@@ -221,9 +240,9 @@ def _verify_wave_module(wave_text, wave_opt):
         )
 
 
-def _compile_wave_module_to_hsaco(wave_text, wave_opt):
+def _compile_wave_module_to_hsaco(wave_text, wave_opt, chip):
     result = subprocess.run(
-        [wave_opt, "-", *_WAVE_HSACO_PIPELINE],
+        [wave_opt, "-", *_wave_hsaco_pipeline_args(wave_opt, chip)],
         input=wave_text,
         text=True,
         stdout=subprocess.PIPE,

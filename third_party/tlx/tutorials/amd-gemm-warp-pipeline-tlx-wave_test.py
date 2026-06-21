@@ -165,18 +165,15 @@ def _wave_text(compiled):
 
 
 def _run_wave_promote_buffer_to_machine(wave_artifact):
-    from triton.backends.tlx_wave.wave_bridge_tools import _WAVE_HSACO_PIPELINE
+    from triton.backends.tlx_wave.wave_bridge_tools import _wave_machine_pipeline_args
 
     wave_opt = (
         Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
     )
     if not wave_opt.exists():
         pytest.skip("wave-opt is not built")
-    machine_pipeline = _WAVE_HSACO_PIPELINE[
-        : _WAVE_HSACO_PIPELINE.index("--waveamd-metadata")
-    ]
     result = subprocess.run(
-        [str(wave_opt), "-", *machine_pipeline],
+        [str(wave_opt), "-", *_wave_machine_pipeline_args(str(wave_opt), "gfx950")],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
@@ -188,18 +185,15 @@ def _run_wave_promote_buffer_to_machine(wave_artifact):
 
 
 def _run_wave_to_amdgpu_asm(wave_artifact):
-    from triton.backends.tlx_wave.wave_bridge_tools import _WAVE_HSACO_PIPELINE
+    from triton.backends.tlx_wave.wave_bridge_tools import _wave_machine_pipeline_args
 
     wave_bin = Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin"
     wave_opt = wave_bin / "wave-opt"
     wave_translate = wave_bin / "wave-translate"
     if not wave_opt.exists() or not wave_translate.exists():
         pytest.skip("wave asm tools are not built")
-    machine_pipeline = _WAVE_HSACO_PIPELINE[
-        : _WAVE_HSACO_PIPELINE.index("--waveamd-metadata")
-    ]
     opt = subprocess.run(
-        [str(wave_opt), "-", *machine_pipeline],
+        [str(wave_opt), "-", *_wave_machine_pipeline_args(str(wave_opt), "gfx950")],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,

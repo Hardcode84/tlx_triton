@@ -11,6 +11,7 @@ from .wave_bridge_tools import (
     _verify_wave_module,
     _wave_opt,
     _wave_opt_sha256,
+    _wave_pipelines_sha256,
 )
 
 
@@ -175,7 +176,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     @staticmethod
     def make_hsaco(src, metadata, options):
         wave_opt = _wave_opt()
-        hsaco = _compile_wave_module_to_hsaco(src, wave_opt)
+        hsaco = _compile_wave_module_to_hsaco(src, wave_opt, options.arch)
         metadata["tlx_wave_binary_stage"] = "wave-compile-kernels"
         metadata["tlx_wave_hsaco_size_bytes"] = len(hsaco)
         return hsaco
@@ -193,7 +194,8 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     def hash(self):
         return (
             f"{self.target}:stage7-staged-converter-hsaco:"
-            f"wave-opt-sha256={_wave_opt_sha256()}"
+            f"wave-opt-sha256={_wave_opt_sha256()}:"
+            f"wave-pipelines-sha256={_wave_pipelines_sha256()}"
         )
 
 

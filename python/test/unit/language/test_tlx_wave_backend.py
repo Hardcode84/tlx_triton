@@ -2251,8 +2251,9 @@ def _run_wave_verify(wave_artifact):
 
 
 def _run_wave_compile_kernels(wave_artifact):
+    wave_opt = wave_bridge_tools._wave_opt()
     result = subprocess.run(
-        [wave_bridge_tools._wave_opt(), "-", *wave_bridge_tools._WAVE_HSACO_PIPELINE],
+        [wave_opt, "-", *wave_bridge_tools._wave_hsaco_pipeline_args(wave_opt, "gfx950")],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
