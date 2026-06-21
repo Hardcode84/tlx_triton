@@ -175,6 +175,9 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.source_domains_for_op("amdg.buffer_load_to_local") == (
         "memory_dma",
     )
+    assert converter_domains.source_domains_for_op("rocdl.sched.barrier") == (
+        "arithmetic_control",
+    )
     assert converter_domains.target_domain_for_op("local_load_fragment") == (
         "local_memory_layout"
     )
@@ -540,6 +543,39 @@ def test_tlx_wave_converter_token_stage_orders_generic_memory_effects(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_token_stage_uses_memory_frontier(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_memory_frontier(%ptr: tensor<64x!tt.ptr<f32>, #blocked>) attributes {noinline = false} {
+    %loaded0 = tt.load %ptr : tensor<64x!tt.ptr<f32>, #blocked>
+    %loaded1 = tt.load %ptr : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.store %ptr, %loaded0 : tensor<64x!tt.ptr<f32>, #blocked>
+    %loaded2 = tt.load %ptr : tensor<64x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    read0, read1, write, read2 = token_program.memory_effects
+    assert (read0.kind, read1.kind, write.kind, read2.kind) == (
+        "read",
+        "read",
+        "write",
+        "read",
+    )
+    assert read0.depends_on_effect_ids == ()
+    assert read1.depends_on_effect_ids == ()
+    assert write.depends_on_effect_ids == (read0.effect_id, read1.effect_id)
+    assert read2.depends_on_effect_ids == (write.effect_id,)
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_orders_local_memory_effects(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -701,6 +737,149 @@ def test_tlx_wave_converter_token_stage_records_buffer_load_effect():
     assert effect.offset_value_id == 2
     assert effect.value_value_id is None
     assert effect.mask_value_id == 3
+
+
+def test_tlx_wave_converter_token_stage_treats_global_and_buffer_as_may_alias():
+    value_type = converter_source_ir.SourceType(
+        "tensor<64xf32>",
+        "tensor",
+        shape=(64,),
+        element_type="f32",
+    )
+    pointer_type = converter_source_ir.SourceType(
+        "!tt.ptr<f32>",
+        "pointer",
+        pointee_type="f32",
+        address_space=1,
+    )
+    tensor_pointer_type = converter_source_ir.SourceType(
+        "tensor<64x!tt.ptr<f32>>",
+        "tensor",
+        shape=(64,),
+        element_type="!tt.ptr<f32>",
+        address_space=1,
+    )
+    offset_type = converter_source_ir.SourceType(
+        "tensor<64xi32>",
+        "tensor",
+        shape=(64,),
+        element_type="i32",
+    )
+    program = converter_source_ir.SourceProgram(
+        converter_source_ir.KernelInfo("global_buffer_alias"),
+        (
+            converter_source_ir.SourceOp(
+                0,
+                "tt.load",
+                operands=(1,),
+                results=(4,),
+            ),
+            converter_source_ir.SourceOp(
+                1,
+                "amdg.buffer_store",
+                operands=(5, 2, 3),
+                attrs={
+                    "cacheModifier": "none",
+                    "operandSegmentSizes": (1, 1, 1, 0, 0),
+                },
+            ),
+        ),
+        {
+            1: converter_source_ir.SourceValue(1, tensor_pointer_type, producer_name="arg0"),
+            2: converter_source_ir.SourceValue(2, pointer_type, producer_name="arg1"),
+            3: converter_source_ir.SourceValue(3, offset_type, producer_name="arg2"),
+            4: converter_source_ir.SourceValue(4, value_type, producer_name="load"),
+            5: converter_source_ir.SourceValue(5, value_type, producer_name="arg3"),
+        },
+        (converter_source_ir.SourceRegion(0, (0, 1)),),
+        0,
+    )
+
+    token_program = converter_tokens.build_token_program(program, None)
+
+    load_effect, store_effect = token_program.memory_effects
+    assert (load_effect.address_space, store_effect.address_space) == (
+        "global",
+        "buffer",
+    )
+    assert store_effect.depends_on_effect_ids == (load_effect.effect_id,)
+
+
+def test_tlx_wave_converter_token_stage_treats_unknown_space_as_may_alias():
+    value_type = converter_source_ir.SourceType(
+        "tensor<64xf32>",
+        "tensor",
+        shape=(64,),
+        element_type="f32",
+    )
+    unknown_tensor_pointer_type = converter_source_ir.SourceType(
+        "tensor<64x!tt.ptr<f32>>",
+        "tensor",
+        shape=(64,),
+        element_type="!tt.ptr<f32>",
+    )
+    buffer_pointer_type = converter_source_ir.SourceType(
+        "!tt.ptr<f32>",
+        "pointer",
+        pointee_type="f32",
+        address_space=1,
+    )
+    offset_type = converter_source_ir.SourceType(
+        "tensor<64xi32>",
+        "tensor",
+        shape=(64,),
+        element_type="i32",
+    )
+    program = converter_source_ir.SourceProgram(
+        converter_source_ir.KernelInfo("unknown_alias"),
+        (
+            converter_source_ir.SourceOp(
+                0,
+                "tt.load",
+                operands=(1,),
+                results=(4,),
+            ),
+            converter_source_ir.SourceOp(
+                1,
+                "amdg.buffer_store",
+                operands=(5, 2, 3),
+                attrs={
+                    "cacheModifier": "none",
+                    "operandSegmentSizes": (1, 1, 1, 0, 0),
+                },
+            ),
+            converter_source_ir.SourceOp(
+                2,
+                "tt.store",
+                operands=(1, 5),
+            ),
+        ),
+        {
+            1: converter_source_ir.SourceValue(
+                1,
+                unknown_tensor_pointer_type,
+                producer_name="arg0",
+            ),
+            2: converter_source_ir.SourceValue(2, buffer_pointer_type, producer_name="arg1"),
+            3: converter_source_ir.SourceValue(3, offset_type, producer_name="arg2"),
+            4: converter_source_ir.SourceValue(4, value_type, producer_name="load"),
+            5: converter_source_ir.SourceValue(5, value_type, producer_name="arg3"),
+        },
+        (converter_source_ir.SourceRegion(0, (0, 1, 2)),),
+        0,
+    )
+
+    token_program = converter_tokens.build_token_program(program, None)
+
+    unknown_read, buffer_write, unknown_write = token_program.memory_effects
+    assert unknown_read.address_space == "unknown"
+    assert buffer_write.address_space == "buffer"
+    assert unknown_write.address_space == "unknown"
+    assert buffer_write.depends_on_effect_ids == (unknown_read.effect_id,)
+    assert unknown_write.depends_on_effect_ids == (
+        unknown_read.effect_id,
+        buffer_write.effect_id,
+    )
 
 
 def test_tlx_wave_converter_token_stage_reports_malformed_segments():
@@ -950,6 +1129,24 @@ def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
     float_op = next(op for op in output.target_program.ops if op.kind == "float_binary")
     assert converter_target_ir.attrs_dict(float_op)["operation"] == "addf"
     assert "wave.fadd" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_ignores_sched_barrier(tmp_path):
+    local_func = """
+  tt.func public @converter_sched_barrier() attributes {noinline = false} {
+    rocdl.sched.barrier 0 {triton.warp_pipeline.border = "stage0", triton.warp_pipeline.priority = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops] == ["return"]
+    assert "rocdl.sched.barrier" not in output.emitted_module.text
+    assert "wave.barrier" not in output.emitted_module.text
+    assert "s_barrier" not in output.emitted_module.text
     del ctx
 
 
@@ -1599,6 +1796,35 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_pipeline_joins_independent_dma_packets(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_buffer_load_to_local_join(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1024xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<1024xi32, #blocked>] -> <1024xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    attrs = converter_target_ir.attrs_dict(output.target_program.ops[2])
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["component_count"] == 2
+    assert attrs["destination_component_offsets"] == (0, 512)
+    assert output.emitted_module.text.count("waveamd.dma_load_lds") == 2
+    assert output.emitted_module.text.count("wave.join") == 2
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     tmp_path,
 ):
@@ -1827,6 +2053,11 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     assert "wave.binary shrui" not in wave
     assert wave.count("wave.load") == 2
     assert wave.count("waveamd.transpose_load") == 4
+    assert all(
+        " after " not in line
+        for line in wave.splitlines()
+        if "waveamd.transpose_load" in line
+    )
     assert wave.count("wave.pack") == 2
     assert wave.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
     del ctx
@@ -1862,6 +2093,11 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     assert '<"20 + 40*Mod' in wave
     assert '<"100 + 40*Mod' not in wave
     assert wave.count("waveamd.transpose_load") == 16
+    assert all(
+        " after " not in line
+        for line in wave.splitlines()
+        if "waveamd.transpose_load" in line
+    )
     del ctx
 
 

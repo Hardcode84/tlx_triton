@@ -94,6 +94,7 @@ def build_token_program(source_program, type_layout_program):
     users_by_value = {}
     open_async_tokens = []
     committed_groups = []
+    dependency_frontier = _DependencyFrontier()
 
     for op in source_program.ops:
         token_node_id = None
@@ -135,7 +136,8 @@ def build_token_program(source_program, type_layout_program):
                     source_program,
                     op,
                     token_node_id,
-                    tuple(effect.effect_id for effect in memory_effects),
+                    len(memory_effects),
+                    dependency_frontier,
                 )
             )
 
@@ -306,7 +308,82 @@ def _buffer_async_copy_fields(op):
     }
 
 
-def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
+class _DependencyFrontier:
+    def __init__(self):
+        self._last_writes_by_domain = {}
+        self._reads_since_write_by_domain = {}
+
+    def dependencies_for(
+        self,
+        *,
+        kind,
+        address_space,
+        volatile=False,
+        ordering=None,
+        sync_scope=None,
+    ):
+        domains = _alias_domains_for_query(address_space, self._known_domains())
+        if _effect_is_barrier_like(volatile, ordering, sync_scope):
+            return _dedupe_effect_ids(
+                effect_id
+                for domain in domains
+                for effect_id in (
+                    *self._last_writes_by_domain.get(domain, ()),
+                    *self._reads_since_write_by_domain.get(domain, ()),
+                )
+            )
+        if kind == "read":
+            return _dedupe_effect_ids(
+                effect_id
+                for domain in domains
+                for effect_id in self._last_writes_by_domain.get(domain, ())
+            )
+        if kind == "write":
+            return _dedupe_effect_ids(
+                effect_id
+                for domain in domains
+                for effect_id in (
+                    *self._last_writes_by_domain.get(domain, ()),
+                    *self._reads_since_write_by_domain.get(domain, ()),
+                )
+            )
+        return ()
+
+    def record(self, effect):
+        domain = _alias_domain(effect.address_space)
+        if _effect_is_barrier_like(
+            effect.volatile,
+            effect.ordering,
+            effect.sync_scope,
+        ) or effect.kind == "write":
+            if domain == "unknown":
+                self._last_writes_by_domain.clear()
+                self._reads_since_write_by_domain.clear()
+            self._last_writes_by_domain[domain] = (effect.effect_id,)
+            self._reads_since_write_by_domain[domain] = ()
+            return
+        if effect.kind == "read":
+            self._reads_since_write_by_domain[domain] = (
+                *self._reads_since_write_by_domain.get(domain, ()),
+                effect.effect_id,
+            )
+
+    def _known_domains(self):
+        return frozenset(
+            (
+                *self._last_writes_by_domain.keys(),
+                *self._reads_since_write_by_domain.keys(),
+            )
+        )
+
+
+def _memory_effects_for_op(
+    source_program,
+    op,
+    token_node_id,
+    next_effect_id,
+    dependency_frontier,
+):
     fields = _token_fields(source_program, op) if op.name in _ASYNC_COPY_OPS else {}
     if op.name == "ttg.async_copy_global_to_local":
         return _effect_pair(
@@ -317,7 +394,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
             None,
             fields["memdesc_value_id"],
             fields["mask_value_id"],
-            prior_effect_ids,
+            next_effect_id,
+            dependency_frontier,
             read_space="global",
         )
     if op.name == "amdg.buffer_load_to_local":
@@ -329,7 +407,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
             fields["source_offset_value_id"],
             fields["memdesc_value_id"],
             fields["mask_value_id"],
-            prior_effect_ids,
+            next_effect_id,
+            dependency_frontier,
             read_space="buffer",
         )
     if op.name == "tt.load":
@@ -345,7 +424,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 None,
                 mask_value_id,
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     if op.name == "tt.store":
@@ -361,7 +441,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 _operand_or_none(op, 1),
                 mask_value_id,
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     if op.name == "ttg.local_load":
@@ -376,7 +457,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 _operand_or_none(op, 1) if len(op.operands) > 1 else None,
                 None,
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     if op.name == "ttg.local_store":
@@ -391,7 +473,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 _operand_or_none(op, 0),
                 None,
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     if op.name == "amdg.buffer_load":
@@ -407,7 +490,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 None,
                 fields["mask_value_id"],
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     if op.name == "amdg.buffer_store":
@@ -423,7 +507,8 @@ def _memory_effects_for_op(source_program, op, token_node_id, prior_effect_ids):
                 fields["value_value_id"],
                 fields["mask_value_id"],
                 token_node_id,
-                prior_effect_ids,
+                next_effect_id,
+                dependency_frontier,
             ),
         )
     return ()
@@ -437,7 +522,8 @@ def _effect_pair(
     source_offset_value_id,
     memdesc_value_id,
     mask_value_id,
-    prior_effect_ids,
+    next_effect_id,
+    dependency_frontier,
     *,
     read_space,
 ):
@@ -451,7 +537,8 @@ def _effect_pair(
         None,
         mask_value_id,
         token_node_id,
-        prior_effect_ids,
+        next_effect_id,
+        dependency_frontier,
     )
     write = _memory_effect(
         source_program,
@@ -463,7 +550,9 @@ def _effect_pair(
         None,
         mask_value_id,
         token_node_id,
-        prior_effect_ids + (read.effect_id,),
+        next_effect_id + 1,
+        dependency_frontier,
+        explicit_dependency_ids=(read.effect_id,),
     )
     return read, write
 
@@ -478,11 +567,16 @@ def _memory_effect(
     value_value_id,
     mask_value_id,
     token_node_id,
-    prior_effect_ids,
+    effect_id,
+    dependency_frontier,
+    explicit_dependency_ids=(),
 ):
     del source_program
-    return MemoryEffect(
-        len(prior_effect_ids),
+    volatile = bool(op.attrs.get("volatile", False))
+    ordering = _attr_or_none(op, "ordering")
+    sync_scope = _attr_or_none(op, "syncscope")
+    effect = MemoryEffect(
+        effect_id,
         op.index,
         op.name,
         kind,
@@ -493,12 +587,56 @@ def _memory_effect(
         mask_value_id,
         token_node_id,
         _cache_modifier(op),
-        bool(op.attrs.get("volatile", False)),
-        _attr_or_none(op, "ordering"),
-        _attr_or_none(op, "syncscope"),
+        volatile,
+        ordering,
+        sync_scope,
         "unknown",
-        tuple(prior_effect_ids),
+        _dedupe_effect_ids(
+            (
+                *dependency_frontier.dependencies_for(
+                    kind=kind,
+                    address_space=address_space,
+                    volatile=volatile,
+                    ordering=ordering,
+                    sync_scope=sync_scope,
+                ),
+                *explicit_dependency_ids,
+            )
+        ),
     )
+    dependency_frontier.record(effect)
+    return effect
+
+
+def _alias_domain(address_space):
+    if address_space in {"global", "buffer"}:
+        return "global"
+    if address_space == "local":
+        return "local"
+    return "unknown"
+
+
+def _alias_domains_for_query(address_space, known_domains):
+    domain = _alias_domain(address_space)
+    if domain == "unknown":
+        return tuple(sorted(known_domains | {"global", "local", "unknown"}))
+    return (domain, "unknown")
+
+
+def _effect_is_barrier_like(volatile, ordering, sync_scope):
+    return bool(volatile or ordering or sync_scope)
+
+
+def _dedupe_effect_ids(effect_ids):
+    result = []
+    seen = set()
+    for effect_id in effect_ids:
+        effect_id = int(effect_id)
+        if effect_id in seen:
+            continue
+        seen.add(effect_id)
+        result.append(effect_id)
+    return tuple(sorted(result))
 
 
 def _buffer_load_fields(op):

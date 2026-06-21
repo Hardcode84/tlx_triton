@@ -564,7 +564,8 @@ def _emit_buffer_load_to_local(state, op):
             f"unsupported amdg.buffer_load_to_local mode {attrs['mode']}",
             target_op_id=op.target_op_id,
         )
-    token = state.builder.token()
+    dependency = state.builder.token()
+    component_tokens = []
     lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
     value_type = state.dsl.simd_type(element_type, lane_width)
     source_ptr_type = state.dsl.simd_ptr_type(
@@ -586,7 +587,11 @@ def _emit_buffer_load_to_local(state, op):
             offset_component,
             result_type=source_ptr_type,
         )
-        loaded, load_token = state.builder.load(source_ptr, value_type, after=token)
+        loaded, load_token = state.builder.load(
+            source_ptr,
+            value_type,
+            after=dependency,
+        )
         dest_offset = lane
         if destination_base_offset:
             base_offset = state.builder.splat(
@@ -604,8 +609,8 @@ def _emit_buffer_load_to_local(state, op):
             dest_offset,
             result_type=dest_ptr_type,
         )
-        token = state.builder.store(loaded, dest_ptr, after=load_token)
-    state.values[_single_result(op)] = token
+        component_tokens.append(state.builder.store(loaded, dest_ptr, after=load_token))
+    state.values[_single_result(op)] = _join_memory_tokens(state, component_tokens)
 
 
 def _emit_buffer_load_to_local_packet_dma(
@@ -651,7 +656,8 @@ def _emit_buffer_load_to_local_packet_dma(
             (0, max(0, int(component_thread_count) - 1)),
             op,
         )
-    token = state.builder.token()
+    dependency = state.builder.token()
+    component_tokens = []
     for component, destination_offset in enumerate(destination_offsets):
         coords = _packet_coordinate_values(
             state,
@@ -696,13 +702,15 @@ def _emit_buffer_load_to_local_packet_dma(
                 dest_offset,
                 result_type=i32_shared,
             )
-        token = state.builder.dma_load_lds(
-            source_ptr,
-            dest_ptr,
-            after=token,
-            bytes=packet_bytes,
+        component_tokens.append(
+            state.builder.dma_load_lds(
+                source_ptr,
+                dest_ptr,
+                after=dependency,
+                bytes=packet_bytes,
+            )
         )
-    return token
+    return _join_memory_tokens(state, component_tokens)
 
 
 def _emit_buffer_load_to_local_dma(
@@ -724,7 +732,8 @@ def _emit_buffer_load_to_local_dma(
             "amdg.buffer_load_to_local DMA requires a positive packet byte width",
             target_op_id=op.target_op_id,
         )
-    token = state.builder.token()
+    dependency = state.builder.token()
+    component_tokens = []
     source_ptr_type = state.dsl.simd_ptr_type(
         element_type,
         state.dsl.buffer_address_space(),
@@ -747,13 +756,15 @@ def _emit_buffer_load_to_local_dma(
                 state.builder.constant(state.dsl.i32(), destination_base_offset),
                 result_type=dest_ptr_type,
             )
-        token = state.builder.dma_load_lds(
-            source_ptr,
-            dest_ptr,
-            after=token,
-            bytes=packet_bytes,
+        component_tokens.append(
+            state.builder.dma_load_lds(
+                source_ptr,
+                dest_ptr,
+                after=dependency,
+                bytes=packet_bytes,
+            )
         )
-    return token
+    return _join_memory_tokens(state, component_tokens)
 
 
 def _emit_async_commit_group(state, op):
@@ -764,6 +775,15 @@ def _emit_async_commit_group(state, op):
         token = state.builder.token()
     if op.results:
         state.values[_single_result(op)] = token
+
+
+def _join_memory_tokens(state, tokens):
+    tokens = tuple(tokens)
+    if not tokens:
+        return state.builder.token()
+    if len(tokens) == 1:
+        return tokens[0]
+    return state.builder.join(*tokens)
 
 
 def _emit_async_wait(state, op):
@@ -889,7 +909,6 @@ def _emit_b16_transpose_fragment_load(
     chunk_element_deltas = attrs.get("chunk_element_deltas")
     fragments = []
     for component_index, tile_offsets in enumerate(attrs["component_tile_offsets"]):
-        token = None
         components = []
         component_deltas = None
         if chunk_element_deltas is not None:
@@ -924,7 +943,7 @@ def _emit_b16_transpose_fragment_load(
                 physical_extra_elements=physical_extra_elements,
             )
             ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
-            loaded, token = state.builder.transpose_load(ptr, load_type, after=token)
+            loaded, _token = state.builder.transpose_load(ptr, load_type)
             for component in range(int(attrs["chunk_elements"])):
                 components.append(
                     state.dsl.wave.ExtractOp(

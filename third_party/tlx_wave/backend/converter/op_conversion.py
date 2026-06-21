@@ -262,6 +262,9 @@ def _convert_source_op(
             op,
         )
         return
+    if op.name == "rocdl.sched.barrier":
+        _convert_sched_barrier(op)
+        return
     converter = _converter_for_op(op.name)
     if converter is None:
         fail(
@@ -1403,6 +1406,7 @@ _SIMPLE_OP_CONVERTERS = {
 _SPECIALIZED_SOURCE_OPS = frozenset(
     {
         "arith.truncf",
+        "rocdl.sched.barrier",
         "scf.if",
         "ttg.local_alloc",
         "ttg.memdesc_index",
@@ -1421,6 +1425,16 @@ _SUPPORTED_SOURCE_OPS = frozenset(_SIMPLE_OP_CONVERTERS) | _SPECIALIZED_SOURCE_O
 _UNOWNED_SOURCE_OPS = _SUPPORTED_SOURCE_OPS - domains.all_source_ops()
 if _UNOWNED_SOURCE_OPS:
     raise RuntimeError(f"unsupported source op domains: {sorted(_UNOWNED_SOURCE_OPS)}")
+
+
+def _convert_sched_barrier(op):
+    if op.results:
+        fail(
+            "TLXW_OP_UNEXPECTED_RESULT",
+            STAGE,
+            "rocdl.sched.barrier must not produce values",
+            source_op_index=op.index,
+        )
 
 
 def _fact_ids_by_source_op(fact_program):

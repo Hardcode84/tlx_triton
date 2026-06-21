@@ -40,6 +40,7 @@ LOWERING_DOMAINS = (
             "tt.broadcast",
             "tt.expand_dims",
             "tt.get_program_id",
+            "rocdl.sched.barrier",
             "scf.if",
             "tt.return",
         ),

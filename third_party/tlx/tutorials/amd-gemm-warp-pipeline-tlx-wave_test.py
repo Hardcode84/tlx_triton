@@ -261,7 +261,7 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert wave.count("wave.cast fpconvert") == 32
     assert wave.count("wave.store") == 32
     assert wave.count("wave.where") == 0
-    assert wave.count("wave.join") <= 8
+    assert wave.count("wave.join") <= 10
     assert wave.count("wave.extract") == 256
     assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741820 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
@@ -270,7 +270,7 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
     assert "waveamdmachine.global_load_lds_b128" not in machine
     assert machine.count("waveamdmachine.ds_load_b128") == 16
-    assert machine.count("waveamdmachine.token_join") <= 8
+    assert machine.count("waveamdmachine.token_join") <= 10
     assert machine.count("waveamdmachine.buffer_store_b64") == 32
     assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 8
     assert machine.count("waveamdmachine.exec_if") == 0
@@ -309,3 +309,27 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert machine.count("waveamdmachine.tuple_to_elements") < 384
     assert machine.count("waveamdmachine.tuple_from_elements") < 640
     assert machine.count("waveamdmachine.v_mov_b32_tuple") < 256
+
+
+def test_gfx9_v9_tlx_wave_hot_loop_waits_are_not_full_drains(monkeypatch, tmp_path):
+    amd_compiled = _warmup_gfx9_v9_amd(tmp_path, monkeypatch, k=256)
+    amd_asm = _asm_text(amd_compiled, "amdgcn")
+
+    compiled = _warmup_gfx9_v9_tlx_wave(tmp_path, monkeypatch, k=256)
+    wave = _wave_text(compiled)
+    machine = _run_wave_promote_buffer_to_machine(wave)
+    asm, _diagnostics = _run_wave_to_amdgpu_asm(wave)
+
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_num_mmas == 256
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 32
+    assert asm.count("v_mfma") == amd_asm.count("v_mfma") == 256
+    assert asm.count("buffer_load") == amd_asm.count("buffer_load") == 32
+    assert asm.count("buffer_store") == amd_asm.count("buffer_store") == 32
+    assert wave.count("wave.wait") == 6
+    assert machine.count("waveamdmachine.s_waitcnt vmcnt(10)") == 1
+    assert machine.count("waveamdmachine.s_waitcnt vmcnt(8)") == 4
+    assert asm.count("s_waitcnt vmcnt(10)") == 1
+    assert asm.count("s_waitcnt vmcnt(8)") == 4
+    assert asm.count("s_waitcnt vmcnt(0)") == 2
+    assert asm.count("s_waitcnt vmcnt(0)") < amd_asm.count("s_waitcnt vmcnt(0)")

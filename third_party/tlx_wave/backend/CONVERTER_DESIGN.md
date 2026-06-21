@@ -13,8 +13,8 @@ text emission, or terminal-op graph reconstruction.
   bindings only.
 - Make conversion decisions in stateless rewrite/type-conversion stages, not in
   the final emitter.
-- Represent layout, pointer, mask, fragment, memory-token, and arithmetic facts
-  as explicit converted values.
+- Represent layout, pointer, mask, fragment, memory-dependency, and arithmetic
+  facts as explicit converted values.
 - Make unsupported semantics fail early with precise diagnostics.
 - Keep each lowering unit testable without compiling a full GEMM.
 - Produce Wave IR close enough to the existing AMD backend that assembly
@@ -32,13 +32,45 @@ text emission, or terminal-op graph reconstruction.
   `_BridgePlan`-shaped mutable state. Compatibility with the old bridge is
   limited to external golden comparison.
 
+## Source Memory Contracts
+
+The converter's memory-dependency model is derived from Wave, Triton, and LLVM
+contracts, not from a blanket "memory op implies token chain" rule.
+
+- Wave memory dependencies are explicit: an operation is ordered after another
+  memory operation only when it consumes a token produced by that operation or a
+  token derived from it. A read result's normal SSA uses are enough to require
+  data readiness for the loaded value. Wave/WaveAMD waitcnt lowering can still
+  track every memory issuer with target event tickets, but those tickets are not
+  source-level happens-before edges unless consumed by a token use.
+- Triton `tt.load` and `tt.store` carry memory effects, masks, cache modifiers,
+  and volatile flags, but they do not define an async-token protocol. Triton
+  still preserves ordinary program-order memory semantics for may-alias
+  read/write and write/write effects unless a pass proves the accesses cannot
+  conflict. Kernel pointer arguments are may-alias by default: passing the same
+  tensor/storage through multiple pointer parameters is valid, and attributes
+  such as `tt.divisibility`, `tt.contiguity`, and `tt.pointer_range` describe
+  alignment, contiguity, or offset width, not allocation disjointness. Triton
+  atomics carry explicit `sem` and `scope`;
+  `ttg.async_copy_global_to_local`,
+  `ttg.async_commit_group`, and `ttg.async_wait` define explicit async groups
+  and wait windows; `ttg.async_wait` does not synchronize CTA execution, so
+  barriers remain separate. Triton's membar analysis inserts local-memory
+  barriers from possible shared-memory hazards, not from all memory effects.
+- LLVM's normal non-atomic load/store model does not make every memory access a
+  scheduling token, but it also does not allow arbitrary reordering across
+  potentially aliasing writes. Ordering comes from normal memory dependencies,
+  atomic orderings, fences, volatile ordering rules, and target-specific hazards.
+  LLVM's `token` type is an explicit protocol value associated with particular
+  instructions; it is not the representation of ordinary memory effects.
+
 ## Hard Rules
 
 1. Rewriters are stateless.
 
    A rewriter receives the source op, converted operands, source/result type
-   facts, token facts, and layout facts. It must not walk MLIR def-use chains,
-   inspect users, or rediscover producers.
+   facts, dependency facts, and layout facts. It must not walk MLIR def-use
+   chains, inspect users, or rediscover producers.
 
 2. Type conversion owns representation choice.
 
@@ -81,6 +113,17 @@ text emission, or terminal-op graph reconstruction.
    each get an explicit converted op form. Buffer promotion is not an emitter
    heuristic.
 
+   Memory dependency tokens encode required happens-before edges only. They are
+   not a generic representation of "this op has memory effects", source order,
+   or scheduler preference. A memory operation may create a target event ticket
+   for waitcnt scoreboarding without exposing or threading a dependency token.
+   The converter must distinguish:
+
+   - data readiness, represented by normal SSA uses of loaded values;
+   - memory happens-before, represented by explicit dependency tokens;
+   - target hazards and counter depth, handled by Wave/WaveAMD scheduling and
+     ticket-wait passes.
+
 7. Failure is explicit.
 
    Unsupported cache modifiers, cross-lane remaps, unsupported layouts,
@@ -98,9 +141,9 @@ text emission, or terminal-op graph reconstruction.
 
    Shared helpers must be pure and belong to one domain such as layouts, facts,
    tokens, target IR, diagnostics, or emission. No helper may access source
-   program state, converted values, token graph, target program, and emitter
-   state together. No helper may choose representation or memory-op family
-   outside the owning conversion stage.
+   program state, converted values, memory-dependency graph, target program, and
+   emitter state together. No helper may choose representation or memory-op
+   family outside the owning conversion stage.
 
 ## Pipeline
 
@@ -157,26 +200,61 @@ The converter is a sequence of independent stages:
    nonnegative values is not nonnegative unless overflow is impossible in the
    relevant fixed-width semantics.
 
-4. Token graph
+4. Memory dependency graph
 
-   Build async and memory-token ordering before op conversion:
+   Build async and memory-dependency ordering before op conversion:
 
    - async copy tokens;
    - commit groups;
    - wait windows;
-   - local-load/local-store token dependencies;
+   - local-load/local-store dependencies required by source semantics or
+     shared-memory hazard analysis;
    - global/buffer memory effects.
    - read/write/RMW kind, volatile flag, atomic ordering, sync scope, address
      space, and conservative alias class for every memory effect.
 
-   Token facts may include token users because this graph is a dedicated token
-   dependency model. General SSA value users are not allowed.
+   Dependency facts may include token users because this graph is a dedicated
+   token dependency model. General SSA value users are not allowed.
 
-   Unknown-alias or may-alias memory effects must be ordered in source order,
-   including across region boundaries through yielded tokens. Edges may be
-   omitted only with a cited no-alias or disjoint-byte-interval proof. Atomic,
-   volatile, barrier, and fence-like source ops require exact target semantics
-   for ordering, visibility, return value, and scope; otherwise they reject.
+   The graph records every memory effect, but it emits dependency edges only for
+   ordering required by the source program. Plain Triton global/buffer
+   load/store effects do not become a single source-order chain of all memory
+   effects. They do, however, require conservative source-order edges for
+   potentially aliasing RAW, WAR, and WAW pairs unless there is a no-alias,
+   disjoint-byte, inactive-mask, or equivalent proof. Different kernel pointer
+   arguments are not a no-alias proof by themselves, and range/alignment attrs
+   are not alias proofs. Loaded values use normal SSA data dependencies for
+   readiness; dependency tokens cover memory ordering that is not already
+   represented by a value use.
+
+   Required edges come from:
+
+   - Triton async copy commit/wait protocol;
+   - barriers, fences, atomics, and volatile ordering;
+   - local/shared-memory hazards required by Triton's memory-barrier contract;
+   - explicit token operands/results in source IR;
+   - region yields when a required dependency crosses a structured boundary.
+
+   Unknown or may-alias effects are ordered in source order when at least one
+   side writes and the relevant memory contract can observe the order. RAR pairs
+   do not need an ordering edge. Edges may be omitted only with a cited no-alias
+   or disjoint-byte proof, or when masks prove the potentially conflicting lanes
+   inactive. If a source operation requests ordering that the converter cannot
+   model exactly for the address space, scope, mask, or region shape, conversion
+   rejects. Atomic, volatile, barrier, and fence-like source ops require exact
+   target semantics for ordering, visibility, return value, and scope; otherwise
+   they reject.
+
+   Wave/WaveAMD may attach internal event tickets to all memory issuers for
+   waitcnt accounting. Those tickets are not dependency tokens unless a token is
+   consumed by another memory op or by an explicit wait/barrier operation.
+
+   The dependency graph must be able to represent more than one outstanding
+   async group. Waiting an older group while newer groups remain live must lower
+   to a partial counter wait such as `vmcnt(N)` or `lgkmcnt(N)`, where `N`
+   preserves the younger tickets. Full `vmcnt(0)` or `lgkmcnt(0)` drains are
+   legal only when the source semantics require all outstanding work to complete
+   or at terminal boundaries outside the hot prefetch/compute loop.
 
 5. Op conversion
 
@@ -189,9 +267,9 @@ The converter is a sequence of independent stages:
    `WaveIf`, and `WaveFor`.
 
    Rewriter entrypoints receive only the current `SourceOpView`, converted
-   operands/results, fact/layout/token handles, and a target builder. They must
-   not receive a `SourceProgram`, source value table, owner-op lookup API, user
-   map, or producer lookup API.
+   operands/results, fact/layout/dependency handles, and a target builder. They
+   must not receive a `SourceProgram`, source value table, owner-op lookup API,
+   user map, or producer lookup API.
 
 6. Verification
 
@@ -210,7 +288,10 @@ The converter is a sequence of independent stages:
    - buffer and DMA ops cite byte-range, alignment, address-space, mask,
      cache/other-value, and layout-contiguity facts as applicable;
    - all layout conversions are explicit;
-   - all memory effects are tokenized.
+   - every required memory happens-before edge is represented by a dependency
+     token;
+   - memory effects with no required happens-before edge are not threaded into a
+     dependency chain.
 
 7. Structural emission
 
@@ -259,18 +340,18 @@ Each stage must be usable and testable before the next stage is implemented.
    invalid shift amounts, branch-local fact escape, loop-carried fact escape,
    inactive masked pointer lanes, and unproven packet uniformity.
 
-4. Token gate
+4. Memory-dependency gate
 
-   The stage accepts source-program snapshots and produces an async/memory token
-   graph. It must not inspect general SSA value users. Negative tests cover
-   malformed commit/wait structure, missing token dependencies, and untokenized
-   memory effects.
+   The stage accepts source-program snapshots and produces an async/memory
+   dependency graph. It must not inspect general SSA value users. Negative tests
+   cover malformed commit/wait structure, missing required dependencies, and
+   dependency edges added for RAR pairs or effects proven disjoint/inactive.
 
 5. Op-conversion gate
 
-   The stage accepts converted operands, facts, layouts, and token facts and
-   produces target IR. It must run without Wave Python bindings. Negative tests
-   cover missing facts for proof-dependent target ops, unresolved layout
+   The stage accepts converted operands, facts, layouts, and dependency facts
+   and produces target IR. It must run without Wave Python bindings. Negative
+   tests cover missing facts for proof-dependent target ops, unresolved layout
    conversions, unsupported cache/other semantics, and attempts to attach source
    values or lazy resolvers to target ops.
 
@@ -279,7 +360,8 @@ Each stage must be usable and testable before the next stage is implemented.
    The stage accepts target IR fixtures and produces success or diagnostics. It
    must run without Wave Python bindings. Negative tests cover recursive
    materialization requests, fact scope mismatches, mask-scope mismatches,
-   fixed-width mismatches, unjoined facts, and untokenized effects.
+   fixed-width mismatches, unjoined facts, missing required dependency tokens,
+   and over-tokenized unrelated effects.
 
 7. Emission gate
 
@@ -300,7 +382,7 @@ The imported source program contains:
 - `KernelInfo`: target, arch, waves, CTAs, argument attrs, noinline.
 
 The owner op index is allowed because it is definition metadata, not a def-use
-walk. Consumers are not stored except in the token graph.
+walk. Consumers are not stored except in the memory-dependency graph.
 
 ### Converted Value
 
@@ -324,8 +406,8 @@ The target program is a closed schema over target values:
   provenance, and optional debug name.
 - `TargetOp`: op kind, target operand IDs, target result IDs, attrs, fact IDs,
   and region IDs.
-- `TargetEffect`: memory/token effect with explicit target operands and token
-  results.
+- `TargetEffect`: memory effect, internal event-ticket effect, or explicit
+  dependency-token effect with target operands and results.
 - `TargetRegion`: ordered target op IDs, block argument target IDs, and yielded
   target IDs.
 
@@ -503,6 +585,18 @@ Load/store conversion produces explicit target memory ops.
   for inactive lanes independent of EXEC/mask state, conversion requires an
   all-active fact or valid-inactive-address fact; otherwise it must select an
   explicit masked scalar/vector target op or reject.
+- A plain load without a required predecessor emits no dependency-token operand.
+  Consumers of the loaded value rely on the value SSA edge for data readiness.
+  The load result token, if the Wave op syntax produces one, is retained only
+  when a later required happens-before edge consumes it, such as a later
+  may-alias store that must not move before the load.
+- A plain store produces a target memory effect and may produce an event ticket,
+  but its token is retained or joined only when a later operation requires store
+  completion or visibility. Stores proven independent are not chained by source
+  order; stores that may alias a prior read or write keep the required ordering.
+- Atomic, volatile, barrier, and fence-like source operations lower through
+  their own ordering rules. They must not be approximated by serializing all
+  neighboring memory operations.
 
 ### Async Copy and DMA
 
@@ -545,6 +639,19 @@ would change copy order. The chosen packet width is recorded in bytes and
 elements and verified against source element type, destination memdesc element
 type, LDS physical layout, and address-space legality.
 
+Async-copy packets and fallback load/store chunks are group members, not a
+serial chain. The rewriter must emit one target event token per independent
+packet/chunk, all depending on the required predecessor token for the async copy,
+and then produce the async-copy result by joining those member tokens. It must
+not thread `after=previous_packet` or `after=previous_chunk` unless the source
+semantics require that packet order.
+
+`ttg.async_commit_group` closes the current member set and records a group token.
+`ttg.async_wait num = K` waits only the committed groups that must complete while
+leaving the newest `K` groups live. Lowering `num > 0` to a full drain in the
+steady-state prefetch/compute loop is a correctness/performance bug in the
+dependency model, even if the emitted code happens to run.
+
 ### Dot and MFMA
 
 MFMA lowering uses explicit fragment values.
@@ -573,7 +680,9 @@ Control flow conversion must be region-structured.
 - `scf.if` and `scf.for` produce target region ops.
 - Values yielded from regions are explicit target values.
 - Facts have region scope.
-- Memory effects inside regions are tokenized and yielded when necessary.
+- Required memory dependencies inside regions are tokenized and yielded when
+  necessary. Effects with no required happens-before edge stay as effects and do
+  not force yielded tokens.
 - Fact use is dominance-checked. A fact proven inside an `scf.if` branch is not
   available after the `scf.if` unless equivalent facts are yielded from all
   branches for the same yielded value and joined explicitly.
@@ -593,7 +702,7 @@ Target module split:
 - `types.py`: source/converted type records and type conversion.
 - `layouts.py`: structural TTGIR layout maps and layout conversion.
 - `facts.py`: range/divisibility/pow2/no-overflow/uniformity facts.
-- `tokens.py`: async and memory-token graph.
+- `tokens.py`: async and memory-dependency graph.
 - `rewriters/`: one file per op family.
 - `target_ir.py`: Wave target-program records.
 - `verify.py`: target-program verifier.
@@ -666,7 +775,8 @@ Tests should be layered.
 5. Verifier tests
 
    Verify the target program rejects recursive materialization requests,
-   missing facts, unhandled layout conversions, and untokenized memory effects.
+   missing facts, unhandled layout conversions, missing required memory
+   dependencies, and dependency tokens that serialize unrelated effects.
 
 6. Emitter tests
 
@@ -693,7 +803,7 @@ Additional acceptance tests:
 - Static import-policy tests import every pre-emission stage with Wave bindings
   and old bridge modules unavailable.
 - Stage fixture tests cover import-only snapshots, type/layout-only snapshots,
-  fact-only snapshots, token-graph-only snapshots, verifier-only target IR
+  fact-only snapshots, dependency-graph-only snapshots, verifier-only target IR
   snapshots, and emitter-from-handwritten-target-program snapshots.
 - Stage fixtures include positive minimum-support cases, so a stage cannot pass
   by rejecting everything. Positive cases cover valid no-overflow facts, legal
@@ -703,11 +813,18 @@ Additional acceptance tests:
   JSON-like form, reject callables/source objects in attrs/provenance, strip
   debug provenance before emission, and compare emitted structural IR.
 - Negative verifier tests cover recursive materialization requests, missing
-  no-overflow facts, forwarded `ttg.convert_layout`, untokenized memory effects,
-  unproven mask uniformity, and unconditional assumptions on masked lanes.
+  no-overflow facts, forwarded `ttg.convert_layout`, missing required memory
+  dependencies, over-tokenized unrelated effects, unproven mask uniformity, and
+  unconditional assumptions on masked lanes.
 - Token/control-flow tests cover multiple async groups, `wait 0`/`wait 1`,
-  consuming LDS before wait, tokens yielded through `scf.for`, and untokenized
-  effects inside branches/loops.
+  consuming LDS before wait, tokens yielded through `scf.for`, missing required
+  dependencies inside branches/loops, and memory effects that intentionally have
+  no dependency token.
+- Waitcnt-shape tests cover independent DMA packets, independent transpose-load
+  chunks, multibuffer `wait 1`/`wait 2`, and both VMEM and LGKM streams. These
+  tests must fail if group membership is represented by serial packet/chunk
+  after-chains or if a hot-loop wait for an older group becomes `vmcnt(0)` or
+  `lgkmcnt(0)` while newer groups are live.
 - Bridge-removal tests run the required TLX Wave end-to-end cases with old
   text fallback disabled or absent and assert the structural path.
 - Anti-overfit tests cover at least two GEMM shapes, mask all-active and
@@ -741,9 +858,10 @@ Required end-to-end matrix:
 
    Build tests around source values and layouts before adding emission.
 
-3. Implement fact and token analysis.
+3. Implement fact and memory-dependency analysis.
 
-   Reproduce the known div/pow2/pointer-range/mask-uniform cases as fact tests.
+   Reproduce the known div/pow2/pointer-range/mask-uniform cases as fact tests,
+   and the async-copy/multibuffer waitcnt cases as dependency tests.
 
 4. Implement target IR and verifier.
 
@@ -770,7 +888,7 @@ Required end-to-end matrix:
 
 Reject a patch if it:
 
-- adds a source-user map outside the token graph;
+- adds a source-user map outside the memory-dependency graph;
 - adds a target op operand that is not a target value ID;
 - adds an open-ended target op kind or attr object that is not part of a closed,
   serializable target IR schema;
@@ -783,6 +901,12 @@ Reject a patch if it:
 - adds a silent fallback;
 - adds a semantic fallback that is not an explicit target IR op with a
   test-assertable reason;
+- serializes RAR pairs, proven-disjoint effects, or inactive masked effects only
+  because they are memory effects;
+- threads a mutable "last token" through packet, chunk, component, or store
+  loops without a required happens-before edge;
+- lowers a steady-state async wait with newer live groups to a full
+  `vmcnt(0)`/`lgkmcnt(0)` drain;
 - proves multiplication range without no-overflow;
 - adds unmasked assumptions for masked lanes;
 - uses a pointer range as an element-index bound instead of a byte-interval
