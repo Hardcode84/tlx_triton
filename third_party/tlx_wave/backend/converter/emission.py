@@ -1549,6 +1549,63 @@ def _emit_layout_convert(state, op):
             tuple(components[index * group_size] for index in range(result_count))
         )
         return
+    if mode == "same_lane_register_remap":
+        result_count = int(attrs["result_component_count"])
+        source_indices = tuple(int(index) for index in attrs["source_indices"])
+        source_element_indices = tuple(
+            int(index) for index in attrs["source_element_indices"]
+        )
+        registers_per_component = int(attrs["source_registers_per_component"])
+        if len(source_indices) != result_count or len(source_element_indices) != result_count:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "layout_convert remap attrs do not match result component count",
+                target_op_id=op.target_op_id,
+            )
+        if len(components) != int(attrs["source_component_count"]):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "layout_convert remap source component count does not match attrs",
+                target_op_id=op.target_op_id,
+            )
+        result_id = _single_result(op)
+        result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
+        extracted = {}
+
+        def scalar_component(component_index, element_index):
+            key = (int(component_index), int(element_index))
+            if key in extracted:
+                return extracted[key]
+            component = components[int(component_index)]
+            if registers_per_component == 1:
+                if int(element_index) != 0:
+                    fail(
+                        "TLXW_EMIT_LAYOUT_REMAP",
+                        STAGE,
+                        "scalar layout remap requested a non-zero element index",
+                        target_op_id=op.target_op_id,
+                    )
+                extracted[key] = component
+                return component
+            extracted[key] = state.dsl.wave.ExtractOp(
+                result_type,
+                component,
+                int(element_index),
+            ).result
+            return extracted[key]
+
+        state.values[result_id] = _pack_components(
+            tuple(
+                scalar_component(component_index, element_index)
+                for component_index, element_index in zip(
+                    source_indices,
+                    source_element_indices,
+                )
+            )
+        )
+        return
     fail(
         "TLXW_EMIT_UNSUPPORTED_LAYOUT_CONVERT",
         STAGE,

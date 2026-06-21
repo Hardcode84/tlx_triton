@@ -447,6 +447,162 @@ Supported maps:
 Unsupported maps must fail in layout analysis or layout conversion, not inside a
 store or DMA emitter.
 
+### Distributed Tensor Layouts
+
+Distributed tensor layout maps have a stricter contract than local/shared memory
+maps. They describe values held by one Wave wave, not the whole CTA. A component
+tuple is therefore a tuple of per-wave registers or register vectors. It must
+not contain extra components just because the CTA has multiple waves.
+
+The layout map relation is:
+
+```text
+(component/register, lane, warp, block) -> logical tensor coordinates
+```
+
+For Wave emission, `lane` is the lane inside the current wave and `warp` is the
+wave's CTA-local warp coordinate. The converter must derive `lane` and `warp`
+from the kernel workgroup metadata and Wave workitem IDs; it must not assume a
+flat workgroup shape unless the imported kernel metadata proves that this is the
+launch shape. Existing one-dimensional GEMM layouts are allowed to use the
+single Wave axis that carries `warp * lane_width + lane`, but that axis choice
+is kernel metadata, not a layout hard-code.
+
+Per-wave component count is computed from the register input dimension of the
+structural layout:
+
+- blocked and linear tensor layouts use the `register` dimension size for one
+  wave;
+- AMD MFMA accumulator layouts use their per-wave accumulator register layout;
+- dot-operand layouts use their per-wave operand tile layout;
+- shared-memory layouts do not define value component count; they define
+  physical memory offsets.
+
+`warpsPerCTA` contributes to the `warp` coordinate in the relation above. It is
+not multiplied into the component count. For example, a CTA-wide 256x256
+epilogue tensor with four waves may still have 256 scalar register positions per
+wave for a blocked layout; representing it as 1024 components is invalid because
+it folds four different waves into one Wave SSA value.
+
+If a value component stores a vector register, the layout map records both the
+component count and the scalar register width of each component. A conversion
+that compares two physical layouts must compare scalar register slots:
+
+```text
+scalar_slot = component * scalar_registers_per_component + vector_element
+```
+
+The target type's `component_count` remains the number of Wave SSA components.
+The layout map owns the vector/scalar expansion needed for remaps.
+
+#### Coordinate Materialization
+
+Every tensor producer that materializes logical coordinates must go through its
+result layout map. This includes `tt.make_range`, splats expanded to tensor
+values, pointer arithmetic offsets, masks, generic loads/stores, async-copy
+packet proofs, and local-memory packet planning.
+
+The old flattened rule:
+
+```text
+logical = start + component * lane_width + lane
+```
+
+is legal only for a layout map that proves it is the actual structural relation.
+Otherwise op conversion emits an explicit target op whose attrs cite the layout
+map and requested output dimension. Emission mechanically lowers that target op
+to Wave index expressions using the encoded structural map:
+
+```text
+lane = workitem_lane(...)
+warp = workitem_warp(...)
+coords = layout_map.apply(component, lane, warp, block)
+```
+
+For exact `#ttg.linear` and generic linear layouts this lowering uses the
+structural basis maps from the TTGIR encoding. For blocked layouts it uses the
+same structural basis construction that Triton uses for `toLinearLayout`, not
+string parsing. For AMD MFMA layouts it uses the MFMA accumulator map keyed by
+`instrShape`, `isTransposed`, `warpsPerCTA`, `tilesPerWarp`, and element width.
+
+Coordinate target ops are pure index-producing ops. They do not inspect source
+producers, consumers, or terminal memory ops. If a terminal op needs a packet
+uniformity, contiguity, or bounds proof, that proof must cite facts derived from
+the same layout map rather than rediscovering coordinate arithmetic.
+
+#### Layout Conversion
+
+`ttg.convert_layout` lowers by composing the source and result layout maps. For
+each destination scalar slot and each active lane/warp, conversion asks:
+
+```text
+dst_coords = result_map.apply(dst_slot, lane, warp, block)
+src_slot, src_lane, src_warp = source_map.inverse(dst_coords)
+```
+
+The conversion is legal only when the source map is injective for all
+coordinates read by the result map and every destination coordinate is covered
+by the source value. The result is classified into one of these explicit target
+forms:
+
+- `layout_alias`: source and result have identical component, scalar-slot, lane,
+  warp, logical-coordinate, shape, and element-type mappings.
+- `layout_register_remap`: every destination scalar slot reads a fixed source
+  scalar slot from the same lane and same warp. This is a pure component/vector
+  extraction and packing operation.
+- `layout_lane_mux`: every destination lane reads from the same source lane and
+  warp, but the source scalar slot varies by lane. This is still same-lane data
+  movement, but it requires explicit per-lane selection masks and is not an
+  alias.
+- `layout_cross_lane_remap`: a destination lane reads data from another lane in
+  the same warp. This requires a Wave-level lane permutation/remap operation
+  with defined semantics. The TLX converter may build the remap plan, but Wave
+  owns the physical lowering to DS permute, DPP, LDS roundtrip, or any target
+  instruction sequence.
+- `layout_cross_warp_remap`: a destination warp reads data from another warp.
+  This is not representable as a per-wave SSA remap. It must lower through an
+  explicit CTA-local memory exchange with memory dependency tokens, or reject.
+  The v5 bring-up path must reject this class until a CTA-local exchange is
+  designed as separate work.
+
+The converter must not choose a store-side interpretation to paper over a
+missing layout conversion. If a tensor is converted before `tt.store`,
+`tt.load`, `tt.dot`, `ttg.local_store`, or a mask use, those consumers see only
+the converted value and its result layout map. They must not inspect the
+original producer to infer a physical layout.
+
+Conversion also handles facts:
+
+- element facts can be remapped only when they are keyed by logical coordinate
+  or by a scalar-slot permutation that the conversion explicitly records;
+- component, packet, mask-uniform, contiguity, and pointer-range facts are
+  invalidated unless remapped or re-proven for the result layout;
+- cross-lane and cross-warp conversions cannot preserve lane-local facts unless
+  the target remap operation publishes the required fact remapping.
+
+#### v5 Epilogue Bring-Up Scope
+
+The v5 local-prefetch GEMM epilogue exercises this contract with:
+
+```text
+amd_mfma accumulator -> truncf f16 in MFMA layout
+ttg.convert_layout   -> blocked<[1,8], [2,32], [4,1], order=[1,0]>
+```
+
+The first enablement step is to make the blocked result's component count match
+the per-wave register layout instead of the CTA-wide flattened element count.
+After that, the expected diagnostic should move from a component-model mismatch
+to the exact remap class required by the MFMA-to-blocked pair. If the pair needs
+cross-lane movement, the converter must emit `layout_cross_lane_remap` only when
+Wave exposes a corresponding semantic operation; otherwise it must reject with a
+diagnostic that names the missing Wave remap support.
+
+This design intentionally does not include generic `tt.store` enablement. Store
+lowering is a separate consumer of the converted blocked value. It should be
+implemented after layout maps and `ttg.convert_layout` are faithful, so the
+store lowering can remain a normal memory op conversion rather than a hidden
+layout-fixup path.
+
 ### Fact Record
 
 Fact records include:

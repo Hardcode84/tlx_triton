@@ -5,6 +5,7 @@ import re
 
 from .diagnostics import fail
 from . import domains
+from . import layout_remap
 from . import target_ir
 
 
@@ -1654,9 +1655,27 @@ def _convert_layout(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
+    register_remap = layout_remap.same_lane_register_remap(
+        operand,
+        result,
+        operand_layout,
+        result_layout,
+        op,
+    )
     if int(operand.type.component_count) == int(result.type.component_count):
         mode = "alias"
-        group_size = 1
+        attrs = {
+            "group_size": 1,
+            "mode": mode,
+            "result_component_count": int(result.type.component_count),
+        }
+    elif register_remap is not None:
+        mode = "same_lane_register_remap"
+        attrs = {
+            "mode": mode,
+            "result_component_count": int(result.type.component_count),
+            **register_remap,
+        }
     elif (
         operand_layout is not None
         and result_layout is not None
@@ -1666,6 +1685,11 @@ def _convert_layout(builder, type_layout_program, op):
     ):
         mode = "component_group_first"
         group_size = int(operand.type.component_count) // int(result.type.component_count)
+        attrs = {
+            "group_size": int(group_size),
+            "mode": mode,
+            "result_component_count": int(result.type.component_count),
+        }
     else:
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
@@ -1678,11 +1702,7 @@ def _convert_layout(builder, type_layout_program, op):
         "layout_convert",
         operands=_operand_target_ids(builder, op),
         results=result_target_ids,
-        attrs={
-            "group_size": int(group_size),
-            "mode": mode,
-            "result_component_count": int(result.type.component_count),
-        },
+        attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )

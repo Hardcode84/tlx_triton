@@ -2242,6 +2242,57 @@ def test_tlx_wave_converter_pipeline_joins_independent_dma_packets(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+"""
+    local_func = """
+  tt.func public @converter_mfma_to_blocked_epilogue_remap() attributes {noinline = false} {
+    %acc = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #mma>
+    %c = arith.truncf %acc : tensor<256x256xf32, #mma> to tensor<256x256xf16, #mma>
+    %converted = ttg.convert_layout %c : tensor<256x256xf16, #mma> -> tensor<256x256xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "warp-aware result component model" in str(diagnostic)
+    assert "per-wave register layout has 256" in str(diagnostic)
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_same_lane_mfma_to_blocked_remap(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [0, 1]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+"""
+    local_func = """
+  tt.func public @converter_same_lane_mfma_to_blocked_remap() attributes {noinline = false} {
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %c = arith.truncf %acc : tensor<16x16xf32, #mma> to tensor<16x16xf16, #mma>
+    %converted = ttg.convert_layout %c : tensor<16x16xf16, #mma> -> tensor<16x16xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "same_lane_register_remap"
+    assert attrs["source_indices"] == (0, 0, 0, 0)
+    assert attrs["source_element_indices"] == (0, 1, 2, 3)
+    assert output.emitted_module.text.count("wave.extract") == 4
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     tmp_path,
 ):
