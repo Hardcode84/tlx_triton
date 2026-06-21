@@ -44,6 +44,7 @@ def emit_wave_module(target_program, fact_program=None):
                 kernel.name,
                 arg_types,
                 lds_size=lds_size or None,
+                workgroup_size=_kernel_workgroup_size(kernel),
                 attrs=_function_attrs(dsl, ir, kernel),
             ) as builder:
                 state = _EmissionState(
@@ -2293,17 +2294,34 @@ def _set_module_attrs(module_builder, dsl, ir, kernel):
         )
 
 
+def _kernel_num_warps(kernel):
+    return int(kernel.num_warps or 1)
+
+
+def _kernel_threads_per_warp(kernel):
+    return int(kernel.threads_per_warp or 64)
+
+
+def _kernel_workgroup_size(kernel):
+    # Triton supports ND launch grids, but its per-CTA block shape is flat X:
+    # AMD/NVIDIA launchers pass (warp_size * num_warps, 1, 1). num_ctas is a
+    # cluster/CTA count and is not part of the per-workgroup thread shape.
+    return [_kernel_num_warps(kernel) * _kernel_threads_per_warp(kernel), 1, 1]
+
+
 def _function_attrs(dsl, ir, kernel):
+    num_warps = _kernel_num_warps(kernel)
     return {
         "tlx_wave.converter.stage": ir.StringAttr.get("structural-emission"),
-        "tlx_wave.num_warps": ir.IntegerAttr.get(dsl.i32(), int(kernel.num_warps or 1)),
+        "tlx_wave.num_warps": ir.IntegerAttr.get(dsl.i32(), num_warps),
         "tlx_wave.wave_size": ir.IntegerAttr.get(
             dsl.i32(),
-            int(kernel.threads_per_warp or 64),
+            _kernel_threads_per_warp(kernel),
         ),
         "tlx_wave.ttgir.noinline": ir.Attribute.parse(
             "true" if kernel.noinline else "false"
         ),
+        "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
     }
 
 

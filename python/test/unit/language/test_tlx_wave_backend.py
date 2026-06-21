@@ -1446,6 +1446,28 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_emits_workgroup_shape_from_ttgir(tmp_path):
+    local_func = """
+  tt.func public @converter_workgroup_shape() attributes {noinline = false} {
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=4,
+        threads_per_warp=64,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    wave_artifact = output.emitted_module.text
+
+    assert "wave.workgroup_size = array<i32: 256, 1, 1>" in wave_artifact
+    assert "gpu.known_block_size = array<i32: 256, 1, 1>" in wave_artifact
+    assert "wave.waves_per_workgroup = 4 : i64" in wave_artifact
+    del ctx
+
+
 def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch):
     local_func = """
   tt.func public @backend_wave_stage(%arg0: i32) attributes {noinline = false} {
@@ -1476,6 +1498,7 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
     assert metadata["tlx_wave_num_kernel_args"] == 1
     assert metadata["tlx_wave_num_scalar_args"] == 1
     assert metadata["tlx_wave_num_pointer_args"] == 0
+    assert metadata["tlx_wave_workgroup_size"] == 64
     _run_wave_verify(wave_artifact)
     del ctx
 

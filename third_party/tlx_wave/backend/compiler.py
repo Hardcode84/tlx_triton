@@ -245,6 +245,9 @@ def _populate_staged_converter_metadata(metadata, output, options, wave_opt):
     metadata["tlx_wave_threads_per_warp"] = int(
         source_kernel.threads_per_warp or options.warp_size
     )
+    metadata["tlx_wave_workgroup_size"] = (
+        metadata["tlx_wave_num_warps"] * metadata["tlx_wave_threads_per_warp"]
+    )
     metadata["tlx_wave_num_kernel_args"] = len(target_program.kernel.arg_target_ids)
     metadata["tlx_wave_num_pointer_args"] = sum(
         1 for target_type in arg_types if target_type.kind == "pointer"
