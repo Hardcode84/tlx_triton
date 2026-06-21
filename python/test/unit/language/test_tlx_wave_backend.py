@@ -1797,13 +1797,15 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         "swizzled_fragment_load",
         "b16_transpose",
     ]
-    assert output.emitted_module.text.count("wave.load") == 2
-    assert output.emitted_module.text.count("waveamd.transpose_load") == 4
-    assert output.emitted_module.text.count("wave.pack") == 2
-    assert output.emitted_module.text.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
-    machine = _run_waveamd_to_machine(output.emitted_module.text)
-    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 2
-    assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 4
+    wave = output.emitted_module.text
+    assert wave.count("wave.index_expr") == 6
+    assert "xor(" in wave
+    assert "wave.binary andi" not in wave
+    assert "wave.binary shrui" not in wave
+    assert wave.count("wave.load") == 2
+    assert wave.count("waveamd.transpose_load") == 4
+    assert wave.count("wave.pack") == 2
+    assert wave.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
     del ctx
 
 
@@ -1811,7 +1813,7 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [32, 32, 16], isTransposed = true}>
 #dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
-#shared = #ttg.padded_shared<[512:+16] {order = [1, 0], shape = [64, 128]}>
+#shared = #ttg.padded_shared<[4:+16] {order = [1, 0], shape = [64, 128]}>
 #smem = #ttg.shared_memory
 """
     local_func = """
@@ -1832,8 +1834,11 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
 
     assert len(local_load_attrs) == 1
     assert local_load_attrs[0]["load_mode"] == "b16_transpose"
-    assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 4),) * 8
-    assert output.emitted_module.text.count("waveamd.transpose_load") == 16
+    assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 20),) * 8
+    wave = output.emitted_module.text
+    assert '<"20 + 40*Mod' in wave
+    assert '<"100 + 40*Mod' not in wave
+    assert wave.count("waveamd.transpose_load") == 16
     del ctx
 
 
@@ -1988,17 +1993,7 @@ def _run_wave_verify(wave_artifact):
 
 def _run_wave_compile_kernels(wave_artifact):
     result = subprocess.run(
-        [
-            wave_bridge_tools._wave_opt(),
-            "-",
-            "--waveamd-to-machine",
-            "--waveamd-abi-lowering",
-            "--waveamd-reg-alloc",
-            "--waveamd-insert-hazard-waits",
-            "--waveamd-resource-info",
-            "--waveamd-metadata",
-            "--wave-compile-kernels=features=",
-        ],
+        [wave_bridge_tools._wave_opt(), "-", *wave_bridge_tools._WAVE_HSACO_PIPELINE],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,

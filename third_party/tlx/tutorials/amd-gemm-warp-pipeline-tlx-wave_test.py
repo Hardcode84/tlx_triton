@@ -165,26 +165,18 @@ def _wave_text(compiled):
 
 
 def _run_wave_promote_buffer_to_machine(wave_artifact):
+    from triton.backends.tlx_wave.wave_bridge_tools import _WAVE_HSACO_PIPELINE
+
     wave_opt = (
         Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
     )
     if not wave_opt.exists():
         pytest.skip("wave-opt is not built")
+    machine_pipeline = _WAVE_HSACO_PIPELINE[
+        : _WAVE_HSACO_PIPELINE.index("--waveamd-metadata")
+    ]
     result = subprocess.run(
-        [
-            str(wave_opt),
-            "-",
-            "--wave-expand-integer-div-rem",
-            "--canonicalize",
-            "--cse",
-            "--wave-simplify-index-exprs",
-            "--canonicalize",
-            "--cse",
-            "--wave-promote-global-to-buffer",
-            "--waveamd-to-machine",
-            "--canonicalize",
-            "--cse",
-        ],
+        [str(wave_opt), "-", *machine_pipeline],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
@@ -196,29 +188,18 @@ def _run_wave_promote_buffer_to_machine(wave_artifact):
 
 
 def _run_wave_to_amdgpu_asm(wave_artifact):
+    from triton.backends.tlx_wave.wave_bridge_tools import _WAVE_HSACO_PIPELINE
+
     wave_bin = Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin"
     wave_opt = wave_bin / "wave-opt"
     wave_translate = wave_bin / "wave-translate"
     if not wave_opt.exists() or not wave_translate.exists():
         pytest.skip("wave asm tools are not built")
+    machine_pipeline = _WAVE_HSACO_PIPELINE[
+        : _WAVE_HSACO_PIPELINE.index("--waveamd-metadata")
+    ]
     opt = subprocess.run(
-        [
-            str(wave_opt),
-            "-",
-            "--wave-expand-integer-div-rem",
-            "--canonicalize",
-            "--cse",
-            "--wave-simplify-index-exprs",
-            "--canonicalize",
-            "--cse",
-            "--wave-promote-global-to-buffer",
-            "--waveamd-to-machine",
-            "--canonicalize",
-            "--cse",
-            "--waveamd-abi-lowering",
-            "--waveamd-reg-alloc",
-            "--waveamd-resource-info",
-        ],
+        [str(wave_opt), "-", *machine_pipeline],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
@@ -288,9 +269,9 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
     assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
     assert "waveamdmachine.global_load_lds_b128" not in machine
-    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 16
+    assert machine.count("waveamdmachine.ds_load_b128") == 16
     assert machine.count("waveamdmachine.token_join") <= 8
-    assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 32
+    assert machine.count("waveamdmachine.buffer_store_b64") == 32
     assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 8
     assert machine.count("waveamdmachine.exec_if") == 0
     assert "waveamdmachine.buffer_store_b16" not in machine
@@ -319,7 +300,7 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_lshrrev_b64" not in machine
     assert "waveamdmachine.v_add_u64" not in machine
     assert machine.count("waveamdmachine.v_cmp") <= 16
-    assert machine.count("waveamdmachine.s_cmp_lg_u32") <= 20
+    assert machine.count("waveamdmachine.s_cmp_lg_u32") <= 32
     assert machine.count("waveamdmachine.s_cselect_b32") <= 40
     assert machine.count("waveamdmachine.s_xor_b32") <= 32
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16

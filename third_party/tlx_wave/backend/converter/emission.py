@@ -803,8 +803,6 @@ def _emit_local_load_fragment(state, op):
     i32_shared = state.dsl.ptr_type(state.dsl.i32(), state.dsl.shared_address_space())
     base_i32 = _ptr_cast(state, base, i32_shared)
     wi = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
-    simd_i32 = state.dsl.simd_type(state.dsl.i32(), lane_width)
-    lane_i32 = _simd_binary_const(state, "remui", wi, lane_width, lane_width)
     fragment_type = state.dsl.fragment_type(
         int(attrs["role"]),
         element_type,
@@ -822,8 +820,6 @@ def _emit_local_load_fragment(state, op):
             element_type,
             fragment_type,
             wi,
-            lane_i32,
-            simd_i32,
         )
         return
     if load_mode == "swizzled_fragment_load":
@@ -834,8 +830,6 @@ def _emit_local_load_fragment(state, op):
             base,
             fragment_type,
             wi,
-            lane_i32,
-            simd_i32,
         )
         return
     if load_mode != "fragment_load":
@@ -846,43 +840,24 @@ def _emit_local_load_fragment(state, op):
             target_op_id=op.target_op_id,
         )
     component_offsets = tuple(int(value) for value in attrs["component_dword_offsets"])
-    lane_stride = lane_i32
-    if registers != 1:
-        lane_stride = _simd_binary_const(
-            state,
-            "muli",
-            lane_i32,
-            registers,
-            lane_width,
-        )
     ptr_type = state.dsl.simd_ptr_type(
         state.dsl.i32(),
         state.dsl.shared_address_space(),
         lane_width,
     )
-    wave_tile_offset = _wave_tile_offset_i32(
-        state,
-        wi,
-        wave_tile_axis,
-        warps_per_cta,
-        wave_tile_stride_dwords,
-        lane_width,
-        op,
-    )
     fragments = []
     for component_offset in component_offsets:
-        offset = _add_optional_offset(state, lane_stride, wave_tile_offset)
-        if component_offset:
-            base_offset = state.builder.splat(
-                state.builder.constant(state.dsl.i32(), component_offset),
-                state.dsl.i32(),
-                lane_width,
-            )
-            offset = state.builder.binary(
-                state.dsl.BinaryKind.AddI,
-                offset,
-                base_offset,
-            )
+        offset = _linear_local_fragment_index_offset(
+            state,
+            wi,
+            lane_width,
+            elements_per_lane=registers,
+            wave_tile_axis=wave_tile_axis,
+            warps_per_cta=warps_per_cta,
+            wave_tile_stride=wave_tile_stride_dwords,
+            extra_elements=component_offset,
+            op=op,
+        )
         ptr = state.builder.ptr_add(base_i32, offset, result_type=ptr_type)
         fragment, _token = state.builder.fragment_load(ptr, fragment_type)
         fragments.append(fragment)
@@ -897,8 +872,6 @@ def _emit_b16_transpose_fragment_load(
     element_type,
     fragment_type,
     wi,
-    lane,
-    simd_i32,
 ):
     lane_width = int(attrs["lane_width"])
     base_type = state.dsl.ptr_type(element_type, state.dsl.shared_address_space())
@@ -913,63 +886,43 @@ def _emit_b16_transpose_fragment_load(
         width=lane_width,
     )
     component_type = state.dsl.simd_type(element_type, lane_width)
-    wave_tile_offset = _wave_tile_offset_i32(
-        state,
-        wi,
-        attrs.get("wave_tile_axis", "none"),
-        tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1))),
-        int(attrs.get("wave_tile_stride_elements", 0)),
-        lane_width,
-        op,
-    )
-    lane_scaled = _simd_binary_const(
-        state,
-        "muli",
-        lane,
-        int(attrs["elements_per_lane"]),
-        lane_width,
-    )
-    logical_base = _add_optional_offset(state, lane_scaled, wave_tile_offset)
     chunk_element_deltas = attrs.get("chunk_element_deltas")
     fragments = []
     for component_index, tile_offsets in enumerate(attrs["component_tile_offsets"]):
         token = None
         components = []
-        component_base = None
         component_deltas = None
         if chunk_element_deltas is not None:
             component_deltas = tuple(
                 int(value) for value in chunk_element_deltas[component_index]
             )
-            component_base = _local_fragment_element_offset(
+        for chunk in range(int(attrs["chunks_per_component"])):
+            logical_extra_elements = (
+                0
+                if component_deltas is not None
+                else int(attrs["chunk_elements"]) * chunk
+            )
+            physical_extra_elements = (
+                int(component_deltas[chunk])
+                if component_deltas is not None
+                else 0
+            )
+            offset = _local_fragment_element_offset(
                 state,
                 attrs,
-                logical_base,
+                wi,
                 tuple(int(value) for value in tile_offsets),
-                0,
+                logical_extra_elements,
                 lane_width,
+                elements_per_lane=int(attrs["elements_per_lane"]),
+                wave_tile_axis=attrs.get("wave_tile_axis", "none"),
+                warps_per_cta=tuple(
+                    int(value) for value in attrs.get("warps_per_cta", (1, 1))
+                ),
+                wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
+                op=op,
+                physical_extra_elements=physical_extra_elements,
             )
-        for chunk in range(int(attrs["chunks_per_component"])):
-            if component_base is not None:
-                offset = component_base
-                delta = int(component_deltas[chunk])
-                if delta:
-                    offset = _simd_binary_const(
-                        state,
-                        "addi",
-                        offset,
-                        delta,
-                        lane_width,
-                    )
-            else:
-                offset = _local_fragment_element_offset(
-                    state,
-                    attrs,
-                    logical_base,
-                    tuple(int(value) for value in tile_offsets),
-                    int(attrs["chunk_elements"]) * chunk,
-                    lane_width,
-                )
             ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
             loaded, token = state.builder.transpose_load(ptr, load_type, after=token)
             for component in range(int(attrs["chunk_elements"])):
@@ -996,8 +949,6 @@ def _emit_swizzled_fragment_load(
     base,
     fragment_type,
     wi,
-    lane,
-    simd_i32,
 ):
     lane_width = int(attrs["lane_width"])
     i32_shared = state.dsl.ptr_type(state.dsl.i32(), state.dsl.shared_address_space())
@@ -1007,32 +958,22 @@ def _emit_swizzled_fragment_load(
         state.dsl.shared_address_space(),
         lane_width,
     )
-    wave_tile_offset = _wave_tile_offset_i32(
-        state,
-        wi,
-        attrs.get("wave_tile_axis", "none"),
-        tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1))),
-        int(attrs.get("wave_tile_stride_elements", 0)),
-        lane_width,
-        op,
-    )
-    lane_scaled = _simd_binary_const(
-        state,
-        "muli",
-        lane,
-        int(attrs["elements_per_lane"]),
-        lane_width,
-    )
-    logical_base = _add_optional_offset(state, lane_scaled, wave_tile_offset)
     fragments = []
     for tile_offsets in attrs["component_tile_offsets"]:
         offset = _local_fragment_element_offset(
             state,
             attrs,
-            logical_base,
+            wi,
             tuple(int(value) for value in tile_offsets),
             0,
             lane_width,
+            elements_per_lane=int(attrs["elements_per_lane"]),
+            wave_tile_axis=attrs.get("wave_tile_axis", "none"),
+            warps_per_cta=tuple(
+                int(value) for value in attrs.get("warps_per_cta", (1, 1))
+            ),
+            wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
+            op=op,
             elements_per_offset_unit=2,
         )
         ptr = state.builder.ptr_add(base_i32, offset, result_type=ptr_type)
@@ -1044,33 +985,40 @@ def _emit_swizzled_fragment_load(
 def _local_fragment_element_offset(
     state,
     attrs,
-    logical_base,
+    wi,
     tile_offsets,
     extra_elements,
     lane_width,
     *,
+    elements_per_lane,
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride,
+    op,
     elements_per_offset_unit=1,
+    physical_extra_elements=0,
 ):
     tile_base = _dense_tile_base_elements(
         attrs.get("memdesc_shape", attrs["source_shape"]),
         tile_offsets,
     )
-    logical = logical_base
-    if tile_base or extra_elements:
-        logical = _simd_binary_const(
-            state,
-            "addi",
-            logical,
-            int(tile_base) + int(extra_elements),
-            lane_width,
-        )
+    logical = _linear_local_fragment_offset_expr(
+        state,
+        lane_width,
+        elements_per_lane=elements_per_lane,
+        wave_tile_axis=wave_tile_axis,
+        warps_per_cta=warps_per_cta,
+        wave_tile_stride=wave_tile_stride,
+        extra_elements=int(tile_base) + int(extra_elements),
+        op=op,
+    )
     layout_kind = attrs.get("shared_layout_kind", "dense")
     if layout_kind == "dense":
         encoded = logical
     elif layout_kind == "swizzled_shared":
-        encoded = _swizzled_element_offset(state, attrs, logical, lane_width)
+        encoded = _swizzled_element_offset_expr(state, attrs, logical)
     elif layout_kind == "padded_shared":
-        encoded = _padded_element_offset(state, attrs, logical, lane_width)
+        encoded = _padded_element_offset_expr(state, attrs, logical)
     else:
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
@@ -1078,23 +1026,76 @@ def _local_fragment_element_offset(
             f"unsupported local_load shared layout {layout_kind}",
         )
     if int(elements_per_offset_unit) != 1:
-        encoded = _simd_binary_const(
-            state,
-            "divui",
-            encoded,
-            int(elements_per_offset_unit),
-            lane_width,
-        )
-    return encoded
+        encoded = state.dsl.floor(encoded / int(elements_per_offset_unit))
+    if int(physical_extra_elements):
+        encoded += int(physical_extra_elements)
+    wi_sym = state.dsl.sym("wi")
+    return state.builder.index_expr(encoded, bindings={wi_sym: wi})
 
 
-def _wave_tile_offset_i32(
+def _linear_local_fragment_index_offset(
     state,
     wi,
+    lane_width,
+    *,
+    elements_per_lane,
     wave_tile_axis,
     warps_per_cta,
     wave_tile_stride,
+    extra_elements,
+    op,
+):
+    expr = _linear_local_fragment_offset_expr(
+        state,
+        lane_width,
+        elements_per_lane=elements_per_lane,
+        wave_tile_axis=wave_tile_axis,
+        warps_per_cta=warps_per_cta,
+        wave_tile_stride=wave_tile_stride,
+        extra_elements=extra_elements,
+        op=op,
+    )
+    wi_sym = state.dsl.sym("wi")
+    return state.builder.index_expr(expr, bindings={wi_sym: wi})
+
+
+def _linear_local_fragment_offset_expr(
+    state,
     lane_width,
+    *,
+    elements_per_lane,
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride,
+    extra_elements,
+    op,
+):
+    wi = state.dsl.sym("wi")
+    lane = state.dsl.mod(wi, int(lane_width))
+    expr = lane * int(elements_per_lane)
+    wave_tile = _wave_tile_offset_expr(
+        state,
+        wi,
+        lane_width,
+        wave_tile_axis,
+        warps_per_cta,
+        wave_tile_stride,
+        op,
+    )
+    if wave_tile is not None:
+        expr += wave_tile
+    if int(extra_elements):
+        expr += int(extra_elements)
+    return expr
+
+
+def _wave_tile_offset_expr(
+    state,
+    wi,
+    lane_width,
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride,
     op,
 ):
     if wave_tile_axis == "none" or not int(wave_tile_stride):
@@ -1106,23 +1107,11 @@ def _wave_tile_offset_i32(
             "local_load_fragment requires a valid warps_per_cta mapping",
             target_op_id=op.target_op_id,
         )
-    wave_id = _simd_binary_const(state, "divui", wi, int(lane_width), lane_width)
+    wave_id = state.dsl.floor(wi / int(lane_width))
     if wave_tile_axis == "m":
-        wave_coord = _simd_binary_const(
-            state,
-            "divui",
-            wave_id,
-            int(warps_per_cta[1]),
-            lane_width,
-        )
+        wave_coord = state.dsl.floor(wave_id / int(warps_per_cta[1]))
     elif wave_tile_axis == "n":
-        wave_coord = _simd_binary_const(
-            state,
-            "remui",
-            wave_id,
-            int(warps_per_cta[1]),
-            lane_width,
-        )
+        wave_coord = state.dsl.mod(wave_id, int(warps_per_cta[1]))
     else:
         fail(
             "TLXW_EMIT_LOCAL_LOAD_TILE_MAP",
@@ -1130,57 +1119,29 @@ def _wave_tile_offset_i32(
             f"unsupported local_load_fragment wave axis {wave_tile_axis}",
             target_op_id=op.target_op_id,
         )
-    return _simd_binary_const(
-        state,
-        "muli",
-        wave_coord,
-        int(wave_tile_stride),
-        lane_width,
-    )
+    return wave_coord * int(wave_tile_stride)
 
 
-def _swizzled_element_offset(state, attrs, logical, lane_width):
+def _swizzled_element_offset_expr(state, attrs, logical):
     cols = int(attrs.get("memdesc_shape", attrs["source_shape"])[-1])
     vec = int(attrs["swizzled_vec"])
-    row = _simd_binary_const(state, "divui", logical, cols, lane_width)
-    col = _simd_binary_const(state, "remui", logical, cols, lane_width)
-    row_phase = _simd_binary_const(
-        state,
-        "divui",
-        row,
-        int(attrs["swizzled_per_phase"]),
-        lane_width,
-    )
-    phase = _simd_binary_const(
-        state,
-        "remui",
-        row_phase,
-        int(attrs["swizzled_max_phase"]),
-        lane_width,
-    )
-    col_group = _simd_binary_const(state, "divui", col, vec, lane_width)
-    swizzled_group = state.builder.binary(
-        state.dsl.BinaryKind.XOrI,
-        col_group,
-        phase,
-    )
-    swizzled_base = _simd_binary_const(state, "muli", swizzled_group, vec, lane_width)
-    col_in_vec = _simd_binary_const(state, "remui", col, vec, lane_width)
-    swizzled_col = state.builder.binary(
-        state.dsl.BinaryKind.AddI,
-        swizzled_base,
-        col_in_vec,
-    )
-    row_scaled = _simd_binary_const(state, "muli", row, cols, lane_width)
-    return state.builder.binary(state.dsl.BinaryKind.AddI, row_scaled, swizzled_col)
+    row = state.dsl.floor(logical / cols)
+    col = state.dsl.mod(logical, cols)
+    row_phase = state.dsl.floor(row / int(attrs["swizzled_per_phase"]))
+    phase = state.dsl.mod(row_phase, int(attrs["swizzled_max_phase"]))
+    col_group = state.dsl.floor(col / vec)
+    swizzled_group = state.dsl.xor(col_group, phase)
+    swizzled_col = swizzled_group * vec + state.dsl.mod(col, vec)
+    return row * cols + swizzled_col
 
 
-def _padded_element_offset(state, attrs, logical, lane_width):
+def _padded_element_offset_expr(state, attrs, logical):
     encoded = logical
-    for interval, padding in zip(attrs.get("padded_intervals", ()), attrs.get("padded_paddings", ())):
-        quotient = _simd_binary_const(state, "divui", logical, int(interval), lane_width)
-        pad = _simd_binary_const(state, "muli", quotient, int(padding), lane_width)
-        encoded = state.builder.binary(state.dsl.BinaryKind.AddI, encoded, pad)
+    for interval, padding in zip(
+        attrs.get("padded_intervals", ()),
+        attrs.get("padded_paddings", ()),
+    ):
+        encoded += state.dsl.floor(logical / int(interval)) * int(padding)
     return encoded
 
 
