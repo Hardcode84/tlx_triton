@@ -1946,6 +1946,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     same_layout = _same_layout_alias(operand, result, operand_layout, result_layout)
     register_remap = None
     distributed_remap = None
+    dot_operand_remap = None
     if not same_layout:
         register_remap = layout_remap.register_remap(
             operand,
@@ -1962,6 +1963,14 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 result_layout,
                 op,
             )
+        if register_remap is None and distributed_remap is None:
+            dot_operand_remap = layout_remap.dot_operand_fragment_pack(
+                operand,
+                result,
+                operand_layout,
+                result_layout,
+                op,
+            )
     if same_layout:
         mode = "alias"
         attrs = {
@@ -1970,7 +1979,11 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
             "mode": mode,
             "result_component_count": int(result.type.component_count),
         }
-    elif register_remap is not None or distributed_remap is not None:
+    elif (
+        register_remap is not None
+        or distributed_remap is not None
+        or dot_operand_remap is not None
+    ):
         if (
             operand.type.representation in {"fragment", "fragment_tuple"}
             and operand.type.element_type == "f32"
@@ -1983,7 +1996,13 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 source_op_index=op.index,
                 source_value_id=operand.value_id,
             )
-        remap = register_remap if register_remap is not None else distributed_remap
+        remap = (
+            register_remap
+            if register_remap is not None
+            else distributed_remap
+            if distributed_remap is not None
+            else dot_operand_remap
+        )
         attrs = {
             "fact_policy": "invalidate_layout_sensitive",
             "result_component_count": int(result.type.component_count),
@@ -2023,7 +2042,10 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
 
 
 def _add_layout_remap_scratch_attrs(attrs, conversion_input, result, op):
-    if attrs.get("mode") != "cta_exchange_register_remap":
+    if attrs.get("mode") not in {
+        "cta_exchange_register_remap",
+        "dot_operand_fragment_pack",
+    }:
         return attrs
     element_byte_width = conversion_input.value_element_byte_widths.get(
         result.value_id

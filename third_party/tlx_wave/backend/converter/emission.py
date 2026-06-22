@@ -2025,6 +2025,138 @@ def _emit_layout_convert(state, op):
             )
         )
         return
+    if mode == "dot_operand_fragment_pack":
+        result_count = int(attrs["result_component_count"])
+        if len(components) != int(attrs["source_component_count"]):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "dot_operand fragment pack source component count does not "
+                "match attrs",
+                target_op_id=op.target_op_id,
+            )
+        lane_width = int(
+            state.target_program.values[_single_result(op)].type.lane_width or 64
+        )
+        element_type = _scalar_type(state.dsl, attrs["element_type"])
+        cta_thread_count = int(attrs["cta_thread_count"])
+        if cta_thread_count % lane_width:
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "dot_operand fragment pack CTA thread count must be a "
+                "multiple of lane width",
+                target_op_id=op.target_op_id,
+            )
+        scratch_base = state.builder.lds_base(
+            element_type,
+            offset=int(attrs["scratch_byte_offset"]),
+        )
+        ptr_type = state.dsl.simd_ptr_type(
+            element_type,
+            state.dsl.shared_address_space(),
+            lane_width,
+        )
+        workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+        source_store_bases = tuple(attrs["source_store_bases"])
+        source_store_coefficients = tuple(attrs["source_store_coefficients"])
+        if (
+            len(source_store_bases) != len(components)
+            or len(source_store_coefficients) != len(components)
+        ):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "dot_operand fragment pack source store attrs do not match "
+                "source component count",
+                target_op_id=op.target_op_id,
+            )
+        group_dependency = state.scratch_token
+        store_tokens = []
+        for source_component, (store_base, coefficients) in enumerate(
+            zip(source_store_bases, source_store_coefficients)
+        ):
+            store_offset = _bit_affine_thread_offset(
+                state,
+                workitem,
+                int(store_base),
+                tuple(int(value) for value in coefficients),
+                lane_width,
+            )
+            ptr = state.builder.ptr_add(
+                scratch_base,
+                store_offset,
+                result_type=ptr_type,
+            )
+            store_tokens.append(
+                state.builder.store(
+                    components[source_component],
+                    ptr,
+                    after=group_dependency,
+                )
+            )
+        barrier_token = state.builder.barrier(*store_tokens)
+        fragment_type = state.dsl.fragment_type(
+            int(attrs["role"]),
+            element_type,
+            int(attrs["rows"]),
+            int(attrs["columns"]),
+            lane_width,
+            int(attrs["registers"]),
+        )
+        element_count = int(attrs["elements_per_lane"])
+        load_tokens = []
+        fragments = []
+        if attrs.get("payload_mode") != "vector":
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "dot_operand fragment pack requires vector payload attrs",
+                target_op_id=op.target_op_id,
+            )
+        vector_load_bases = tuple(attrs["fragment_vector_load_bases"])
+        vector_load_coefficients = tuple(attrs["fragment_vector_load_coefficients"])
+        if (
+            len(vector_load_bases) != result_count
+            or len(vector_load_coefficients) != result_count
+        ):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "dot_operand fragment pack vector attrs do not match "
+                "result component count",
+                target_op_id=op.target_op_id,
+            )
+        load_type = state.dsl.simd_type(
+            state.dsl.vector_type(element_count, element_type),
+            width=lane_width,
+        )
+        for load_base, coefficients in zip(
+            vector_load_bases,
+            vector_load_coefficients,
+        ):
+            load_offset = _bit_affine_thread_offset(
+                state,
+                workitem,
+                int(load_base),
+                tuple(int(value) for value in coefficients),
+                lane_width,
+            )
+            ptr = state.builder.ptr_add(
+                scratch_base,
+                load_offset,
+                result_type=ptr_type,
+            )
+            loaded, load_token = state.builder.load(
+                ptr,
+                load_type,
+                after=barrier_token,
+            )
+            load_tokens.append(load_token)
+            fragments.append(state.builder.fragment_pack(loaded, fragment_type))
+        state.scratch_token = state.builder.barrier(*load_tokens)
+        state.values[_single_result(op)] = _pack_components(tuple(fragments))
+        return
     if mode == "cta_exchange_register_remap":
         result_count = int(attrs["result_component_count"])
         registers_per_component = int(attrs["source_registers_per_component"])

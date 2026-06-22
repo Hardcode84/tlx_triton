@@ -3454,6 +3454,75 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_packs_blocked_dot_operand_parent_layout(tmp_path):
+    preamble = """
+#blocked_a = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked_b = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+"""
+    local_func = """
+  tt.func public @converter_blocked_dot_operand_parent_layout() attributes {noinline = false} {
+    %a = arith.constant dense<0.000000e+00> : tensor<256x64xf16, #blocked_a>
+    %b = arith.constant dense<0.000000e+00> : tensor<64x256xf16, #blocked_b>
+    %a_dot = ttg.convert_layout %a : tensor<256x64xf16, #blocked_a> -> tensor<256x64xf16, #dot0>
+    %b_dot = ttg.convert_layout %b : tensor<64x256xf16, #blocked_b> -> tensor<64x256xf16, #dot1>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    layout_converts = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "layout_convert"
+    ]
+    assert [attrs["mode"] for attrs in layout_converts] == [
+        "dot_operand_fragment_pack",
+        "dot_operand_fragment_pack",
+    ]
+    assert [attrs["payload_mode"] for attrs in layout_converts] == ["vector", "vector"]
+    assert [attrs["result_component_count"] for attrs in layout_converts] == [16, 16]
+    assert all(len(attrs["fragment_vector_load_bases"]) == 16 for attrs in layout_converts)
+    wave = output.emitted_module.text
+    assert wave.count("wave.store") == sum(
+        attrs["source_component_count"] for attrs in layout_converts
+    )
+    assert wave.count("wave.load") == 32
+    assert wave.count("waveamd.fragment_pack") == 32
+    assert "vector<8xf16>" in wave
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_chunked_blocked_dot_operand_pack(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+"""
+    local_func = """
+  tt.func public @converter_rejects_chunked_dot_operand_parent_layout() attributes {noinline = false} {
+    %a = arith.constant dense<0.000000e+00> : tensor<256x64xf16, #blocked>
+    %a_dot = ttg.convert_layout %a : tensor<256x64xf16, #blocked> -> tensor<256x64xf16, #dot0>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "requires kWidth to match the fragment payload width" in str(diagnostic)
+    assert "kWidth=4" in str(diagnostic)
+    assert "payload_width=8" in str(diagnostic)
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>

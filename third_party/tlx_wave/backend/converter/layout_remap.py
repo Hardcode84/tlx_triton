@@ -250,6 +250,200 @@ def distributed_remap(operand, result, operand_layout, result_layout, op):
     }
 
 
+def dot_operand_fragment_pack(operand, result, operand_layout, result_layout, op):
+    if operand_layout is None or result_layout is None:
+        return None
+    if operand_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
+        return None
+    if result_layout.kind != "dot_operand":
+        return None
+    if operand.type.element_type != result.type.element_type:
+        return None
+    if operand.type.representation not in {"simd", "simd_tuple"}:
+        return None
+    if result.type.representation not in {"fragment", "fragment_tuple"}:
+        return None
+    if tuple(operand_layout.shape) != tuple(result_layout.shape):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand convert_layout requires matching "
+            "source and result shapes",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(int(value) for value in parent.get("instr_shape", ()))
+    warps_per_cta = tuple(int(value) for value in parent.get("warps_per_cta", ()))
+    if instr_shape not in {(16, 16, 32), (32, 32, 16)} or len(warps_per_cta) < 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand convert_layout requires a supported "
+            "MFMA parent layout",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    registers = _dot_operand_fragment_registers(
+        result.type.element_type,
+        instr_shape,
+        op,
+    )
+    elements_per_lane = _fragment_elements_per_lane(
+        result.type.element_type,
+        registers,
+        op,
+        result.value_id,
+    )
+    k_width = int(result_layout.properties.get("k_width", 0))
+    if k_width != int(elements_per_lane):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand convert_layout requires kWidth to "
+            "match the fragment payload width; chunked kWidth payloads are "
+            f"not implemented yet: kWidth={k_width}, "
+            f"payload_width={int(elements_per_lane)}",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    source_layout = _distributed_linear_layout(operand_layout, op)
+    _require_injective_layout(
+        source_layout,
+        op,
+        operand.value_id,
+        "distributed to dot_operand source layout",
+    )
+    source_component_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    if int(operand.type.component_count) != source_component_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand source component model does not "
+            "match the source register layout",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    source_warp_count = _layout_warp_count(operand_layout)
+    result_warp_count = _dot_operand_parent_warp_count(result_layout)
+    if int(source_warp_count) != int(result_warp_count):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand convert_layout requires matching "
+            "source and dot-parent wave counts",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    cta_warp_count = int(source_warp_count)
+    source_component_count = int(source_component_count)
+    cta_thread_count = int(lane_width) * int(cta_warp_count)
+
+    source_store_bases = []
+    source_store_coefficients = []
+    for source_component in range(source_component_count):
+        store_offsets = []
+        for source_warp in range(int(cta_warp_count)):
+            for lane in range(int(lane_width)):
+                coords = layouts.linear_layout_coords(
+                    source_layout,
+                    source_component,
+                    lane,
+                    warp=source_warp,
+                )
+                store_offsets.append(
+                    _checked_dense_linear_offset(
+                        operand_layout.shape,
+                        coords,
+                        op,
+                        operand.value_id,
+                        "distributed to dot_operand source store",
+                    )
+                )
+        base, coefficients = _fit_bit_affine_offsets(
+            store_offsets,
+            cta_thread_count,
+            op,
+            operand.value_id,
+            description="distributed to dot_operand source store convert_layout",
+        )
+        source_store_bases.append(int(base))
+        source_store_coefficients.append(tuple(int(value) for value in coefficients))
+
+    component_vector_load_bases = []
+    component_vector_load_coefficients = []
+    for component in range(int(result.type.component_count)):
+        vector_load_offsets = []
+        for result_warp in range(int(cta_warp_count)):
+            for lane in range(int(lane_width)):
+                base = _dot_operand_payload_linear(
+                    result_layout,
+                    component,
+                    0,
+                    lane,
+                    result_warp,
+                    elements_per_lane,
+                    instr_shape,
+                    warps_per_cta,
+                    op,
+                )
+                end = _dot_operand_payload_linear(
+                    result_layout,
+                    component,
+                    int(elements_per_lane) - 1,
+                    lane,
+                    result_warp,
+                    elements_per_lane,
+                    instr_shape,
+                    warps_per_cta,
+                    op,
+                )
+                if int(end) != int(base) + int(elements_per_lane) - 1:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                        STAGE,
+                        "distributed to dot_operand payload is not dense "
+                        "contiguous in logical scratch",
+                        source_op_index=op.index,
+                        source_value_id=result.value_id,
+                    )
+                vector_load_offsets.append(int(base))
+        base, coefficients = _fit_bit_affine_offsets(
+            vector_load_offsets,
+            cta_thread_count,
+            op,
+            result.value_id,
+            description="distributed to dot_operand vector payload convert_layout",
+        )
+        component_vector_load_bases.append(int(base))
+        component_vector_load_coefficients.append(
+            tuple(int(value) for value in coefficients)
+        )
+
+    return {
+        "cta_thread_count": int(cta_thread_count),
+        "element_type": result.type.element_type,
+        "elements_per_lane": int(elements_per_lane),
+        "fragment_vector_load_bases": tuple(component_vector_load_bases),
+        "fragment_vector_load_coefficients": tuple(component_vector_load_coefficients),
+        "mode": "dot_operand_fragment_pack",
+        "payload_mode": "vector",
+        "registers": int(registers),
+        "role": int(result_layout.properties["op_idx"]),
+        "rows": int(instr_shape[0]),
+        "columns": int(instr_shape[1]),
+        "source_component_count": int(operand.type.component_count),
+        "source_store_bases": tuple(source_store_bases),
+        "source_store_coefficients": tuple(source_store_coefficients),
+        "scratch_element_count": _product(result_layout.shape),
+    }
+
+
 def reject_unsupported_pair(operand_layout, result_layout, op):
     operand_kind = "none" if operand_layout is None else operand_layout.kind
     result_kind = "none" if result_layout is None else result_layout.kind
@@ -535,14 +729,20 @@ def _require_injective_layout(linear, op, source_value_id, description):
     )
 
 
-def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id):
+def _fit_bit_affine_offsets(
+    load_offsets,
+    cta_thread_count,
+    op,
+    result_value_id,
+    *,
+    description="MFMA to blocked convert_layout",
+):
     load_offsets = tuple(int(offset) for offset in load_offsets)
     if len(load_offsets) != int(cta_thread_count):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout produced a malformed CTA "
-            "exchange load map",
+            f"{description} produced a malformed CTA exchange load map",
             source_op_index=op.index,
             source_value_id=result_value_id,
         )
@@ -552,8 +752,8 @@ def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id)
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout CTA exchange requires a "
-            "power-of-two CTA thread count",
+            f"{description} CTA exchange requires a power-of-two CTA "
+            "thread count",
             source_op_index=op.index,
             source_value_id=result_value_id,
         )
@@ -570,12 +770,217 @@ def _fit_bit_affine_offsets(load_offsets, cta_thread_count, op, result_value_id)
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
-                "MFMA to blocked convert_layout requires a non-bit-affine "
-                "CTA exchange load map",
+                f"{description} requires a non-bit-affine CTA exchange "
+                "load map",
                 source_op_index=op.index,
                 source_value_id=result_value_id,
             )
     return int(base), tuple(int(value) for value in coefficients)
+
+
+def _dot_operand_fragment_registers(element_type, instr_shape, op):
+    if element_type in {"f16", "bf16"} and instr_shape in {
+        (16, 16, 32),
+        (32, 32, 16),
+    }:
+        return 4
+    fail(
+        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+        STAGE,
+        "distributed to dot_operand fragment registers are not known for "
+        f"element_type={element_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _fragment_elements_per_lane(element_type, registers, op, source_value_id):
+    element_bits = {"f16": 16, "bf16": 16}.get(element_type)
+    if element_bits is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"distributed to dot_operand does not support {element_type} fragments",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    return int(registers) * 32 // int(element_bits)
+
+
+def _dot_operand_parent_warp_count(layout):
+    parent = layout.properties.get("parent_properties", {})
+    warps_per_cta = tuple(int(value) for value in parent.get("warps_per_cta", ()))
+    result = 1
+    for value in warps_per_cta:
+        result *= max(1, int(value))
+    return result
+
+
+def _dense_linear_offset(shape, coords):
+    shape = tuple(int(dim) for dim in shape)
+    coords = tuple(int(coord) for coord in coords)
+    if len(shape) != len(coords):
+        raise AssertionError("rank mismatch in dense linear offset")
+    linear = 0
+    for coord, extent in zip(coords, shape):
+        linear = linear * int(extent) + int(coord)
+    return int(linear)
+
+
+def _dot_operand_payload_linear(
+    layout,
+    component,
+    element,
+    lane,
+    result_warp,
+    elements_per_lane,
+    instr_shape,
+    warps_per_cta,
+    op,
+):
+    coords = _dot_operand_payload_coords(
+        layout,
+        component,
+        element,
+        lane,
+        result_warp,
+        elements_per_lane,
+        instr_shape,
+        warps_per_cta,
+        op,
+    )
+    return _dense_linear_offset(layout.shape, coords)
+
+
+def _checked_dense_linear_offset(shape, coords, op, source_value_id, description):
+    shape = tuple(int(dim) for dim in shape)
+    coords = tuple(int(coord) for coord in coords)
+    if len(shape) != len(coords) or any(
+        int(coord) < 0 or int(coord) >= int(extent)
+        for coord, extent in zip(coords, shape)
+    ):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} coordinate exceeds tensor shape",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    return _dense_linear_offset(shape, coords)
+
+
+def _dot_operand_payload_coords(
+    layout,
+    component,
+    element,
+    lane,
+    result_warp,
+    elements_per_lane,
+    instr_shape,
+    warps_per_cta,
+    op,
+):
+    shape = tuple(int(dim) for dim in layout.shape)
+    if len(shape) < 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand requires rank-2 tensors",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    op_idx = int(layout.properties.get("op_idx", -1))
+    component = int(component)
+    if op_idx == 0:
+        k_tiles = _ceil_div(shape[1], instr_shape[2])
+        if int(layout.component_count) % k_tiles:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "A dot_operand component count is not divisible by K tiles",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        per_wave_m_tiles = int(layout.component_count) // k_tiles
+        m_tile = component // k_tiles
+        k_tile = component % k_tiles
+        row = m_tile * int(instr_shape[0])
+        col = k_tile * int(instr_shape[2])
+        row_base = row + (
+            _dot_operand_wave_tile_coord(result_warp, warps_per_cta, "m")
+            * per_wave_m_tiles
+            * int(instr_shape[0])
+        )
+        linear = (
+            row_base * shape[1]
+            + col
+            + int(lane) * int(elements_per_lane)
+            + int(element)
+        )
+        row = linear // shape[1]
+        col = linear % shape[1]
+    elif op_idx == 1:
+        k_tiles = _ceil_div(shape[0], instr_shape[2])
+        if int(layout.component_count) % k_tiles:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                STAGE,
+                "B dot_operand component count is not divisible by K tiles",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        per_wave_n_tiles = int(layout.component_count) // k_tiles
+        n_tile = component // k_tiles
+        k_tile = component % k_tiles
+        row = k_tile * int(instr_shape[2])
+        col = n_tile * int(instr_shape[1])
+        col_base = col + (
+            _dot_operand_wave_tile_coord(result_warp, warps_per_cta, "n")
+            * per_wave_n_tiles
+            * int(instr_shape[1])
+        )
+        linear = int(lane) * int(elements_per_lane) + int(element)
+        linear += row * shape[1] + col_base
+        row = linear // shape[1]
+        col = linear % shape[1]
+    else:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"unsupported dot operand index {op_idx}",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    coords = (int(row), int(col))
+    if any(coord < 0 or coord >= extent for coord, extent in zip(coords, shape)):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to dot_operand payload coordinate exceeds tensor shape",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+    return coords
+
+
+def _dot_operand_wave_tile_coord(result_warp, warps_per_cta, axis):
+    warps_n = max(1, int(warps_per_cta[1]))
+    if axis == "m":
+        wave_coord = int(result_warp) // warps_n
+        return wave_coord
+    if axis == "n":
+        return int(result_warp) % warps_n
+    return 0
+
+
+def _ceil_div(lhs, rhs):
+    return (int(lhs) + int(rhs) - 1) // int(rhs)
+
+
+def _product(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return int(result)
 
 
 def _classify_source_lane_maps(
