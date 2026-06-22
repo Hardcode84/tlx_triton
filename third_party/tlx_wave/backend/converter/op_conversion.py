@@ -2284,6 +2284,20 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 result_layout,
                 op,
             )
+        if (
+            register_remap is None
+            and distributed_remap is None
+            and dot_operand_remap is None
+        ):
+            candidate = layout_remap.distributed_to_mfma_base_remap(
+                operand,
+                result,
+                operand_layout,
+                result_layout,
+                op,
+            )
+            if candidate is not None and "scratch_element_count" not in candidate:
+                mfma_base_remap = candidate
     if same_layout:
         mode = "alias"
         attrs = {
@@ -2358,11 +2372,19 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
 
 
 def _add_layout_remap_scratch_attrs(attrs, conversion_input, result, op):
+    if attrs.get("mode") not in {
+        "cta_exchange_register_remap",
+        "dot_operand_fragment_pack",
+        "mfma_vector_register_remap",
+    }:
+        return attrs
     if "scratch_element_count" not in attrs:
         return attrs
     element_byte_width = conversion_input.value_element_byte_widths.get(
         result.value_id
     )
+    if result.type.representation in {"mask", "mask_tuple"}:
+        element_byte_width = 4
     if element_byte_width is None:
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",

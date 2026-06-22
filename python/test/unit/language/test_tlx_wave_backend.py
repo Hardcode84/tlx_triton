@@ -3314,6 +3314,109 @@ def test_tlx_wave_converter_dispatches_blocked_to_mfma_base_remap(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_dispatches_tiled_blocked_to_mfma_base_remap(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [4, 2], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 2], instrShape = [16, 16, 32], isTransposed = true}>
+"""
+    local_func = """
+  tt.func public @converter_tiled_blocked_to_mfma_base_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<256x128xf32, #blocked>
+    %converted = ttg.convert_layout %value : tensor<256x128xf32, #blocked> -> tensor<256x128xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [
+        op for op in output.target_program.ops if op.kind == "layout_convert"
+    ]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "mfma_vector_register_remap"
+    assert attrs["result_component_count"] == 16
+    assert attrs["source_component_count"] == 64
+    assert attrs["scalar_result_component_count"] == 64
+    assert attrs["source_registers_per_component"] == 1
+    assert attrs["vector_length"] == 4
+    assert attrs["mode"] != "component_group_first"
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_layout_remap_scratch_attrs_are_mode_specific():
+    conversion_input = SimpleNamespace(
+        value_element_byte_widths={7: 2, 8: None},
+        lds_size=33,
+    )
+    op = SimpleNamespace(index=0)
+    simd_result = SimpleNamespace(
+        value_id=7,
+        type=SimpleNamespace(representation="simd"),
+    )
+    mask_result = SimpleNamespace(
+        value_id=8,
+        type=SimpleNamespace(representation="mask_tuple"),
+    )
+
+    unrelated = {
+        "mode": "same_lane_register_remap",
+        "scratch_element_count": 16,
+    }
+    assert (
+        converter_op_conversion._add_layout_remap_scratch_attrs(
+            unrelated,
+            conversion_input,
+            simd_result,
+            op,
+        )
+        == unrelated
+    )
+
+    dot_attrs = converter_op_conversion._add_layout_remap_scratch_attrs(
+        {
+            "mode": "dot_operand_fragment_pack",
+            "scratch_element_count": 16,
+        },
+        conversion_input,
+        simd_result,
+        op,
+    )
+    assert dot_attrs["scratch_byte_offset"] == 48
+    assert dot_attrs["scratch_allocation_bytes"] == 32
+
+    mask_attrs = converter_op_conversion._add_layout_remap_scratch_attrs(
+        {
+            "mode": "cta_exchange_register_remap",
+            "scratch_element_count": 16,
+            "scratch_reuse_lds": True,
+        },
+        conversion_input,
+        mask_result,
+        op,
+    )
+    assert mask_attrs["scratch_byte_offset"] == 48
+    assert mask_attrs["scratch_allocation_bytes"] == 64
+
+    empty_lds_input = SimpleNamespace(
+        value_element_byte_widths={8: None},
+        lds_size=0,
+    )
+    empty_lds_mask_attrs = converter_op_conversion._add_layout_remap_scratch_attrs(
+        {
+            "mode": "cta_exchange_register_remap",
+            "scratch_element_count": 16,
+            "scratch_reuse_lds": True,
+        },
+        empty_lds_input,
+        mask_result,
+        op,
+    )
+    assert empty_lds_mask_attrs["scratch_byte_offset"] == 0
+    assert empty_lds_mask_attrs["scratch_allocation_bytes"] == 64
+
+
 def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
