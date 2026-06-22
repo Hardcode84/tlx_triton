@@ -111,6 +111,18 @@ def _active_tlx_wave_driver():
 
 
 @contextmanager
+def _active_amd_driver():
+    from triton.backends.amd import driver as amd_driver
+
+    previous_driver = triton.runtime.driver.active
+    triton.runtime.driver.set_active(amd_driver.HIPDriver())
+    try:
+        yield
+    finally:
+        triton.runtime.driver.set_active(previous_driver)
+
+
+@contextmanager
 def _tlx_wave_compile_driver(monkeypatch):
     previous_default = triton.runtime.driver._default
     previous_active = triton.runtime.driver._active
@@ -128,7 +140,7 @@ def _tlx_wave_compile_driver(monkeypatch):
         triton.runtime.driver._active = previous_active
 
 
-def _load_tlx_gfx9_gemm_kernel(version_dir, function_name):
+def _load_tlx_gfx9_gemm_module(version_dir, module_name=None):
     repo_root = Path(__file__).resolve().parents[4]
     kernel_path = (
         repo_root
@@ -141,11 +153,19 @@ def _load_tlx_gfx9_gemm_kernel(version_dir, function_name):
         / "matmul_kernel.py"
     )
     spec = importlib.util.spec_from_file_location(
-        f"_tlx_wave_test_{version_dir}_{function_name}",
+        module_name or f"_tlx_wave_test_{version_dir}",
         kernel_path,
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _load_tlx_gfx9_gemm_kernel(version_dir, function_name):
+    module = _load_tlx_gfx9_gemm_module(
+        version_dir,
+        f"_tlx_wave_test_{version_dir}_{function_name}",
+    )
     return getattr(module, function_name)
 
 
@@ -1932,6 +1952,90 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     assert compiled.metadata.tlx_wave_lds_size_bytes > 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
     assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+
+
+@pytest.mark.parametrize(
+    "case_name,b_layout",
+    [
+        ("contiguous_b", "contiguous"),
+        pytest.param(
+            "transposed_b",
+            "transposed",
+            marks=pytest.mark.xfail(
+                raises=AssertionError,
+                reason=(
+                    "v9 TLX Wave lowering currently miscomputes benchmark-style "
+                    "B tensors with shape (K, N) and stride (1, K)"
+                ),
+                strict=True,
+            ),
+        ),
+    ],
+)
+def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for gfx950 v9 e2e, got {arch}")
+    tutorial = _load_tlx_gfx9_gemm_module(
+        "v9_beyond_hotloop",
+        f"_tlx_wave_v9_runtime_{case_name}",
+    )
+
+    m = n = k = 256
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    if b_layout == "contiguous":
+        b = torch.randn((k, n), device=device, dtype=torch.float16)
+    else:
+        b = torch.randn((n, k), device=device, dtype=torch.float16).T
+    assert b.shape == (k, n)
+
+    with (
+        _active_tlx_wave_driver(),
+        triton.knobs.cache.scope(),
+        triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{case_name}-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.matmul(a, b)
+        torch.cuda.synchronize()
+
+    expected = torch.matmul(a, b)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got, expected, atol=1e-1, rtol=0)
+
+
+def test_tlx_runtime_gfx950_v9_amd_backend_transposed_b_e2e(tmp_path):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for gfx950 v9 e2e, got {arch}")
+    tutorial = _load_tlx_gfx9_gemm_module(
+        "v9_beyond_hotloop",
+        "_tlx_v9_amd_backend_transposed_b",
+    )
+
+    m = n = k = 256
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    b = torch.randn((n, k), device=device, dtype=torch.float16).T
+    assert b.shape == (k, n)
+    assert b.stride() == (1, k)
+
+    with (
+        _active_amd_driver(),
+        triton.knobs.cache.scope(),
+        triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / "amd-backend-transposed-b-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.matmul(a, b)
+        torch.cuda.synchronize()
+
+    expected = torch.matmul(a, b)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got, expected, atol=1e-1, rtol=0)
 
 
 def test_tlx_wave_runtime_launches_no_memory_kernel():
