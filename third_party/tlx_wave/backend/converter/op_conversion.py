@@ -300,9 +300,8 @@ def _convert_source_op(
     if op.name == "ttg.async_wait":
         _convert_async_wait(
             builder,
+            conversion_input,
             type_layout_program,
-            conversion_input.token_nodes_by_op,
-            conversion_input.token_groups_by_id,
             op,
         )
         return
@@ -330,7 +329,7 @@ def _convert_source_op(
         type_layout_program,
     )
     fact_ids = conversion_input.fact_ids_by_op.get(op.index, ())
-    operand_fact_ids = _operand_assume_fact_ids(fact_program, op)
+    operand_fact_ids = _operand_assume_fact_ids(conversion_input, fact_program, op)
     view = OpConversionView(
         op.index,
         op.name,
@@ -816,28 +815,33 @@ def _convert_if(
             "scf.if conversion requires one condition and then/else regions",
             source_op_index=op.index,
         )
+    _reject_implicit_if_token_escapes(conversion_input, op)
     condition_targets = _operand_target_ids(builder, op)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
         type_layout_program,
     )
-    then_yields = _convert_region(
-        builder,
-        conversion_input,
-        type_layout_program,
-        fact_program,
-        op.region_ids[0],
-        allow_yield=True,
-    )
-    else_yields = _convert_region(
-        builder,
-        conversion_input,
-        type_layout_program,
-        fact_program,
-        op.region_ids[1],
-        allow_yield=True,
-    )
+    then_region_id = builder.add_region()
+    else_region_id = builder.add_region()
+    with builder.insertion_region(then_region_id):
+        then_yields = _convert_region(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op.region_ids[0],
+            allow_yield=True,
+        )
+    with builder.insertion_region(else_region_id):
+        else_yields = _convert_region(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op.region_ids[1],
+            allow_yield=True,
+        )
     if len(then_yields) != len(result_target_ids) or len(else_yields) != len(result_target_ids):
         fail(
             "TLXW_OP_IF_YIELD_MISMATCH",
@@ -845,16 +849,52 @@ def _convert_if(
             "scf.if yield counts must match result count",
             source_op_index=op.index,
         )
-    for index, result_target_id in enumerate(result_target_ids):
-        true_target_id = _single_source_target(builder, then_yields[index], op)
-        false_target_id = _single_source_target(builder, else_yields[index], op)
-        builder.add_op(
-            "select",
-            operands=(condition_targets[0], true_target_id, false_target_id),
-            results=(result_target_id,),
-            layout_map_ids=result_layout_map_ids,
-            source_op_index=op.index,
-        )
+    builder.set_region_yields(
+        then_region_id,
+        tuple(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in then_yields
+        ),
+    )
+    builder.set_region_yields(
+        else_region_id,
+        tuple(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in else_yields
+        ),
+    )
+    builder.add_op(
+        "if",
+        operands=condition_targets,
+        results=result_target_ids,
+        layout_map_ids=result_layout_map_ids,
+        region_ids=(then_region_id, else_region_id),
+        source_op_index=op.index,
+    )
+
+
+def _reject_implicit_if_token_escapes(conversion_input, op):
+    branch_op_indices = frozenset(
+        op_index
+        for region_id in op.region_ids
+        for op_index in _region_op_indices_recursive(conversion_input, region_id)
+    )
+    if not branch_op_indices:
+        return
+    for node in conversion_input.token_nodes_by_op.values():
+        if node.op_index in branch_op_indices or node.op_name != "ttg.async_wait":
+            continue
+        for group_id in node.waited_group_ids:
+            group = conversion_input.token_groups_by_id[group_id]
+            if group.commit_op_index not in branch_op_indices:
+                continue
+            fail(
+                "TLXW_OP_UNSUPPORTED_IF_TOKENS",
+                STAGE,
+                "scf.if branch async groups must be yielded explicitly before "
+                "an outside wait",
+                source_op_index=op.index,
+            )
 
 
 def _convert_for(
@@ -2451,12 +2491,11 @@ def _convert_async_commit_group(builder, type_layout_program, token_groups_by_co
 
 def _convert_async_wait(
     builder,
+    conversion_input,
     type_layout_program,
-    token_nodes_by_op,
-    token_groups_by_id,
     op,
 ):
-    node = token_nodes_by_op.get(op.index)
+    node = conversion_input.token_nodes_by_op.get(op.index)
     if node is None:
         fail(
             "TLXW_OP_ASYNC_WAIT_TOKEN",
@@ -2468,11 +2507,7 @@ def _convert_async_wait(
     if node.input_token_ids:
         wait_token_ids = node.input_token_ids
     else:
-        wait_token_ids = tuple(
-            token_groups_by_id[group_id].token_value_id
-            for group_id in node.waited_group_ids
-            if token_groups_by_id[group_id].token_value_id is not None
-        )
+        wait_token_ids = _implicit_wait_token_ids(conversion_input, node, op)
     operands = tuple(
         _single_source_target(builder, token_value_id, op)
         for token_value_id in wait_token_ids
@@ -2487,6 +2522,28 @@ def _convert_async_wait(
         },
         source_op_index=op.index,
     )
+
+
+def _implicit_wait_token_ids(conversion_input, node, op):
+    wait_token_ids = []
+    for group_id in node.waited_group_ids:
+        group = conversion_input.token_groups_by_id[group_id]
+        if group.token_value_id is None:
+            continue
+        if _source_token_crosses_if_branch_path(
+            conversion_input,
+            group.commit_op_index,
+            op.index,
+        ):
+            fail(
+                "TLXW_OP_UNSUPPORTED_IF_TOKENS",
+                STAGE,
+                "implicit ttg.async_wait cannot wait an async group from a "
+                "different scf.if branch path",
+                source_op_index=op.index,
+            )
+        wait_token_ids.append(group.token_value_id)
+    return tuple(wait_token_ids)
 
 
 def _convert_return(builder, view):
@@ -2600,7 +2657,7 @@ def _fact_target_id(builder, fact, op):
     return targets[0]
 
 
-def _operand_assume_fact_ids(fact_program, op):
+def _operand_assume_fact_ids(conversion_input, fact_program, op):
     fact_ids = []
     seen = set()
     for source_value_id in op.operands:
@@ -2608,11 +2665,117 @@ def _operand_assume_fact_ids(fact_program, op):
             fact = fact_program.facts[fact_id]
             if fact.kind != "range" or fact.provenance != "llvm.intr.assume":
                 continue
+            if not _source_fact_is_in_scope(
+                conversion_input,
+                fact.source_op_index,
+                op.index,
+            ):
+                continue
             if fact_id in seen:
                 continue
             seen.add(fact_id)
             fact_ids.append(fact_id)
     return tuple(fact_ids)
+
+
+def _source_fact_is_in_scope(conversion_input, fact_op_index, user_op_index):
+    if fact_op_index is None:
+        return False
+    if fact_op_index == user_op_index:
+        return True
+    try:
+        fact_op = conversion_input.ops[fact_op_index]
+    except IndexError:
+        return False
+    fact_region_id = fact_op.parent_region_id
+    if fact_region_id is None:
+        return False
+    user_anchor = _op_anchor_in_region(
+        conversion_input,
+        user_op_index,
+        fact_region_id,
+    )
+    if user_anchor is None:
+        return False
+    if user_anchor == user_op_index:
+        return True
+    if user_anchor == fact_op_index:
+        return True
+    return _op_precedes_in_region(
+        conversion_input,
+        fact_region_id,
+        fact_op_index,
+        user_anchor,
+    )
+
+
+def _source_token_crosses_if_branch_path(conversion_input, commit_op_index, wait_op_index):
+    commit_branches = _enclosing_if_branch_regions(conversion_input, commit_op_index)
+    if not commit_branches:
+        return False
+    wait_branches = _enclosing_if_branch_regions(conversion_input, wait_op_index)
+    for if_op_index, commit_branch_region_id in commit_branches.items():
+        wait_branch_region_id = wait_branches.get(if_op_index)
+        if wait_branch_region_id is None:
+            return True
+        if wait_branch_region_id != commit_branch_region_id:
+            return True
+    return False
+
+
+def _enclosing_if_branch_regions(conversion_input, op_index):
+    try:
+        region_id = conversion_input.ops[op_index].parent_region_id
+    except IndexError:
+        return {}
+    result = {}
+    while region_id is not None:
+        try:
+            region = conversion_input.regions[region_id]
+        except IndexError:
+            break
+        parent_op_index = region.parent_op_index
+        if parent_op_index is None:
+            break
+        try:
+            parent_op = conversion_input.ops[parent_op_index]
+        except IndexError:
+            break
+        if parent_op.name == "scf.if":
+            result[parent_op_index] = region_id
+        region_id = parent_op.parent_region_id
+    return result
+
+
+def _op_anchor_in_region(conversion_input, op_index, region_id):
+    current_op_index = op_index
+    while True:
+        try:
+            current_op = conversion_input.ops[current_op_index]
+        except IndexError:
+            return None
+        current_region_id = current_op.parent_region_id
+        if current_region_id == region_id:
+            return current_op_index
+        if current_region_id is None:
+            return None
+        parent_op_index = conversion_input.regions[current_region_id].parent_op_index
+        if parent_op_index is None:
+            return None
+        current_op_index = parent_op_index
+
+
+def _op_precedes_in_region(
+    conversion_input,
+    region_id,
+    lhs_op_index,
+    rhs_op_index,
+):
+    try:
+        region_ops = conversion_input.regions[region_id].op_indices
+        return region_ops.index(lhs_op_index) < region_ops.index(rhs_op_index)
+    except (IndexError, ValueError):
+        return False
 
 
 def _pointer_byte_range_fact(fact_program, value_id, op):

@@ -968,6 +968,103 @@ def _emit_select(state, op):
         )
 
 
+def _emit_if(state, op):
+    if len(op.operands) != 1:
+        fail(
+            "TLXW_EMIT_IF_OPERAND_COUNT",
+            STAGE,
+            "if target op requires one condition operand",
+            target_op_id=op.target_op_id,
+        )
+    if len(op.region_ids) != 2:
+        fail(
+            "TLXW_EMIT_IF_REGION_COUNT",
+            STAGE,
+            "if target op requires then and else regions",
+            target_op_id=op.target_op_id,
+        )
+    condition = _require_value(state, op.operands[0], op)
+    if not _is_scalar_i1_value(state, condition):
+        fail(
+            "TLXW_EMIT_IF_CONDITION",
+            STAGE,
+            "if condition must be a scalar i1 value",
+            target_op_id=op.target_op_id,
+            target_value_id=op.operands[0],
+        )
+    result_types, result_shapes = _structured_result_types_and_shapes(
+        state,
+        op.results,
+        op,
+    )
+
+    outer_values = dict(state.values)
+    outer_uniform_pointer_bases = dict(state.uniform_pointer_bases)
+    outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
+    outer_scratch_token = state.scratch_token
+    with state.builder.if_(condition, result_types, otherwise=True) as ifop:
+        _restore_emission_state(
+            state,
+            outer_values,
+            outer_uniform_pointer_bases,
+            outer_shared_pointer_dword_bases,
+            outer_scratch_token,
+        )
+        then_yields = _emit_structured_branch(
+            state,
+            op.region_ids[0],
+            op.results,
+            result_shapes,
+            "if then",
+            op,
+        )
+        if then_yields:
+            state.builder.yield_(then_yields)
+        _restore_emission_state(
+            state,
+            outer_values,
+            outer_uniform_pointer_bases,
+            outer_shared_pointer_dword_bases,
+            outer_scratch_token,
+        )
+        with ifop.otherwise():
+            else_yields = _emit_structured_branch(
+                state,
+                op.region_ids[1],
+                op.results,
+                result_shapes,
+                "if else",
+                op,
+            )
+            if else_yields:
+                state.builder.yield_(else_yields)
+    _restore_emission_state(
+        state,
+        outer_values,
+        outer_uniform_pointer_bases,
+        outer_shared_pointer_dword_bases,
+        outer_scratch_token,
+    )
+
+    flat_results = tuple(ifop.results)
+    if len(flat_results) != len(result_types):
+        fail(
+            "TLXW_EMIT_IF_RESULT_COMPONENTS",
+            STAGE,
+            "if result component count must match result types",
+            target_op_id=op.target_op_id,
+        )
+    cursor = 0
+    for result_id, shape in zip(op.results, result_shapes):
+        state.values[result_id] = _pack_structured_value_components(
+            flat_results[cursor : cursor + shape.component_count],
+            shape,
+            "if",
+            op,
+        )
+        cursor += shape.component_count
+
+
 def _emit_for_loop(state, op):
     attrs = target_ir.attrs_dict(op)
     if len(op.region_ids) != 1:
@@ -991,10 +1088,11 @@ def _emit_for_loop(state, op):
     )
     init_target_ids = op.operands[3:]
     init_values = tuple(_require_value(state, target_value_id, op) for target_value_id in init_target_ids)
-    flat_init_values, init_shapes = _flatten_loop_values(
+    flat_init_values, init_shapes = _flatten_structured_values(
         state,
         init_values,
         init_target_ids,
+        "for_loop",
         op,
     )
     region = state.target_program.regions[op.region_ids[0]]
@@ -1038,10 +1136,11 @@ def _emit_for_loop(state, op):
             op,
         )
         yielded_values = _emit_region(state, op.region_ids[0])
-        flat_yield_values, yield_shapes = _flatten_loop_values(
+        flat_yield_values, yield_shapes = _flatten_structured_values(
             state,
             yielded_values,
             region.yield_value_ids,
+            "for_loop",
             op,
         )
         if tuple(yield_shapes) != tuple(init_shapes):
@@ -1085,16 +1184,114 @@ def _emit_for_loop(state, op):
             state.values[result_id] = _pack_loop_value_components(
                 flat_results[cursor : cursor + shape.component_count],
                 shape,
+                op,
             )
             cursor += shape.component_count
 
 
-def _flatten_loop_values(state, values, target_value_ids, op):
+def _emit_structured_branch(
+    state,
+    region_id,
+    result_target_ids,
+    result_shapes,
+    label,
+    op,
+):
+    region = state.target_program.regions[region_id]
+    if region.block_arg_ids:
+        fail(
+            "TLXW_EMIT_IF_BLOCK_ARGS",
+            STAGE,
+            "if branch regions must not have block arguments",
+            target_op_id=op.target_op_id,
+        )
+    if len(region.yield_value_ids) != len(result_target_ids):
+        fail(
+            "TLXW_EMIT_IF_YIELD_COUNT",
+            STAGE,
+            "if branch yield count must match result count",
+            target_op_id=op.target_op_id,
+        )
+    yielded_values = _emit_region(state, region_id)
+    flat_yield_values, yield_shapes = _flatten_structured_values(
+        state,
+        yielded_values,
+        region.yield_value_ids,
+        label,
+        op,
+    )
+    if tuple(yield_shapes) != tuple(result_shapes):
+        fail(
+            "TLXW_EMIT_IF_YIELD_COMPONENTS",
+            STAGE,
+            "if branch yielded component shape must match result types",
+            target_op_id=op.target_op_id,
+        )
+    return flat_yield_values
+
+
+def _structured_result_types_and_shapes(state, target_value_ids, op):
+    result_types = []
+    shapes = []
+    for target_value_id in target_value_ids:
+        target_type = state.target_program.values[target_value_id].type
+        component_count = int(target_type.component_count)
+        if target_type.representation in {"mask", "mask_tuple"}:
+            lane_width = int(target_type.lane_width or 64)
+            shapes.append(
+                _LoopValueShape(
+                    component_count,
+                    is_mask_payload=True,
+                )
+            )
+            result_types.extend(
+                [state.dsl.simd_type(state.dsl.i32(), lane_width)] * component_count
+            )
+            continue
+        if target_type.representation == "token":
+            shapes.append(_LoopValueShape(component_count))
+            result_types.extend([state.dsl.mem_token_type()] * component_count)
+            continue
+        if target_type.representation in {
+            "scalar",
+            "uniform_pointer",
+            "simd",
+            "simd_tuple",
+            "per_lane_pointer",
+            "pointer_tuple",
+        }:
+            shapes.append(_LoopValueShape(component_count))
+            result_types.extend([_wave_type(state.dsl, target_type)] * component_count)
+            continue
+        fail(
+            "TLXW_EMIT_IF_RESULT_TYPE",
+            STAGE,
+            f"if result type {target_type.representation} is not supported",
+            target_op_id=op.target_op_id,
+            target_value_id=target_value_id,
+        )
+    return tuple(result_types), tuple(shapes)
+
+
+def _restore_emission_state(
+    state,
+    values,
+    uniform_pointer_bases,
+    shared_pointer_dword_bases,
+    scratch_token,
+):
+    state.values = dict(values)
+    state.uniform_pointer_bases = dict(uniform_pointer_bases)
+    state.shared_pointer_dword_bases = dict(shared_pointer_dword_bases)
+    state.scratch_token = scratch_token
+
+
+def _flatten_structured_values(state, values, target_value_ids, context, op):
     if len(values) != len(target_value_ids):
         fail(
-            "TLXW_EMIT_FOR_COMPONENT_SHAPE",
+            "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
             STAGE,
-            "for_loop value and target id counts do not match",
+            f"{context} value and target id counts do not match",
             target_op_id=op.target_op_id,
         )
     flat_values = []
@@ -1123,17 +1320,22 @@ def _flatten_loop_values(state, values, target_value_ids, op):
     return tuple(flat_values), tuple(shapes)
 
 
-def _pack_loop_value_components(components, shape):
+def _pack_structured_value_components(components, shape, context, op):
     components = tuple(components)
     if len(components) != int(shape.component_count):
         fail(
-            "TLXW_EMIT_FOR_COMPONENT_SHAPE",
+            "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
             STAGE,
-            "for_loop component slice does not match recorded value shape",
+            f"{context} component slice does not match recorded value shape",
+            target_op_id=None if op is None else op.target_op_id,
         )
     if shape.is_mask_payload:
         return _I32MaskPayload(components)
     return _pack_components(components)
+
+
+def _pack_loop_value_components(components, shape, op=None):
+    return _pack_structured_value_components(components, shape, "for_loop", op)
 
 
 def _bind_loop_region_args(
@@ -1150,6 +1352,7 @@ def _bind_loop_region_args(
         state.values[block_arg_id] = _pack_loop_value_components(
             flat_iter_values[cursor : cursor + shape.component_count],
             shape,
+            op,
         )
         cursor += shape.component_count
     if cursor != len(flat_iter_values):
@@ -4177,6 +4380,7 @@ _TARGET_EMITTERS = {
     "expand_dims": _emit_expand_dims,
     "program_id": _emit_program_id,
     "for_loop": _emit_for_loop,
+    "if": _emit_if,
     "select": _emit_select,
     "local_alloc": _emit_local_alloc,
     "memdesc_index": _emit_memdesc_index,

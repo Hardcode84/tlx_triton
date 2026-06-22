@@ -2097,17 +2097,177 @@ def test_tlx_wave_converter_pipeline_lowers_pure_value_if(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    assert [op.kind for op in output.target_program.ops] == [
-        "constant",
-        "cmpi",
-        "constant",
-        "binary",
-        "constant",
-        "binary",
-        "select",
-        "return",
+    root_region = output.target_program.regions[0]
+    root_kinds = [
+        output.target_program.ops[op_id].kind for op_id in root_region.op_ids
     ]
-    assert "wave.select" in output.emitted_module.text
+    assert root_kinds == ["constant", "cmpi", "if", "return"]
+    if_op = next(op for op in output.target_program.ops if op.kind == "if")
+    assert len(if_op.region_ids) == 2
+    assert [
+        output.target_program.ops[op_id].kind
+        for op_id in output.target_program.regions[if_op.region_ids[0]].op_ids
+    ] == ["constant", "binary"]
+    assert [
+        output.target_program.ops[op_id].kind
+        for op_id in output.target_program.regions[if_op.region_ids[1]].op_ids
+    ] == ["constant", "binary"]
+    assert "scf.if" in output.emitted_module.text
+    assert "wave.select" not in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_keeps_if_stores_in_branches(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_if_stores(
+      %cond: i1,
+      %ptr: tensor<64x!tt.ptr<f32>, #blocked>,
+      %then_value: tensor<64xf32, #blocked>,
+      %else_value: tensor<64xf32, #blocked>) attributes {noinline = false} {
+    scf.if %cond {
+      tt.store %ptr, %then_value : tensor<64x!tt.ptr<f32>, #blocked>
+    } else {
+      tt.store %ptr, %else_value : tensor<64x!tt.ptr<f32>, #blocked>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    root_region = output.target_program.regions[0]
+    root_kinds = [
+        output.target_program.ops[op_id].kind for op_id in root_region.op_ids
+    ]
+    assert root_kinds == ["if", "return"]
+    if_op = next(op for op in output.target_program.ops if op.kind == "if")
+    assert [
+        output.target_program.ops[op_id].kind
+        for op_id in output.target_program.regions[if_op.region_ids[0]].op_ids
+    ] == ["store"]
+    assert [
+        output.target_program.ops[op_id].kind
+        for op_id in output.target_program.regions[if_op.region_ids[1]].op_ids
+    ] == ["store"]
+    wave = output.emitted_module.text
+    assert "wave.store" not in wave.split("scf.if", 1)[0]
+    assert wave.count("wave.store") == 2
+    _run_wave_verify(wave)
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_keeps_branch_assumes_scoped(tmp_path):
+    local_func = """
+  tt.func public @converter_if_assume_scope(%arg0: i32, %cond: i1) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    scf.if %cond {
+      %positive = arith.cmpi sgt, %arg0, %zero : i32
+      llvm.intr.assume %positive : i1
+      scf.yield
+    } else {
+      scf.yield
+    }
+    %one = arith.constant 1 : i32
+    %sum = arith.addi %arg0, %one : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    post_if_add = next(
+        op
+        for op in output.target_program.ops
+        if op.kind == "binary"
+        and converter_target_ir.attrs_dict(op)["operation"] == "addi"
+    )
+    assert post_if_add.fact_ids == ()
+    if_op = next(op for op in output.target_program.ops if op.kind == "if")
+    then_kinds = [
+        output.target_program.ops[op_id].kind
+        for op_id in output.target_program.regions[if_op.region_ids[0]].op_ids
+    ]
+    assert then_kinds == ["cmpi", "assume"]
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_implicit_if_async_wait_escape(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_if_async_wait_escape(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %cond: i1) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    scf.if %cond {
+      %token = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+      %group = ttg.async_commit_group tokens %token
+      scf.yield
+    } else {
+      scf.yield
+    }
+    %wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_IF_TOKENS"
+    assert diagnostic.stage == "op_conversion"
+    assert diagnostic.no_fallback is True
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_if_wait_on_sibling_async_group(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_if_sibling_async_wait(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %cond: i1) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    scf.if %cond {
+      %then_token = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+      %then_group = ttg.async_commit_group tokens %then_token
+      scf.yield
+    } else {
+      %else_token = amdg.buffer_load_to_local %arg1[%range] into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+      %else_group = ttg.async_commit_group tokens %else_token
+      %else_wait = ttg.async_wait {num = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_IF_TOKENS"
+    assert diagnostic.stage == "op_conversion"
+    assert diagnostic.no_fallback is True
     del ctx
 
 

@@ -59,6 +59,7 @@ LOWERING_DOMAINS = (
             "expand_dims",
             "program_id",
             "for_loop",
+            "if",
             "select",
             "return",
         ),
