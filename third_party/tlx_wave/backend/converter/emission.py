@@ -579,6 +579,48 @@ def _linearize_coordinates(state, coords, shape, lane_width):
     return result
 
 
+def _linearize_coordinates_with_order(state, coords, shape, order, lane_width):
+    if len(coords) != len(shape):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "coordinate count does not match shape rank",
+        )
+    result = state.builder.splat(
+        state.builder.constant(state.dsl.i32(), 0),
+        state.dsl.i32(),
+        int(lane_width),
+    )
+    stride = 1
+    for dim in order:
+        term = coords[int(dim)]
+        if int(stride) != 1:
+            term = _simd_binary_const(state, "muli", term, int(stride), lane_width)
+        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+        stride *= int(shape[int(dim)])
+    return result
+
+
+def _physical_order_from_attrs(attrs, key, shape, op, diagnostic):
+    order = tuple(int(dim) for dim in attrs.get(key, ()))
+    if not order:
+        return _default_physical_order(shape)
+    if len(order) > len(shape) or sorted(order) != list(range(len(order))):
+        fail(
+            diagnostic,
+            STAGE,
+            f"shared layout order {order} cannot be applied to rank-{len(shape)} shape",
+            target_op_id=op.target_op_id,
+        )
+    prefix_rank = len(shape) - len(order)
+    mapped = tuple(prefix_rank + int(dim) for dim in order)
+    return mapped + tuple(reversed(range(prefix_rank)))
+
+
+def _default_physical_order(shape):
+    return tuple(reversed(range(len(shape))))
+
+
 def _bit_linear_thread_coordinate(state, workitem, base, coefficients, lane_width):
     lane_width = int(lane_width)
     result = state.builder.splat(
@@ -1408,6 +1450,7 @@ def _emit_buffer_load_to_local(state, op):
             coords,
             destination_shape,
             lane_width,
+            op,
         )
 
     def emit_component_load_store(component_index, offset_component):
@@ -1486,17 +1529,30 @@ def _local_destination_lane_offset(
     return state.builder.binary(state.dsl.BinaryKind.AddI, lane, wave_offset)
 
 
-def _shared_destination_element_offset(state, attrs, coords, shape, lane_width):
+def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, op):
     layout = attrs.get("destination_shared_layout", "dense")
     if layout == "dense":
         return _linearize_coordinates(state, coords, shape, lane_width)
     if layout == "padded":
-        logical = _linearize_coordinates(state, coords, shape, lane_width)
-        encoded = logical
+        order = _physical_order_from_attrs(
+            attrs,
+            "destination_padded_order",
+            shape,
+            op,
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+        )
+        physical = _linearize_coordinates_with_order(
+            state,
+            coords,
+            shape,
+            order,
+            lane_width,
+        )
+        encoded = physical
         intervals = tuple(int(value) for value in attrs["destination_padded_intervals"])
         paddings = tuple(int(value) for value in attrs["destination_padded_paddings"])
         for interval, padding in zip(intervals, paddings):
-            term = _simd_binary_const(state, "divui", logical, interval, lane_width)
+            term = _simd_binary_const(state, "divui", physical, interval, lane_width)
             if padding != 1:
                 term = _simd_binary_const(state, "muli", term, padding, lane_width)
             encoded = state.builder.binary(state.dsl.BinaryKind.AddI, encoded, term)
@@ -1572,6 +1628,13 @@ def _emit_buffer_load_to_local_packet_dma(
     component_count = int(attrs["component_count"])
     component_thread_count = int(attrs.get("component_thread_count", lane_width))
     shape = tuple(int(dim) for dim in attrs["source_shape"])
+    packet_order = _physical_order_from_attrs(
+        attrs,
+        "packet_order",
+        shape,
+        op,
+        "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+    )
     destination_offsets = tuple(int(value) for value in attrs["destination_component_offsets"])
     if len(destination_offsets) != component_count:
         fail(
@@ -1615,6 +1678,7 @@ def _emit_buffer_load_to_local_packet_dma(
             component_thread_count,
             packet_elements,
             shape,
+            packet_order,
         )
         source_offset = _affine_offset_value(
             state,
@@ -2027,7 +2091,7 @@ def _local_fragment_element_offset(
     elif layout_kind == "swizzled_shared":
         encoded = _swizzled_element_offset_expr(state, attrs, logical)
     elif layout_kind == "padded_shared":
-        encoded = _padded_element_offset_expr(state, attrs, logical)
+        encoded = _padded_element_offset_expr(state, attrs, logical, op)
     else:
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
@@ -2118,6 +2182,20 @@ def _local_fragment_source_coords_expr(
         if int(extra_elements):
             col += int(extra_elements)
         return (row, col)
+    if lane_layout == "gfx950_mfma_b":
+        if len(source_shape) != 2:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "gfx950 MFMA B fragment load requires a rank-2 source shape",
+                target_op_id=op.target_op_id,
+            )
+        non_k_dim = int(source_shape[1])
+        col = state.dsl.mod(lane, non_k_dim)
+        row = state.dsl.floor(lane / non_k_dim) * int(elements_per_lane)
+        if int(extra_elements):
+            row += int(extra_elements)
+        return (row, col)
     if lane_layout == "gfx950_mfma_b_transpose":
         if len(source_shape) != 2:
             fail(
@@ -2175,6 +2253,15 @@ def _linearize_local_fragment_coords(shape, coords):
     for dim in reversed(range(len(shape))):
         result += coords[dim] * stride
         stride *= int(shape[dim])
+    return result
+
+
+def _linearize_local_fragment_coords_with_order(shape, coords, order):
+    result = 0
+    stride = 1
+    for dim in order:
+        result += coords[int(dim)] * stride
+        stride *= int(shape[int(dim)])
     return result
 
 
@@ -2280,13 +2367,23 @@ def _swizzled_element_offset_expr(state, attrs, logical):
     return row * cols + swizzled_col
 
 
-def _padded_element_offset_expr(state, attrs, logical):
-    encoded = logical
+def _padded_element_offset_expr(state, attrs, logical, op):
+    shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
+    order = _physical_order_from_attrs(
+        attrs,
+        "padded_order",
+        shape,
+        op,
+        "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+    )
+    coords = _delinearize_local_fragment_expr(state, logical, shape)
+    physical = _linearize_local_fragment_coords_with_order(shape, coords, order)
+    encoded = physical
     for interval, padding in zip(
         attrs.get("padded_intervals", ()),
         attrs.get("padded_paddings", ()),
     ):
-        encoded += state.dsl.floor(logical / int(interval)) * int(padding)
+        encoded += state.dsl.floor(physical / int(interval)) * int(padding)
     return encoded
 
 
@@ -4182,6 +4279,7 @@ def _packet_coordinate_values(
     component_thread_count,
     packet_elements,
     shape,
+    packet_order,
 ):
     linear = _simd_binary_const(
         state,
@@ -4200,13 +4298,13 @@ def _packet_coordinate_values(
             int(state.dsl.SimdType(lane.type).width),
         )
     lane_width = int(state.dsl.SimdType(lane.type).width)
-    coords = []
-    for dim, extent in enumerate(shape):
-        stride = _product(shape[dim + 1 :])
-        coord = _simd_binary_const(state, "divui", linear, int(stride), lane_width)
-        if int(extent) != 1:
-            coord = _simd_binary_const(state, "remui", coord, int(extent), lane_width)
-        coords.append(coord)
+    coords = [None] * len(shape)
+    remainder = linear
+    for dim in packet_order:
+        extent = int(shape[int(dim)])
+        coord = _simd_binary_const(state, "remui", remainder, extent, lane_width)
+        coords[int(dim)] = coord
+        remainder = _simd_binary_const(state, "divui", remainder, extent, lane_width)
     return tuple(coords)
 
 

@@ -180,7 +180,7 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
     b = MockTensor(torch.float16, [k, n])
     c = MockTensor(torch.float16, [m, n])
     a_strides = a.stride()
-    b_strides = b.stride()
+    b_strides = case.get("b_strides", b.stride())
     c_strides = c.stride()
 
     with (
@@ -1917,8 +1917,17 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
             "disables_post_misched": True,
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
         },
+        {
+            "id": "v9_beyond_hotloop_transposed_b",
+            "version_dir": "v9_beyond_hotloop",
+            "function_name": "v9_beyond_hotloop",
+            "num_warps": 8,
+            "disables_post_misched": True,
+            "b_strides": (1, 256),
+            "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
+        },
     ],
-    ids=lambda case: case["version_dir"],
+    ids=lambda case: case.get("id", case["version_dir"]),
 )
 def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     tmp_path,
@@ -1958,18 +1967,7 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     "case_name,b_layout",
     [
         ("contiguous_b", "contiguous"),
-        pytest.param(
-            "transposed_b",
-            "transposed",
-            marks=pytest.mark.xfail(
-                raises=AssertionError,
-                reason=(
-                    "v9 TLX Wave lowering currently miscomputes benchmark-style "
-                    "B tensors with shape (K, N) and stride (1, K)"
-                ),
-                strict=True,
-            ),
-        ),
+        ("transposed_b", "transposed"),
     ],
 )
 def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout):

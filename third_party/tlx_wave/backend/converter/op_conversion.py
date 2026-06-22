@@ -1403,6 +1403,7 @@ def _convert_buffer_load_to_local(
                 "mode": "dma_packet_lds",
                 "packet_bytes": int(packet_plan["packet_bytes"]),
                 "packet_elements": int(packet_plan["packet_elements"]),
+                "packet_order": tuple(int(dim) for dim in packet_plan["packet_order"]),
                 "range_bytes": int(range_fact.upper),
                 "source_offset_range": (
                     0,
@@ -3343,6 +3344,12 @@ def _scalarized_shared_layout_attrs(layout, shape, op):
         return {
             "destination_shared_layout": "padded",
             "destination_padded_intervals": tuple(int(value) for value in intervals),
+            "destination_padded_order": _shared_layout_physical_order(
+                layout,
+                shape,
+                op,
+                diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            ),
             "destination_padded_paddings": tuple(int(value) for value in paddings),
         }
     fail(
@@ -3443,9 +3450,27 @@ def _buffer_load_to_local_packet_plan(
         if layout_id is None
         else type_layout_program.layouts[int(layout_id)]
     )
+    packet_order = _shared_layout_physical_order(
+        layout,
+        shape,
+        op,
+        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+    )
+    if not _packet_source_is_contiguous(
+        affine,
+        shape,
+        packet_order,
+        packet_elements,
+        component_count,
+        wave_count,
+        lane_width,
+    ):
+        return None
     destination_offsets, destination_wave_stride_dwords = (
         _packet_destination_offsets(
             layout,
+            shape,
+            packet_order,
             component_count,
             elements_per_cta_packet,
             elements_per_wave_packet,
@@ -3463,13 +3488,64 @@ def _buffer_load_to_local_packet_plan(
         "destination_wave_stride_dwords": int(destination_wave_stride_dwords),
         "packet_bytes": int(packet_bytes),
         "packet_elements": int(packet_elements),
+        "packet_order": tuple(int(dim) for dim in packet_order),
         "scalar_value_ids": tuple(scalar_value_ids),
         "source_offset_terms": tuple(terms),
     }
 
 
+def _packet_source_is_contiguous(
+    affine,
+    shape,
+    packet_order,
+    packet_elements,
+    component_count,
+    wave_count,
+    lane_width,
+):
+    if not packet_order:
+        return False
+    packet_dim = int(packet_order[0])
+    delta = 0
+    for term in affine.terms:
+        coefficient = int(term.coefficient)
+        if term.kind in {"const", "scalar", "scalar_product"}:
+            continue
+        if term.kind == "dim":
+            if int(term.dim) == packet_dim:
+                delta += coefficient
+            continue
+        if term.kind == "dim_scalar":
+            if int(term.dim) == packet_dim and coefficient:
+                return False
+            continue
+        return False
+    if delta != 1:
+        return False
+
+    component_thread_count = int(wave_count) * int(lane_width)
+    for component in range(int(component_count)):
+        component_base = int(component) * component_thread_count * int(packet_elements)
+        for workitem in range(component_thread_count):
+            linear_start = component_base + workitem * int(packet_elements)
+            linear_end = linear_start + int(packet_elements) - 1
+            if linear_end >= _product(shape):
+                return False
+            start = _ordered_coords_from_linear(linear_start, shape, packet_order)
+            end = _ordered_coords_from_linear(linear_end, shape, packet_order)
+            for dim in range(len(shape)):
+                if dim == packet_dim:
+                    if int(end[dim]) - int(start[dim]) != int(packet_elements) - 1:
+                        return False
+                elif int(end[dim]) != int(start[dim]):
+                    return False
+    return True
+
+
 def _packet_destination_offsets(
     layout,
+    shape,
+    packet_order,
     component_count,
     elements_per_cta_packet,
     elements_per_wave_packet,
@@ -3482,8 +3558,10 @@ def _packet_destination_offsets(
     for component in range(int(component_count)):
         component_linear = int(component) * int(elements_per_cta_packet)
         wave_offsets = tuple(
-            _physical_component_offset(
+            _packet_physical_component_offset(
                 layout,
+                shape,
+                packet_order,
                 component_linear + wave * int(elements_per_wave_packet),
                 elements_per_wave_packet,
                 op,
@@ -3526,6 +3604,63 @@ def _packet_destination_offsets(
                 source_value_id=layout.value_id if layout is not None else None,
             )
     return tuple(destination_offsets), int(wave_stride_dwords or 0)
+
+
+def _packet_physical_component_offset(
+    layout,
+    shape,
+    packet_order,
+    ordered_linear_start,
+    lane_width,
+    op,
+):
+    default_order = _default_physical_order(shape)
+    if layout is None or layout.kind in {"none", "linear"}:
+        if tuple(packet_order) != default_order:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "dense packet DMA destination must use row-major physical order",
+                source_op_index=op.index,
+                source_value_id=layout.value_id if layout is not None else None,
+            )
+        return int(ordered_linear_start)
+    if layout.kind == "swizzled_shared":
+        _require_identity_swizzled(layout, op)
+        if tuple(packet_order) != default_order:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "identity swizzled packet DMA destination must use row-major "
+                "physical order",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        return int(ordered_linear_start)
+    if layout.kind == "padded_shared":
+        intervals, paddings = _padded_shared_parameters(layout, op)
+        linear_start = int(ordered_linear_start)
+        linear_end = linear_start + int(lane_width) - 1
+        encoded = linear_start
+        for interval, padding in zip(intervals, paddings):
+            if linear_start // int(interval) != linear_end // int(interval):
+                fail(
+                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                    STAGE,
+                    "packet DMA destination component crosses a padded LDS interval",
+                    source_op_index=op.index,
+                    source_value_id=layout.value_id,
+                )
+            encoded += (linear_start // int(interval)) * int(padding)
+        return encoded
+    fail(
+        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        STAGE,
+        f"amdg.buffer_load_to_local destination layout {layout.kind} "
+        "is not converted yet",
+        source_op_index=op.index,
+        source_value_id=layout.value_id,
+    )
 
 
 def _dma_packet_bytes_for_element(element_byte_width):
@@ -4006,7 +4141,8 @@ def _indexed_fragment_load_plan(
     if not requires_indexed:
         return None
     elements_per_lane = int(registers) * (4 // int(memdesc.element_byte_width))
-    lane_layout = _fragment_lane_layout(
+    lane_layout = _indexed_fragment_lane_layout(
+        layout,
         result_layout,
         instr_shape,
         int(elements_per_lane),
@@ -4191,11 +4327,29 @@ def _fragment_lane_layout(
     return "row_major_linear"
 
 
+def _indexed_fragment_lane_layout(layout, result_layout, instr_shape, elements_per_lane):
+    if (
+        layout is not None
+        and layout.kind == "padded_shared"
+        and tuple(layout.properties.get("order", ())) == (0, 1)
+        and int(result_layout.properties.get("op_idx", -1)) == 1
+        and tuple(int(value) for value in instr_shape) in {(16, 16, 32), (32, 32, 16)}
+        and int(result_layout.lane_width) == 64
+        and int(elements_per_lane) == 8
+    ):
+        return "gfx950_mfma_b"
+    return _fragment_lane_layout(
+        result_layout,
+        instr_shape,
+        int(elements_per_lane),
+    )
+
+
 def _is_supported_b16_transpose_layout(layout):
     if layout is None:
         return False
     if layout.kind == "padded_shared":
-        return True
+        return tuple(layout.properties.get("order", ())) == (1, 0)
     return _is_supported_swizzled_layout(layout)
 
 
@@ -4552,6 +4706,28 @@ def _static_local_fragment_lane_offset(
             if not fail_on_oob:
                 return None
         return linear
+    if lane_layout == "gfx950_mfma_b":
+        if len(memdesc_shape) != 2 or len(source_shape) != 2 or len(tile_offsets) != 2:
+            fail(
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "gfx950 MFMA B fragment load requires rank-2 source and memdesc shapes",
+                source_op_index=op.index,
+            )
+        non_k_dim = int(source_shape[1])
+        col = int(lane) % non_k_dim
+        row = (int(lane) // non_k_dim) * int(elements_per_lane) + int(extra_elements)
+        coords = (int(tile_offsets[0]) + row, int(tile_offsets[1]) + col)
+        for dim, coord in enumerate(coords):
+            if int(coord) < 0 or int(coord) >= int(memdesc_shape[dim]):
+                if not fail_on_oob:
+                    return None
+                _check_coords_in_bounds(coords, memdesc_shape, op)
+        linear = _static_linear_offset(memdesc_shape, coords) + int(wave_offset)
+        if int(linear) < 0 or int(linear) >= _product(memdesc_shape):
+            if not fail_on_oob:
+                return None
+        return linear
     fail(
         "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         STAGE,
@@ -4654,6 +4830,66 @@ def _static_linear_offset(shape, coords):
     return int(offset)
 
 
+def _default_physical_order(shape):
+    return tuple(reversed(range(len(shape))))
+
+
+def _expand_physical_order(order, rank, layout, op, diagnostic):
+    order = tuple(int(dim) for dim in order)
+    if len(order) > int(rank) or sorted(order) != list(range(len(order))):
+        fail(
+            diagnostic,
+            STAGE,
+            f"shared layout order {order} cannot be applied to rank-{rank} shape",
+            source_op_index=op.index,
+            source_value_id=layout.value_id if layout is not None else None,
+        )
+    prefix_rank = int(rank) - len(order)
+    mapped = tuple(prefix_rank + int(dim) for dim in order)
+    return mapped + tuple(reversed(range(prefix_rank)))
+
+
+def _shared_layout_physical_order(
+    layout,
+    shape,
+    op,
+    *,
+    diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+):
+    if not shape:
+        return ()
+    if layout is not None and layout.kind == "padded_shared":
+        order = tuple(int(dim) for dim in layout.properties.get("order", ()))
+        if order:
+            return _expand_physical_order(
+                order,
+                len(shape),
+                layout,
+                op,
+                diagnostic,
+            )
+    return _default_physical_order(shape)
+
+
+def _ordered_linear_offset(shape, coords, order):
+    offset = 0
+    stride = 1
+    for dim in order:
+        offset += int(coords[int(dim)]) * stride
+        stride *= int(shape[int(dim)])
+    return int(offset)
+
+
+def _ordered_coords_from_linear(linear, shape, order):
+    coords = [0] * len(shape)
+    remainder = int(linear)
+    for dim in order:
+        extent = int(shape[int(dim)])
+        coords[int(dim)] = remainder % extent
+        remainder //= extent
+    return tuple(coords)
+
+
 def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
     order, vec, per_phase, max_phase = _swizzled_shared_parameters(
         layout,
@@ -4681,7 +4917,8 @@ def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
 
 def _static_padded_byte_offset(layout, shape, coords, element_byte_width, op):
     intervals, paddings = _padded_shared_parameters(layout, op)
-    linear = _static_linear_offset(shape, coords)
+    order = _shared_layout_physical_order(layout, shape, op)
+    linear = _ordered_linear_offset(shape, coords, order)
     encoded = linear
     for interval, padding in zip(intervals, paddings):
         encoded += (linear // int(interval)) * int(padding)
@@ -4898,7 +5135,7 @@ def _fragment_component_dword_offsets(
                 source_value_id=result_layout.value_id,
             )
         linear_offsets.append(int(linear))
-        physical = _physical_element_offset(layout, linear, op)
+        physical = _physical_element_offset(layout, shape, linear, op)
         byte_offset = physical * int(memdesc.element_byte_width)
         if byte_offset % 4:
             fail(
@@ -4911,6 +5148,7 @@ def _fragment_component_dword_offsets(
         offsets.append(byte_offset // 4)
     wave_tile_stride_dwords = _element_stride_to_dwords(
         layout,
+        shape,
         wave_tile_stride_elements,
         int(memdesc.element_byte_width),
         tuple(linear_offsets),
@@ -4924,11 +5162,18 @@ def _fragment_component_dword_offsets(
     }
 
 
-def _physical_element_offset(layout, linear, op):
-    return _physical_component_offset(layout, int(linear), 1, op)
+def _physical_element_offset(layout, shape, linear, op):
+    return _physical_component_offset(layout, shape, int(linear), 1, op)
 
 
-def _element_stride_to_dwords(layout, element_stride, element_byte_width, linear_offsets, op):
+def _element_stride_to_dwords(
+    layout,
+    shape,
+    element_stride,
+    element_byte_width,
+    linear_offsets,
+    op,
+):
     if int(element_stride) == 0:
         return 0
     if layout is None or layout.kind in {"none", "swizzled_shared"}:
@@ -4937,8 +5182,14 @@ def _element_stride_to_dwords(layout, element_stride, element_byte_width, linear
         byte_stride = int(element_stride) * int(element_byte_width)
     elif layout.kind == "padded_shared":
         physical_strides = {
-            _physical_component_offset(layout, int(linear) + int(element_stride), 1, op)
-            - _physical_component_offset(layout, int(linear), 1, op)
+            _physical_component_offset(
+                layout,
+                shape,
+                int(linear) + int(element_stride),
+                1,
+                op,
+            )
+            - _physical_component_offset(layout, shape, int(linear), 1, op)
             for linear in linear_offsets
         }
         if len(physical_strides) != 1:
@@ -4970,7 +5221,7 @@ def _element_stride_to_dwords(layout, element_stride, element_byte_width, linear
     return byte_stride // 4
 
 
-def _physical_component_offset(layout, linear_start, lane_width, op):
+def _physical_component_offset(layout, shape, linear_start, lane_width, op):
     linear_end = int(linear_start) + int(lane_width) - 1
     if layout is None or layout.kind in {"none", "swizzled_shared"}:
         if layout is not None and layout.kind == "swizzled_shared":
@@ -4998,7 +5249,40 @@ def _physical_component_offset(layout, linear_start, lane_width, op):
                 source_op_index=op.index,
                 source_value_id=layout.value_id,
             )
-        if linear_start // interval != linear_end // interval:
+        physical_start = _static_shared_byte_offset_from_linear(
+            layout,
+            shape,
+            int(linear_start),
+            1,
+            op,
+        )
+        physical_end = _static_shared_byte_offset_from_linear(
+            layout,
+            shape,
+            int(linear_end),
+            1,
+            op,
+        )
+        if physical_start is None or physical_end is None:
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "scalarized amdg.buffer_load_to_local component exceeds "
+                "local memdesc shape",
+                source_op_index=op.index,
+                source_value_id=layout.value_id,
+            )
+        unpadded_start = _ordered_linear_offset(
+            shape,
+            _static_delinearize_row_major(int(linear_start), shape, op),
+            _shared_layout_physical_order(layout, shape, op),
+        )
+        unpadded_end = _ordered_linear_offset(
+            shape,
+            _static_delinearize_row_major(int(linear_end), shape, op),
+            _shared_layout_physical_order(layout, shape, op),
+        )
+        if unpadded_start // interval != unpadded_end // interval:
             fail(
                 "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
                 STAGE,
@@ -5007,7 +5291,7 @@ def _physical_component_offset(layout, linear_start, lane_width, op):
                 source_op_index=op.index,
                 source_value_id=layout.value_id,
             )
-        return int(linear_start) + (int(linear_start) // interval) * padding
+        return int(physical_start)
     fail(
         "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
         STAGE,
