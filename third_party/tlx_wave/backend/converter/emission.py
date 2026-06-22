@@ -607,11 +607,42 @@ def _emit_splat(state, op):
 
 
 def _emit_broadcast(state, op):
+    attrs = target_ir.attrs_dict(op)
     operand = _operand_values(state, op, 1)[0]
     operand_id = op.operands[0]
     result_id = _single_result(op)
     target_count = _component_count(state, result_id)
     source_components = _as_components(operand)
+    component_sources = attrs.get("component_sources")
+    if component_sources is not None:
+        component_sources = tuple(int(index) for index in component_sources)
+        if len(component_sources) != int(target_count):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BROADCAST",
+                STAGE,
+                "tt.broadcast component source map does not match the result "
+                "component count",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+        if any(index < 0 or index >= len(source_components) for index in component_sources):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BROADCAST",
+                STAGE,
+                "tt.broadcast component source map references a missing "
+                "source component",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+        state.values[result_id] = _pack_components(
+            tuple(source_components[index] for index in component_sources)
+        )
+        source_bases = state.uniform_pointer_bases.get(operand_id)
+        if source_bases is not None:
+            state.uniform_pointer_bases[result_id] = tuple(
+                source_bases[index] for index in component_sources
+            )
+        return
     if target_count == len(source_components):
         state.values[result_id] = operand
         _propagate_uniform_pointer_bases(state, operand_id, result_id)
@@ -1571,7 +1602,7 @@ def _emit_local_load_fragment(state, op):
             wi,
         )
         return
-    if load_mode == "swizzled_fragment_load":
+    if load_mode in {"swizzled_fragment_load", "indexed_fragment_load"}:
         state.values[_single_result(op)] = _emit_swizzled_fragment_load(
             state,
             op,
@@ -1746,21 +1777,45 @@ def _local_fragment_element_offset(
     elements_per_offset_unit=1,
     physical_extra_elements=0,
 ):
-    tile_base = _dense_tile_base_elements(
-        attrs.get("memdesc_shape", attrs["source_shape"]),
-        tile_offsets,
-    )
-    logical = _linear_local_fragment_offset_expr(
-        state,
-        lane_width,
-        elements_per_lane=elements_per_lane,
-        wave_tile_axis=wave_tile_axis,
-        warps_per_cta=warps_per_cta,
-        wave_tile_stride=wave_tile_stride,
-        extra_elements=int(tile_base) + int(extra_elements),
-        op=op,
-    )
     layout_kind = attrs.get("shared_layout_kind", "dense")
+    lane_layout = attrs.get("fragment_lane_layout", "row_major_linear")
+    source_shape = tuple(int(dim) for dim in attrs["source_shape"])
+    memdesc_shape = tuple(
+        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
+    )
+    if (
+        lane_layout == "row_major_linear"
+        and layout_kind in {"dense", "swizzled_shared"}
+        and source_shape == memdesc_shape
+    ):
+        tile_base = _dense_tile_base_elements(
+            memdesc_shape,
+            tile_offsets,
+        )
+        logical = _linear_local_fragment_offset_expr(
+            state,
+            lane_width,
+            elements_per_lane=elements_per_lane,
+            wave_tile_axis=wave_tile_axis,
+            warps_per_cta=warps_per_cta,
+            wave_tile_stride=wave_tile_stride,
+            extra_elements=int(tile_base) + int(extra_elements),
+            op=op,
+        )
+    else:
+        logical = _local_fragment_logical_offset_expr(
+            state,
+            attrs,
+            wi,
+            tile_offsets,
+            int(extra_elements),
+            lane_width,
+            elements_per_lane=elements_per_lane,
+            wave_tile_axis=wave_tile_axis,
+            warps_per_cta=warps_per_cta,
+            wave_tile_stride=wave_tile_stride,
+            op=op,
+        )
     if layout_kind == "dense":
         encoded = logical
     elif layout_kind == "swizzled_shared":
@@ -1779,6 +1834,142 @@ def _local_fragment_element_offset(
         encoded += int(physical_extra_elements)
     wi_sym = state.dsl.sym("wi")
     return state.builder.index_expr(encoded, bindings={wi_sym: wi})
+
+
+def _local_fragment_logical_offset_expr(
+    state,
+    attrs,
+    wi,
+    tile_offsets,
+    extra_elements,
+    lane_width,
+    *,
+    elements_per_lane,
+    wave_tile_axis,
+    warps_per_cta,
+    wave_tile_stride,
+    op,
+):
+    del wi
+    wi_sym = state.dsl.sym("wi")
+    lane = state.dsl.mod(wi_sym, int(lane_width))
+    source_shape = tuple(int(dim) for dim in attrs["source_shape"])
+    memdesc_shape = tuple(
+        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
+    )
+    lane_layout = attrs.get("fragment_lane_layout", "row_major_linear")
+    source_coords = _local_fragment_source_coords_expr(
+        state,
+        lane,
+        source_shape,
+        int(elements_per_lane),
+        int(extra_elements),
+        lane_layout,
+        op,
+    )
+    coords = tuple(
+        int(tile_offsets[dim]) + source_coords[dim] for dim in range(len(source_shape))
+    )
+    logical = _linearize_local_fragment_coords(memdesc_shape, coords)
+    wave_tile = _wave_tile_offset_expr(
+        state,
+        wi_sym,
+        lane_width,
+        wave_tile_axis,
+        warps_per_cta,
+        wave_tile_stride,
+        op,
+    )
+    if wave_tile is not None:
+        logical += wave_tile
+    return logical
+
+
+def _local_fragment_source_coords_expr(
+    state,
+    lane,
+    source_shape,
+    elements_per_lane,
+    extra_elements,
+    lane_layout,
+    op,
+):
+    if lane_layout == "row_major_linear":
+        local = lane * int(elements_per_lane)
+        if int(extra_elements):
+            local += int(extra_elements)
+        return _delinearize_local_fragment_expr(state, local, source_shape)
+    if lane_layout == "gfx950_mfma_a":
+        if len(source_shape) != 2:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "gfx950 MFMA A fragment load requires a rank-2 source shape",
+                target_op_id=op.target_op_id,
+            )
+        row = state.dsl.mod(lane, int(source_shape[0]))
+        col = state.dsl.floor(lane / int(source_shape[0])) * int(elements_per_lane)
+        if int(extra_elements):
+            col += int(extra_elements)
+        return (row, col)
+    if lane_layout == "gfx950_mfma_b_transpose":
+        if len(source_shape) != 2:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "gfx950 MFMA B transpose load requires a rank-2 source shape",
+                target_op_id=op.target_op_id,
+            )
+        non_k_dim = int(source_shape[1])
+        if non_k_dim % 16:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+                STAGE,
+                "gfx950 MFMA B transpose load requires the non-K dimension "
+                "to be a multiple of the ds_read_tr group width",
+                target_op_id=op.target_op_id,
+            )
+        lane_in_group = state.dsl.mod(lane, 16)
+        non_k_group = state.dsl.floor(state.dsl.mod(lane, non_k_dim) / 16)
+        k_group = state.dsl.floor(lane / non_k_dim)
+        chunk_k = (int(extra_elements) // 4) * 4
+        packet_col = int(extra_elements) % 4
+        row = (
+            k_group * int(elements_per_lane)
+            + chunk_k
+            + state.dsl.floor(lane_in_group / 4)
+        )
+        col = non_k_group * 16 + 4 * state.dsl.mod(lane_in_group, 4) + packet_col
+        return (row, col)
+    fail(
+        "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported fragment lane layout {lane_layout}",
+        target_op_id=op.target_op_id,
+    )
+
+
+def _delinearize_local_fragment_expr(state, linear, shape):
+    coords = []
+    remainder = linear
+    for dim, extent in enumerate(shape):
+        stride = _product(shape[dim + 1 :])
+        if stride == 1:
+            coord = state.dsl.mod(remainder, int(extent))
+        else:
+            coord = state.dsl.floor(remainder / int(stride))
+            remainder = state.dsl.mod(remainder, int(stride))
+        coords.append(coord)
+    return tuple(coords)
+
+
+def _linearize_local_fragment_coords(shape, coords):
+    result = 0
+    stride = 1
+    for dim in reversed(range(len(shape))):
+        result += coords[dim] * stride
+        stride *= int(shape[dim])
+    return result
 
 
 def _linear_local_fragment_index_offset(
@@ -2481,7 +2672,9 @@ def _emit_mfma_vector_register_remap(state, op, attrs, components):
         else:
             vector = component
         simd_type = state.dsl.SimdType(vector.type)
-        scalar_type = state.dsl.simd_type(simd_type.element_type, int(simd_type.width))
+        payload_type = state.ir.VectorType.maybe_downcast(simd_type.element_type)
+        register_type = payload_type.element_type if payload_type is not None else element_type
+        scalar_type = state.dsl.simd_type(register_type, int(simd_type.width))
         extracted[key] = state.dsl.wave.ExtractOp(
             scalar_type,
             vector,
