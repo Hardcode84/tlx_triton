@@ -1808,6 +1808,11 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     "case",
     [
         {
+            "version_dir": "v6_loop_unroll",
+            "function_name": "v6_loop_unroll",
+            "num_warps": 4,
+        },
+        {
             "version_dir": "v7_slice",
             "function_name": "v7_slice",
             "num_warps": 4,
@@ -1828,7 +1833,7 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     ],
     ids=lambda case: case["version_dir"],
 )
-def test_tlx_wave_backend_compiles_gfx9_gemm_v7_to_v9_to_hsaco(
+def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     tmp_path,
     monkeypatch,
     case,
