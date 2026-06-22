@@ -2596,6 +2596,13 @@ def _emit_buffer_load(state, op):
             "buffer_load other component count does not match attrs",
             target_op_id=op.target_op_id,
         )
+    if other_components is not None and mask_components is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_OTHER",
+            STAGE,
+            "buffer_load other requires a mask",
+            target_op_id=op.target_op_id,
+        )
     result_id = _single_result(op)
     result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
     element_type = _scalar_type(state.dsl, attrs["element_type"])
@@ -2612,92 +2619,268 @@ def _emit_buffer_load(state, op):
         state.dsl.buffer_address_space(),
         lane_width,
     )
+    packet_elements = _buffer_load_packet_elements(attrs)
     loaded_components = []
-    for index, offset_component in enumerate(offset_components):
-        if mask_components is None:
-            offset_component = _assume_value_range(
-                state,
-                offset_component,
-                attrs.get("offset_range"),
-                op,
-            )
-            ptr = state.builder.ptr_add(
-                buffer_base,
-                offset_component,
-                result_type=ptr_type,
-            )
-            loaded, _token = state.builder.load(ptr, result_type)
-        else:
-            if mask_mode != "exec_where":
-                fail(
-                    "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
-                    STAGE,
-                    f"unsupported buffer_load mask mode {mask_mode}",
-                    target_op_id=op.target_op_id,
-                )
-            def emit_active_load(offset_component=offset_component):
-                active_offset = _assume_value_range(
+    index = 0
+    while index < component_count:
+        if _can_vectorize_buffer_load_packet(
+            index,
+            packet_elements,
+            component_count,
+            mask_components,
+            other_components,
+        ):
+            loaded_components.extend(
+                _emit_buffer_load_vector_packet(
                     state,
-                    offset_component,
-                    attrs.get("offset_range"),
                     op,
-                )
-                ptr = state.builder.ptr_add(
+                    attrs,
+                    index,
+                    packet_elements,
                     buffer_base,
-                    active_offset,
-                    result_type=ptr_type,
-                )
-                loaded, _token = state.builder.load(ptr, result_type)
-                return loaded
-
-            other_component = None
-            if other_components is not None:
-                other_component = (
-                    other_components[0]
-                    if len(other_components) == 1
-                    else other_components[index]
-                )
-            if _is_scalar_i1_value(state, mask_components[index]):
-                loaded = _emit_masked_value_region(
-                    state,
-                    mask_components[index],
+                    ptr_type,
+                    offset_components,
+                    mask_components,
+                    element_type,
                     result_type,
-                    other_component
-                    if other_component is not None
-                    else _zero_simd_value(
-                        state,
-                        result_type,
-                        attrs["element_type"],
-                        op,
-                    ),
-                    emit_active_load,
+                    lane_width,
                 )
-            else:
-                with state.builder.where(
-                    mask_components[index],
-                    [result_type],
-                ) as where:
-                    loaded = emit_active_load()
-                    state.builder.yield_([loaded])
-                loaded = where.results[0]
-            if other_component is not None and not _is_scalar_i1_value(
-                state,
-                mask_components[index],
-            ):
-                loaded = state.builder.select(
-                    mask_components[index],
-                    loaded,
-                    other_component,
-                )
-        if other_components is not None and mask_components is None:
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_OTHER",
-                STAGE,
-                "buffer_load other requires a mask",
-                target_op_id=op.target_op_id,
             )
-        loaded_components.append(loaded)
+            index += packet_elements
+            continue
+        loaded_components.append(
+            _emit_buffer_load_scalar_component(
+                state,
+                op,
+                attrs,
+                index,
+                buffer_base,
+                ptr_type,
+                offset_components,
+                mask_components,
+                other_components,
+                result_type,
+                mask_mode,
+            )
+        )
+        index += 1
     state.values[result_id] = _pack_components(tuple(loaded_components))
+
+
+def _buffer_load_packet_elements(attrs):
+    access_elements = int(attrs.get("access_element_count", 1))
+    element_byte_width = int(attrs["element_byte_width"])
+    if access_elements <= 1 or element_byte_width <= 0:
+        return 1
+    max_elements = max(1, 16 // element_byte_width)
+    packet_elements = min(access_elements, max_elements)
+    while packet_elements > 1:
+        payload_bits = packet_elements * element_byte_width * 8
+        if (
+            access_elements % packet_elements == 0
+            and payload_bits <= 128
+            and (payload_bits == 16 or payload_bits % 32 == 0)
+        ):
+            return packet_elements
+        packet_elements -= 1
+    return 1
+
+
+def _can_vectorize_buffer_load_packet(
+    index,
+    packet_elements,
+    component_count,
+    mask_components,
+    other_components,
+):
+    if packet_elements <= 1:
+        return False
+    if int(index) % int(packet_elements):
+        return False
+    if int(index) + int(packet_elements) > int(component_count):
+        return False
+    if other_components is not None:
+        return False
+    if mask_components is None:
+        return True
+    packet_mask = mask_components[int(index)]
+    return all(
+        mask_components[int(index) + element] is packet_mask
+        for element in range(int(packet_elements))
+    )
+
+
+def _emit_buffer_load_scalar_component(
+    state,
+    op,
+    attrs,
+    index,
+    buffer_base,
+    ptr_type,
+    offset_components,
+    mask_components,
+    other_components,
+    result_type,
+    mask_mode,
+):
+    offset_component = offset_components[int(index)]
+    if mask_components is None:
+        offset_component = _assume_value_range(
+            state,
+            offset_component,
+            attrs.get("offset_range"),
+            op,
+        )
+        ptr = state.builder.ptr_add(
+            buffer_base,
+            offset_component,
+            result_type=ptr_type,
+        )
+        loaded, _token = state.builder.load(ptr, result_type)
+        return loaded
+    if mask_mode != "exec_where":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
+            STAGE,
+            f"unsupported buffer_load mask mode {mask_mode}",
+            target_op_id=op.target_op_id,
+        )
+
+    def emit_active_load(offset_component=offset_component):
+        active_offset = _assume_value_range(
+            state,
+            offset_component,
+            attrs.get("offset_range"),
+            op,
+        )
+        ptr = state.builder.ptr_add(
+            buffer_base,
+            active_offset,
+            result_type=ptr_type,
+        )
+        loaded, _token = state.builder.load(ptr, result_type)
+        return loaded
+
+    other_component = None
+    if other_components is not None:
+        other_component = (
+            other_components[0]
+            if len(other_components) == 1
+            else other_components[int(index)]
+        )
+    if _is_scalar_i1_value(state, mask_components[int(index)]):
+        return _emit_masked_value_region(
+            state,
+            mask_components[int(index)],
+            result_type,
+            other_component
+            if other_component is not None
+            else _zero_simd_value(
+                state,
+                result_type,
+                attrs["element_type"],
+                op,
+            ),
+            emit_active_load,
+        )
+    with state.builder.where(
+        mask_components[int(index)],
+        [result_type],
+    ) as where:
+        loaded = emit_active_load()
+        state.builder.yield_([loaded])
+    loaded = where.results[0]
+    if other_component is not None:
+        loaded = state.builder.select(
+            mask_components[int(index)],
+            loaded,
+            other_component,
+        )
+    return loaded
+
+
+def _emit_buffer_load_vector_packet(
+    state,
+    op,
+    attrs,
+    index,
+    packet_elements,
+    buffer_base,
+    ptr_type,
+    offset_components,
+    mask_components,
+    element_type,
+    component_type,
+    lane_width,
+):
+    packet_elements = int(packet_elements)
+    load_type = state.dsl.simd_type(
+        state.dsl.vector_type(packet_elements, element_type),
+        width=int(lane_width),
+    )
+
+    def emit_active_load():
+        active_offset = _assume_value_range(
+            state,
+            offset_components[int(index)],
+            attrs.get("offset_range"),
+            op,
+        )
+        ptr = state.builder.ptr_add(
+            buffer_base,
+            active_offset,
+            result_type=ptr_type,
+        )
+        loaded, _token = state.builder.load(ptr, load_type)
+        return loaded
+
+    if mask_components is None:
+        loaded = emit_active_load()
+    else:
+        packet_mask = mask_components[int(index)]
+        if _is_scalar_i1_value(state, packet_mask):
+            loaded = _emit_masked_value_region(
+                state,
+                packet_mask,
+                load_type,
+                _zero_vector_simd_value(
+                    state,
+                    load_type,
+                    component_type,
+                    attrs["element_type"],
+                    packet_elements,
+                    op,
+                ),
+                emit_active_load,
+            )
+        else:
+            with state.builder.where(packet_mask, [load_type]) as where:
+                loaded = emit_active_load()
+                state.builder.yield_([loaded])
+            loaded = where.results[0]
+    return tuple(
+        state.dsl.wave.ExtractOp(
+            component_type,
+            loaded,
+            element,
+        ).result
+        for element in range(packet_elements)
+    )
+
+
+def _zero_vector_simd_value(
+    state,
+    result_type,
+    component_type,
+    element_type,
+    component_count,
+    op,
+):
+    zero = _zero_simd_value(state, component_type, element_type, op)
+    return state.dsl.wave.PackOp(
+        result_type,
+        [zero for _ in range(int(component_count))],
+    ).result
 
 
 def _emit_store(state, op):

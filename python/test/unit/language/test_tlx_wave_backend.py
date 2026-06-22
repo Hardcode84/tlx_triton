@@ -3360,6 +3360,110 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(
     del ctx
 
 
+def test_tlx_wave_converter_vectorizes_contiguous_f16_buffer_load(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_vector_buffer_load(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op,) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
+    attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["access_element_count"] == 8
+    wave = output.emitted_module.text
+    assert wave.count("wave.load") == 1
+    assert "!wave.simd<vector<8xf16>, 64>" in wave
+    assert wave.count("wave.extract") == 8
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_tuple_b32" in machine
+    assert "waveamdmachine.buffer_load_b16" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_vectorizes_packet_uniform_masked_f16_buffer_load(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_masked_vector_buffer_load(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %mask = arith.constant dense<true> : tensor<512xi1, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range], %mask {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    assert wave.count("wave.load") == 1
+    assert "!wave.simd<vector<8xf16>, 64>" in wave
+    assert wave.count("wave.extract") == 8
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_tuple_b32" in machine
+    assert "waveamdmachine.buffer_load_b16" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_buffer_load_packets_inside_contiguity_groups(
+    tmp_path,
+):
+    assert (
+        converter_emission._buffer_load_packet_elements(
+            {"access_element_count": 3, "element_byte_width": 2}
+        )
+        == 1
+    )
+    assert (
+        converter_emission._buffer_load_packet_elements(
+            {"access_element_count": 5, "element_byte_width": 2}
+        )
+        == 1
+    )
+    assert (
+        converter_emission._buffer_load_packet_elements(
+            {"access_element_count": 10, "element_byte_width": 2}
+        )
+        == 2
+    )
+
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_nondividing_contiguity_buffer_load(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range] {contiguity = 5 : i32} : tensor<512xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    assert "!wave.simd<vector<" not in wave
+    assert wave.count("wave.load") == 8
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.buffer_load_b16") == 8
+    assert "waveamdmachine.buffer_load_tuple_b32" not in machine
+    del ctx
+
+
 def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
