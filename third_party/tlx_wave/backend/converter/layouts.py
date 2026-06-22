@@ -271,6 +271,15 @@ def distributed_linear_layout_from_parts(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
+    if kind == "slice":
+        return _slice_linear_layout(
+            shape,
+            properties,
+            lane_width,
+            stage=stage,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
     if kind == "amd_mfma":
         return _mfma_linear_layout(
             shape,
@@ -330,6 +339,11 @@ def linear_layout_bases(linear, in_dim):
 def layout_warp_count(layout):
     if layout.kind == "linear":
         return 1 << len(tuple(layout.properties.get("warp_bases", ())))
+    if layout.kind == "slice":
+        return _layout_warp_count_from_parts(
+            layout.properties.get("parent_kind"),
+            layout.properties.get("parent_properties", {}),
+        )
     warps_per_cta = tuple(
         int(value) for value in layout.properties.get("warps_per_cta", ())
     )
@@ -418,6 +432,11 @@ def _require_supported_coordinate_domain(
 def _layout_warp_count_from_parts(kind, properties):
     if kind == "linear":
         return 1 << len(tuple(properties.get("warp_bases", ())))
+    if kind == "slice":
+        return _layout_warp_count_from_parts(
+            properties.get("parent_kind"),
+            properties.get("parent_properties", {}),
+        )
     warps_per_cta = tuple(int(value) for value in properties.get("warps_per_cta", ()))
     result = 1
     for value in warps_per_cta:
@@ -533,6 +552,68 @@ def _linear_encoding_layout(
     return LinearLayout.from_bases(bases, out_dims, list(shape), False)
 
 
+def _slice_linear_layout(
+    shape,
+    properties,
+    lane_width,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    parent_kind = properties.get("parent_kind")
+    parent_properties = properties.get("parent_properties", {})
+    if parent_kind not in {"blocked", "linear"}:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            f"slice parent layout {parent_kind} does not have a distributed register map",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    dim = int(properties.get("dim", 0))
+    shape = tuple(int(value) for value in shape)
+    parent_shape = list(shape)
+    if dim < 0 or dim > len(parent_shape):
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "slice layout dimension is outside the parent rank",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    parent_shape.insert(dim, 1)
+    parent = distributed_linear_layout_from_parts(
+        parent_kind,
+        tuple(parent_shape),
+        parent_properties,
+        lane_width,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+    parent_dim_to_basis_index = {
+        str(name): index for index, (name, _size) in enumerate(parent.out_dims)
+    }
+    kept_parent_dims = [
+        f"dim{index}" for index in range(len(parent_shape)) if index != dim
+    ]
+    out_dims = [f"dim{index}" for index in range(len(shape))]
+    bases = []
+    for in_dim, in_bases in parent.bases:
+        projected = []
+        for basis in in_bases:
+            basis = tuple(int(value) for value in basis)
+            projected.append(
+                [
+                    basis[parent_dim_to_basis_index[parent_dim]]
+                    for parent_dim in kept_parent_dims
+                ]
+            )
+        bases.append((in_dim, projected))
+    return LinearLayout.from_bases(bases, out_dims, list(shape), False)
+
+
 def _mfma_linear_layout(
     shape,
     properties,
@@ -559,14 +640,6 @@ def _mfma_linear_layout(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    if not bool(properties.get("is_transposed", False)):
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "non-transposed MFMA distributed layout is not implemented yet",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
     element_bit_width = int(properties.get("element_bit_width", 32))
     height = 1 if element_bit_width == 64 else 4
     m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
@@ -582,12 +655,20 @@ def _mfma_linear_layout(
         )
     dim_m = "dim0"
     dim_n = "dim1"
-    linear = LinearLayout.identity_1d(height, "register", dim_n)
-    linear *= (
-        LinearLayout.identity_1d(m_dim, "lane", dim_m)
-        * LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n)
-    )
-    linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
+    if bool(properties.get("is_transposed", False)):
+        linear = LinearLayout.identity_1d(height, "register", dim_n)
+        linear *= (
+            LinearLayout.identity_1d(m_dim, "lane", dim_m)
+            * LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n)
+        )
+        linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
+    else:
+        linear = LinearLayout.identity_1d(height, "register", dim_m)
+        linear *= (
+            LinearLayout.identity_1d(n_dim, "lane", dim_n)
+            * LinearLayout.identity_1d(warp_size // n_dim, "lane", dim_m)
+        )
+        linear *= LinearLayout.identity_1d(tiles, "register", dim_m)
     tiles_per_warp = tuple(int(value) for value in properties.get("tiles_per_warp", ()))
     if len(tiles_per_warp) < 2:
         tiles_per_warp = (1, 1)

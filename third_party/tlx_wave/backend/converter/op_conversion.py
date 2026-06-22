@@ -527,7 +527,7 @@ def _make_range_coordinate_attrs(type_layout_program, op):
     if result.layout_map_id is None:
         return {}
     layout = type_layout_program.layouts[int(result.layout_map_id)]
-    if layout.kind not in {"blocked", "linear"}:
+    if layout.kind not in {"blocked", "linear", "slice"}:
         return {}
     lane_width = int(result.type.lane_width or layout.lane_width)
     warp_count = _layout_warp_count(layout)
@@ -548,6 +548,16 @@ def _make_range_coordinate_attrs(type_layout_program, op):
             "coordinate_mode": "affine_workitem",
             "component_bases": tuple(int(base) for base in bases),
             "workitem_stride": int(stride),
+        }
+    bit_affine = coordinates.is_flat_bit_affine_make_range(plan)
+    if bit_affine is not None:
+        bases, coefficients = bit_affine
+        return {
+            "coordinate_mode": "bit_affine_workitem",
+            "component_bases": tuple(int(base) for base in bases),
+            "workitem_coefficients": tuple(
+                int(coefficient) for coefficient in coefficients
+            ),
         }
     return {
         "coordinate_mode": "layout_coordinates",
@@ -1950,6 +1960,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     register_remap = None
     distributed_remap = None
     dot_operand_remap = None
+    mfma_base_remap = None
     if not same_layout:
         register_remap = layout_remap.register_remap(
             operand,
@@ -1966,6 +1977,22 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 result_layout,
                 op,
             )
+        if (
+            register_remap is None
+            and distributed_remap is None
+            and dot_operand_remap is None
+            and operand.type.element_type in {"bf16", "f16", "f32"}
+            and int(result.type.component_count) == 1
+        ):
+            candidate = layout_remap.distributed_to_mfma_base_remap(
+                operand,
+                result,
+                operand_layout,
+                result_layout,
+                op,
+            )
+            if candidate is not None and candidate.get("mode") != "cta_exchange_register_remap":
+                mfma_base_remap = candidate
         if register_remap is None and distributed_remap is None:
             dot_operand_remap = layout_remap.dot_operand_fragment_pack(
                 operand,
@@ -1986,6 +2013,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         register_remap is not None
         or distributed_remap is not None
         or dot_operand_remap is not None
+        or mfma_base_remap is not None
     ):
         if (
             operand.type.representation in {"fragment", "fragment_tuple"}
@@ -2005,6 +2033,8 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
             else distributed_remap
             if distributed_remap is not None
             else dot_operand_remap
+            if dot_operand_remap is not None
+            else mfma_base_remap
         )
         attrs = {
             "fact_policy": "invalidate_layout_sensitive",
@@ -2045,10 +2075,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
 
 
 def _add_layout_remap_scratch_attrs(attrs, conversion_input, result, op):
-    if attrs.get("mode") not in {
-        "cta_exchange_register_remap",
-        "dot_operand_fragment_pack",
-    }:
+    if "scratch_element_count" not in attrs:
         return attrs
     element_byte_width = conversion_input.value_element_byte_widths.get(
         result.value_id

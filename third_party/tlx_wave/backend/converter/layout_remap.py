@@ -1,5 +1,7 @@
 """Structural layout-remap helpers for TLX Wave conversion."""
 
+from dataclasses import replace
+
 from .diagnostics import fail
 from . import layouts
 
@@ -444,6 +446,445 @@ def dot_operand_fragment_pack(operand, result, operand_layout, result_layout, op
     }
 
 
+def distributed_to_mfma_base_remap(operand, result, operand_layout, result_layout, op):
+    if operand_layout is None or result_layout is None:
+        return None
+    if operand_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
+        return None
+    if result_layout.kind != "amd_mfma":
+        return None
+    if operand.type.element_type != result.type.element_type:
+        return None
+    value_remap = (
+        operand.type.representation in {"simd", "simd_tuple"}
+        and result.type.representation in {"fragment", "fragment_tuple"}
+        and operand.type.element_type != "i1"
+    )
+    mask_remap = (
+        operand.type.representation in {"mask", "mask_tuple"}
+        and result.type.representation in {"mask", "mask_tuple"}
+        and operand.type.element_type == "i1"
+    )
+    if not value_remap and not mask_remap:
+        return None
+    if tuple(operand_layout.shape) != tuple(result_layout.shape):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA base convert_layout requires matching "
+            "source and result shapes",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+
+    source_layout = _distributed_linear_layout(operand_layout, op)
+    result_layout_ll = _distributed_linear_layout(result_layout, op)
+    description = "distributed to MFMA base convert_layout"
+    _require_injective_layout(
+        source_layout,
+        op,
+        operand.value_id,
+        f"{description} source layout",
+    )
+    source_register_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    if int(operand.type.component_count) != int(source_register_count):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA base source component model does not match "
+            "the source register layout",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    registers_per_component = layouts.mfma_registers_per_component(
+        result_layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    result_register_count = layouts.linear_layout_in_dim_size(
+        result_layout_ll,
+        "register",
+    )
+    if int(result.type.component_count) * int(registers_per_component) != int(
+        result_register_count
+    ):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA base result component model does not match "
+            "the MFMA register layout",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    cta_warp_count = max(
+        _layout_warp_count(operand_layout),
+        _layout_warp_count(result_layout),
+    )
+    source_by_coord = _source_slots_by_coord(
+        source_layout,
+        source_register_count,
+        lane_width,
+        cta_warp_count,
+        op,
+        operand.value_id,
+        description=description,
+    )
+    result_sources = []
+    component_vectors_are_contiguous = True
+    for component in range(int(result.type.component_count)):
+        base_register = int(component) * int(registers_per_component)
+        if not _mfma_component_vector_is_contiguous(
+            result_layout_ll,
+            base_register,
+            int(registers_per_component),
+            lane_width,
+            cta_warp_count,
+        ):
+            component_vectors_are_contiguous = False
+        result_sources.append(
+            _sources_for_result_slot(
+                result_layout_ll,
+                base_register,
+                source_by_coord,
+                lane_width,
+                cta_warp_count,
+                op,
+                result.value_id,
+                description=description,
+            )
+        )
+    result_sources = tuple(result_sources)
+
+    if value_remap and result.type.element_type == "f32":
+        scalar_result_sources = _mfma_scalar_result_sources(
+            result_layout_ll,
+            source_by_coord,
+            int(result.type.component_count),
+            int(registers_per_component),
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description,
+        )
+        return _mfma_vector_register_remap_attrs(
+            result,
+            result_layout,
+            scalar_result_sources,
+            lane_width,
+            cta_warp_count,
+            int(operand.type.component_count),
+            source_registers_per_component=1,
+            registers_per_component=int(registers_per_component),
+            op=op,
+            result_value_id=result.value_id,
+            description=description,
+        )
+
+    if not component_vectors_are_contiguous:
+        _reject_distributed_movement(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description,
+        )
+
+    remap = _simple_register_remap(
+        result_sources,
+        lane_width,
+        cta_warp_count,
+        1,
+        op,
+        result.value_id,
+        description=description,
+    )
+    if remap is not None and (
+        remap["mode"] == "same_lane_register_remap" or value_remap
+    ):
+        return {
+            "source_component_count": int(operand.type.component_count),
+            "source_registers_per_component": 1,
+            **remap,
+        }
+
+    return {
+        "mode": "cta_exchange_register_remap",
+        "source_component_count": int(operand.type.component_count),
+        "source_registers_per_component": 1,
+        **_cta_exchange_register_remap(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description=description,
+        ),
+    }
+
+
+def _mfma_scalar_result_sources(
+    result_layout,
+    source_by_coord,
+    result_component_count,
+    registers_per_component,
+    lane_width,
+    cta_warp_count,
+    op,
+    result_value_id,
+    description,
+):
+    scalar_result_sources = []
+    for component in range(int(result_component_count)):
+        base_register = int(component) * int(registers_per_component)
+        for element in range(int(registers_per_component)):
+            scalar_result_sources.append(
+                _sources_for_result_slot(
+                    result_layout,
+                    base_register + int(element),
+                    source_by_coord,
+                    lane_width,
+                    cta_warp_count,
+                    op,
+                    result_value_id,
+                    description=description,
+                )
+            )
+    return tuple(scalar_result_sources)
+
+
+def _mfma_vector_register_remap_attrs(
+    result,
+    result_layout,
+    scalar_result_sources,
+    lane_width,
+    cta_warp_count,
+    source_component_count,
+    *,
+    source_registers_per_component,
+    registers_per_component,
+    op,
+    result_value_id,
+    description,
+):
+    instr_shape = tuple(
+        int(entry) for entry in result_layout.properties.get("instr_shape", ())
+    )
+    scalar_remap = _simple_register_remap(
+        scalar_result_sources,
+        lane_width,
+        cta_warp_count,
+        source_registers_per_component,
+        op,
+        result_value_id,
+        description=description,
+        allow_fallback=True,
+    )
+    attrs = {
+        "mode": "mfma_vector_register_remap",
+        "columns": int(instr_shape[1]),
+        "registers": int(registers_per_component),
+        "role": 2,
+        "rows": int(instr_shape[0]),
+        "scalar_result_component_count": len(scalar_result_sources),
+        "source_component_count": int(source_component_count),
+        "source_registers_per_component": int(source_registers_per_component),
+        "vector_length": int(registers_per_component),
+    }
+    if scalar_remap is not None:
+        return {
+            **attrs,
+            "scalar_mode": scalar_remap["mode"],
+            "scalar_source_element_indices": tuple(
+                scalar_remap["source_element_indices"]
+            ),
+            "scalar_source_indices": tuple(scalar_remap["source_indices"]),
+            **{
+                key: value
+                for key, value in scalar_remap.items()
+                if key.startswith("source_lane_")
+            },
+        }
+    return {
+        **attrs,
+        "scratch_reuse_lds": True,
+        **_cta_exchange_register_remap(
+            scalar_result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result_value_id,
+            description=description,
+        ),
+    }
+
+
+def mfma_accumulator_to_native_remap(value, value_layout, op):
+    return _mfma_accumulator_layout_remap(
+        value,
+        value_layout,
+        op,
+        source_is_native=False,
+        description="result layout to native MFMA accumulator",
+    )
+
+
+def mfma_native_accumulator_remap(value, value_layout, op):
+    return _mfma_accumulator_layout_remap(
+        value,
+        value_layout,
+        op,
+        source_is_native=True,
+        description="native MFMA accumulator to result layout",
+    )
+
+
+def _mfma_accumulator_layout_remap(
+    value,
+    value_layout,
+    op,
+    *,
+    source_is_native,
+    description,
+):
+    if value_layout is None or value_layout.kind != "amd_mfma":
+        return None
+    if value.type.representation not in {"fragment", "fragment_tuple"}:
+        return None
+    instr_shape = tuple(
+        int(entry) for entry in value_layout.properties.get("instr_shape", ())
+    )
+    if instr_shape not in {(16, 16, 32), (32, 32, 16)}:
+        return None
+    if not bool(value_layout.properties.get("is_transposed", False)):
+        return None
+
+    native_layout = replace(
+        value_layout,
+        properties={**value_layout.properties, "is_transposed": False},
+    )
+    native_layout_ll = _distributed_linear_layout(native_layout, op)
+    value_layout_ll = _distributed_linear_layout(value_layout, op)
+    source_layout = native_layout_ll if source_is_native else value_layout_ll
+    result_layout_ll = value_layout_ll if source_is_native else native_layout_ll
+    registers_per_component = layouts.mfma_registers_per_component(
+        value_layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    source_register_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    result_register_count = layouts.linear_layout_in_dim_size(
+        result_layout_ll,
+        "register",
+    )
+    expected_register_count = (
+        int(value.type.component_count) * int(registers_per_component)
+    )
+    if int(source_register_count) != expected_register_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "native MFMA accumulator source component model does not match "
+            "the native register layout",
+            source_op_index=op.index,
+            source_value_id=value.value_id,
+        )
+    if int(result_register_count) != expected_register_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "native MFMA accumulator result component model does not match "
+            "the result register layout",
+            source_op_index=op.index,
+            source_value_id=value.value_id,
+        )
+
+    lane_width = int(value.type.lane_width or value_layout.lane_width or 64)
+    cta_warp_count = _layout_warp_count(value_layout)
+    source_by_coord = _source_slots_by_coord(
+        source_layout,
+        source_register_count,
+        lane_width,
+        cta_warp_count,
+        op,
+        value.value_id,
+        description=description,
+        allow_replicated_warps=True,
+    )
+    scalar_result_sources = []
+    for component in range(int(value.type.component_count)):
+        base_register = int(component) * int(registers_per_component)
+        for element in range(int(registers_per_component)):
+            scalar_result_sources.append(
+                _sources_for_result_slot(
+                    result_layout_ll,
+                    base_register + int(element),
+                    source_by_coord,
+                    lane_width,
+                    cta_warp_count,
+                    op,
+                    value.value_id,
+                    description=description,
+                )
+            )
+    scalar_result_sources = tuple(scalar_result_sources)
+    scalar_remap = _simple_register_remap(
+        scalar_result_sources,
+        lane_width,
+        cta_warp_count,
+        registers_per_component,
+        op,
+        value.value_id,
+        description=description,
+        allow_fallback=True,
+    )
+    attrs = {
+        "mode": "mfma_vector_register_remap",
+        "columns": int(instr_shape[1]),
+        "registers": int(registers_per_component),
+        "role": 2,
+        "rows": int(instr_shape[0]),
+        "scalar_result_component_count": len(scalar_result_sources),
+        "source_component_count": int(value.type.component_count),
+        "source_registers_per_component": int(registers_per_component),
+        "vector_length": int(registers_per_component),
+    }
+    if scalar_remap is not None:
+        return {
+            **attrs,
+            "scalar_mode": scalar_remap["mode"],
+            "scalar_source_element_indices": tuple(
+                scalar_remap["source_element_indices"]
+            ),
+            "scalar_source_indices": tuple(scalar_remap["source_indices"]),
+            **{
+                key: value
+                for key, value in scalar_remap.items()
+                if key.startswith("source_lane_")
+            },
+        }
+    return {
+        **attrs,
+        **_cta_exchange_register_remap(
+            scalar_result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            value.value_id,
+            description=description,
+        ),
+    }
+
+
 def reject_unsupported_pair(operand_layout, result_layout, op):
     operand_kind = "none" if operand_layout is None else operand_layout.kind
     result_kind = "none" if result_layout is None else result_layout.kind
@@ -473,6 +914,7 @@ def _source_slots_by_coord(
     source_value_id,
     *,
     description="MFMA convert_layout",
+    allow_replicated_warps=False,
 ):
     source_by_coord = {}
     for source_warp in range(int(cta_warp_count)):
@@ -484,7 +926,21 @@ def _source_slots_by_coord(
                     lane,
                     warp=source_warp,
                 )
+                source = (source_warp, lane, source_register)
                 if coords in source_by_coord:
+                    if allow_replicated_warps:
+                        existing = source_by_coord[coords]
+                        if existing and isinstance(existing[0], tuple):
+                            source_by_coord[coords] = (
+                                *existing,
+                                tuple(int(value) for value in source),
+                            )
+                        else:
+                            source_by_coord[coords] = (
+                                tuple(int(value) for value in existing),
+                                tuple(int(value) for value in source),
+                            )
+                        continue
                     fail(
                         "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                         STAGE,
@@ -493,7 +949,7 @@ def _source_slots_by_coord(
                         source_op_index=op.index,
                         source_value_id=source_value_id,
                     )
-                source_by_coord[coords] = (source_warp, lane, source_register)
+                source_by_coord[coords] = tuple(int(value) for value in source)
     return source_by_coord
 
 
@@ -527,8 +983,57 @@ def _sources_for_result_slot(
                     source_op_index=op.index,
                     source_value_id=result_value_id,
                 )
+            if source and isinstance(source[0], tuple):
+                same_warp_sources = [
+                    candidate
+                    for candidate in source
+                    if int(candidate[0]) == int(result_warp)
+                ]
+                if not same_warp_sources:
+                    fail(
+                        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+                        STAGE,
+                        f"{description} replicated source coordinate is not "
+                        "available in the result wave",
+                        source_op_index=op.index,
+                        source_value_id=result_value_id,
+                    )
+                source = same_warp_sources[0]
             sources.append(tuple(int(value) for value in source))
     return tuple(sources)
+
+
+def _mfma_component_vector_is_contiguous(
+    result_layout,
+    base_register,
+    registers_per_component,
+    lane_width,
+    cta_warp_count,
+):
+    if int(registers_per_component) <= 1:
+        return True
+    for result_warp in range(int(cta_warp_count)):
+        for lane in range(int(lane_width)):
+            base_coords = layouts.linear_layout_coords(
+                result_layout,
+                int(base_register),
+                lane,
+                warp=result_warp,
+            )
+            for element in range(1, int(registers_per_component)):
+                coords = layouts.linear_layout_coords(
+                    result_layout,
+                    int(base_register) + int(element),
+                    lane,
+                    warp=result_warp,
+                )
+                expected = (
+                    base_coords[0],
+                    base_coords[1] + int(element),
+                )
+                if tuple(coords) != expected:
+                    return False
+    return True
 
 
 def _simple_register_remap(
@@ -540,6 +1045,7 @@ def _simple_register_remap(
     result_value_id,
     *,
     description="MFMA to blocked convert_layout",
+    allow_fallback=False,
 ):
     source_indices = []
     source_element_indices = []
@@ -573,6 +1079,8 @@ def _simple_register_remap(
             return None
         first_lane_map = lane_maps[0]
         if not all(lane_map == first_lane_map for lane_map in lane_maps):
+            if allow_fallback:
+                return None
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
@@ -589,13 +1097,23 @@ def _simple_register_remap(
         source_element_indices.append(first_source % int(source_registers_per_component))
         source_lane_maps.append(source_lane_map)
 
-    lane_map_attrs = _classify_source_lane_maps(
-        source_lane_maps,
-        lane_width,
-        op,
-        result_value_id,
-        description=description,
-    )
+    if allow_fallback:
+        lane_map_attrs = _classify_source_lane_maps_or_none(
+            source_lane_maps,
+            lane_width,
+        )
+        if lane_map_attrs is None and any(
+            lane_map is not None for lane_map in source_lane_maps
+        ):
+            return None
+    else:
+        lane_map_attrs = _classify_source_lane_maps(
+            source_lane_maps,
+            lane_width,
+            op,
+            result_value_id,
+            description=description,
+        )
     return {
         "mode": "cross_lane_register_remap"
         if lane_map_attrs is not None
@@ -606,12 +1124,35 @@ def _simple_register_remap(
     }
 
 
+def _classify_source_lane_maps_or_none(source_lane_maps, lane_width):
+    concrete_maps = [lane_map for lane_map in source_lane_maps if lane_map is not None]
+    if not concrete_maps:
+        return None
+    first = concrete_maps[0]
+    if not all(lane_map == first for lane_map in concrete_maps):
+        return None
+    if len(first) != int(lane_width):
+        return None
+    if any(int(lane) < 0 or int(lane) >= int(lane_width) for lane in first):
+        return None
+    kind, attrs = _classify_lane_map(first, lane_width)
+    if kind is None:
+        return None
+    return {
+        "source_lane_map": tuple(int(lane) for lane in first),
+        "source_lane_map_kind": kind,
+        **attrs,
+    }
+
+
 def _cta_exchange_register_remap(
     result_sources,
     lane_width,
     cta_warp_count,
     op,
     result_value_id,
+    *,
+    description="MFMA to blocked convert_layout",
 ):
     cta_thread_count = int(lane_width) * int(cta_warp_count)
     groups = {}
@@ -621,8 +1162,7 @@ def _cta_exchange_register_remap(
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
-                "MFMA to blocked convert_layout produced a malformed "
-                "CTA source map",
+                f"{description} produced a malformed CTA source map",
                 source_op_index=op.index,
                 source_value_id=result_value_id,
             )
@@ -631,8 +1171,7 @@ def _cta_exchange_register_remap(
             fail(
                 "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
                 STAGE,
-                "MFMA to blocked convert_layout produced an empty "
-                "CTA source map",
+                f"{description} produced an empty CTA source map",
                 source_op_index=op.index,
                 source_value_id=result_value_id,
             )

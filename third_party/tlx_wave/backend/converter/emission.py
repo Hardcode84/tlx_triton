@@ -419,6 +419,37 @@ def _emit_make_range(state, op):
             components.append(value)
         state.values[result_id] = _pack_components(tuple(components))
         return
+    if attrs.get("coordinate_mode") == "bit_affine_workitem":
+        component_bases = tuple(int(value) for value in attrs["component_bases"])
+        coefficients = tuple(
+            int(value) for value in attrs["workitem_coefficients"]
+        )
+        if len(component_bases) != _component_count(state, result_id):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "make_range component bases do not match result component count",
+                target_op_id=op.target_op_id,
+            )
+        dynamic = _bit_affine_thread_offset(
+            state,
+            workitem,
+            0,
+            coefficients,
+            width,
+        )
+        for component_base in component_bases:
+            components.append(
+                _add_simd_const(
+                    state,
+                    dynamic,
+                    start + int(component_base),
+                    element_type,
+                    width,
+                )
+            )
+        state.values[result_id] = _pack_components(tuple(components))
+        return
     if attrs.get("coordinate_mode") == "layout_coordinates":
         shape = tuple(int(value) for value in attrs["coordinate_shape"])
         component_bases = tuple(
@@ -2041,7 +2072,14 @@ def _emit_layout_convert(state, op):
                 target_op_id=op.target_op_id,
             )
         result_id = _single_result(op)
-        result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
+        target_type = state.target_program.values[result_id].type
+        if target_type.representation in {"fragment", "fragment_tuple"}:
+            result_type = state.dsl.simd_type(
+                _scalar_type(state.dsl, target_type.element_type),
+                int(target_type.lane_width or 64),
+            )
+        else:
+            result_type = _wave_type(state.dsl, target_type)
         extracted = {}
 
         def scalar_component(component_index, element_index):
@@ -2099,6 +2137,9 @@ def _emit_layout_convert(state, op):
                 )
             )
         )
+        return
+    if mode == "mfma_vector_register_remap":
+        _emit_mfma_vector_register_remap(state, op, attrs, components)
         return
     if mode == "dot_operand_fragment_pack":
         result_count = int(attrs["result_component_count"])
@@ -2245,9 +2286,12 @@ def _emit_layout_convert(state, op):
             )
         result_id = _single_result(op)
         target_type = state.target_program.values[result_id].type
-        result_type = _wave_type(state.dsl, target_type)
         lane_width = int(target_type.lane_width or 64)
         element_type = _scalar_type(state.dsl, target_type.element_type)
+        if target_type.representation in {"fragment", "fragment_tuple"}:
+            result_type = state.dsl.simd_type(element_type, lane_width)
+        else:
+            result_type = _wave_type(state.dsl, target_type)
         cta_thread_count = int(attrs["cta_thread_count"])
         if cta_thread_count % lane_width:
             fail(
@@ -2377,8 +2421,290 @@ def _emit_layout_convert(state, op):
     )
 
 
+def _emit_mfma_vector_register_remap(state, op, attrs, components):
+    result_id = _single_result(op)
+    target_type = state.target_program.values[result_id].type
+    if target_type.representation not in {"fragment", "fragment_tuple"}:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "MFMA vector remap requires a fragment result type",
+            target_op_id=op.target_op_id,
+        )
+    result_count = int(attrs["result_component_count"])
+    scalar_count = int(attrs["scalar_result_component_count"])
+    vector_length = int(attrs["vector_length"])
+    if scalar_count != result_count * vector_length:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "MFMA vector remap scalar count does not match result fragments",
+            target_op_id=op.target_op_id,
+        )
+    registers_per_component = int(attrs["source_registers_per_component"])
+    if len(components) != int(attrs["source_component_count"]):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "MFMA vector remap source component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    lane_width = int(target_type.lane_width or 64)
+    element_type = _scalar_type(state.dsl, target_type.element_type)
+    fragment_type = state.dsl.fragment_type(
+        int(attrs["role"]),
+        element_type,
+        int(attrs["rows"]),
+        int(attrs["columns"]),
+        lane_width,
+        int(attrs["registers"]),
+    )
+    extracted = {}
+
+    def scalar_component(component_index, element_index):
+        key = (int(component_index), int(element_index))
+        if key in extracted:
+            return extracted[key]
+        component = components[int(component_index)]
+        if registers_per_component == 1:
+            if int(element_index) != 0:
+                fail(
+                    "TLXW_EMIT_LAYOUT_REMAP",
+                    STAGE,
+                    "scalar MFMA vector remap requested a non-zero element index",
+                    target_op_id=op.target_op_id,
+                )
+            extracted[key] = component
+            return component
+        if state.dsl.FragmentType.isinstance(component.type):
+            vector = state.builder.fragment_unpack(component)
+        else:
+            vector = component
+        simd_type = state.dsl.SimdType(vector.type)
+        scalar_type = state.dsl.simd_type(simd_type.element_type, int(simd_type.width))
+        extracted[key] = state.dsl.wave.ExtractOp(
+            scalar_type,
+            vector,
+            int(element_index),
+        ).result
+        return extracted[key]
+
+    scalars = _emit_mfma_vector_register_scalars(
+        state,
+        op,
+        attrs,
+        scalar_count,
+        components,
+        registers_per_component,
+        scalar_component,
+        lane_width,
+    )
+    fragments = []
+    for component in range(result_count):
+        start = int(component) * vector_length
+        vector_components = scalars[start : start + vector_length]
+        simd = state.dsl.SimdType(vector_components[0].type)
+        vector_type = state.dsl.simd_type(
+            state.dsl.vector_type(vector_length, simd.element_type),
+            width=lane_width,
+        )
+        packed = state.dsl.wave.PackOp(vector_type, vector_components).result
+        fragments.append(state.builder.fragment_pack(packed, fragment_type))
+    state.values[result_id] = _pack_components(tuple(fragments))
+
+
+def _emit_mfma_vector_register_scalars(
+    state,
+    op,
+    attrs,
+    scalar_count,
+    components,
+    registers_per_component,
+    scalar_component,
+    lane_width,
+):
+    scalar_mode = attrs.get("scalar_mode")
+    if scalar_mode in {"same_lane_register_remap", "cross_lane_register_remap"}:
+        source_indices = tuple(int(index) for index in attrs["scalar_source_indices"])
+        source_element_indices = tuple(
+            int(index) for index in attrs["scalar_source_element_indices"]
+        )
+        if (
+            len(source_indices) != int(scalar_count)
+            or len(source_element_indices) != int(scalar_count)
+        ):
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "MFMA vector remap scalar source attrs do not match result count",
+                target_op_id=op.target_op_id,
+            )
+        source_lane = None
+
+        def remapped_scalar(component_index, element_index):
+            component = scalar_component(component_index, element_index)
+            if scalar_mode == "same_lane_register_remap":
+                return component
+            nonlocal source_lane
+            if source_lane is None:
+                source_lane = _layout_convert_source_lane(
+                    state,
+                    attrs,
+                    component,
+                    op,
+                )
+            return _shuffle_component(state, component, source_lane, op)
+
+        return tuple(
+            remapped_scalar(component_index, element_index)
+            for component_index, element_index in zip(
+                source_indices,
+                source_element_indices,
+            )
+        )
+    if scalar_mode is not None:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            f"unsupported MFMA vector scalar remap mode {scalar_mode!r}",
+            target_op_id=op.target_op_id,
+        )
+    cta_thread_count = int(attrs["cta_thread_count"])
+    if cta_thread_count % int(lane_width):
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "MFMA vector CTA exchange thread count must be a multiple of lane width",
+            target_op_id=op.target_op_id,
+        )
+    exchange_groups = tuple(attrs["exchange_groups"])
+    if not exchange_groups or not exchange_groups[0][0]:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "MFMA vector CTA exchange requires non-empty source slots",
+            target_op_id=op.target_op_id,
+        )
+    first_source_slot = int(exchange_groups[0][0][0])
+    sample = scalar_component(
+        first_source_slot // int(registers_per_component),
+        first_source_slot % int(registers_per_component),
+    )
+    element_type = state.dsl.SimdType(sample.type).element_type
+    scratch_base = state.builder.lds_base(
+        element_type,
+        offset=int(attrs["scratch_byte_offset"]),
+    )
+    ptr_type = state.dsl.simd_ptr_type(
+        element_type,
+        state.dsl.shared_address_space(),
+        lane_width,
+    )
+    workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    result_components = [None] * int(scalar_count)
+    group_dependency = state.scratch_token
+    for group in exchange_groups:
+        source_slots, result_indices, load_bases, load_coefficients = group
+        store_tokens = []
+        for slot_index, source_slot in enumerate(source_slots):
+            source_slot = int(source_slot)
+            store_offset = workitem
+            base_offset = int(slot_index) * cta_thread_count
+            if base_offset:
+                store_offset = _simd_binary_const(
+                    state,
+                    "addi",
+                    store_offset,
+                    base_offset,
+                    lane_width,
+                )
+            ptr = state.builder.ptr_add(
+                scratch_base,
+                store_offset,
+                result_type=ptr_type,
+            )
+            value = scalar_component(
+                source_slot // int(registers_per_component),
+                source_slot % int(registers_per_component),
+            )
+            store_tokens.append(state.builder.store(value, ptr, after=group_dependency))
+        barrier_token = state.builder.barrier(*store_tokens)
+        load_tokens = []
+        for result_index, load_base, coefficients in zip(
+            result_indices,
+            load_bases,
+            load_coefficients,
+        ):
+            load_offset = _bit_affine_thread_offset(
+                state,
+                workitem,
+                load_base,
+                coefficients,
+                lane_width,
+            )
+            ptr = state.builder.ptr_add(
+                scratch_base,
+                load_offset,
+                result_type=ptr_type,
+            )
+            loaded, load_token = state.builder.load(
+                ptr,
+                state.dsl.simd_type(element_type, lane_width),
+                after=barrier_token,
+            )
+            result_components[int(result_index)] = loaded
+            load_tokens.append(load_token)
+        group_dependency = state.builder.barrier(*load_tokens)
+    state.scratch_token = group_dependency
+    missing = [index for index, component in enumerate(result_components) if component is None]
+    if missing:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "MFMA vector CTA exchange did not populate every scalar result",
+            target_op_id=op.target_op_id,
+        )
+    return tuple(result_components)
+
+
 def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
     lane_width = int(lane_width)
+    packed = _packed_bit_affine_coefficients(coefficients)
+    if packed is not None:
+        first_bit, bit_count, stride = packed
+        if int(stride) == 0:
+            return state.builder.splat(
+                state.builder.constant(state.dsl.i32(), int(base)),
+                state.dsl.i32(),
+                lane_width,
+            )
+        result = workitem
+        if first_bit:
+            result = _simd_binary_const(
+                state,
+                "divui",
+                result,
+                1 << int(first_bit),
+                lane_width,
+            )
+        result = _simd_binary_const(
+            state,
+            "remui",
+            result,
+            1 << int(bit_count),
+            lane_width,
+        )
+        if int(stride) != 1:
+            result = _simd_binary_const(
+                state,
+                "muli",
+                result,
+                int(stride),
+                lane_width,
+            )
+        if int(base):
+            result = _simd_binary_const(state, "addi", result, int(base), lane_width)
+        return result
     result = state.builder.splat(
         state.builder.constant(state.dsl.i32(), int(base)),
         state.dsl.i32(),
@@ -2400,6 +2726,25 @@ def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
             )
         result = state.builder.binary(state.dsl.BinaryKind.AddI, result, bit_value)
     return result
+
+
+def _packed_bit_affine_coefficients(coefficients):
+    nonzero = [
+        (bit, int(coefficient))
+        for bit, coefficient in enumerate(coefficients)
+        if int(coefficient)
+    ]
+    if not nonzero:
+        return 0, 1, 0
+    first_bit, first_coefficient = nonzero[0]
+    if first_coefficient <= 0:
+        return None
+    for expected_index, (bit, coefficient) in enumerate(nonzero):
+        if int(bit) != int(first_bit) + int(expected_index):
+            return None
+        if int(coefficient) != int(first_coefficient) << int(expected_index):
+            return None
+    return int(first_bit), len(nonzero), int(first_coefficient)
 
 
 def _layout_convert_source_lane(state, attrs, component, op):

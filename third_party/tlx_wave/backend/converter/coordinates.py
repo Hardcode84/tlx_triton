@@ -24,7 +24,7 @@ def layout_coordinate_plan(
     op,
     source_value_id,
 ):
-    if layout.kind not in {"blocked", "linear"}:
+    if layout.kind not in {"blocked", "linear", "slice"}:
         return None
     shape = tuple(int(dim) for dim in layout.shape)
     if not shape:
@@ -131,6 +131,18 @@ def is_flat_affine_make_range(plan, lane_width, warp_count):
     if not bases:
         return (), stride
     return bases, stride
+
+
+def is_flat_bit_affine_make_range(plan):
+    if len(plan.shape) != 1:
+        return None
+    bases = tuple(int(base[0]) for base in plan.component_bases)
+    coefficients = tuple(
+        int(coefficient[0]) for coefficient in plan.workitem_coefficients
+    )
+    if not _xor_masks_are_additive(bases, coefficients):
+        return None
+    return bases, coefficients
 
 
 def _workitem_coefficients(linear, lane_bits, warp_bits):

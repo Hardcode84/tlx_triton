@@ -475,6 +475,38 @@ def test_tlx_wave_converter_type_layout_stage_supports_slice_encoding(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_make_range_uses_slice_coordinates(tmp_path):
+    preamble = """
+#parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #parent}>
+"""
+    local_func = """
+  tt.func public @converter_slice_make_range() attributes {noinline = false} {
+    %range = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #slice>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    fact_program = converter_facts.analyze_facts(source, converted)
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    target = converter_op_conversion.convert_ops(
+        source,
+        converted,
+        fact_program,
+        token_program,
+    )
+
+    (range_op,) = [op for op in target.ops if op.kind == "make_range"]
+    attrs = converter_target_ir.attrs_dict(range_op)
+    assert attrs["coordinate_mode"] == "bit_affine_workitem"
+    assert attrs["component_bases"] == (0,)
+    assert attrs["workitem_coefficients"] == (1, 2, 4, 8, 16, 0)
+    del ctx
+
+
 def test_tlx_wave_converter_fact_stage_extracts_provenance_facts(tmp_path):
     local_func = """
   tt.func public @converter_facts(
@@ -2752,17 +2784,9 @@ def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
 
     (range_op,) = [op for op in output.target_program.ops if op.kind == "make_range"]
     attrs = converter_target_ir.attrs_dict(range_op)
-    assert attrs["coordinate_mode"] == "layout_coordinates"
-    assert attrs["coordinate_shape"] == (64,)
-    assert attrs["component_coordinate_bases"] == ((0,),)
-    assert attrs["workitem_coordinate_coefficients"] == (
-        (32,),
-        (16,),
-        (8,),
-        (4,),
-        (2,),
-        (1,),
-    )
+    assert attrs["coordinate_mode"] == "bit_affine_workitem"
+    assert attrs["component_bases"] == (0,)
+    assert attrs["workitem_coefficients"] == (32, 16, 8, 4, 2, 1)
     assert "wave.binary shrui" in output.emitted_module.text
     assert "wave.binary andi" in output.emitted_module.text
     del ctx
@@ -3133,6 +3157,119 @@ def test_tlx_wave_converter_rejects_slice_parent_layout_remap(tmp_path):
     assert "slice to slice convert_layout requires parent layout movement support" in str(
         diagnostic
     )
+    del ctx
+
+
+def test_tlx_wave_converter_dispatches_blocked_to_mfma_base_remap(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
+"""
+    local_func = """
+  tt.func public @converter_blocked_to_mfma_base_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %converted = ttg.convert_layout %value : tensor<32x32xf32, #blocked> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    fact_program = converter_facts.analyze_facts(source, converted)
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    target = converter_op_conversion.convert_ops(
+        source,
+        converted,
+        fact_program,
+        token_program,
+    )
+
+    (convert_op,) = [op for op in target.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "mfma_vector_register_remap"
+    assert attrs["scalar_mode"] == "cross_lane_register_remap"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
+    assert attrs["result_component_count"] == 1
+    assert attrs["scalar_result_component_count"] == 4
+    assert attrs["source_component_count"] == 4
+    assert attrs["source_registers_per_component"] == 1
+    assert attrs["vector_length"] == 4
+    assert attrs["scalar_source_indices"] == (0, 1, 2, 3)
+    assert attrs["scalar_source_element_indices"] == (0, 0, 0, 0)
+    assert attrs["source_lane_map_kind"] == "transpose"
+    assert attrs["source_lane_transpose_inner"] == 16
+    assert attrs["source_lane_transpose_outer"] == 4
+    assert attrs["mode"] != "component_group_first"
+    del ctx
+
+
+def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_blocked_accumulator_remap_for_dot() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<16x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #shared, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<16x32xf16, #shared, #smem, mutable> -> tensor<16x32xf16, #dot0>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x16xf16, #shared, #smem, mutable> -> tensor<32x16xf16, #dot1>
+    %base = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #blocked>
+    %acc = ttg.convert_layout %base : tensor<16x16xf32, #blocked> -> tensor<16x16xf32, #mma>
+    %dot = tt.dot %lhs, %rhs, %acc : tensor<16x32xf16, #dot0> * tensor<32x16xf16, #dot1> -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [
+        op for op in output.target_program.ops if op.kind == "layout_convert"
+    ]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "mfma_vector_register_remap"
+    assert attrs["scalar_mode"] == "cross_lane_register_remap"
+    wave = output.emitted_module.text
+    assert 'waveamd.fragment_pack' in wave
+    assert 'waveamd.mma "mfma.f32.16x16x32.f16"' in wave
+    _run_waveamd_to_machine(wave)
+    del ctx
+
+
+def test_tlx_wave_converter_emits_mfma32_vector_accumulator_remap(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+"""
+    local_func = """
+  tt.func public @converter_mfma32_vector_accumulator_remap() attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %converted = ttg.convert_layout %value : tensor<32x32xf32, #blocked> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (convert_op,) = [
+        op for op in output.target_program.ops if op.kind == "layout_convert"
+    ]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "mfma_vector_register_remap"
+    assert attrs["result_component_count"] == 1
+    assert attrs["scalar_result_component_count"] == 16
+    assert attrs["vector_length"] == 16
+    wave = output.emitted_module.text
+    assert "waveamd.fragment_pack" in wave
+    assert "vector<16xf32>" in wave
+    _run_wave_verify(wave)
     del ctx
 
 
