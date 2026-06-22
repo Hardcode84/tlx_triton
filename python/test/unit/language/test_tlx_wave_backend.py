@@ -4129,8 +4129,33 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
     assert local_load_attrs[1]["source_shape"] == (32, 16)
     assert local_load_attrs[1]["memdesc_shape"] == (64, 128)
     assert [attrs["wave_tile_axis"] for attrs in local_load_attrs] == ["m", "n"]
+    assert [attrs["wave_tile_stride_elements"] for attrs in local_load_attrs] == [
+        1024,
+        16,
+    ]
+    assert local_load_attrs[0]["component_tile_offsets"] == (
+        (0, 0),
+        (0, 32),
+        (64, 0),
+        (64, 32),
+        (128, 0),
+        (128, 32),
+        (192, 0),
+        (192, 32),
+    )
+    assert local_load_attrs[1]["component_tile_offsets"] == (
+        (0, 0),
+        (32, 0),
+        (0, 32),
+        (32, 32),
+        (0, 64),
+        (32, 64),
+        (0, 96),
+        (32, 96),
+    )
     wave = output.emitted_module.text
     assert "64*floor(1/2*Mod(wi, 64))" in wave
+    assert "native_register_layout" not in wave
     assert wave.count("waveamd.fragment_fill") == 16
     assert wave.count('waveamd.mma "mfma.f32.16x16x32.f16"') == 32
     del ctx
@@ -4281,6 +4306,7 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     assert local_load_attrs[0]["load_mode"] == "b16_transpose"
     assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 2560),) * 8
     wave = output.emitted_module.text
+    assert '<"2560 + 5120*floor' in wave
     assert '<"2560 + ' in wave
     assert '<"20 + ' not in wave
     assert '<"100 + 40*Mod' not in wave

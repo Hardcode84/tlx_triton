@@ -3903,6 +3903,12 @@ def _b16_transpose_fragment_load_plan(
             source_op_index=op.index,
             source_value_id=result_layout.value_id,
         )
+    lane_layout = _fragment_lane_layout(
+        result_layout,
+        instr_shape,
+        int(elements_per_lane),
+        transpose_load=True,
+    )
     for tile_offsets in tile_plan["component_tile_offsets"]:
         _validate_b16_transpose_packets(
             layout,
@@ -3913,20 +3919,9 @@ def _b16_transpose_fragment_load_plan(
             int(result_layout.lane_width),
             elements_per_lane,
             (0,),
-            _fragment_lane_layout(
-                result_layout,
-                instr_shape,
-                int(elements_per_lane),
-                transpose_load=True,
-            ),
+            lane_layout,
             op,
         )
-    lane_layout = _fragment_lane_layout(
-        result_layout,
-        instr_shape,
-        int(elements_per_lane),
-        transpose_load=True,
-    )
     chunk_element_deltas = _b16_transpose_chunk_element_deltas(
         layout,
         tuple(int(dim) for dim in memdesc.shape),
