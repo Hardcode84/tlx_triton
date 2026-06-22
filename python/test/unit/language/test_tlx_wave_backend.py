@@ -3591,6 +3591,39 @@ def test_tlx_wave_converter_masks_wide_buffer_store_with_oob_select(
     del ctx
 
 
+def test_tlx_wave_converter_keeps_buffer_store_components_independent(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_independent_buffer_store_components(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<128xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%range] {contiguity = 1 : i32} : tensor<128xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    store_lines = [
+        line
+        for line in wave.splitlines()
+        if "wave.store" in line and "#waveamd.buffer" in line
+    ]
+    assert len(store_lines) == 2
+    assert all(" after " not in line for line in store_lines)
+
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.buffer_store_b16") == 2
+    assert machine.count("waveamdmachine.s_waitcnt_vscnt") <= 1
+    del ctx
+
+
 def test_tlx_wave_converter_masks_byte_buffer_store_with_triton_oob_sentinel(
     tmp_path,
 ):

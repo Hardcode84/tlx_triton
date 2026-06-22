@@ -3283,7 +3283,6 @@ def _emit_buffer_store(state, op):
         lane_width,
     )
     zero_mask_payload = None
-    store_dependency = None
     for index, (value_component, offset_component) in enumerate(
         zip(value_components, offset_components)
     ):
@@ -3373,7 +3372,7 @@ def _emit_buffer_store(state, op):
                         scalar_mask_payload,
                         zero_mask_payload,
                     )
-                store_dependency = _emit_buffer_store_component(
+                _emit_buffer_store_component(
                     state,
                     op,
                     attrs,
@@ -3384,7 +3383,6 @@ def _emit_buffer_store(state, op):
                     scalar_offset,
                     scalar_mask,
                     mask_mode,
-                    dependency=store_dependency,
                 )
             continue
 
@@ -3398,7 +3396,7 @@ def _emit_buffer_store(state, op):
                 mask_payload_component,
                 zero_mask_payload,
             )
-        store_dependency = _emit_buffer_store_component(
+        _emit_buffer_store_component(
             state,
             op,
             attrs,
@@ -3409,7 +3407,6 @@ def _emit_buffer_store(state, op):
             offset_component,
             mask_component,
             mask_mode,
-            dependency=store_dependency,
         )
 
 
