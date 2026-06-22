@@ -193,7 +193,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     def hash(self):
         return (
-            f"{self.target}:stage7-staged-converter-hsaco:"
+            f"{self.target}:stage8-staged-converter-hsaco-static-lds:"
             f"wave-opt-sha256={_wave_opt_sha256()}:"
             f"wave-pipelines-sha256={_wave_pipelines_sha256()}"
         )
@@ -228,7 +228,12 @@ def _populate_staged_converter_metadata(metadata, output, options, wave_opt):
     ]
 
     metadata["name"] = target_program.kernel.name
-    metadata["shared"] = emitted.lds_size
+    # Match Triton's launch contract: metadata.shared is the dynamic LDS byte
+    # count passed to hipModuleLaunchKernel. Wave lowers emitted.lds_size into
+    # the HSACO's group_segment_fixed_size, so passing it here would reserve the
+    # same LDS twice.
+    metadata["shared"] = 0
+    metadata["tlx_wave_launch_shared_bytes"] = 0
     metadata["global_scratch_size"] = 0
     metadata["global_scratch_align"] = 1
     metadata["profile_scratch_size"] = 0

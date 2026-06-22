@@ -1688,6 +1688,36 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
     del ctx
 
 
+def test_tlx_wave_backend_wave_stage_keeps_fixed_lds_out_of_launch_shared(
+    tmp_path,
+):
+    preamble = """
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @backend_wave_stage_fixed_lds() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    metadata = {}
+
+    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
+        mod,
+        metadata,
+        _tlx_wave_options(),
+    )
+
+    assert "wave.lds_size = 128 : i64" in wave_artifact
+    assert metadata["shared"] == 0
+    assert metadata["tlx_wave_launch_shared_bytes"] == 0
+    assert metadata["tlx_wave_lds_size_bytes"] == 128
+    _run_wave_verify(wave_artifact)
+    del ctx
+
+
 def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     backend = tlx_wave_compiler.TLXWaveBackend(GFX950_WAVE)
     first_sha = "1" * 64
@@ -1699,6 +1729,7 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
     second_hash = backend.hash()
 
+    assert "stage8-staged-converter-hsaco-static-lds" in first_hash
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
@@ -1851,6 +1882,9 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
     assert compiled.metadata.tlx_wave_hsaco_size_bytes == len(hsaco)
     assert compiled.metadata.tlx_wave_ttgir_target == "hip:gfx950"
+    assert compiled.metadata.shared == 0
+    assert compiled.metadata.tlx_wave_launch_shared_bytes == 0
+    assert compiled.metadata.tlx_wave_lds_size_bytes > 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
     assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
 
