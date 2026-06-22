@@ -2529,11 +2529,7 @@ def _emit_buffer_store(state, op):
             result_type=ptr_type,
         )
         if mask_components is not None and mask_mode == "select_oob_offset":
-            inactive_offset = state.builder.splat(
-                state.builder.constant(state.dsl.i32(), int(attrs["inactive_offset"])),
-                state.dsl.i32(),
-                lane_width,
-            )
+            inactive_offset = _buffer_inactive_element_offset(state, attrs, lane_width)
             inactive_ptr = state.builder.ptr_add(
                 buffer_base,
                 inactive_offset,
@@ -2558,6 +2554,23 @@ def _emit_buffer_store(state, op):
                 ptr,
             ),
         )
+
+
+def _buffer_inactive_element_offset(state, attrs, lane_width):
+    inactive_byte_offset = int(attrs.get("inactive_byte_offset", 1 << 31))
+    element_byte_width = int(attrs["element_byte_width"])
+    if element_byte_width <= 0 or inactive_byte_offset % element_byte_width:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
+            STAGE,
+            "buffer_store inactive byte offset must align to element size",
+        )
+    element_offset = inactive_byte_offset // element_byte_width
+    return state.builder.splat(
+        state.builder.constant(state.dsl.index_type(), element_offset),
+        state.dsl.index_type(),
+        lane_width,
+    )
 
 
 def _emit_buffer_load(state, op):

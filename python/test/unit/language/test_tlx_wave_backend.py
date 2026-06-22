@@ -3259,6 +3259,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     attrs = converter_target_ir.attrs_dict(store_op)
     assert attrs["has_mask"] is True
     assert attrs["mask_mode"] == "select_oob_offset"
+    assert attrs["inactive_byte_offset"] == 2147483648
     assert attrs["inactive_offset"] == 1073741824
     assert attrs["offset_range"] == (0, 1073741823)
     assert "wave.where" not in output.emitted_module.text
@@ -3267,6 +3268,72 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
 
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.buffer_store_b16" in machine
+    assert "waveamdmachine.exec_if" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_masks_wide_buffer_store_with_oob_select(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_wide_masked_buffer_store(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}, %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    amdg.buffer_store %value, %arg0[%range], %mask {contiguity = 4 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["mask_mode"] == "select_oob_offset"
+    assert attrs["access_element_count"] == 4
+    assert attrs["inactive_byte_offset"] == 2147483648
+    assert attrs["offset_range"] == (0, 1073741820)
+    assert attrs["inactive_offset"] == 1073741824
+    assert "wave.select" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_masks_byte_buffer_store_with_triton_oob_sentinel(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_byte_masked_buffer_store(%arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32}, %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0> : tensor<64xi8, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    amdg.buffer_store %value, %arg0[%range], %mask {contiguity = 1 : i32} : tensor<64xi8, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["mask_mode"] == "select_oob_offset"
+    assert attrs["inactive_byte_offset"] == 2147483648
+    assert attrs["inactive_offset"] == 2147483648
+    wave = output.emitted_module.text
+    assert "wave.select" in wave
+    assert "arith.constant -2147483648" not in wave
+
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_store_b8" in machine
     assert "waveamdmachine.exec_if" not in machine
     del ctx
 
@@ -3346,6 +3413,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(
     assert attrs["has_mask"] is True
     assert attrs["has_other"] is True
     assert attrs["mask_mode"] == "exec_where"
+    assert attrs["inactive_byte_offset"] == 2147483648
     assert attrs["inactive_offset"] == 536870912
     assert attrs["offset_range"] == (0, 536870911)
     assert output.emitted_module.text.count("waveamd.make_buffer") == 2
@@ -3486,7 +3554,8 @@ def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
     (load_op,) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
     attrs = converter_target_ir.attrs_dict(load_op)
     assert attrs["offset_range"] == (0, 0)
-    assert attrs["inactive_offset"] == 1
+    assert attrs["inactive_byte_offset"] == 2147483648
+    assert attrs["inactive_offset"] == 536870912
     wave = output.emitted_module.text
     assert wave.index("wave.where") < wave.index("wave.assume") < wave.index("wave.load")
     machine = _run_waveamd_to_machine(wave)

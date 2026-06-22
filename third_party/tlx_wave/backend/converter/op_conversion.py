@@ -1400,7 +1400,8 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "element_type": loaded.type.element_type,
             "has_mask": has_mask,
             "has_other": has_other,
-            "inactive_offset": int(offset_upper) + 1,
+            "inactive_byte_offset": _buffer_inactive_byte_offset(),
+            "inactive_offset": _buffer_inactive_element_offset(element_byte_width, op),
             "lane_width": int(loaded.type.lane_width or offsets.type.lane_width or 64),
             "mask_mode": "exec_where" if has_mask else "none",
             "offset_range": (0, int(offset_upper)),
@@ -1479,7 +1480,8 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "element_byte_width": int(element_byte_width),
             "element_type": value.type.element_type,
             "has_mask": has_mask,
-            "inactive_offset": int(offset_upper) + 1,
+            "inactive_byte_offset": _buffer_inactive_byte_offset(),
+            "inactive_offset": _buffer_inactive_element_offset(element_byte_width, op),
             "lane_width": int(value.type.lane_width or offsets.type.lane_width or 64),
             "mask_mode": "select_oob_offset" if has_mask else "none",
             "offset_range": (0, int(offset_upper)),
@@ -3095,6 +3097,30 @@ def _buffer_source_offset_upper(range_upper_bytes, packet_bytes, element_byte_wi
             source_op_index=op.index,
         )
     return (range_upper_bytes - packet_bytes + 1) // element_byte_width
+
+
+def _buffer_inactive_byte_offset():
+    return 1 << 31
+
+
+def _buffer_inactive_element_offset(element_byte_width, op):
+    element_byte_width = int(element_byte_width)
+    if element_byte_width <= 0:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            f"{op.name} inactive source offset requires positive element byte width",
+            source_op_index=op.index,
+        )
+    inactive_byte_offset = _buffer_inactive_byte_offset()
+    if inactive_byte_offset % element_byte_width:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            f"{op.name} inactive byte offset is not aligned to element size",
+            source_op_index=op.index,
+        )
+    return inactive_byte_offset // element_byte_width
 
 
 def _packet_affine_terms(affine):
