@@ -3352,6 +3352,30 @@ def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
     ]
     assert attrs["mode"] == "mfma_vector_register_remap"
     assert attrs["scalar_mode"] == "cross_lane_register_remap"
+    native_convert_ops = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "layout_convert"
+        and "scratch_element_count" in converter_target_ir.attrs_dict(op)
+    ]
+    native_convert_attrs = [
+        converter_target_ir.attrs_dict(op) for op in native_convert_ops
+    ]
+    assert [attrs["mode"] for attrs in native_convert_attrs] == [
+        "mfma_vector_register_remap",
+        "mfma_vector_register_remap",
+    ]
+    assert [attrs["result_component_count"] for attrs in native_convert_attrs] == [
+        1,
+        1,
+    ]
+    assert [attrs["scalar_result_component_count"] for attrs in native_convert_attrs] == [
+        4,
+        4,
+    ]
+    (mma_op,) = [op for op in output.target_program.ops if op.kind == "mma"]
+    assert native_convert_ops[0].results[0] == mma_op.operands[2]
+    assert mma_op.results[0] == native_convert_ops[1].operands[0]
     wave = output.emitted_module.text
     assert 'waveamd.fragment_pack' in wave
     assert 'waveamd.mma "mfma.f32.16x16x32.f16"' in wave

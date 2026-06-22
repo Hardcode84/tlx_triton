@@ -254,7 +254,7 @@ def _convert_source_op(
         _convert_layout(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "tt.dot":
-        _convert_dot(builder, type_layout_program, op)
+        _convert_dot(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "amdg.buffer_load_to_local":
         _convert_buffer_load_to_local(
@@ -1988,7 +1988,7 @@ def _convert_fragment_constant(builder, type_layout_program, op):
     )
 
 
-def _convert_dot(builder, type_layout_program, op):
+def _convert_dot(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 3 or len(op.results) != 1:
         fail(
             "TLXW_OP_DOT",
@@ -2075,19 +2075,98 @@ def _convert_dot(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
+    native_remap = layout_remap.mfma_native_accumulator_remap(
+        result,
+        result_layout,
+        op,
+    )
+    if (
+        native_remap is not None
+        and (int(result.type.component_count) != 1 or instr_shape != (16, 16, 32))
+    ):
+        native_remap = None
+    mma_result_target_ids = result_target_ids
+    mma_result_layout_map_ids = result_layout_map_ids
+    mma_operand_target_ids = list(_operand_target_ids(builder, op))
+    if native_remap is not None:
+        native_acc_remap = layout_remap.mfma_accumulator_to_native_remap(
+            acc,
+            acc_layout,
+            op,
+        )
+        if native_acc_remap is None:
+            fail(
+                "TLXW_OP_DOT",
+                STAGE,
+                "tt.dot requires a native accumulator input remap for this "
+                "MFMA result layout",
+                source_op_index=op.index,
+                source_value_id=op.operands[2],
+            )
+        native_acc_target_id = builder.add_value(
+            target_ir.target_type_from_converted(acc.type),
+            debug_name=f"v{op.operands[2]}_native_mfma_acc",
+        )
+        attrs = {
+            "fact_policy": "invalidate_layout_sensitive",
+            "result_component_count": int(acc.type.component_count),
+            **native_acc_remap,
+        }
+        attrs = _add_layout_remap_scratch_attrs(
+            attrs,
+            conversion_input,
+            acc,
+            op,
+        )
+        builder.add_op(
+            "layout_convert",
+            operands=(mma_operand_target_ids[2],),
+            results=(native_acc_target_id,),
+            attrs=attrs,
+            layout_map_ids=(),
+            source_op_index=op.index,
+        )
+        mma_operand_target_ids[2] = native_acc_target_id
+        mma_result_target_ids = (
+            builder.add_value(
+                target_ir.target_type_from_converted(result.type),
+                debug_name=f"v{op.results[0]}_native_mfma",
+            ),
+        )
+        mma_result_layout_map_ids = ()
     builder.add_op(
         "mma",
-        operands=_operand_target_ids(builder, op),
-        results=result_target_ids,
+        operands=tuple(mma_operand_target_ids),
+        results=mma_result_target_ids,
         attrs={
             "kind": kind,
             "k_tiles": int(k_tiles),
             "m_tiles": int(m_tiles),
             "n_tiles": int(n_tiles),
         },
-        layout_map_ids=result_layout_map_ids,
+        layout_map_ids=mma_result_layout_map_ids,
         source_op_index=op.index,
     )
+    if native_remap is not None:
+        attrs = {
+            "fact_policy": "invalidate_layout_sensitive",
+            "result_component_count": int(result.type.component_count),
+            **native_remap,
+        }
+        attrs = _add_layout_remap_scratch_attrs(
+            attrs,
+            conversion_input,
+            result,
+            op,
+        )
+        builder.add_op(
+            "layout_convert",
+            operands=mma_result_target_ids,
+            results=result_target_ids,
+            attrs=attrs,
+            layout_map_ids=result_layout_map_ids,
+            source_op_index=op.index,
+        )
 
 
 def _convert_fragment_truncf(builder, type_layout_program, op):
