@@ -2405,6 +2405,40 @@ def test_tlx_wave_converter_pipeline_lowers_memdesc_index(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_pipeline_lowers_padded_memdesc_index_stride(tmp_path):
+    preamble = """
+#shared = #ttg.padded_shared<[512:+16] {order = [1, 0], shape = [256, 64]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_padded_memdesc_index() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x256x64xf16, #shared, #smem, mutable>
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %view0 = ttg.memdesc_index %alloc[%zero] : !ttg.memdesc<2x256x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
+    %view1 = ttg.memdesc_index %alloc[%one] : !ttg.memdesc<2x256x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    local_alloc_attrs = converter_target_ir.attrs_dict(output.target_program.ops[0])
+    assert local_alloc_attrs["allocation_bytes"] == 67520
+    assert output.emitted_module.lds_size == 67520
+    assert "wave.lds_size = 67520 : i64" in output.emitted_module.text
+
+    first_view_attrs = converter_target_ir.attrs_dict(output.target_program.ops[3])
+    second_view_attrs = converter_target_ir.attrs_dict(output.target_program.ops[4])
+    assert first_view_attrs["elements_per_slot"] == 16880
+    assert first_view_attrs["static_lds_byte_offset"] == 0
+    assert second_view_attrs["elements_per_slot"] == 16880
+    assert second_view_attrs["static_lds_byte_offset"] == 33760
+    assert "{offset = 33760 : i64}" in output.emitted_module.text
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -4174,6 +4208,34 @@ def test_tlx_wave_converter_pipeline_lowers_blocked_broadcast(tmp_path):
         "broadcast",
         "return",
     ]
+    assert "tt.broadcast" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_blocked_column_broadcast_components(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 0, parent = #blocked}>
+"""
+    local_func = """
+  tt.func public @converter_column_broadcast() attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #slice>
+    %expanded = tt.expand_dims %range {axis = 0 : i32} : tensor<128xi32, #slice> -> tensor<1x128xi32, #blocked>
+    %broadcast = tt.broadcast %expanded : tensor<1x128xi32, #blocked> -> tensor<256x128xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (broadcast_op,) = [
+        op for op in output.target_program.ops if op.kind == "broadcast"
+    ]
+    attrs = converter_target_ir.attrs_dict(broadcast_op)
+    assert attrs["component_sources"] == tuple(index % 8 for index in range(64))
     assert "tt.broadcast" not in output.emitted_module.text
     del ctx
 
