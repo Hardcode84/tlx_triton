@@ -1883,10 +1883,6 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
             "version_dir": "v7_slice",
             "function_name": "v7_slice",
             "num_warps": 4,
-            "expected_failure": (
-                "waveamd-reg-alloc",
-                "wave.lds_size = 134976",
-            ),
         },
         {
             "version_dir": "v8_warp_pipeline",
@@ -1910,14 +1906,15 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     case,
 ):
     if "expected_failure" in case:
-        with pytest.raises(RuntimeError) as exc_info:
-            _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
-        detail = str(exc_info.value)
-        for expected in case["expected_failure"]:
-            assert expected in detail
-        return
-
-    compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
+        try:
+            compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
+        except RuntimeError as exc:
+            detail = str(exc)
+            for expected in case["expected_failure"]:
+                assert expected in detail
+            return
+    else:
+        compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
     wave_artifact = _asm_text(compiled, "wave")
     hsaco = compiled.asm["hsaco"]
 
@@ -2041,6 +2038,69 @@ def test_tlx_wave_converter_pipeline_lowers_dynamic_for_with_iter_args(tmp_path)
     assert "scf.for" in output.emitted_module.text
     assert "iter_args" in output.emitted_module.text
     assert "scf.yield" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_mask_payload_across_dynamic_for(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_dynamic_for_mask_payload(%limit: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c64 = arith.constant 64 : index
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %init = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    %carried = scf.for %i = %c0 to %c64 step %c1 iter_args(%mask = %init) -> (tensor<64xi1, #blocked>) {
+      %next = arith.andi %mask, %init : tensor<64xi1, #blocked>
+      scf.yield %next : tensor<64xi1, #blocked>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert "scf.for" in output.emitted_module.text
+    assert "scf.yield" in output.emitted_module.text
+    assert "arith.andi" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_normalizes_carried_mask_init_to_payload(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_dynamic_for_mask_constant_init(%limit: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c64 = arith.constant 64 : index
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %init = arith.constant dense<true> : tensor<64xi1, #blocked>
+    %carried = scf.for %i = %c0 to %c64 step %c1 iter_args(%mask = %init) -> (tensor<64xi1, #blocked>) {
+      %active = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+      %next = arith.andi %mask, %active : tensor<64xi1, #blocked>
+      scf.yield %next : tensor<64xi1, #blocked>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert "scf.for" in output.emitted_module.text
+    assert "scf.yield" in output.emitted_module.text
+    assert "arith.andi" not in output.emitted_module.text
     del ctx
 
 
