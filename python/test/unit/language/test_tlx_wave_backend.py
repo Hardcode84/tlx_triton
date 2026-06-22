@@ -1896,7 +1896,7 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
             "num_warps": 4,
             "expected_failure": (
                 "waveamd-reg-alloc",
-                "wave.lds_size = 135040",
+                "wave.lds_size = 139136",
             ),
         },
         {
@@ -4255,6 +4255,21 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
         (0, 96),
         (32, 96),
     )
+    layout_converts = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "layout_convert"
+    ]
+    native_remaps = [
+        attrs
+        for attrs in layout_converts
+        if attrs["mode"] == "mfma_vector_register_remap"
+    ]
+    assert [attrs["result_component_count"] for attrs in native_remaps] == [16, 16]
+    assert [attrs["scalar_result_component_count"] for attrs in native_remaps] == [
+        64,
+        64,
+    ]
     wave = output.emitted_module.text
     assert "64*floor(1/2*Mod(wi, 64))" in wave
     assert "native_register_layout" not in wave
@@ -4359,25 +4374,48 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         for op in output.target_program.ops
         if op.kind == "local_load_fragment"
     ]
+    layout_converts = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "layout_convert"
+    ]
+    native_remaps = [
+        attrs
+        for attrs in layout_converts
+        if attrs["mode"] == "mfma_vector_register_remap"
+    ]
 
     assert [attrs["load_mode"] for attrs in local_load_attrs] == [
         "swizzled_fragment_load",
         "b16_transpose",
     ]
+    assert [attrs["result_component_count"] for attrs in native_remaps] == [1, 1]
+    assert [attrs["scalar_result_component_count"] for attrs in native_remaps] == [
+        16,
+        16,
+    ]
     wave = output.emitted_module.text
     assert wave.count("wave.index_expr") == 6
     assert "xor(" in wave
-    assert "wave.binary andi" not in wave
-    assert "wave.binary shrui" not in wave
-    assert wave.count("wave.load") == 2
     assert wave.count("waveamd.transpose_load") == 4
+    lines = wave.splitlines()
+    transpose_load_lines = [
+        index for index, line in enumerate(lines) if "waveamd.transpose_load" in line
+    ]
+    transpose_load_prefix = "\n".join(
+        lines[: max(transpose_load_lines, default=-1) + 1]
+    )
+    assert "wave.binary andi" not in transpose_load_prefix
+    assert "wave.binary shrui" not in transpose_load_prefix
+    assert transpose_load_prefix.count("wave.load") == 2
     assert all(
         " after " not in line
-        for line in wave.splitlines()
+        for line in lines
         if "waveamd.transpose_load" in line
     )
-    assert wave.count("wave.pack") == 2
+    assert wave.count("wave.pack") == 4
     assert wave.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
+    _run_waveamd_to_machine(wave)
     del ctx
 
 

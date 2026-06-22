@@ -2081,14 +2081,6 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
         result_layout,
         op,
     )
-    if (
-        native_remap is not None
-        and (int(result.type.component_count) != 1 or instr_shape != (16, 16, 32))
-    ):
-        native_remap = None
-    mma_result_target_ids = result_target_ids
-    mma_result_layout_map_ids = result_layout_map_ids
-    mma_operand_target_ids = list(_operand_target_ids(builder, op))
     if native_remap is not None:
         native_acc_remap = layout_remap.mfma_accumulator_to_native_remap(
             acc,
@@ -2104,6 +2096,10 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
                 source_op_index=op.index,
                 source_value_id=op.operands[2],
             )
+    mma_result_target_ids = result_target_ids
+    mma_result_layout_map_ids = result_layout_map_ids
+    mma_operand_target_ids = list(_operand_target_ids(builder, op))
+    if native_remap is not None:
         native_acc_target_id = builder.add_value(
             target_ir.target_type_from_converted(acc.type),
             debug_name=f"v{op.operands[2]}_native_mfma_acc",
