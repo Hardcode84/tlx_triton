@@ -19,6 +19,12 @@ class EmittedWaveModule:
     lds_size: int = 0
 
 
+@dataclass(frozen=True)
+class _SharedPointerDwordBase:
+    base: object
+    dword_offset: object | None = None
+
+
 @dataclass
 class _EmissionState:
     dsl: object
@@ -28,6 +34,9 @@ class _EmissionState:
     fact_program: object | None
     values: dict[int, object]
     uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
+    shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(
+        default_factory=dict
+    )
     scratch_token: object | None = None
 
 
@@ -745,6 +754,7 @@ def _emit_for_loop(state, op):
         )
 
     outer_values = dict(state.values)
+    outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
     outer_scratch_token = state.scratch_token
     with state.builder.for_loop(
         lower,
@@ -786,6 +796,7 @@ def _emit_for_loop(state, op):
                 target_op_id=op.target_op_id,
             )
     state.values = outer_values
+    state.shared_pointer_dword_bases = outer_shared_pointer_dword_bases
     state.scratch_token = outer_scratch_token
 
     if len(op.results) != init_arg_count:
@@ -848,23 +859,28 @@ def _bind_loop_region_args(
 
 def _emit_local_alloc(state, op):
     attrs = target_ir.attrs_dict(op)
-    state.values[_single_result(op)] = state.builder.lds_base(
+    result_id = _single_result(op)
+    value = state.builder.lds_base(
         _scalar_type(state.dsl, attrs["element_type"]),
         offset=int(attrs.get("byte_offset", 0)),
     )
+    state.values[result_id] = value
+    state.shared_pointer_dword_bases[result_id] = _SharedPointerDwordBase(value)
 
 
 def _emit_memdesc_index(state, op):
     attrs = target_ir.attrs_dict(op)
     base, index = _operand_values(state, op, 2)
+    result_id = _single_result(op)
     static_offset = attrs.get("static_lds_byte_offset")
     if static_offset is not None:
-        result_id = _single_result(op)
         target_type = state.target_program.values[result_id].type
-        state.values[result_id] = state.builder.lds_base(
+        value = state.builder.lds_base(
             _scalar_type(state.dsl, target_type.element_type),
             offset=int(static_offset),
         )
+        state.values[result_id] = value
+        state.shared_pointer_dword_bases[result_id] = _SharedPointerDwordBase(value)
         return
     if isinstance(index, tuple):
         fail(
@@ -878,10 +894,56 @@ def _emit_memdesc_index(state, op):
     if elements_per_slot != 1:
         stride = state.builder.constant(index.type, elements_per_slot)
         offset = state.builder.binary(state.dsl.BinaryKind.MulI, index, stride)
-    state.values[_single_result(op)] = state.builder.ptr_add(
+    state.values[result_id] = state.builder.ptr_add(
         base,
         offset,
         result_type=base.type,
+    )
+    _record_dynamic_memdesc_dword_base(
+        state,
+        op,
+        result_id,
+        op.operands[0],
+        index,
+        elements_per_slot,
+        attrs.get("element_byte_width"),
+    )
+
+
+def _record_dynamic_memdesc_dword_base(
+    state,
+    op,
+    result_id,
+    base_id,
+    index,
+    elements_per_slot,
+    element_byte_width,
+):
+    base_plan = state.shared_pointer_dword_bases.get(base_id)
+    if base_plan is None or element_byte_width is None:
+        return
+    if str(index.type) != str(state.dsl.i32()):
+        return
+    slot_bytes = int(elements_per_slot) * int(element_byte_width)
+    if slot_bytes % 4:
+        return
+    slot_dwords = slot_bytes // 4
+    if slot_dwords == 1:
+        dword_offset = index
+    else:
+        dword_offset = _scalar_binary_const_i32(
+            state,
+            "muli",
+            index,
+            slot_dwords,
+        )
+    state.shared_pointer_dword_bases[result_id] = _SharedPointerDwordBase(
+        base_plan.base,
+        _combine_optional_i32_offsets(
+            state,
+            base_plan.dword_offset,
+            dword_offset,
+        ),
     )
 
 
@@ -906,6 +968,7 @@ def _emit_buffer_load_to_local(state, op):
             state,
             op,
             attrs,
+            op.operands[0],
             dest_base,
             buffer_base,
             scalar_values,
@@ -1227,6 +1290,7 @@ def _emit_buffer_load_to_local_packet_dma(
     state,
     op,
     attrs,
+    dest_base_target_id,
     dest_base,
     buffer_base,
     scalar_values,
@@ -1255,7 +1319,13 @@ def _emit_buffer_load_to_local_packet_dma(
         lane_width,
     )
     i32_shared = state.dsl.ptr_type(state.dsl.i32(), state.dsl.shared_address_space())
-    dest_base_i32 = _ptr_cast(state, dest_base, i32_shared)
+    dword_base = state.shared_pointer_dword_bases.get(dest_base_target_id)
+    dest_base_offset = None
+    if dword_base is not None:
+        dest_base_i32 = _ptr_cast(state, dword_base.base, i32_shared)
+        dest_base_offset = dword_base.dword_offset
+    else:
+        dest_base_i32 = _ptr_cast(state, dest_base, i32_shared)
     lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
     wave_first = None
     destination_wave_stride_dwords = int(attrs.get("destination_wave_stride_dwords", 0))
@@ -1304,6 +1374,11 @@ def _emit_buffer_load_to_local_packet_dma(
             wave_first,
             lane_width,
             op,
+        )
+        dest_offset = _combine_optional_i32_offsets(
+            state,
+            dest_base_offset,
+            dest_offset,
         )
         if dest_offset is None:
             dest_ptr = dest_base_i32
@@ -3155,6 +3230,14 @@ def _scalar_binary_const_i32(state, operation, value, constant):
         operation_kind = _binary_kind(state.dsl, operation)
     rhs = state.builder.constant(state.dsl.i32(), constant)
     return state.builder.binary(operation_kind, value, rhs)
+
+
+def _combine_optional_i32_offsets(state, lhs, rhs):
+    if lhs is None:
+        return rhs
+    if rhs is None:
+        return lhs
+    return state.builder.binary(state.dsl.BinaryKind.AddI, lhs, rhs)
 
 
 def _require_dim_slot(dim, coords, op):

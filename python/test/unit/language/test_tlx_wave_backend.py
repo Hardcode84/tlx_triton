@@ -2247,6 +2247,7 @@ def test_tlx_wave_converter_pipeline_lowers_memdesc_index(tmp_path):
         "return",
     ]
     assert converter_target_ir.attrs_dict(output.target_program.ops[2]) == {
+        "element_byte_width": 2,
         "elements_per_slot": 64,
         "static_lds_byte_offset": 128,
     }
@@ -2300,6 +2301,53 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert "waveamd.dma_load_lds" in output.emitted_module.text
     assert "wave.wait" in output.emitted_module.text
     assert "wave.barrier" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_dynamic_memdesc_index_packet_dma_destination(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_dynamic_memdesc_dma(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %stage: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x512xf16, #shared, #smem, mutable>
+    %view = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<2x512xf16, #shared, #smem, mutable> -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %view : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops] == [
+        "local_alloc",
+        "memdesc_index",
+        "make_range",
+        "buffer_load_to_local",
+        "async_commit_group",
+        "async_wait",
+        "return",
+    ]
+    memdesc_attrs = converter_target_ir.attrs_dict(output.target_program.ops[1])
+    assert memdesc_attrs["element_byte_width"] == 2
+    assert memdesc_attrs["elements_per_slot"] == 512
+    assert memdesc_attrs["static_lds_byte_offset"] is None
+    load_attrs = converter_target_ir.attrs_dict(output.target_program.ops[3])
+    assert load_attrs["mode"] == "dma_packet_lds"
+    wave = output.emitted_module.text
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_lds_b128" in machine
     del ctx
 
 

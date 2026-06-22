@@ -1067,6 +1067,7 @@ def _convert_memdesc_index(
         operands=_operand_target_ids(builder, op),
         results=result_target_ids,
         attrs={
+            "element_byte_width": memdesc.element_byte_width,
             "elements_per_slot": element_count,
             "static_lds_byte_offset": static_lds_byte_offset,
         },
