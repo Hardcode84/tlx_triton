@@ -1,5 +1,6 @@
 import ast
 from contextlib import contextmanager
+import importlib.util
 from pathlib import Path
 import re
 import subprocess
@@ -13,6 +14,7 @@ import triton.language as tl
 from triton.backends import backends
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
+from triton.runtime.jit import MockTensor
 
 if "tlx_wave" in backends:
     from triton.backends.tlx_wave import compiler as tlx_wave_compiler
@@ -106,6 +108,90 @@ def _active_tlx_wave_driver():
         yield
     finally:
         triton.runtime.driver.set_active(previous_driver)
+
+
+@contextmanager
+def _tlx_wave_compile_driver(monkeypatch):
+    previous_default = triton.runtime.driver._default
+    previous_active = triton.runtime.driver._active
+    monkeypatch.setenv("TRITON_DEFAULT_BACKEND", "tlx_wave")
+    try:
+        triton.runtime.driver._default = None
+        triton.runtime.driver._active = None
+        active_driver = triton.runtime.driver.active
+    except RuntimeError as exc:
+        pytest.skip(f"requires active TLX Wave compile driver: {exc}")
+    try:
+        yield active_driver
+    finally:
+        triton.runtime.driver._default = previous_default
+        triton.runtime.driver._active = previous_active
+
+
+def _load_tlx_gfx9_gemm_kernel(version_dir, function_name):
+    repo_root = Path(__file__).resolve().parents[4]
+    kernel_path = (
+        repo_root
+        / "third_party"
+        / "tlx"
+        / "tutorials"
+        / "gfx9_gemm"
+        / "a16w16"
+        / version_dir
+        / "matmul_kernel.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"_tlx_wave_test_{version_dir}_{function_name}",
+        kernel_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, function_name)
+
+
+def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
+    torch = pytest.importorskip("torch")
+    if case.get("disables_post_misched", False):
+        monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    kernel = _load_tlx_gfx9_gemm_kernel(case["version_dir"], case["function_name"])
+
+    m = n = k = 256
+    a = MockTensor(torch.float16, [m, k])
+    b = MockTensor(torch.float16, [k, n])
+    c = MockTensor(torch.float16, [m, n])
+    a_strides = a.stride()
+    b_strides = b.stride()
+    c_strides = c.stride()
+
+    with (
+        _tlx_wave_compile_driver(monkeypatch),
+        triton.knobs.cache.scope(),
+        triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{case['version_dir']}-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        return kernel.warmup(
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            a_strides[0],
+            a_strides[1],
+            b_strides[0],
+            b_strides[1],
+            c_strides[0],
+            c_strides[1],
+            BLOCK_M=256,
+            BLOCK_N=256,
+            BLOCK_K=64,
+            num_warps=case["num_warps"],
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            grid=(1,),
+            **case.get("extra_meta", {}),
+        )
 
 
 def test_tlx_wave_converter_import_stage_boundary_is_static():
@@ -1716,6 +1802,52 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "version_dir": "v7_slice",
+            "function_name": "v7_slice",
+            "num_warps": 4,
+        },
+        {
+            "version_dir": "v8_warp_pipeline",
+            "function_name": "v8_warp_pipeline",
+            "num_warps": 8,
+            "disables_post_misched": True,
+        },
+        {
+            "version_dir": "v9_beyond_hotloop",
+            "function_name": "v9_beyond_hotloop",
+            "num_warps": 8,
+            "disables_post_misched": True,
+            "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
+        },
+    ],
+    ids=lambda case: case["version_dir"],
+)
+def test_tlx_wave_backend_compiles_gfx9_gemm_v7_to_v9_to_hsaco(
+    tmp_path,
+    monkeypatch,
+    case,
+):
+    compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
+    wave_artifact = _asm_text(compiled, "wave")
+    hsaco = compiled.asm["hsaco"]
+
+    assert "tlx_wave.new_converter" in wave_artifact
+    assert "gpu.kernel" in wave_artifact
+    assert isinstance(hsaco, bytes)
+    assert hsaco.startswith(b"\x7fELF")
+    assert compiled.kernel == hsaco
+    assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
+    assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+    assert compiled.metadata.tlx_wave_hsaco_size_bytes == len(hsaco)
+    assert compiled.metadata.tlx_wave_ttgir_target == "hip:gfx950"
+    assert compiled.metadata.tlx_wave_num_mmas > 0
+    assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
 
 
 def test_tlx_wave_runtime_launches_no_memory_kernel():
