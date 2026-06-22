@@ -176,14 +176,52 @@ def _emit_binary(state, op):
                 target_op_id=op.target_op_id,
                 target_value_id=result_id,
             )
-        false_mask = _wave_mask_constant(
-            state,
-            _wave_type(state.dsl, result_type),
-            False,
-        )
+        false_i1 = None
+        false_mask = None
         reused = []
-        state.values[result_id] = _pack_components(
-            tuple(
+        components = []
+        for lhs_component, rhs_component in zip(lhs_components, rhs_components):
+            if _is_scalar_i1_value(state, lhs_component) and _is_scalar_i1_value(
+                state,
+                rhs_component,
+            ):
+                if false_i1 is None:
+                    false_i1 = _scalar_constant(
+                        state,
+                        state.dsl.i1(),
+                        "i1",
+                        False,
+                        op,
+                    )
+
+                def emit_scalar_mask_and(
+                    lhs_component=lhs_component,
+                    rhs_component=rhs_component,
+                    false_i1=false_i1,
+                ):
+                    return state.builder.select(
+                        lhs_component,
+                        rhs_component,
+                        false_i1,
+                    )
+
+                components.append(
+                    _reuse_component_result(
+                        reused,
+                        (lhs_component, rhs_component, false_i1),
+                        emit_scalar_mask_and,
+                    )
+                )
+                continue
+            if _is_scalar_i1_value(state, rhs_component):
+                lhs_component, rhs_component = rhs_component, lhs_component
+            if false_mask is None:
+                false_mask = _wave_mask_constant(
+                    state,
+                    _wave_type(state.dsl, result_type),
+                    False,
+                )
+            components.append(
                 _reuse_component_result(
                     reused,
                     (lhs_component, rhs_component, false_mask),
@@ -193,9 +231,8 @@ def _emit_binary(state, op):
                         false_mask,
                     ),
                 )
-                for lhs_component, rhs_component in zip(lhs_components, rhs_components)
             )
-        )
+        state.values[result_id] = _pack_components(tuple(components))
         return
     reused = []
     state.values[result_id] = _pack_components(
@@ -501,6 +538,19 @@ def _emit_splat(state, op):
     operand = _operand_values(state, op, 1)[0]
     result_id = _single_result(op)
     target_type = state.target_program.values[result_id].type
+    if target_type.representation in {"mask", "mask_tuple"}:
+        if not _is_scalar_i1_value(state, operand):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_MASK_SPLAT",
+                STAGE,
+                f"mask splat expects scalar i1, got {operand.type}",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+        state.values[result_id] = _pack_components(
+            tuple(operand for _ in range(_component_count(state, result_id)))
+        )
+        return
     splat = state.builder.splat(
         operand,
         _splat_element_type(state.dsl, target_type),
@@ -1067,16 +1117,17 @@ def _emit_buffer_load_to_local(state, op):
                 f"unsupported buffer_load_to_local mask mode {mask_mode}",
                 target_op_id=op.target_op_id,
             )
-        with state.builder.where(
-            mask_components[index],
-            [state.dsl.mem_token_type()],
-        ) as where:
-            store_token = emit_component_load_store(
-                index,
-                offset_component,
+        component_tokens.append(
+            _emit_masked_token_region(
+                state,
+                mask_components[index],
+                dependency,
+                lambda index=index, offset_component=offset_component: emit_component_load_store(
+                    index,
+                    offset_component,
+                ),
             )
-            state.builder.yield_([store_token])
-        component_tokens.append(where.results[0])
+        )
     state.values[_single_result(op)] = _join_memory_tokens(state, component_tokens)
 
 
@@ -2292,8 +2343,14 @@ def _emit_buffer_store(state, op):
                 f"unsupported buffer_store mask mode {mask_mode}",
                 target_op_id=op.target_op_id,
             )
-        with state.builder.where(mask_components[index]):
-            state.builder.store(value_component, ptr)
+        _emit_masked_effect_region(
+            state,
+            mask_components[index],
+            lambda value_component=value_component, ptr=ptr: state.builder.store(
+                value_component,
+                ptr,
+            ),
+        )
 
 
 def _emit_buffer_load(state, op):
@@ -2371,7 +2428,7 @@ def _emit_buffer_load(state, op):
                     f"unsupported buffer_load mask mode {mask_mode}",
                     target_op_id=op.target_op_id,
                 )
-            with state.builder.where(mask_components[index], [result_type]) as where:
+            def emit_active_load(offset_component=offset_component):
                 active_offset = _assume_value_range(
                     state,
                     offset_component,
@@ -2384,14 +2441,42 @@ def _emit_buffer_load(state, op):
                     result_type=ptr_type,
                 )
                 loaded, _token = state.builder.load(ptr, result_type)
-                state.builder.yield_([loaded])
-            loaded = where.results[0]
+                return loaded
+
+            other_component = None
             if other_components is not None:
                 other_component = (
                     other_components[0]
                     if len(other_components) == 1
                     else other_components[index]
                 )
+            if _is_scalar_i1_value(state, mask_components[index]):
+                loaded = _emit_masked_value_region(
+                    state,
+                    mask_components[index],
+                    result_type,
+                    other_component
+                    if other_component is not None
+                    else _zero_simd_value(
+                        state,
+                        result_type,
+                        attrs["element_type"],
+                        op,
+                    ),
+                    emit_active_load,
+                )
+            else:
+                with state.builder.where(
+                    mask_components[index],
+                    [result_type],
+                ) as where:
+                    loaded = emit_active_load()
+                    state.builder.yield_([loaded])
+                loaded = where.results[0]
+            if other_component is not None and not _is_scalar_i1_value(
+                state,
+                mask_components[index],
+            ):
                 loaded = state.builder.select(
                     mask_components[index],
                     loaded,
@@ -2453,8 +2538,14 @@ def _emit_store(state, op):
                 f"unsupported store mask mode {mask_mode}",
                 target_op_id=op.target_op_id,
             )
-        with state.builder.where(mask_components[index]):
-            state.builder.store(value_component, ptr_component)
+        _emit_masked_effect_region(
+            state,
+            mask_components[index],
+            lambda value_component=value_component, ptr_component=ptr_component: state.builder.store(
+                value_component,
+                ptr_component,
+            ),
+        )
 
 
 def _emit_load(state, op):
@@ -2517,15 +2608,44 @@ def _emit_load(state, op):
                     f"unsupported load mask mode {mask_mode}",
                     target_op_id=op.target_op_id,
                 )
-            with state.builder.where(mask_components[index], [result_type]) as where:
+            def emit_active_load(ptr_component=ptr_component):
                 loaded, _token = state.builder.load(ptr_component, result_type)
-                state.builder.yield_([loaded])
-            loaded = where.results[0]
-            if other_components is not None:
+                return loaded
+
+            other_component = (
+                None if other_components is None else other_components[index]
+            )
+            if _is_scalar_i1_value(state, mask_components[index]):
+                loaded = _emit_masked_value_region(
+                    state,
+                    mask_components[index],
+                    result_type,
+                    other_component
+                    if other_component is not None
+                    else _zero_simd_value(
+                        state,
+                        result_type,
+                        attrs["element_type"],
+                        op,
+                    ),
+                    emit_active_load,
+                )
+            else:
+                with state.builder.where(
+                    mask_components[index],
+                    [result_type],
+                ) as where:
+                    loaded = emit_active_load()
+                    state.builder.yield_([loaded])
+                loaded = where.results[0]
+            if other_component is not None and not _is_scalar_i1_value(
+                state,
+                mask_components[index],
+            ):
                 loaded = state.builder.select(
                     mask_components[index],
                     loaded,
-                    other_components[index],
+                    other_component,
                 )
         loaded_components.append(loaded)
     state.values[result_id] = _pack_components(tuple(loaded_components))
@@ -2546,6 +2666,57 @@ def _memory_simd_component(state, value, element_type, lane_width, op, splat_cac
         splat_cache,
         (value,),
         lambda: state.builder.splat(value, scalar_type, int(lane_width)),
+    )
+
+
+def _emit_masked_effect_region(state, condition, emit_body):
+    if _is_scalar_i1_value(state, condition):
+        with state.builder.if_(condition):
+            emit_body()
+        return
+    with state.builder.where(condition):
+        emit_body()
+
+
+def _emit_masked_token_region(state, condition, inactive_token, emit_body):
+    result_type = state.dsl.mem_token_type()
+    if _is_scalar_i1_value(state, condition):
+        with state.builder.if_(condition, [result_type], otherwise=True) as ifop:
+            state.builder.yield_([emit_body()])
+            with ifop.otherwise():
+                state.builder.yield_([inactive_token])
+        return ifop.results[0]
+    with state.builder.where(condition, [result_type]) as where:
+        state.builder.yield_([emit_body()])
+    return where.results[0]
+
+
+def _emit_masked_value_region(
+    state,
+    condition,
+    result_type,
+    inactive_value,
+    emit_body,
+):
+    if _is_scalar_i1_value(state, condition):
+        with state.builder.if_(condition, [result_type], otherwise=True) as ifop:
+            state.builder.yield_([emit_body()])
+            with ifop.otherwise():
+                state.builder.yield_([inactive_value])
+        return ifop.results[0]
+    with state.builder.where(condition, [result_type]) as where:
+        state.builder.yield_([emit_body()])
+    return where.results[0]
+
+
+def _zero_simd_value(state, result_type, element_type, op):
+    return _wave_constant(
+        state,
+        result_type,
+        _scalar_type(state.dsl, element_type),
+        element_type,
+        0,
+        op,
     )
 
 
@@ -3078,6 +3249,13 @@ def _is_simd_value(dsl, value):
     except ValueError:
         return False
     return True
+
+
+def _is_scalar_i1_value(state, value):
+    is_integer = getattr(value.type, "is_integer", None)
+    if is_integer is not None and bool(is_integer(1)):
+        return True
+    return str(value.type) == str(state.dsl.i1())
 
 
 def _cmpi(state, predicate_name, lhs, rhs):

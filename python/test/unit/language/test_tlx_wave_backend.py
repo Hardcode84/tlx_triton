@@ -2387,6 +2387,48 @@ def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(
     del ctx
 
 
+def test_tlx_wave_converter_lowers_splat_i1_buffer_load_to_local_mask(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_splat_i1_buffer_load_to_local_mask(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %stage: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %two = arith.constant 2 : i32
+    %three = arith.constant 3 : i32
+    %active_a = arith.cmpi ne, %stage, %two : i32
+    %active_b = arith.cmpi ne, %stage, %three : i32
+    %mask_a = tt.splat %active_a : i1 -> tensor<64xi1, #blocked>
+    %mask_b = tt.splat %active_b : i1 -> tensor<64xi1, #blocked>
+    %mask = arith.andi %mask_a, %mask_b : tensor<64xi1, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] mask = %mask into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    assert "scf.if" in wave
+    assert "wave.select" in wave
+    assert "arith.andi" not in wave
+    assert "i1 -> !wave.simd<i1" not in wave
+    assert "wave.where" not in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_b16" in machine
+    del ctx
+
+
 def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(
     tmp_path,
 ):
