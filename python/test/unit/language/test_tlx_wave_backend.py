@@ -836,6 +836,75 @@ def test_tlx_wave_converter_token_stage_records_loop_async_final_wait_carry(
     del ctx
 
 
+def test_tlx_wave_converter_token_stage_records_multi_group_loop_carries(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_token_multi_async_for(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup0_group = ttg.async_commit_group tokens %warmup0
+    %warmup1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup1_group = ttg.async_commit_group tokens %warmup1
+    %warmup2 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup2_group = ttg.async_commit_group tokens %warmup2
+    %warmup3 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup3_group = ttg.async_commit_group tokens %warmup3
+    %prewait = ttg.async_wait {num = 3 : i32}
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %wait0 = ttg.async_wait {num = 2 : i32}
+      %body0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body0_group = ttg.async_commit_group tokens %body0
+      %wait1 = ttg.async_wait {num = 2 : i32}
+      %body1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body1_group = ttg.async_commit_group tokens %body1
+      %wait2 = ttg.async_wait {num = 2 : i32}
+      %body2 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body2_group = ttg.async_commit_group tokens %body2
+      %wait3 = ttg.async_wait {num = 2 : i32}
+      %body3 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body3_group = ttg.async_commit_group tokens %body3
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    for_op = next(op for op in source.ops if op.name == "scf.for")
+    group_ops = [op for op in source.ops if op.name == "ttg.async_commit_group"]
+    load_ops = [op for op in source.ops if op.name == "amdg.buffer_load_to_local"]
+    carries = token_program.loop_token_carries_by_op[for_op.index]
+    assert tuple(carry.loop_op_index for carry in carries) == (for_op.index,) * 3
+    assert tuple(carry.init_source_value_id for carry in carries) == tuple(
+        op.results[0] for op in group_ops[1:4]
+    )
+    assert tuple(carry.yield_source_value_id for carry in carries) == tuple(
+        op.results[0] for op in group_ops[5:8]
+    )
+    assert tuple(carry.add_issue_dependency for carry in carries) == (True, True, True)
+    assert tuple(carry.issue_dependency_op_indices for carry in carries) == tuple(
+        (op.index,) for op in load_ops[4:7]
+    )
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_orders_generic_memory_effects(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -2841,6 +2910,76 @@ def test_tlx_wave_converter_pipeline_carries_async_tokens_through_nested_for(
     )
     assert wave.count("waveamd.dma_load_lds") == 4
     assert wave.count("scf.for") == 2
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_multiple_async_groups_across_for(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_multi_async_for(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup0_group = ttg.async_commit_group tokens %warmup0
+    %warmup1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup1_group = ttg.async_commit_group tokens %warmup1
+    %warmup2 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup2_group = ttg.async_commit_group tokens %warmup2
+    %warmup3 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup3_group = ttg.async_commit_group tokens %warmup3
+    %prewait = ttg.async_wait {num = 3 : i32}
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %wait0 = ttg.async_wait {num = 2 : i32}
+      %body0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body0_group = ttg.async_commit_group tokens %body0
+      %wait1 = ttg.async_wait {num = 2 : i32}
+      %body1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body1_group = ttg.async_commit_group tokens %body1
+      %wait2 = ttg.async_wait {num = 2 : i32}
+      %body2 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body2_group = ttg.async_commit_group tokens %body2
+      %wait3 = ttg.async_wait {num = 2 : i32}
+      %body3 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body3_group = ttg.async_commit_group tokens %body3
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (for_op,) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    for_attrs = converter_target_ir.attrs_dict(for_op)
+    assert for_attrs["source_result_count"] == 1
+    assert for_attrs["init_arg_count"] == 4
+    dma_ops = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    assert [
+        converter_target_ir.attrs_dict(op)["issue_dependency_count"]
+        for op in dma_ops
+    ] == [0, 0, 0, 0, 1, 1, 1, 0]
+    wave = output.emitted_module.text
+    assert re.search(
+        r"scf\.for .*-> \(i32, !wave\.mem\.token, !wave\.mem\.token, "
+        r"!wave\.mem\.token\)",
+        wave,
+    )
+    assert wave.count("waveamd.dma_load_lds") == 8
     del ctx
 
 

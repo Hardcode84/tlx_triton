@@ -201,48 +201,52 @@ def _loop_token_carries_for_body(
     groups_by_value_id,
     nodes_by_value_id,
 ):
-    waited_external_tokens = []
-    for node in nodes:
-        if node.op_index not in body_op_indices or node.op_name != "ttg.async_wait":
-            continue
-        for group_id in node.waited_group_ids:
-            group = groups_by_id[group_id]
-            if group.commit_op_index in body_op_indices or group.token_value_id is None:
-                continue
-            waited_external_tokens.append(group.token_value_id)
-    committed_body_tokens = tuple(
-        group.token_value_id
-        for group in sorted(groups, key=lambda group: group.commit_op_index)
-        if group.commit_op_index in body_op_indices and group.token_value_id is not None
+    external_wait_issue_pairs = _loop_external_wait_issue_pairs(
+        nodes,
+        groups,
+        groups_by_id,
+        body_op_indices,
     )
-    waited_external_tokens = _dedupe_preserving_order(waited_external_tokens)
+    waited_external_tokens = _dedupe_preserving_order(
+        init_token_id for init_token_id, _issue_token_id in external_wait_issue_pairs
+    )
     externally_waited_body_tokens = _externally_waited_body_tokens(
         nodes,
         groups_by_id,
         body_op_indices,
     )
     if waited_external_tokens:
-        if len(waited_external_tokens) != 1 or len(committed_body_tokens) != 1:
+        issue_tokens_by_init = {
+            init_token_id: issue_token_id
+            for init_token_id, issue_token_id in external_wait_issue_pairs
+        }
+        if (
+            len(externally_waited_body_tokens) != len(waited_external_tokens)
+            or len(issue_tokens_by_init) != len(waited_external_tokens)
+        ):
             fail(
                 "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
                 STAGE,
-                "scf.for async token carry supports one external waited group "
-                "and one body commit group",
+                "scf.for async token carry requires each externally waited group "
+                "to map to one loop-exit body group and one subsequent body issue",
                 source_op_index=op.index,
             )
-        yield_source_value_id = committed_body_tokens[0]
-        return (
+        return tuple(
             LoopTokenCarry(
-                op.index,
-                waited_external_tokens[0],
-                yield_source_value_id,
-                True,
-                _group_issue_dependency_op_indices(
+                loop_op_index=op.index,
+                init_source_value_id=init_source_value_id,
+                yield_source_value_id=yield_source_value_id,
+                add_issue_dependency=True,
+                issue_dependency_op_indices=_group_issue_dependency_op_indices(
                     groups_by_value_id,
                     nodes_by_value_id,
-                    yield_source_value_id,
+                    issue_tokens_by_init[init_source_value_id],
                 ),
-            ),
+            )
+            for init_source_value_id, yield_source_value_id in zip(
+                waited_external_tokens,
+                externally_waited_body_tokens,
+            )
         )
     return tuple(
         LoopTokenCarry(
@@ -253,6 +257,78 @@ def _loop_token_carries_for_body(
         )
         for body_token in externally_waited_body_tokens
     )
+
+
+def _loop_external_wait_issue_pairs(nodes, groups, groups_by_id, body_op_indices):
+    body_groups = tuple(
+        group
+        for group in sorted(groups, key=lambda group: group.commit_op_index)
+        if group.commit_op_index in body_op_indices and group.token_value_id is not None
+    )
+    body_groups_after_index = 0
+    assigned_body_tokens = set()
+    committed_queue = []
+    groups_by_commit = {group.commit_op_index: group for group in groups}
+    nodes_by_op = {node.op_index: node for node in nodes}
+    token_op_indices = sorted(set(groups_by_commit) | set(nodes_by_op))
+    pairs = []
+    for op_index in token_op_indices:
+        group = groups_by_commit.get(op_index)
+        if group is not None:
+            committed_queue.append(group)
+        node = nodes_by_op.get(op_index)
+        if node is None or node.op_name != "ttg.async_wait":
+            continue
+        external_waited_tokens = []
+        for group_id in node.waited_group_ids:
+            waited_group = groups_by_id[group_id]
+            if (
+                node.op_index not in body_op_indices
+                or waited_group.commit_op_index in body_op_indices
+                or waited_group.token_value_id is None
+            ):
+                continue
+            external_waited_tokens.append(waited_group.token_value_id)
+        for init_token_id in external_waited_tokens:
+            waited_group_ids = set(node.waited_group_ids)
+            issue_group = next(
+                (
+                    queued_group
+                    for queued_group in committed_queue
+                    if queued_group.commit_op_index in body_op_indices
+                    and queued_group.group_id not in waited_group_ids
+                    and queued_group.token_value_id is not None
+                    and queued_group.token_value_id not in assigned_body_tokens
+                ),
+                None,
+            )
+            while issue_group is None and body_groups_after_index < len(body_groups):
+                candidate = body_groups[body_groups_after_index]
+                body_groups_after_index += 1
+                if (
+                    candidate.commit_op_index <= node.op_index
+                    or candidate.token_value_id in assigned_body_tokens
+                ):
+                    continue
+                issue_group = candidate
+            if issue_group is None:
+                fail(
+                    "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
+                    STAGE,
+                    "scf.for async token carry could not find a body issue "
+                    "for an external wait",
+                    source_op_index=node.op_index,
+                )
+            pairs.append((init_token_id, issue_group.token_value_id))
+            assigned_body_tokens.add(issue_group.token_value_id)
+        if node.waited_group_ids:
+            waited_group_ids = set(node.waited_group_ids)
+            committed_queue = [
+                queued_group
+                for queued_group in committed_queue
+                if queued_group.group_id not in waited_group_ids
+            ]
+    return tuple(pairs)
 
 
 def _externally_waited_body_tokens(nodes, groups_by_id, body_op_indices):
