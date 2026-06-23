@@ -2559,7 +2559,15 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
         ("transposed_b", "transposed"),
     ],
 )
-def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout):
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (256, 256, 256),
+        (1024, 1024, 1024),
+    ],
+    ids=["256", "1024"],
+)
+def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout, m, n, k):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
         pytest.skip(f"requires physical gfx950 hardware for gfx950 v9 e2e, got {arch}")
@@ -2568,7 +2576,6 @@ def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout):
         f"_tlx_wave_v9_runtime_{case_name}",
     )
 
-    m = n = k = 256
     device = torch.device("cuda")
     torch.manual_seed(0)
     a = torch.randn((m, k), device=device, dtype=torch.float16)
@@ -2583,7 +2590,39 @@ def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout):
         triton.knobs.cache.scope(),
         triton.knobs.runtime.scope(),
     ):
-        triton.knobs.cache.dir = str(tmp_path / f"{case_name}-cache")
+        triton.knobs.cache.dir = str(tmp_path / f"{case_name}-{m}x{n}x{k}-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.matmul(a, b)
+        torch.cuda.synchronize()
+
+    expected = torch.matmul(a, b)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got, expected, atol=1e-1, rtol=0)
+
+
+def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for gfx950 v9 e2e, got {arch}")
+    tutorial = _load_tlx_gfx9_gemm_module(
+        "v9_beyond_hotloop",
+        "_tlx_wave_v9_runtime_group_swizzle_multi_n",
+    )
+
+    m, n, k = 512, 1024, 256
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    b = torch.randn((n, k), device=device, dtype=torch.float16).T
+    assert b.shape == (k, n)
+    assert b.stride() == (1, k)
+
+    with (
+        _active_tlx_wave_driver(),
+        triton.knobs.cache.scope(),
+        triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / "group-swizzle-multi-n-cache")
         triton.knobs.runtime.override_arch = "gfx950"
         got = tutorial.matmul(a, b)
         torch.cuda.synchronize()
