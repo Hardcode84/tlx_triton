@@ -2877,11 +2877,14 @@ def _emit_mma(state, op):
             "mma accumulator component count does not match tile attrs",
             target_op_id=op.target_op_id,
         )
+    swap_operands = bool(attrs.get("swap_operands_for_transposed_result", False))
+    lhs_role = int(attrs["rhs_role"] if swap_operands else attrs["lhs_role"])
+    rhs_role = int(attrs["lhs_role"] if swap_operands else attrs["rhs_role"])
     lhs_components = tuple(
         _ensure_mma_fragment(
             state,
             component,
-            role=int(attrs["lhs_role"]),
+            role=lhs_role,
             element_type=attrs["lhs_element_type"],
             rows=int(attrs["lhs_rows"]),
             columns=int(attrs["lhs_columns"]),
@@ -2894,7 +2897,7 @@ def _emit_mma(state, op):
         _ensure_mma_fragment(
             state,
             component,
-            role=int(attrs["rhs_role"]),
+            role=rhs_role,
             element_type=attrs["rhs_element_type"],
             rows=int(attrs["rhs_rows"]),
             columns=int(attrs["rhs_columns"]),
@@ -2929,10 +2932,14 @@ def _emit_mma(state, op):
             index = m_tile * n_tiles + n_tile
             acc_value = acc_components[index]
             for k_tile in range(k_tiles):
+                lhs_value = lhs_components[m_tile * k_tiles + k_tile]
+                rhs_value = rhs_components[n_tile * k_tiles + k_tile]
+                if swap_operands:
+                    lhs_value, rhs_value = rhs_value, lhs_value
                 acc_value = state.builder.mma(
                     attrs["kind"],
-                    lhs_components[m_tile * k_tiles + k_tile],
-                    rhs_components[n_tile * k_tiles + k_tile],
+                    lhs_value,
+                    rhs_value,
                     acc_value,
                 )
             # Fragments are only MMA-local values. The bridge state carries the
@@ -2958,8 +2965,6 @@ def _ensure_mma_fragment(
     lane_width,
     registers,
 ):
-    if state.dsl.FragmentType.isinstance(value.type):
-        return value
     fragment_type = state.dsl.fragment_type(
         int(role),
         _scalar_type(state.dsl, element_type),
@@ -2968,6 +2973,30 @@ def _ensure_mma_fragment(
         int(lane_width),
         int(registers),
     )
+    if state.dsl.FragmentType.isinstance(value.type):
+        current = state.dsl.FragmentType(value.type)
+        if value.type == fragment_type:
+            return value
+        if (
+            int(current.wave_size) != int(lane_width)
+            or int(current.registers) != int(registers)
+            or int(current.rows) != int(rows)
+            or int(current.columns) != int(columns)
+            or str(current.element_type) != str(_scalar_type(state.dsl, element_type))
+        ):
+            fail(
+                "TLXW_EMIT_FRAGMENT_TYPE",
+                STAGE,
+                "mma fragment retag requires matching element type, wave "
+                "size, shape, and register width",
+            )
+        value = state.dsl.waveamd.FragmentUnpackOp(
+            state.dsl.simd_type(
+                state.dsl.vector_type(int(registers), state.dsl.i32()),
+                width=int(lane_width),
+            ),
+            value,
+        ).result
     return state.builder.fragment_pack(value, fragment_type)
 
 

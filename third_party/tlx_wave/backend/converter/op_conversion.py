@@ -2136,6 +2136,16 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
         )
     kind = _mma_kind(lhs.type.element_type, instr_shape, op)
+    is_transposed = bool(result_layout.properties.get("is_transposed", False))
+    if is_transposed and int(instr_shape[0]) != int(instr_shape[1]):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "transposed MFMA dot lowering requires a symmetric instruction "
+            f"shape, got {instr_shape}",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
     warps_per_cta = tuple(result_layout.properties.get("warps_per_cta", ()))
     m_tiles, n_tiles = _mfma_per_wave_tiles(result_layout, instr_shape, warps_per_cta, op)
     acc_layout = _require_layout(type_layout_program, acc.layout_map_id, op)
@@ -2225,6 +2235,7 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
             "rhs_registers": int(rhs_registers),
             "rhs_role": 1,
             "rhs_rows": int(operand_rows),
+            "swap_operands_for_transposed_result": bool(is_transposed),
         },
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,

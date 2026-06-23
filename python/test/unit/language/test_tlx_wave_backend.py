@@ -5246,6 +5246,8 @@ def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
     ]
     assert len(explicit_convert_ops) == 1
     assert explicit_convert_ops[0].results[0] == mma_op.operands[2]
+    mma_attrs = converter_target_ir.attrs_dict(mma_op)
+    assert mma_attrs["swap_operands_for_transposed_result"] is True
     dot_source_op = next(op for op in output.source_program.ops if op.name == "tt.dot")
     assert (
         output.target_program.values[mma_op.results[0]].source_value_id
