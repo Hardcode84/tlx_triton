@@ -32,6 +32,13 @@ PROVIDER_LABELS = {
 }
 
 BENCH_DIR = Path(__file__).resolve().parent
+TILE_M = 256
+TILE_N = 256
+TILE_K = 64
+TWO_STAGE_K = 2 * TILE_K
+TUTORIAL_PROVIDERS = frozenset({"tlx", "wave"})
+TWO_STAGE_K_VERSIONS = frozenset(range(5, 10))
+UNTILED_K_VERSIONS = frozenset({0, 1})
 
 
 def get_x_vals():
@@ -58,6 +65,36 @@ def parse_shape(text):
     if any(dim <= 0 for dim in shape):
         raise argparse.ArgumentTypeError(f"shape dimensions must be positive: {text!r}")
     return shape
+
+
+def validate_shape_for_providers(shape, version, providers):
+    if not TUTORIAL_PROVIDERS.intersection(providers):
+        return
+    M, N, K = shape
+    if M % TILE_M:
+        raise argparse.ArgumentTypeError(
+            f"tutorial kernels require M to be a multiple of {TILE_M}, got {M}"
+        )
+    if N % TILE_N:
+        raise argparse.ArgumentTypeError(
+            f"tutorial kernels require N to be a multiple of {TILE_N}, got {N}"
+        )
+    if version not in UNTILED_K_VERSIONS and K % TILE_K:
+        raise argparse.ArgumentTypeError(
+            f"tutorial kernels v{version} require K to be a multiple of "
+            f"{TILE_K}, got {K}"
+        )
+    if version in TWO_STAGE_K_VERSIONS and (K < TWO_STAGE_K or K % TWO_STAGE_K):
+        raise argparse.ArgumentTypeError(
+            f"tutorial kernels v{version} prefetch two {TILE_K}-wide K tiles; "
+            f"K must be at least {TWO_STAGE_K} and a multiple of {TWO_STAGE_K}, "
+            f"got {K}"
+        )
+
+
+def validate_shapes_for_providers(shapes, version, providers):
+    for shape in shapes:
+        validate_shape_for_providers(shape, version, providers)
 
 
 def load_matmul_module(version_dir, suffix):
@@ -185,7 +222,10 @@ def main():
         action="append",
         type=parse_shape,
         default=None,
-        help="custom shape as MxNxK or M,N,K. Can be repeated.",
+        help=(
+            "custom shape as MxNxK or M,N,K. Can be repeated. TLX/Wave "
+            "providers require tutorial tile-compatible shapes."
+        ),
     )
     parser.add_argument(
         "--b-layout",
@@ -216,6 +256,10 @@ def main():
         sizes = [(m, n, k) for m, n, k in sizes if k == args.K]
     if not sizes:
         raise SystemExit("no shapes selected")
+    try:
+        validate_shapes_for_providers(sizes, args.version, providers)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     device = triton.runtime.driver.active.get_active_torch_device()
 

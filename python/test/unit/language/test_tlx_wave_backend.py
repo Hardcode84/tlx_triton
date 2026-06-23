@@ -2364,6 +2364,17 @@ def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
         bench.parse_shape("128x0x64")
     with pytest.raises(Exception, match="shape must be MxNxK"):
         bench.parse_shape("128x256")
+    bench.validate_shape_for_providers((256, 256, 64), 0, ["tlx"])
+    bench.validate_shape_for_providers((128, 128, 64), 9, ["rocblas"])
+    with pytest.raises(Exception, match="M to be a multiple of 256"):
+        bench.validate_shape_for_providers((128, 256, 64), 9, ["wave"])
+    with pytest.raises(Exception, match="N to be a multiple of 256"):
+        bench.validate_shape_for_providers((256, 128, 64), 9, ["tlx"])
+    with pytest.raises(Exception, match="K to be a multiple of 64"):
+        bench.validate_shape_for_providers((256, 256, 96), 2, ["tlx"])
+    with pytest.raises(Exception, match="prefetch two 64-wide K tiles"):
+        bench.validate_shape_for_providers((256, 256, 64), 9, ["tlx", "wave"])
+    bench.validate_shape_for_providers((256, 256, 128), 9, ["tlx", "wave"])
 
 
 def test_tlx_gfx9_gemm_bench_loads_modules_without_import_leaks():
