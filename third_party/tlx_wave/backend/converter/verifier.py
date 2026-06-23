@@ -1,5 +1,6 @@
 """Target-program verifier for the TLX Wave converter."""
 
+from . import domains
 from .diagnostics import fail
 
 
@@ -48,6 +49,13 @@ def _verify_ops(target_program, fact_program, source_program):
                 "TLXW_VERIFY_OP_ID",
                 STAGE,
                 f"target op id {op.target_op_id} does not match position {expected_id}",
+                target_op_id=op.target_op_id,
+            )
+        if op.kind not in domains.all_target_ops():
+            fail(
+                "TLXW_VERIFY_UNKNOWN_TARGET_OP",
+                STAGE,
+                f"target op {op.target_op_id} has unknown kind {op.kind}",
                 target_op_id=op.target_op_id,
             )
         for target_value_id in (*op.operands, *op.results):

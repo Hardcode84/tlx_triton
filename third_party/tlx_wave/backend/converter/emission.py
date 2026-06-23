@@ -2996,34 +2996,6 @@ def _emit_layout_convert(state, op):
     if mode == "alias":
         state.values[_single_result(op)] = value
         return
-    if mode == "component_group_first":
-        group_size = int(attrs["group_size"])
-        result_count = int(attrs["result_component_count"])
-        if isinstance(value, _I32MaskPayload):
-            components = value.components
-            if len(components) != group_size * result_count:
-                fail(
-                    "TLXW_EMIT_COMPONENT_COUNT",
-                    STAGE,
-                    "layout_convert mask payload component count does not "
-                    "match group attrs",
-                    target_op_id=op.target_op_id,
-                )
-            state.values[_single_result(op)] = _I32MaskPayload(
-                tuple(components[index * group_size] for index in range(result_count))
-            )
-            return
-        if len(components) != group_size * result_count:
-            fail(
-                "TLXW_EMIT_COMPONENT_COUNT",
-                STAGE,
-                "layout_convert component count does not match group attrs",
-                target_op_id=op.target_op_id,
-            )
-        state.values[_single_result(op)] = _pack_components(
-            tuple(components[index * group_size] for index in range(result_count))
-        )
-        return
     if mode in {"same_lane_register_remap", "cross_lane_register_remap"}:
         result_id = _single_result(op)
         target_type = state.target_program.values[result_id].type

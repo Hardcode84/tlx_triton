@@ -335,6 +335,71 @@ def distributed_remap(operand, result, operand_layout, result_layout, op):
     }
 
 
+def mfma_component_metadata_remap(operand, result, operand_layout, result_layout, op):
+    if operand_layout is None or result_layout is None:
+        return None
+    if operand_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
+        return None
+    if result_layout.kind != "amd_mfma":
+        return None
+    if operand.type.element_type != result.type.element_type:
+        return None
+    value_metadata = operand.type.representation in {
+        "simd",
+        "simd_tuple",
+    } and result.type.representation in {"simd", "simd_tuple"}
+    mask_metadata = operand.type.representation in {
+        "mask",
+        "mask_tuple",
+    } and result.type.representation in {"mask", "mask_tuple"}
+    if not value_metadata and not mask_metadata:
+        return None
+    if operand_layout.kind == "generic_linear":
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "generic_linear to MFMA metadata convert_layout requires declared "
+            "representative semantics",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    if tuple(operand_layout.shape) != tuple(result_layout.shape):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA metadata convert_layout requires matching "
+            "source and result shapes",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    group_size = layouts.mfma_registers_per_component(
+        result_layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    result_count = int(result.type.component_count)
+    source_count = int(operand.type.component_count)
+    if source_count != result_count * int(group_size):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA metadata convert_layout requires source "
+            "components to be grouped by the MFMA vector width",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    return {
+        "metadata_group_size": int(group_size),
+        "mode": "same_lane_register_remap",
+        "source_component_count": int(source_count),
+        "source_element_indices": tuple(0 for _ in range(result_count)),
+        "source_indices": tuple(
+            int(component) * int(group_size) for component in range(result_count)
+        ),
+        "source_registers_per_component": 1,
+    }
+
+
 def dot_operand_vector_payload(operand, result, operand_layout, result_layout, op):
     if operand_layout is None or result_layout is None:
         return None

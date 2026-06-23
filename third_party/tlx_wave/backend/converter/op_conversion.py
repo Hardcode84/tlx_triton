@@ -32,6 +32,22 @@ _FLOAT_BINARY_OPS = {
     "arith.mulf": "mulf",
 }
 
+_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset(
+    (*_BINARY_OPS, *_FLOAT_BINARY_OPS, "arith.cmpi", "arith.minsi", "tt.addptr")
+)
+
+_FRAGMENT_RESULT_SOURCE_OPS = frozenset(
+    {
+        "arith.constant",
+        "arith.truncf",
+        "ttg.local_load",
+        "ttg.convert_layout",
+        "tt.dot",
+        "scf.if",
+        "scf.for",
+    }
+)
+
 
 @dataclass(frozen=True)
 class OpConversionView:
@@ -207,6 +223,7 @@ def _convert_source_op(
     fact_program,
     op,
 ):
+    _require_allowed_fragment_results(type_layout_program, op)
     if op.name == "scf.for":
         _convert_for(
             builder,
@@ -322,6 +339,7 @@ def _convert_source_op(
             f"no op conversion for {op.name}",
             source_op_index=op.index,
         )
+    _require_simple_op_layout_contract(type_layout_program, op)
     operand_target_ids = _operand_target_ids(builder, op)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -349,6 +367,14 @@ def _seed_kernel_arguments(builder, conversion_input, type_layout_program):
     arg_target_ids = []
     for source_value_id in conversion_input.kernel_arg_ids:
         converted = type_layout_program.values[source_value_id]
+        if converted.type.representation in {"fragment", "fragment_tuple"}:
+            fail(
+                "TLXW_OP_FRAGMENT_PRODUCER",
+                STAGE,
+                "fragment layouts cannot be kernel arguments; fragments are "
+                "materialized by MMA-producing operations",
+                source_value_id=source_value_id,
+            )
         arg_target_ids.append(
             builder.add_value(
                 target_ir.target_type_from_converted(converted.type),
@@ -849,6 +875,20 @@ def _convert_if(
             "scf.if yield counts must match result count",
             source_op_index=op.index,
         )
+    _require_yield_layouts(
+        type_layout_program,
+        then_yields,
+        op.results,
+        "scf.if then yield and result",
+        op,
+    )
+    _require_yield_layouts(
+        type_layout_program,
+        else_yields,
+        op.results,
+        "scf.if else yield and result",
+        op,
+    )
     builder.set_region_yields(
         then_region_id,
         tuple(
@@ -927,6 +967,13 @@ def _convert_for(
             "scf.for body must have induction variable plus iter_arg block args",
             source_op_index=op.index,
         )
+    _require_for_iter_layouts(
+        type_layout_program,
+        op.operands[3:],
+        op.results,
+        source_region.block_arg_ids[1:],
+        op,
+    )
 
     token_carries = _loop_token_carries(conversion_input, op)
     source_loop_operands = _operand_target_ids(builder, op)
@@ -1022,6 +1069,13 @@ def _convert_for(
             "scf.for yield count must match iter_args count",
             source_op_index=op.index,
         )
+    _require_yield_layouts(
+        type_layout_program,
+        yielded_source_values,
+        op.results,
+        "scf.for yield and result",
+        op,
+    )
     yielded_target_ids = tuple(
         _single_source_target(builder, source_value_id, op)
         for source_value_id in yielded_source_values
@@ -1582,6 +1636,13 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "amdg.buffer_load result and offset components must match",
             source_op_index=op.index,
         )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        offsets,
+        loaded,
+        "amdg.buffer_load result and offsets",
+        op,
+    )
     base_target_id = _single_source_target(builder, fields["base_value_id"], op)
     operands = [
         base_target_id,
@@ -1596,6 +1657,13 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
                 "amdg.buffer_load mask and result components must match",
                 source_op_index=op.index,
             )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            loaded,
+            "amdg.buffer_load mask",
+            op,
+        )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     if fields["other_value_id"] is not None:
         other = type_layout_program.values[fields["other_value_id"]]
@@ -1608,6 +1676,14 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
                 STAGE,
                 "amdg.buffer_load other must be scalar or match result components",
                 source_op_index=op.index,
+            )
+        if other.layout_map_id is not None:
+            _require_same_layout_except_element_type(
+                type_layout_program,
+                other,
+                loaded,
+                "amdg.buffer_load other and result",
+                op,
             )
         operands.append(_single_source_target(builder, fields["other_value_id"], op))
     element_byte_width = conversion_input.value_element_byte_widths.get(op.results[0])
@@ -1798,6 +1874,13 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
             "tt.load pointer/result component counts must match",
             source_op_index=op.index,
         )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        pointer,
+        loaded,
+        "tt.load pointer and result",
+        op,
+    )
     operands = [_single_source_target(builder, fields["pointer_value_id"], op)]
     if fields["mask_value_id"] is not None:
         mask = type_layout_program.values[fields["mask_value_id"]]
@@ -1809,6 +1892,13 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
                 source_op_index=op.index,
                 source_value_id=fields["mask_value_id"],
             )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            loaded,
+            "tt.load mask",
+            op,
+        )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     if fields["other_value_id"] is not None:
         if fields["mask_value_id"] is None:
@@ -1843,6 +1933,14 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
                 "tt.load other must be scalar or match result components",
                 source_op_index=op.index,
                 source_value_id=fields["other_value_id"],
+            )
+        if other.layout_map_id is not None:
+            _require_same_layout_except_element_type(
+                type_layout_program,
+                other,
+                loaded,
+                "tt.load other and result",
+                op,
             )
         operands.append(_single_source_target(builder, fields["other_value_id"], op))
     result_target_ids, result_layout_map_ids = _declare_results(
@@ -1906,6 +2004,14 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=fields["value_value_id"],
         )
+    if value.layout_map_id is not None:
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            value,
+            pointer,
+            "tt.store value and pointer",
+            op,
+        )
     operands = [
         _single_source_target(builder, fields["pointer_value_id"], op),
         _single_source_target(builder, fields["value_value_id"], op),
@@ -1920,6 +2026,13 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
                 source_op_index=op.index,
                 source_value_id=fields["mask_value_id"],
             )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            pointer,
+            "tt.store mask",
+            op,
+        )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     builder.add_op(
         "store",
@@ -2103,6 +2216,8 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
     rhs_layout = _require_layout(type_layout_program, rhs.layout_map_id, op)
     _require_dot_operand_layout(lhs_layout, 0, op)
     _require_dot_operand_layout(rhs_layout, 1, op)
+    _require_dot_operand_parent_layout(lhs_layout, result_layout, 0, op)
+    _require_dot_operand_parent_layout(rhs_layout, result_layout, 1, op)
     lhs_k_tiles = _dot_operand_k_tiles(lhs_layout, instr_shape, op)
     rhs_k_tiles = _dot_operand_k_tiles(rhs_layout, instr_shape, op)
     if lhs_k_tiles != rhs_k_tiles:
@@ -2261,6 +2376,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     same_layout = _same_layout_alias(operand, result, operand_layout, result_layout)
     register_remap = None
     distributed_remap = None
+    mfma_metadata_remap = None
     dot_operand_remap = None
     mfma_base_remap = None
     if not same_layout:
@@ -2279,9 +2395,18 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
                 result_layout,
                 op,
             )
+        if register_remap is None and distributed_remap is None:
+            mfma_metadata_remap = layout_remap.mfma_component_metadata_remap(
+                operand,
+                result,
+                operand_layout,
+                result_layout,
+                op,
+            )
         if (
             register_remap is None
             and distributed_remap is None
+            and mfma_metadata_remap is None
             and dot_operand_remap is None
             and operand.type.element_type in {"bf16", "f16", "f32"}
             and int(result.type.component_count) == 1
@@ -2306,6 +2431,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         if (
             register_remap is None
             and distributed_remap is None
+            and mfma_metadata_remap is None
             and dot_operand_remap is None
         ):
             candidate = layout_remap.distributed_to_mfma_base_remap(
@@ -2328,6 +2454,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     elif (
         register_remap is not None
         or distributed_remap is not None
+        or mfma_metadata_remap is not None
         or dot_operand_remap is not None
         or mfma_base_remap is not None
     ):
@@ -2348,6 +2475,8 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
             if register_remap is not None
             else distributed_remap
             if distributed_remap is not None
+            else mfma_metadata_remap
+            if mfma_metadata_remap is not None
             else dot_operand_remap
             if dot_operand_remap is not None
             else mfma_base_remap
@@ -2363,21 +2492,6 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
             result,
             op,
         )
-    elif (
-        operand_layout is not None
-        and result_layout is not None
-        and operand_layout.kind == "blocked"
-        and result_layout.kind == "amd_mfma"
-        and int(operand.type.component_count) % int(result.type.component_count) == 0
-    ):
-        mode = "component_group_first"
-        group_size = int(operand.type.component_count) // int(result.type.component_count)
-        attrs = {
-            "fact_policy": "invalidate_layout_sensitive",
-            "group_size": int(group_size),
-            "mode": mode,
-            "result_component_count": int(result.type.component_count),
-        }
     else:
         layout_remap.reject_unsupported_pair(operand_layout, result_layout, op)
     builder.add_op(
@@ -2481,6 +2595,69 @@ def _require_same_layout_except_element_type(
         source_op_index=op.index,
         source_value_id=result.value_id,
     )
+
+
+def _require_simple_op_layout_contract(type_layout_program, op):
+    if op.name not in _LAYOUT_PRESERVING_SIMPLE_OPS or not op.results:
+        return
+    result = type_layout_program.values[op.results[0]]
+    for operand_id in op.operands:
+        operand = type_layout_program.values[operand_id]
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            operand,
+            result,
+            f"{op.name} operand and result",
+            op,
+        )
+
+
+def _require_yield_layouts(
+    type_layout_program,
+    yielded_source_value_ids,
+    result_value_ids,
+    description,
+    op,
+):
+    for index, (yielded_source_value_id, result_value_id) in enumerate(
+        zip(yielded_source_value_ids, result_value_ids)
+    ):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[yielded_source_value_id],
+            type_layout_program.values[result_value_id],
+            f"{description} {index}",
+            op,
+        )
+
+
+def _require_for_iter_layouts(
+    type_layout_program,
+    init_value_ids,
+    result_value_ids,
+    block_arg_value_ids,
+    op,
+):
+    for index, (init_value_id, result_value_id) in enumerate(
+        zip(init_value_ids, result_value_ids)
+    ):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[init_value_id],
+            type_layout_program.values[result_value_id],
+            f"scf.for iter_arg and result {index}",
+            op,
+        )
+    for index, (block_arg_value_id, result_value_id) in enumerate(
+        zip(block_arg_value_ids, result_value_ids)
+    ):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[block_arg_value_id],
+            type_layout_program.values[result_value_id],
+            f"scf.for block argument and result {index}",
+            op,
+        )
 
 
 def _require_mask_layout_compatible(
@@ -4054,6 +4231,24 @@ def _has_fragment_result(type_layout_program, op):
     return False
 
 
+def _require_allowed_fragment_results(type_layout_program, op):
+    if op.name in _FRAGMENT_RESULT_SOURCE_OPS:
+        return
+    for value_id in op.results:
+        converted = type_layout_program.values[value_id]
+        if converted.type.representation not in {"fragment", "fragment_tuple"}:
+            continue
+        fail(
+            "TLXW_OP_FRAGMENT_PRODUCER",
+            STAGE,
+            "fragment layouts may only be produced by MMA, dot local_load, "
+            "fragment ops, control-flow carries, or explicit ttg.convert_layout; "
+            f"got {op.name}",
+            source_op_index=op.index,
+            source_value_id=value_id,
+        )
+
+
 def _require_layout(type_layout_program, layout_map_id, op):
     if layout_map_id is None:
         fail(
@@ -4074,6 +4269,20 @@ def _require_dot_operand_layout(layout, op_idx, op):
             source_op_index=op.index,
             source_value_id=layout.value_id,
         )
+
+
+def _require_dot_operand_parent_layout(operand_layout, result_layout, op_idx, op):
+    parent_kind = operand_layout.properties.get("parent_kind")
+    parent_properties = operand_layout.properties.get("parent_properties", {})
+    if parent_kind == result_layout.kind and parent_properties == result_layout.properties:
+        return
+    fail(
+        "TLXW_OP_DOT",
+        STAGE,
+        f"tt.dot operand {op_idx} parent MFMA layout must match the result layout",
+        source_op_index=op.index,
+        source_value_id=operand_layout.value_id,
+    )
 
 
 def _mfma_per_wave_tiles(result_layout, instr_shape, warps_per_cta, op):
