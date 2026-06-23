@@ -3611,6 +3611,7 @@ def test_tlx_wave_converter_lowers_dynamic_memdesc_index_packet_dma_destination(
     assert load_attrs["mode"] == "dma_packet_lds"
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" in wave
+    assert "overflow<nsw>" in wave
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_lds_b128" in machine
     del ctx
@@ -3874,6 +3875,7 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(
     assert "destination_swizzled_order" not in attrs
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
+    assert "overflow<nsw>" in wave
     assert wave.count("wave.load") == 1
     assert wave.count("wave.store") == 1
     machine = _run_waveamd_to_machine(wave)
@@ -4489,6 +4491,7 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     assert "wave.binary shrui" in emitted.text
     assert "wave.binary andi" in emitted.text
     assert "wave.binary muli" in emitted.text
+    assert "overflow<nsw>" in emitted.text
     del ctx
 
 
@@ -4687,6 +4690,7 @@ def test_tlx_wave_converter_lowers_blocked_cross_lane_transpose(tmp_path):
     assert attrs["source_lane_transpose_outer"] == 8
     assert attrs["source_lane_map"][:10] == (0, 8, 16, 24, 32, 40, 48, 56, 1, 9)
     assert output.emitted_module.text.count("wave.shuffle") == 1
+    assert "overflow<nsw>" in output.emitted_module.text
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_bpermute_b32") == 1
     del ctx
@@ -6318,12 +6322,15 @@ def test_tlx_wave_converter_buffer_store_affine_offset_uses_scoped_facts(tmp_pat
     attrs = converter_target_ir.attrs_dict(store_op)
     assert attrs["offset_mode"] == "affine"
     assert attrs["offset_scalar_count"] == 1
+    # This intentionally has no upper bound on %stride.  Layout address
+    # overflow is UB, so a scoped nonnegative stride fact is enough for nsw.
     assert attrs["offset_no_signed_wrap"] is True
     assert attrs["offset_terms"] == (
         ("dim", 1, 0, ()),
         ("scalar", 1, -1, (0,)),
     )
     assert len(store_op.operands) == 4
+    assert "overflow<nsw>" in output.emitted_module.text
     del ctx
 
 

@@ -12,6 +12,11 @@ from . import target_ir
 
 STAGE = "emission"
 
+# Triton layout index/stride/address arithmetic has undefined behavior on signed
+# i32 overflow.  Use this only for backend-synthesized layout math, not generic
+# source arithmetic lowered through _emit_binary.
+_LAYOUT_MATH_NSW = True
+
 
 @dataclass(frozen=True)
 class EmittedWaveModule:
@@ -449,13 +454,21 @@ def _emit_make_range(state, op):
         for component_base in component_bases:
             value = workitem
             if stride != 1:
-                value = _simd_binary_const(state, "muli", value, stride, width)
+                value = _simd_binary_const(
+                    state,
+                    "muli",
+                    value,
+                    stride,
+                    width,
+                    nsw=_LAYOUT_MATH_NSW,
+                )
             value = _add_simd_const(
                 state,
                 value,
                 start + int(component_base),
                 element_type,
                 width,
+                nsw=_LAYOUT_MATH_NSW,
             )
             components.append(value)
         state.values[result_id] = _pack_components(tuple(components))
@@ -487,6 +500,7 @@ def _emit_make_range(state, op):
                     start + int(component_base),
                     element_type,
                     width,
+                    nsw=_LAYOUT_MATH_NSW,
                 )
             )
         state.values[result_id] = _pack_components(tuple(components))
@@ -534,7 +548,14 @@ def _emit_make_range(state, op):
                 for dim, base in enumerate(component_base)
             )
             value = _linearize_coordinates(state, coords, shape, width)
-            value = _add_simd_const(state, value, start, element_type, width)
+            value = _add_simd_const(
+                state,
+                value,
+                start,
+                element_type,
+                width,
+                nsw=_LAYOUT_MATH_NSW,
+            )
             components.append(value)
         state.values[result_id] = _pack_components(tuple(components))
         return
@@ -553,6 +574,7 @@ def _emit_make_range(state, op):
             component_start,
             element_type,
             width,
+            nsw=_LAYOUT_MATH_NSW,
         )
         components.append(value)
     state.values[result_id] = _pack_components(tuple(components))
@@ -574,8 +596,20 @@ def _linearize_coordinates(state, coords, shape, lane_width):
         stride = _product(shape[dim + 1 :])
         term = coord
         if int(stride) != 1:
-            term = _simd_binary_const(state, "muli", term, int(stride), lane_width)
-        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+            term = _simd_binary_const(
+                state,
+                "muli",
+                term,
+                int(stride),
+                lane_width,
+                nsw=_LAYOUT_MATH_NSW,
+            )
+        result = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            result,
+            term,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     return result
 
 
@@ -595,8 +629,20 @@ def _linearize_coordinates_with_order(state, coords, shape, order, lane_width):
     for dim in order:
         term = coords[int(dim)]
         if int(stride) != 1:
-            term = _simd_binary_const(state, "muli", term, int(stride), lane_width)
-        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+            term = _simd_binary_const(
+                state,
+                "muli",
+                term,
+                int(stride),
+                lane_width,
+                nsw=_LAYOUT_MATH_NSW,
+            )
+        result = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            result,
+            term,
+            nsw=_LAYOUT_MATH_NSW,
+        )
         stride *= int(shape[int(dim)])
     return result
 
@@ -641,12 +687,13 @@ def _bit_linear_thread_coordinate(state, workitem, base, coefficients, lane_widt
                 bit_value,
                 coefficient,
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
         result = state.builder.binary(state.dsl.BinaryKind.XOrI, result, bit_value)
     return result
 
 
-def _add_simd_const(state, value, constant, element_type, width):
+def _add_simd_const(state, value, constant, element_type, width, *, nsw=False):
     if not int(constant):
         return value
     start_value = state.builder.splat(
@@ -654,7 +701,12 @@ def _add_simd_const(state, value, constant, element_type, width):
         element_type,
         int(width),
     )
-    return state.builder.binary(state.dsl.BinaryKind.AddI, value, start_value)
+    return state.builder.binary(
+        state.dsl.BinaryKind.AddI,
+        value,
+        start_value,
+        nsw=bool(nsw),
+    )
 
 
 def _emit_splat(state, op):
@@ -1401,7 +1453,12 @@ def _emit_memdesc_index(state, op):
     offset = index
     if elements_per_slot != 1:
         stride = state.builder.constant(index.type, elements_per_slot)
-        offset = state.builder.binary(state.dsl.BinaryKind.MulI, index, stride)
+        offset = state.builder.binary(
+            state.dsl.BinaryKind.MulI,
+            index,
+            stride,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     state.values[result_id] = state.builder.ptr_add(
         base,
         offset,
@@ -1444,6 +1501,7 @@ def _record_dynamic_memdesc_dword_base(
             "muli",
             index,
             slot_dwords,
+            nsw=_LAYOUT_MATH_NSW,
         )
     state.shared_pointer_dword_bases[result_id] = _SharedPointerDwordBase(
         base_plan.base,
@@ -1451,6 +1509,7 @@ def _record_dynamic_memdesc_dword_base(
             state,
             base_plan.dword_offset,
             dword_offset,
+            nsw=_LAYOUT_MATH_NSW,
         ),
     )
 
@@ -1633,6 +1692,7 @@ def _emit_buffer_load_to_local(state, op):
                     state.dsl.BinaryKind.AddI,
                     dest_offset,
                     base_offset,
+                    nsw=_LAYOUT_MATH_NSW,
                 )
             return dest_offset
         coords = tuple(
@@ -1722,15 +1782,40 @@ def _local_destination_lane_offset(
     if wave_stride == 0:
         if lane_stride == 1:
             return workitem
-        return _simd_binary_const(state, "muli", workitem, lane_stride, lane_width)
+        return _simd_binary_const(
+            state,
+            "muli",
+            workitem,
+            lane_stride,
+            lane_width,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     lane = _simd_binary_const(state, "remui", workitem, lane_width, lane_width)
     if lane_stride != 1:
-        lane = _simd_binary_const(state, "muli", lane, lane_stride, lane_width)
+        lane = _simd_binary_const(
+            state,
+            "muli",
+            lane,
+            lane_stride,
+            lane_width,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     wave_first = state.builder.read_first(workitem)
     wave_id = _scalar_binary_const_i32(state, "divui", wave_first, lane_width)
-    wave_offset = _scalar_binary_const_i32(state, "muli", wave_id, wave_stride)
+    wave_offset = _scalar_binary_const_i32(
+        state,
+        "muli",
+        wave_id,
+        wave_stride,
+        nsw=_LAYOUT_MATH_NSW,
+    )
     wave_offset = state.builder.splat(wave_offset, state.dsl.i32(), lane_width)
-    return state.builder.binary(state.dsl.BinaryKind.AddI, lane, wave_offset)
+    return state.builder.binary(
+        state.dsl.BinaryKind.AddI,
+        lane,
+        wave_offset,
+        nsw=_LAYOUT_MATH_NSW,
+    )
 
 
 def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, op):
@@ -1782,8 +1867,20 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
         for interval, padding in zip(intervals, paddings):
             term = _simd_binary_const(state, "divui", physical, interval, lane_width)
             if padding != 1:
-                term = _simd_binary_const(state, "muli", term, padding, lane_width)
-            encoded = state.builder.binary(state.dsl.BinaryKind.AddI, encoded, term)
+                term = _simd_binary_const(
+                    state,
+                    "muli",
+                    term,
+                    padding,
+                    lane_width,
+                    nsw=_LAYOUT_MATH_NSW,
+                )
+            encoded = state.builder.binary(
+                state.dsl.BinaryKind.AddI,
+                encoded,
+                term,
+                nsw=_LAYOUT_MATH_NSW,
+            )
         return encoded
     if plan == "swizzled_xor":
         order = tuple(int(value) for value in attrs["destination_physical_order"])
@@ -1811,11 +1908,13 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
                 swizzled_minor,
                 vec,
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
         swizzled_minor = state.builder.binary(
             state.dsl.BinaryKind.AddI,
             swizzled_minor,
             minor_inner,
+            nsw=_LAYOUT_MATH_NSW,
         )
         major_offset = major
         if minor_extent != 1:
@@ -1825,11 +1924,13 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
                 major_offset,
                 minor_extent,
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
         return state.builder.binary(
             state.dsl.BinaryKind.AddI,
             major_offset,
             swizzled_minor,
+            nsw=_LAYOUT_MATH_NSW,
         )
     fail(
         "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
@@ -1941,6 +2042,7 @@ def _emit_buffer_load_to_local_packet_dma(
             state,
             dest_base_offset,
             dest_offset,
+            nsw=_LAYOUT_MATH_NSW,
         )
         if dest_offset is None:
             dest_ptr = dest_base_i32
@@ -2140,6 +2242,7 @@ def _emit_local_load_mma_payload(state, op):
                 offset,
                 elements_per_register,
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
         ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
         payload, _token = state.builder.load(ptr, load_type)
@@ -2699,8 +2802,14 @@ def _linear_component_offset_from_simd_coords(
                 bit_value,
                 1 << int(bit),
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
-        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, bit_value)
+        result = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            result,
+            bit_value,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     return result
 
 
@@ -3592,6 +3701,7 @@ def _emit_cta_exchange_scalar_components(
                     store_offset,
                     base_offset,
                     lane_width,
+                    nsw=_LAYOUT_MATH_NSW,
                 )
             ptr = state.builder.ptr_add(
                 scratch_base,
@@ -3680,9 +3790,17 @@ def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
                 result,
                 int(stride),
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
         if int(base):
-            result = _simd_binary_const(state, "addi", result, int(base), lane_width)
+            result = _simd_binary_const(
+                state,
+                "addi",
+                result,
+                int(base),
+                lane_width,
+                nsw=_LAYOUT_MATH_NSW,
+            )
         return result
     result = state.builder.splat(
         state.builder.constant(state.dsl.i32(), int(base)),
@@ -3702,8 +3820,14 @@ def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
                 bit_value,
                 coefficient,
                 lane_width,
+                nsw=_LAYOUT_MATH_NSW,
             )
-        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, bit_value)
+        result = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            result,
+            bit_value,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     return result
 
 
@@ -3742,17 +3866,43 @@ def _layout_convert_source_lane(state, attrs, component, op):
             )
         else:
             if stride != 1:
-                lane = _simd_binary_const(state, "muli", lane, stride, lane_width)
+                lane = _simd_binary_const(
+                    state,
+                    "muli",
+                    lane,
+                    stride,
+                    lane_width,
+                    nsw=_LAYOUT_MATH_NSW,
+                )
             if base:
-                lane = _simd_binary_const(state, "addi", lane, base, lane_width)
+                lane = _simd_binary_const(
+                    state,
+                    "addi",
+                    lane,
+                    base,
+                    lane_width,
+                    nsw=_LAYOUT_MATH_NSW,
+                )
         return lane
     if kind == "transpose":
         inner = int(attrs["source_lane_transpose_inner"])
         outer = int(attrs["source_lane_transpose_outer"])
         minor = _simd_binary_const(state, "remui", lane, inner, lane_width)
         major = _simd_binary_const(state, "divui", lane, inner, lane_width)
-        minor = _simd_binary_const(state, "muli", minor, outer, lane_width)
-        return state.builder.binary(_binary_kind(state.dsl, "addi"), minor, major)
+        minor = _simd_binary_const(
+            state,
+            "muli",
+            minor,
+            outer,
+            lane_width,
+            nsw=_LAYOUT_MATH_NSW,
+        )
+        return state.builder.binary(
+            _binary_kind(state.dsl, "addi"),
+            minor,
+            major,
+            nsw=_LAYOUT_MATH_NSW,
+        )
     fail(
         "TLXW_EMIT_LAYOUT_REMAP",
         STAGE,
@@ -4863,18 +5013,13 @@ def _packet_coordinate_values(
     shape,
     packet_order,
 ):
-    linear_no_signed_wrap = _packet_coordinate_linear_no_signed_wrap(
-        component,
-        component_thread_count,
-        packet_elements,
-    )
     linear = _simd_binary_const(
         state,
         "muli",
         lane,
         int(packet_elements),
         int(state.dsl.SimdType(lane.type).width),
-        nsw=linear_no_signed_wrap,
+        nsw=_LAYOUT_MATH_NSW,
     )
     constant = int(component) * int(component_thread_count) * int(packet_elements)
     if constant:
@@ -4884,7 +5029,7 @@ def _packet_coordinate_values(
             linear,
             constant,
             int(state.dsl.SimdType(lane.type).width),
-            nsw=linear_no_signed_wrap,
+            nsw=_LAYOUT_MATH_NSW,
         )
     lane_width = int(state.dsl.SimdType(lane.type).width)
     coords = [None] * len(shape)
@@ -4895,24 +5040,6 @@ def _packet_coordinate_values(
         coords[int(dim)] = coord
         remainder = _simd_binary_const(state, "divui", remainder, extent, lane_width)
     return tuple(coords)
-
-
-def _packet_coordinate_linear_no_signed_wrap(
-    component,
-    component_thread_count,
-    packet_elements,
-):
-    component = int(component)
-    component_thread_count = int(component_thread_count)
-    packet_elements = int(packet_elements)
-    if component < 0 or component_thread_count <= 0 or packet_elements <= 0:
-        return False
-    max_lane = max(0, component_thread_count - 1)
-    max_linear = (
-        component * component_thread_count * packet_elements
-        + max_lane * packet_elements
-    )
-    return max_linear <= 0x7FFFFFFF
 
 
 def _packet_destination_offset_value(
@@ -4955,9 +5082,16 @@ def _packet_destination_offset_value(
         "muli",
         wave_id,
         int(destination_wave_stride_dwords),
+        nsw=_LAYOUT_MATH_NSW,
     )
     if base_dwords:
-        offset = _scalar_binary_const_i32(state, "addi", offset, int(base_dwords))
+        offset = _scalar_binary_const_i32(
+            state,
+            "addi",
+            offset,
+            int(base_dwords),
+            nsw=_LAYOUT_MATH_NSW,
+        )
     return offset
 
 
@@ -5106,7 +5240,7 @@ def _splat_i32_scalar(state, value, lane_width, op):
     return state.builder.splat(value, state.dsl.i32(), lane_width)
 
 
-def _scalar_binary_const_i32(state, operation, value, constant):
+def _scalar_binary_const_i32(state, operation, value, constant, *, nsw=False):
     constant = int(constant)
     if operation == "divui" and constant == 1:
         return value
@@ -5121,15 +5255,20 @@ def _scalar_binary_const_i32(state, operation, value, constant):
     else:
         operation_kind = _binary_kind(state.dsl, operation)
     rhs = state.builder.constant(state.dsl.i32(), constant)
-    return state.builder.binary(operation_kind, value, rhs)
+    return state.builder.binary(operation_kind, value, rhs, nsw=bool(nsw))
 
 
-def _combine_optional_i32_offsets(state, lhs, rhs):
+def _combine_optional_i32_offsets(state, lhs, rhs, *, nsw=False):
     if lhs is None:
         return rhs
     if rhs is None:
         return lhs
-    return state.builder.binary(state.dsl.BinaryKind.AddI, lhs, rhs)
+    return state.builder.binary(
+        state.dsl.BinaryKind.AddI,
+        lhs,
+        rhs,
+        nsw=bool(nsw),
+    )
 
 
 def _require_dim_slot(dim, coords, op):
