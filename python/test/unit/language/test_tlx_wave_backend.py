@@ -905,6 +905,59 @@ def test_tlx_wave_converter_token_stage_records_multi_group_loop_carries(
     del ctx
 
 
+def test_tlx_wave_converter_token_stage_pairs_wait_consumed_body_issue(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_token_consumed_body_issue(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_group = ttg.async_commit_group tokens %warmup
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body0_group = ttg.async_commit_group tokens %body0
+      %body1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body1_group = ttg.async_commit_group tokens %body1
+      %wait = ttg.async_wait {num = 1 : i32}
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    for_op = next(op for op in source.ops if op.name == "scf.for")
+    warmup_group_op, body0_group_op, body1_group_op = [
+        op for op in source.ops if op.name == "ttg.async_commit_group"
+    ]
+    _warmup_load_op, body0_load_op, _body1_load_op = [
+        op for op in source.ops if op.name == "amdg.buffer_load_to_local"
+    ]
+    (carry,) = token_program.loop_token_carries_by_op[for_op.index]
+    assert carry.init_source_value_id == warmup_group_op.results[0]
+    assert carry.yield_source_value_id == body1_group_op.results[0]
+    assert carry.yield_source_value_id != body0_group_op.results[0]
+    assert carry.add_issue_dependency is True
+    assert carry.issue_dependency_op_indices == (body0_load_op.index,)
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_orders_generic_memory_effects(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -2980,6 +3033,56 @@ def test_tlx_wave_converter_pipeline_carries_multiple_async_groups_across_for(
         wave,
     )
     assert wave.count("waveamd.dma_load_lds") == 8
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_orders_wait_consumed_body_issue(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_consumed_body_issue(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_group = ttg.async_commit_group tokens %warmup
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body0_group = ttg.async_commit_group tokens %body0
+      %body1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body1_group = ttg.async_commit_group tokens %body1
+      %wait = ttg.async_wait {num = 1 : i32}
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    dma_ops = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    assert [
+        converter_target_ir.attrs_dict(op)["issue_dependency_count"]
+        for op in dma_ops
+    ] == [0, 1, 0]
+    wave = output.emitted_module.text
+    assert wave.count("waveamd.dma_load_lds") == 3
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.s_waitcnt") <= 2
+    assert "vmcnt(0)" not in machine
     del ctx
 
 

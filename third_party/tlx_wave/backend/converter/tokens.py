@@ -290,13 +290,11 @@ def _loop_external_wait_issue_pairs(nodes, groups, groups_by_id, body_op_indices
                 continue
             external_waited_tokens.append(waited_group.token_value_id)
         for init_token_id in external_waited_tokens:
-            waited_group_ids = set(node.waited_group_ids)
             issue_group = next(
                 (
                     queued_group
                     for queued_group in committed_queue
                     if queued_group.commit_op_index in body_op_indices
-                    and queued_group.group_id not in waited_group_ids
                     and queued_group.token_value_id is not None
                     and queued_group.token_value_id not in assigned_body_tokens
                 ),
