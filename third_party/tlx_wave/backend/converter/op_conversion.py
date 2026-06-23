@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 import re
 
-from .diagnostics import fail
+from .diagnostics import Diagnostic, fail
 from . import domains
 from . import layouts
 from . import coordinates
@@ -452,11 +452,14 @@ def _convert_binary(builder, view):
     operation = _BINARY_OPS[view.op_name]
     if operation in {"divsi", "remsi"} and _can_use_unsigned_div_rem(view):
         operation = "divui" if operation == "divsi" else "remui"
+    source_width = _target_int_width(builder, view.result_target_ids)
     attrs = {
         "operation": operation,
-        "source_width": _target_int_width(builder, view.result_target_ids),
+        "source_width": source_width,
     }
     nsw, nuw = _arith_overflow_flags(view)
+    if not nsw and _range_proves_no_signed_wrap(view, operation, source_width):
+        nsw = True
     if nsw:
         attrs["nsw"] = True
     if nuw:
@@ -485,6 +488,38 @@ def _can_use_unsigned_div_rem(view):
         and rhs_lower is not None
         and rhs_lower > 0
     )
+
+
+def _range_proves_no_signed_wrap(view, operation, source_width):
+    if operation not in {"addi", "subi", "muli"}:
+        return False
+    if source_width is None or int(source_width) <= 0:
+        return False
+    if len(view.operand_ranges) != 2:
+        return False
+    lhs_range, rhs_range = view.operand_ranges
+    if any(bound is None for bound in (*lhs_range, *rhs_range)):
+        return False
+    lhs_lower, lhs_upper = (int(lhs_range[0]), int(lhs_range[1]))
+    rhs_lower, rhs_upper = (int(rhs_range[0]), int(rhs_range[1]))
+    if operation == "addi":
+        lower = lhs_lower + rhs_lower
+        upper = lhs_upper + rhs_upper
+    elif operation == "subi":
+        lower = lhs_lower - rhs_upper
+        upper = lhs_upper - rhs_lower
+    else:
+        products = (
+            lhs_lower * rhs_lower,
+            lhs_lower * rhs_upper,
+            lhs_upper * rhs_lower,
+            lhs_upper * rhs_upper,
+        )
+        lower = min(products)
+        upper = max(products)
+    signed_min = -(1 << (int(source_width) - 1))
+    signed_max = (1 << (int(source_width) - 1)) - 1
+    return signed_min <= lower and upper <= signed_max
 
 
 def _convert_float_binary(builder, view):
@@ -1416,6 +1451,19 @@ def _convert_buffer_load_to_local(
             _single_source_target(builder, source_value_id, op)
             for source_value_id in packet_plan["scalar_value_ids"]
         )
+        source_offset_upper = _buffer_source_offset_upper(
+            range_fact.upper,
+            packet_plan["packet_bytes"],
+            memdesc.element_byte_width,
+            op,
+        )
+        source_offset_no_signed_wrap = _affine_source_offset_no_signed_wrap(
+            conversion_input,
+            fact_program,
+            packet_plan["source_affine"],
+            op,
+            source_offset_upper,
+        )
         builder.add_op(
             "buffer_load_to_local",
             operands=(operands[0], operands[1], *scalar_target_ids, *issue_dependency_target_ids),
@@ -1443,13 +1491,9 @@ def _convert_buffer_load_to_local(
                 "range_bytes": int(range_fact.upper),
                 "source_offset_range": (
                     0,
-                    _buffer_source_offset_upper(
-                        range_fact.upper,
-                        packet_plan["packet_bytes"],
-                        memdesc.element_byte_width,
-                        op,
-                    ),
+                    source_offset_upper,
                 ),
+                "source_offset_no_signed_wrap": bool(source_offset_no_signed_wrap),
                 "source_offset_terms": tuple(packet_plan["source_offset_terms"]),
                 "source_rank": len(memdesc.shape),
                 "source_scalar_count": len(scalar_target_ids),
@@ -1748,9 +1792,45 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
         element_byte_width,
         op,
     )
+    affine_plan = _buffer_store_affine_offset_plan(
+        conversion_input,
+        type_layout_program,
+        fact_program,
+        fields["offset_value_id"],
+        int(offsets.type.component_count),
+        int(value.type.lane_width or offsets.type.lane_width or 64),
+        op,
+    )
+    scalar_target_ids = ()
+    affine_attrs = {}
+    if affine_plan is not None:
+        scalar_target_ids = tuple(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in affine_plan["scalar_value_ids"]
+        )
+        offset_no_signed_wrap = _affine_source_offset_no_signed_wrap(
+            conversion_input,
+            fact_program,
+            affine_plan["source_affine"],
+            op,
+            offset_upper,
+        )
+        affine_attrs = {
+            "offset_mode": "affine",
+            "offset_component_coordinate_bases": tuple(
+                affine_plan["component_coordinate_bases"]
+            ),
+            "offset_no_signed_wrap": bool(offset_no_signed_wrap),
+            "offset_scalar_count": len(scalar_target_ids),
+            "offset_shape": tuple(int(dim) for dim in affine_plan["coordinate_shape"]),
+            "offset_terms": tuple(affine_plan["offset_terms"]),
+            "offset_workitem_coordinate_coefficients": tuple(
+                affine_plan["workitem_coordinate_coefficients"]
+            ),
+        }
     builder.add_op(
         "buffer_store",
-        operands=tuple(operands),
+        operands=tuple((*operands, *scalar_target_ids)),
         attrs={
             "access_element_count": access_element_count,
             "cache_modifier": int(fields["cache"] or 1),
@@ -1763,6 +1843,7 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "lane_width": int(value.type.lane_width or offsets.type.lane_width or 64),
             "mask_mode": "select_oob_offset" if has_mask else "none",
             "offset_range": (0, int(offset_upper)),
+            **affine_attrs,
             "range_bytes": int(range_fact.upper),
         },
         fact_ids=(range_fact.fact_id,),
@@ -3825,9 +3906,104 @@ def _buffer_load_to_local_packet_plan(
         "packet_bytes": int(packet_bytes),
         "packet_elements": int(packet_elements),
         "packet_order": tuple(int(dim) for dim in packet_order),
+        "source_affine": affine,
         "scalar_value_ids": tuple(scalar_value_ids),
         "source_offset_terms": tuple(terms),
     }
+
+
+def _buffer_store_affine_offset_plan(
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    offset_value_id,
+    component_count,
+    lane_width,
+    op,
+):
+    affine = fact_program.tensor_affine.get(offset_value_id)
+    if affine is None:
+        return None
+    offset_value = type_layout_program.values[offset_value_id]
+    if offset_value.layout_map_id is None:
+        return None
+    layout = type_layout_program.layouts[int(offset_value.layout_map_id)]
+    if layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+    }:
+        return None
+    if tuple(affine.shape) != tuple(int(dim) for dim in layout.shape):
+        return None
+    try:
+        plan = coordinates.layout_coordinate_plan(
+            layout,
+            int(component_count),
+            int(lane_width),
+            _layout_warp_count(layout),
+            op,
+            offset_value_id,
+        )
+    except Diagnostic:
+        return None
+    if plan is None:
+        return None
+    scalar_value_ids, terms = _packet_affine_terms(affine)
+    return {
+        "component_coordinate_bases": tuple(
+            tuple(int(value) for value in bases)
+            for bases in plan.component_bases
+        ),
+        "coordinate_shape": tuple(int(dim) for dim in plan.shape),
+        "offset_terms": tuple(terms),
+        "scalar_value_ids": tuple(scalar_value_ids),
+        "source_affine": affine,
+        "workitem_coordinate_coefficients": tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in plan.workitem_coefficients
+        ),
+    }
+
+
+def _affine_source_offset_no_signed_wrap(
+    conversion_input,
+    fact_program,
+    affine,
+    op,
+    offset_upper,
+):
+    if int(offset_upper) > 0x7FFFFFFF:
+        return False
+    return _packet_affine_source_offset_nonnegative(
+        conversion_input,
+        fact_program,
+        affine,
+        op,
+    )
+
+
+def _packet_affine_source_offset_nonnegative(
+    conversion_input,
+    fact_program,
+    affine,
+    op,
+):
+    for term in affine.terms:
+        if int(term.coefficient) < 0:
+            return False
+        for value_id in term.scalar_value_ids:
+            lower, _upper = _combined_range_for_value(
+                conversion_input,
+                fact_program,
+                value_id,
+                op.index,
+            )
+            if lower is None or int(lower) < 0:
+                return False
+    return True
 
 
 def _packet_source_is_contiguous(

@@ -1915,6 +1915,7 @@ def _emit_buffer_load_to_local_packet_dma(
             coords,
             scalar_values,
             op,
+            no_signed_wrap=bool(attrs.get("source_offset_no_signed_wrap", False)),
         )
         source_offset = _assume_value_range(
             state,
@@ -2778,7 +2779,7 @@ def _iter_linear_component_basis_bits(bases, rank, op, diagnostic):
         yield int(bit), int(dim), int(value)
 
 
-def _simd_binary_const(state, operation, value, constant, lane_width):
+def _simd_binary_const(state, operation, value, constant, lane_width, *, nsw=False):
     constant = int(constant)
     simd = state.dsl.SimdType(value.type)
     element_type = simd.element_type
@@ -2804,7 +2805,7 @@ def _simd_binary_const(state, operation, value, constant, lane_width):
         element_type,
         lane_width,
     )
-    return state.builder.binary(operation_kind, value, rhs)
+    return state.builder.binary(operation_kind, value, rhs, nsw=bool(nsw))
 
 
 def _is_power_of_two(value):
@@ -3801,10 +3802,13 @@ def _require_shuffle_simd(state, component, op):
 
 def _emit_buffer_store(state, op):
     attrs = target_ir.attrs_dict(op)
-    operand_count = 4 if attrs["has_mask"] else 3
+    base_operand_count = 4 if attrs["has_mask"] else 3
+    offset_scalar_count = int(attrs.get("offset_scalar_count", 0))
+    operand_count = base_operand_count + offset_scalar_count
     operands = _operand_values(state, op, operand_count)
     value, source_base, offsets = operands[:3]
     masks = operands[3] if attrs["has_mask"] else None
+    offset_scalar_values = operands[base_operand_count:]
     value_components = _as_components(value)
     offset_components = _as_components(offsets)
     mask_payload = masks if isinstance(masks, _I32MaskPayload) else None
@@ -3855,10 +3859,21 @@ def _emit_buffer_store(state, op):
         state.dsl.buffer_address_space(),
         lane_width,
     )
+    affine_offset_components = _buffer_store_affine_offset_components(
+        state,
+        attrs,
+        offset_scalar_values,
+        component_count,
+        lane_width,
+        op,
+    )
     zero_mask_payload = None
     for index, (value_component, offset_component) in enumerate(
         zip(value_components, offset_components)
     ):
+        affine_offset_component = (
+            None if affine_offset_components is None else affine_offset_components[index]
+        )
         mask_payload_component = None
         direct_mask_component = None
         if mask_payload is not None:
@@ -3969,6 +3984,8 @@ def _emit_buffer_store(state, op):
                 mask_payload_component,
                 zero_mask_payload,
             )
+        if affine_offset_component is not None:
+            offset_component = affine_offset_component
         _emit_buffer_store_component(
             state,
             op,
@@ -3981,6 +3998,94 @@ def _emit_buffer_store(state, op):
             mask_component,
             mask_mode,
         )
+
+
+def _buffer_store_affine_offset_components(
+    state,
+    attrs,
+    scalar_values,
+    component_count,
+    lane_width,
+    op,
+):
+    offset_mode = attrs.get("offset_mode", "operand")
+    if offset_mode == "operand":
+        if scalar_values:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
+                STAGE,
+                "operand buffer_store offsets must not carry affine scalar operands",
+                target_op_id=op.target_op_id,
+            )
+        return None
+    if offset_mode != "affine":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
+            STAGE,
+            f"unsupported buffer_store offset mode {offset_mode}",
+            target_op_id=op.target_op_id,
+        )
+    if len(scalar_values) != int(attrs.get("offset_scalar_count", 0)):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_store affine scalar operand count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    shape = tuple(int(value) for value in attrs["offset_shape"])
+    component_bases = tuple(
+        tuple(int(value) for value in bases)
+        for bases in attrs["offset_component_coordinate_bases"]
+    )
+    workitem_coefficients = tuple(
+        tuple(int(value) for value in coefficients)
+        for coefficients in attrs["offset_workitem_coordinate_coefficients"]
+    )
+    if len(component_bases) != int(component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_store affine coordinate bases do not match component count",
+            target_op_id=op.target_op_id,
+        )
+    if any(len(bases) != len(shape) for bases in component_bases):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "buffer_store affine coordinate rank does not match shape",
+            target_op_id=op.target_op_id,
+        )
+    if any(len(coefficients) != len(shape) for coefficients in workitem_coefficients):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "buffer_store affine workitem coordinate rank does not match shape",
+            target_op_id=op.target_op_id,
+        )
+    workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    components = []
+    for component_base in component_bases:
+        coords = tuple(
+            _bit_linear_thread_coordinate(
+                state,
+                workitem,
+                int(base),
+                tuple(coefficients[dim] for coefficients in workitem_coefficients),
+                lane_width,
+            )
+            for dim, base in enumerate(component_base)
+        )
+        components.append(
+            _affine_offset_value(
+                state,
+                attrs["offset_terms"],
+                coords,
+                scalar_values,
+                op,
+                no_signed_wrap=bool(attrs.get("offset_no_signed_wrap", False)),
+            )
+        )
+    return tuple(components)
 
 
 def _emit_buffer_store_component(
@@ -4758,12 +4863,18 @@ def _packet_coordinate_values(
     shape,
     packet_order,
 ):
+    linear_no_signed_wrap = _packet_coordinate_linear_no_signed_wrap(
+        component,
+        component_thread_count,
+        packet_elements,
+    )
     linear = _simd_binary_const(
         state,
         "muli",
         lane,
         int(packet_elements),
         int(state.dsl.SimdType(lane.type).width),
+        nsw=linear_no_signed_wrap,
     )
     constant = int(component) * int(component_thread_count) * int(packet_elements)
     if constant:
@@ -4773,6 +4884,7 @@ def _packet_coordinate_values(
             linear,
             constant,
             int(state.dsl.SimdType(lane.type).width),
+            nsw=linear_no_signed_wrap,
         )
     lane_width = int(state.dsl.SimdType(lane.type).width)
     coords = [None] * len(shape)
@@ -4783,6 +4895,24 @@ def _packet_coordinate_values(
         coords[int(dim)] = coord
         remainder = _simd_binary_const(state, "divui", remainder, extent, lane_width)
     return tuple(coords)
+
+
+def _packet_coordinate_linear_no_signed_wrap(
+    component,
+    component_thread_count,
+    packet_elements,
+):
+    component = int(component)
+    component_thread_count = int(component_thread_count)
+    packet_elements = int(packet_elements)
+    if component < 0 or component_thread_count <= 0 or packet_elements <= 0:
+        return False
+    max_lane = max(0, component_thread_count - 1)
+    max_linear = (
+        component * component_thread_count * packet_elements
+        + max_lane * packet_elements
+    )
+    return max_linear <= 0x7FFFFFFF
 
 
 def _packet_destination_offset_value(
@@ -4831,7 +4961,15 @@ def _packet_destination_offset_value(
     return offset
 
 
-def _affine_offset_value(state, encoded_terms, coords, scalar_values, op):
+def _affine_offset_value(
+    state,
+    encoded_terms,
+    coords,
+    scalar_values,
+    op,
+    *,
+    no_signed_wrap=False,
+):
     lane_width = int(state.dsl.SimdType(coords[0].type).width) if coords else 64
     scalar_components = tuple(
         _splat_i32_scalar(state, value, lane_width, op) for value in scalar_values
@@ -4849,12 +4987,27 @@ def _affine_offset_value(state, encoded_terms, coords, scalar_values, op):
             scalar_components,
             lane_width,
             op,
+            no_signed_wrap=bool(no_signed_wrap),
         )
-        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, term)
+        result = state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            result,
+            term,
+            nsw=bool(no_signed_wrap),
+        )
     return result
 
 
-def _affine_term_i32(state, encoded, coords, scalar_components, lane_width, op):
+def _affine_term_i32(
+    state,
+    encoded,
+    coords,
+    scalar_components,
+    lane_width,
+    op,
+    *,
+    no_signed_wrap=False,
+):
     kind, coefficient, dim, slots = encoded
     coefficient = int(coefficient)
     dim = int(dim)
@@ -4871,6 +5024,7 @@ def _affine_term_i32(state, encoded, coords, scalar_components, lane_width, op):
             coords[_require_dim_slot(dim, coords, op)],
             coefficient,
             lane_width,
+            no_signed_wrap=bool(no_signed_wrap),
         )
     if kind == "scalar":
         return _scale_simd_i32(
@@ -4878,12 +5032,24 @@ def _affine_term_i32(state, encoded, coords, scalar_components, lane_width, op):
             scalar_components[_require_scalar_slot(slots, scalar_components, op)],
             coefficient,
             lane_width,
+            no_signed_wrap=bool(no_signed_wrap),
         )
     if kind == "dim_scalar":
         dim_value = coords[_require_dim_slot(dim, coords, op)]
         scalar_value = scalar_components[_require_scalar_slot(slots, scalar_components, op)]
-        product = state.builder.binary(state.dsl.BinaryKind.MulI, dim_value, scalar_value)
-        return _scale_simd_i32(state, product, coefficient, lane_width)
+        product = state.builder.binary(
+            state.dsl.BinaryKind.MulI,
+            dim_value,
+            scalar_value,
+            nsw=bool(no_signed_wrap),
+        )
+        return _scale_simd_i32(
+            state,
+            product,
+            coefficient,
+            lane_width,
+            no_signed_wrap=bool(no_signed_wrap),
+        )
     if kind == "scalar_product":
         if len(slots) != 2:
             fail(
@@ -4894,8 +5060,19 @@ def _affine_term_i32(state, encoded, coords, scalar_components, lane_width, op):
             )
         lhs = scalar_components[_require_scalar_slot((slots[0],), scalar_components, op)]
         rhs = scalar_components[_require_scalar_slot((slots[1],), scalar_components, op)]
-        product = state.builder.binary(state.dsl.BinaryKind.MulI, lhs, rhs)
-        return _scale_simd_i32(state, product, coefficient, lane_width)
+        product = state.builder.binary(
+            state.dsl.BinaryKind.MulI,
+            lhs,
+            rhs,
+            nsw=bool(no_signed_wrap),
+        )
+        return _scale_simd_i32(
+            state,
+            product,
+            coefficient,
+            lane_width,
+            no_signed_wrap=bool(no_signed_wrap),
+        )
     fail(
         "TLXW_EMIT_BAD_AFFINE_TERM",
         STAGE,
@@ -4904,7 +5081,7 @@ def _affine_term_i32(state, encoded, coords, scalar_components, lane_width, op):
     )
 
 
-def _scale_simd_i32(state, value, coefficient, lane_width):
+def _scale_simd_i32(state, value, coefficient, lane_width, *, no_signed_wrap=False):
     coefficient = int(coefficient)
     if coefficient == 1:
         return value
@@ -4914,6 +5091,7 @@ def _scale_simd_i32(state, value, coefficient, lane_width):
         value,
         coefficient,
         lane_width,
+        nsw=bool(no_signed_wrap),
     )
 
 

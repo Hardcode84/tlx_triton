@@ -79,9 +79,12 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
-        # Keep TTGIR construction aligned with the AMD backend. The Wave
-        # converter still consumes TTGIR directly, so only the post-CF-lift
-        # cleanup below is TLX Wave specific.
+        # The Wave bridge consumes TTGIR, but the TTGIR must be the same
+        # contract that the AMD/LLVM path lowers.  In particular, AMD's
+        # epilogue/layout cleanup builds store offsets and masks directly in the
+        # accumulator layout; a shortened Wave-only pipeline can leave metadata
+        # in an unrelated blocked layout and force expensive convert_layout
+        # lowering that LLVM never sees.
         mod = amd_compiler.HIPBackend.make_ttgir(mod, metadata, options)
         passes.convert.triton_lift_cf_to_scf(mod)
         pm = ir.pass_manager(mod.context)

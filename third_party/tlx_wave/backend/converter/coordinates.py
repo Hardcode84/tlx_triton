@@ -153,15 +153,9 @@ def is_flat_bit_affine_make_range(plan):
 
 
 def _workitem_coefficients(linear, lane_bits, warp_bits):
-    lane_bases = tuple(
-        _basis_in_standard_dim_order(linear, basis)
-        for basis in layouts.linear_layout_bases(linear, "lane")
-    )
-    warp_bases = tuple(
-        _basis_in_standard_dim_order(linear, basis)
-        for basis in layouts.linear_layout_bases(linear, "warp")
-    )
-    rank = len(linear.out_dims)
+    lane_bases = _logical_dim_bases(linear, "lane")
+    warp_bases = _logical_dim_bases(linear, "warp")
+    rank = _basis_rank(linear)
     zero = tuple(0 for _ in range(rank))
     coefficients = []
     for bit in range(int(lane_bits)):
@@ -171,13 +165,40 @@ def _workitem_coefficients(linear, lane_bits, warp_bits):
     return tuple(tuple(int(value) for value in basis) for basis in coefficients)
 
 
-def _basis_in_standard_dim_order(linear, basis):
-    out_indices = {
-        str(name): index for index, (name, _size) in enumerate(linear.out_dims)
-    }
+def _logical_dim_bases(linear, in_dim):
     return tuple(
-        int(basis[out_indices[f"dim{dim}"]]) for dim in range(len(linear.out_dims))
+        _basis_in_logical_dim_order(linear, basis)
+        for basis in layouts.linear_layout_bases(linear, in_dim)
     )
+
+
+def _basis_in_logical_dim_order(linear, basis):
+    basis = tuple(int(value) for value in basis)
+    out_dims = tuple(linear.out_dims)
+    if len(out_dims) != len(basis):
+        return basis
+    dims = []
+    for out_dim in out_dims:
+        name = str(out_dim[0])
+        if not name.startswith("dim"):
+            return basis
+        try:
+            dims.append(int(name[3:]))
+        except ValueError:
+            return basis
+    if sorted(dims) != list(range(len(dims))):
+        return basis
+    result = [0] * len(dims)
+    for index, dim in enumerate(dims):
+        result[dim] = basis[index]
+    return tuple(result)
+
+
+def _basis_rank(linear):
+    for _name, bases in linear.bases:
+        if bases:
+            return len(bases[0])
+    return len(linear.out_dims)
 
 
 def _validate_physical_domain(

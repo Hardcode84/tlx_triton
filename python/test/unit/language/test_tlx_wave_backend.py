@@ -1618,6 +1618,7 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
     binary_op = next(op for op in target.ops if op.kind == "binary")
     assert converter_target_ir.attrs_dict(binary_op) == {
         "operation": "addi",
+        "nsw": True,
         "source_width": 32,
     }
     assume_op = next(op for op in target.ops if op.kind == "assume")
@@ -1712,6 +1713,39 @@ def test_tlx_wave_converter_preserves_explicit_arith_overflow_flags(tmp_path):
 
     binary_op = next(op for op in output.target_program.ops if op.kind == "binary")
     assert converter_target_ir.attrs_dict(binary_op)["nsw"] is True
+    assert "wave.binary addi" in output.emitted_module.text
+    assert "overflow<nsw>" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_derives_arith_nsw_from_scoped_ranges(tmp_path):
+    local_func = """
+  tt.func public @converter_range_nsw(%arg0: i32, %arg1: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c31 = arith.constant 31 : i32
+    %arg0_nonnegative = arith.cmpi sge, %arg0, %c0 : i32
+    llvm.intr.assume %arg0_nonnegative : i1
+    %arg0_bounded = arith.cmpi sle, %arg0, %c31 : i32
+    llvm.intr.assume %arg0_bounded : i1
+    %arg1_nonnegative = arith.cmpi sge, %arg1, %c0 : i32
+    llvm.intr.assume %arg1_nonnegative : i1
+    %arg1_bounded = arith.cmpi sle, %arg1, %c31 : i32
+    llvm.intr.assume %arg1_bounded : i1
+    %sum = arith.addi %arg0, %arg1 : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    add_op = next(
+        op
+        for op in output.target_program.ops
+        if op.kind == "binary"
+        and converter_target_ir.attrs_dict(op)["operation"] == "addi"
+    )
+    assert converter_target_ir.attrs_dict(add_op)["nsw"] is True
     assert "wave.binary addi" in output.emitted_module.text
     assert "overflow<nsw>" in output.emitted_module.text
     del ctx
@@ -4501,6 +4535,47 @@ def test_tlx_wave_layout_coordinate_plan_handles_mfma_out_dim_order(
     assert plan.workitem_coefficients == expected_coefficients
 
 
+def test_tlx_wave_mfma_coordinate_plan_uses_logical_dim_order():
+    layout = _fake_layout(
+        0,
+        0,
+        kind="amd_mfma",
+        shape=(256, 128),
+        component_count=16,
+        lane_width=64,
+        properties={
+            "version": 4,
+            "warps_per_cta": (4, 2),
+            "instr_shape": (16, 16, 32),
+            "is_transposed": True,
+            "tiles_per_warp": (1, 1),
+            "element_bit_width": 32,
+        },
+    )
+
+    plan = converter_coordinates.layout_coordinate_plan(
+        layout,
+        layout.component_count,
+        layout.lane_width,
+        8,
+        SimpleNamespace(index=0),
+        0,
+    )
+
+    assert plan.component_bases[:4] == ((0, 0), (0, 32), (0, 64), (0, 96))
+    assert plan.workitem_coefficients == (
+        (1, 0),
+        (2, 0),
+        (4, 0),
+        (8, 0),
+        (0, 4),
+        (0, 8),
+        (0, 16),
+        (16, 0),
+        (32, 0),
+    )
+
+
 def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [], lane = [[0], [0], [0], [0], [0], [0]], warp = [], block = []}>
@@ -6203,6 +6278,9 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     assert attrs["inactive_byte_offset"] == 2147483648
     assert attrs["inactive_offset"] == 1073741824
     assert attrs["offset_range"] == (0, 1073741823)
+    assert attrs["offset_mode"] == "affine"
+    assert attrs["offset_no_signed_wrap"] is True
+    assert attrs["offset_scalar_count"] == 0
     assert "wave.where" not in output.emitted_module.text
     assert output.emitted_module.text.count("wave.ptr_add") == 2
     assert "wave.select" in output.emitted_module.text
@@ -6210,6 +6288,81 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.buffer_store_b16" in machine
     assert "waveamdmachine.exec_if" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_buffer_store_affine_offset_uses_scoped_facts(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_buffer_store_affine_offset(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %stride: i32) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %stride_nonnegative = arith.cmpi sge, %stride, %zero : i32
+    llvm.intr.assume %stride_nonnegative : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %offset = arith.addi %range, %stride_splat : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["offset_mode"] == "affine"
+    assert attrs["offset_scalar_count"] == 1
+    assert attrs["offset_no_signed_wrap"] is True
+    assert attrs["offset_terms"] == (
+        ("dim", 1, 0, ()),
+        ("scalar", 1, -1, (0,)),
+    )
+    assert len(store_op.operands) == 4
+    del ctx
+
+
+def test_tlx_wave_converter_branch_local_fact_does_not_mark_store_offset_nsw(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_buffer_store_branch_fact(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %stride: i32,
+      %cond: i1) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    scf.if %cond {
+      %stride_nonnegative = arith.cmpi sge, %stride, %zero : i32
+      llvm.intr.assume %stride_nonnegative : i1
+      scf.yield
+    } else {
+      scf.yield
+    }
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %offset = arith.addi %range, %stride_splat : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["offset_mode"] == "affine"
+    assert attrs["offset_scalar_count"] == 1
+    assert attrs["offset_no_signed_wrap"] is False
     del ctx
 
 
