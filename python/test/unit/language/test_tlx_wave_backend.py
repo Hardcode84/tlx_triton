@@ -2270,7 +2270,7 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
     second_hash = backend.hash()
 
-    assert "stage8-staged-converter-hsaco-static-lds" in first_hash
+    assert "stage9-amd-ttgir-staged-converter-hsaco-static-lds" in first_hash
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
@@ -5144,7 +5144,9 @@ def test_tlx_wave_converter_rejects_blocked_to_mfma_without_fragment_plan():
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "MFMA metadata convert_layout requires source components" in str(diagnostic)
+    assert "distributed to MFMA metadata source component model does not match" in str(
+        diagnostic
+    )
 
 
 def test_tlx_wave_converter_layout_remap_scratch_attrs_are_mode_specific():
