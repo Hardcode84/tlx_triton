@@ -228,7 +228,7 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
     if kind == "slice":
         parent_kind = properties.get("parent_kind")
         parent_properties = properties.get("parent_properties", {})
-        if parent_kind in {"blocked", "linear", "generic_linear"}:
+        if parent_kind in {"blocked", "linear", "generic_linear", "amd_mfma"}:
             dim = int(properties.get("dim", 0))
             parent_shape = list(int(value) for value in source_type.shape)
             if dim < 0 or dim > len(parent_shape):
@@ -239,6 +239,13 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
                     source_value_id=value_id,
                 )
             parent_shape.insert(dim, 1)
+            if parent_kind == "amd_mfma":
+                return _mfma_component_count(
+                    tuple(parent_shape),
+                    parent_properties,
+                    lane_width,
+                    source_value_id=value_id,
+                )
             linear = distributed_linear_layout_from_parts(
                 parent_kind,
                 tuple(parent_shape),
@@ -248,16 +255,12 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
             )
             return linear_layout_in_dim_size(linear, "register")
     if kind == "amd_mfma":
-        instr_shape = properties.get("instr_shape", ())
-        warps_per_cta = properties.get("warps_per_cta", ())
-        if len(instr_shape) >= 2 and len(warps_per_cta) >= 2 and len(source_type.shape) >= 2:
-            m_tiles, n_tiles = _per_wave_mfma_tiles(
-                source_type.shape,
-                instr_shape,
-                warps_per_cta,
-            )
-            return m_tiles * n_tiles
-        return 1
+        return _mfma_component_count(
+            source_type.shape,
+            properties,
+            lane_width,
+            source_value_id=value_id,
+        )
     element_count = _product(source_type.shape)
     return max(1, _ceil_div(element_count, int(lane_width)))
 
@@ -391,6 +394,48 @@ def linear_layout_bases(linear, in_dim):
         if name == in_dim:
             return tuple(tuple(int(value) for value in basis) for basis in bases)
     return ()
+
+
+def linear_layout_component_registers(
+    linear,
+    layout,
+    component_count,
+    *,
+    stage=STAGE,
+    source_op_index=None,
+    source_value_id=None,
+):
+    component_count = int(component_count)
+    if component_count <= 0:
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "layout component register mapping requires a positive component count",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    register_count = linear_layout_in_dim_size(linear, "register")
+    if int(register_count) == component_count:
+        stride = 1
+    elif _is_mfma_component_layout(layout) and int(register_count) % component_count == 0:
+        stride = int(register_count) // component_count
+    else:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "layout component model does not match distributed register layout",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return tuple(int(component) * int(stride) for component in range(component_count))
+
+
+def _is_mfma_component_layout(layout):
+    if layout.kind == "amd_mfma":
+        return True
+    if layout.kind == "slice":
+        return layout.properties.get("parent_kind") == "amd_mfma"
+    return False
 
 
 def layout_warp_count(layout):
@@ -1507,7 +1552,7 @@ def _slice_linear_layout(
 ):
     parent_kind = properties.get("parent_kind")
     parent_properties = properties.get("parent_properties", {})
-    if parent_kind not in {"blocked", "linear", "generic_linear"}:
+    if parent_kind not in {"blocked", "linear", "generic_linear", "amd_mfma"}:
         _layout_fail(
             "TLXW_TYPE_UNSUPPORTED_LAYOUT",
             stage,
@@ -1786,6 +1831,21 @@ def _per_wave_mfma_tiles(shape, instr_shape, warps_per_cta):
     warps_m = max(1, int(warps_per_cta[0]))
     warps_n = max(1, int(warps_per_cta[1]))
     return _ceil_div(total_m_tiles, warps_m), _ceil_div(total_n_tiles, warps_n)
+
+
+def _mfma_component_count(shape, properties, lane_width, *, source_value_id=None):
+    del lane_width, source_value_id
+    shape = tuple(int(value) for value in shape)
+    instr_shape = properties.get("instr_shape", ())
+    warps_per_cta = properties.get("warps_per_cta", ())
+    if len(instr_shape) >= 2 and len(warps_per_cta) >= 2 and len(shape) >= 2:
+        m_tiles, n_tiles = _per_wave_mfma_tiles(
+            shape,
+            instr_shape,
+            warps_per_cta,
+        )
+        return m_tiles * n_tiles
+    return 1
 
 
 def _per_wave_tile_count(extent, instr_extent, warp_extent):

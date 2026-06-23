@@ -24,7 +24,13 @@ def layout_coordinate_plan(
     op,
     source_value_id,
 ):
-    if layout.kind not in {"blocked", "linear", "generic_linear", "slice"}:
+    if layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+    }:
         return None
     shape = tuple(int(dim) for dim in layout.shape)
     if not shape:
@@ -39,14 +45,14 @@ def layout_coordinate_plan(
         stage=STAGE,
         source_op_index=op.index,
     )
-    expected_components = layouts.linear_layout_in_dim_size(linear, "register")
-    if int(component_count) != int(expected_components):
-        _fail(
-            "result component model does not match distributed register layout",
-            layout,
-            op,
-            source_value_id,
-        )
+    component_registers = layouts.linear_layout_component_registers(
+        linear,
+        layout,
+        component_count,
+        stage=STAGE,
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
     lane_width = int(lane_width)
     warp_count = max(1, int(warp_count))
     if not _is_power_of_two(lane_width):
@@ -67,8 +73,8 @@ def layout_coordinate_plan(
     warp_bits = warp_count.bit_length() - 1
     workitem_coefficients = _workitem_coefficients(linear, lane_bits, warp_bits)
     component_bases = tuple(
-        layouts.linear_layout_coords(linear, component, 0, warp=0)
-        for component in range(int(component_count))
+        layouts.linear_layout_coords(linear, register, 0, warp=0)
+        for register in component_registers
     )
     _validate_physical_domain(
         linear,
@@ -80,6 +86,7 @@ def layout_coordinate_plan(
         layout,
         op,
         source_value_id,
+        component_registers,
     )
     return CoordinatePlan(
         shape=shape,
@@ -175,11 +182,13 @@ def _validate_physical_domain(
     layout,
     op,
     source_value_id,
+    component_registers,
 ):
     seen = set()
     duplicate_seen = False
     physical_slots = 0
     for component, component_base in enumerate(component_bases):
+        component_register = int(component_registers[component])
         for warp in range(int(warp_count)):
             for lane in range(int(lane_width)):
                 physical_slots += 1
@@ -191,7 +200,7 @@ def _validate_physical_domain(
                 )
                 actual = layouts.linear_layout_coords(
                     linear,
-                    component,
+                    component_register,
                     lane,
                     warp=warp,
                 )
@@ -229,6 +238,8 @@ def _validate_physical_domain(
             source_value_id,
         )
     local_logical_slots = total_logical_slots // int(block_count)
+    if _is_mfma_component_layout(layout):
+        return
     if len(seen) != local_logical_slots:
         if duplicate_seen and int(physical_slots) <= int(local_logical_slots):
             _fail(
@@ -287,6 +298,14 @@ def _basis_pattern(layout):
             "order": tuple(layout.properties.get("order", ())),
         }
     return dict(layout.properties)
+
+
+def _is_mfma_component_layout(layout):
+    if layout.kind == "amd_mfma":
+        return True
+    if layout.kind == "slice":
+        return layout.properties.get("parent_kind") == "amd_mfma"
+    return False
 
 
 def _fail(message, layout, op, source_value_id):

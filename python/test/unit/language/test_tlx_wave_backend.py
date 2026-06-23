@@ -243,7 +243,7 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
         monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
     kernel = _load_tlx_gfx9_gemm_kernel(case["version_dir"], case["function_name"])
 
-    m = n = k = 256
+    m, n, k = case.get("shape", (256, 256, 256))
     a = MockTensor(torch.float16, [m, k])
     b = MockTensor(torch.float16, [k, n])
     c = MockTensor(torch.float16, [m, n])
@@ -277,7 +277,7 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
             num_warps=case["num_warps"],
             num_stages=1,
             matrix_instr_nonkdim=16,
-            grid=(1,),
+            grid=case.get("grid", (case.get("extra_meta", {}).get("GRID_MN", 1),)),
             **case.get("extra_meta", {}),
         )
 
@@ -2467,6 +2467,15 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
         },
         {
+            "id": "v9_beyond_hotloop_grouped_pid_multi_n",
+            "version_dir": "v9_beyond_hotloop",
+            "function_name": "v9_beyond_hotloop",
+            "num_warps": 8,
+            "disables_post_misched": True,
+            "shape": (512, 1024, 256),
+            "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 8},
+        },
+        {
             "id": "v9_beyond_hotloop_transposed_b",
             "version_dir": "v9_beyond_hotloop",
             "function_name": "v9_beyond_hotloop",
@@ -2509,7 +2518,7 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
         assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
         assert "layout_convert" not in wave_artifact
-        assert wave_artifact.count("wave.barrier") == 6
+        assert wave_artifact.count("wave.barrier") == 5
 
 
 @pytest.mark.parametrize(

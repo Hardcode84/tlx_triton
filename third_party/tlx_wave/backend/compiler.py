@@ -15,29 +15,6 @@ from .wave_bridge_tools import (
 )
 
 
-def _module_has_new_bridge_blocker(mod):
-    found = False
-
-    def visit(op):
-        nonlocal found
-        name = op.get_name()
-        segments = op.get_int_array_attr("operandSegmentSizes")
-        if name == "ttg.async_copy_global_to_local" and segments is not None:
-            if len(segments) >= 4 and int(segments[3]):
-                found = True
-                return False
-        if name == "amdg.buffer_load_to_local" and segments is not None:
-            if len(segments) >= 6 and (
-                int(segments[3]) or int(segments[4]) or int(segments[5])
-            ):
-                found = True
-                return False
-        return True
-
-    mod.walk(visit)
-    return found
-
-
 class TLXWaveBackend(amd_compiler.HIPBackend):
     """TLX-first AMD Wave backend scaffold.
 
@@ -102,60 +79,15 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        # Continue to target hip:gfx950 for TTGIR construction because TritonGPU
-        # and TLX passes use that target spelling to choose AMD-compatible
-        # encodings before the Wave bridge takes over.
-        passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
-                                           options.num_ctas)
-        pm.run(mod, "tlx_wave.make_ttgir_early")
-
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        passes.ttgpuir.add_coalesce(pm)
-        passes.ttgpuir.add_f32_dot_tc(pm, False)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
-        passes.ttgpuir.add_optimize_thread_locality(pm)
-        # Keep the HIP/TLX dot layout contract intact for the Wave bridge:
-        # accelerated dot metadata drives require_layout insertion, propagation
-        # retags the local_alloc/local_load chain, and the final cleanup removes
-        # layout conversions left behind by the propagation step.
-        amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
-        tlx.tlx_passes.add_tlx_insert_require_layout(pm)
-        tlx.tlx_passes.add_tlx_propagate_layout(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
-        passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
-        if amd_compiler.is_async_copy_enabled(options.arch):
-            amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
-            passes.common.add_canonicalizer(pm)
-            passes.common.add_cse(pm)
-        passes.common.add_symbol_dce(pm)
-        pm.run(mod, "tlx_wave.make_ttgir")
-
+        # Keep TTGIR construction aligned with the AMD backend. The Wave
+        # converter still consumes TTGIR directly, so only the post-CF-lift
+        # cleanup below is TLX Wave specific.
+        mod = amd_compiler.HIPBackend.make_ttgir(mod, metadata, options)
         passes.convert.triton_lift_cf_to_scf(mod)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_canonicalizer(pm)
-        tlx.tlx_passes.add_tlx_propagate_layout(pm)
-        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
-        if not _module_has_new_bridge_blocker(mod):
-            amd.passes.ttgpuir.add_optimize_epilogue(pm)
-            amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
-            amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
-            amd.passes.ttgpuir.add_sink_layout_conversions(pm)
-            if knobs.amd.use_buffer_ops:
-                amd.passes.ttgpuir.add_canonicalize_pointers(pm)
-                passes.common.add_canonicalizer(pm)
-                amd.passes.ttgpuir.add_convert_to_buffer_ops(
-                    pm,
-                    options.arch,
-                    knobs.amd.use_buffer_atomics,
-                    knobs.amd.buffer_ops_analyze_small_tensor_range,
-                )
-                amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir_post_cf_lift")
@@ -193,7 +125,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     def hash(self):
         return (
-            f"{self.target}:stage8-staged-converter-hsaco-static-lds:"
+            f"{self.target}:stage9-amd-ttgir-staged-converter-hsaco-static-lds:"
             f"wave-opt-sha256={_wave_opt_sha256()}:"
             f"wave-pipelines-sha256={_wave_pipelines_sha256()}"
         )

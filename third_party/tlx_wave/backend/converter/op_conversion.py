@@ -598,7 +598,13 @@ def _make_range_coordinate_attrs(type_layout_program, op):
     if result.layout_map_id is None:
         return {}
     layout = type_layout_program.layouts[int(result.layout_map_id)]
-    if layout.kind not in {"blocked", "linear", "generic_linear", "slice"}:
+    if layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+    }:
         return {}
     lane_width = int(result.type.lane_width or layout.lane_width)
     warp_count = _layout_warp_count(layout)
@@ -720,9 +726,21 @@ def _broadcast_component_sources(type_layout_program, op):
             "tt.broadcast requires rank-matched source and result layouts",
             source_op_index=op.index,
         )
-    if operand_layout.kind not in {"blocked", "linear", "generic_linear", "slice"}:
+    if operand_layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+    }:
         return None
-    if result_layout.kind not in {"blocked", "linear", "generic_linear", "slice"}:
+    if result_layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+    }:
         return None
     if int(operand.type.component_count) == int(result.type.component_count):
         return tuple(range(int(result.type.component_count)))
@@ -757,28 +775,26 @@ def _broadcast_component_sources(type_layout_program, op):
         stage=STAGE,
         source_op_index=op.index,
     )
-    source_register_count = layouts.linear_layout_in_dim_size(source_linear, "register")
-    if int(source_register_count) != int(operand.type.component_count):
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast source component model does not match its layout",
-            source_op_index=op.index,
-            source_value_id=operand.value_id,
-        )
-    result_register_count = layouts.linear_layout_in_dim_size(result_linear, "register")
-    if int(result_register_count) != int(result.type.component_count):
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast result component model does not match its layout",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
+    source_registers = layouts.linear_layout_component_registers(
+        source_linear,
+        operand_layout,
+        operand.type.component_count,
+        stage=STAGE,
+        source_op_index=op.index,
+        source_value_id=operand.value_id,
+    )
+    result_registers = layouts.linear_layout_component_registers(
+        result_linear,
+        result_layout,
+        result.type.component_count,
+        stage=STAGE,
+        source_op_index=op.index,
+        source_value_id=result.value_id,
+    )
 
     source_by_thread_coord = {}
     for warp in range(int(warp_count)):
-        for source_register in range(int(source_register_count)):
+        for source_component, source_register in enumerate(source_registers):
             for lane in range(int(lane_width)):
                 coords = layouts.linear_layout_coords(
                     source_linear,
@@ -788,7 +804,7 @@ def _broadcast_component_sources(type_layout_program, op):
                 )
                 key = (int(warp), int(lane), tuple(int(coord) for coord in coords))
                 existing = source_by_thread_coord.get(key)
-                if existing is not None and int(existing) != int(source_register):
+                if existing is not None and int(existing) != int(source_component):
                     fail(
                         "TLXW_OP_BROADCAST",
                         STAGE,
@@ -797,10 +813,10 @@ def _broadcast_component_sources(type_layout_program, op):
                         source_op_index=op.index,
                         source_value_id=operand.value_id,
                     )
-                source_by_thread_coord[key] = int(source_register)
+                source_by_thread_coord[key] = int(source_component)
 
     component_sources = []
-    for result_register in range(int(result_register_count)):
+    for result_register in result_registers:
         source_registers = set()
         for warp in range(int(warp_count)):
             for lane in range(int(lane_width)):
