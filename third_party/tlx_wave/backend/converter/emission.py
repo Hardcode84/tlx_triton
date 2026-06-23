@@ -12,9 +12,13 @@ from . import target_ir
 
 STAGE = "emission"
 
-# Triton layout index/stride/address arithmetic has undefined behavior on signed
-# i32 overflow.  Use this only for backend-synthesized layout math, not generic
-# source arithmetic lowered through _emit_binary.
+# TLX Wave target programs are only defined for executions where synthesized
+# layout-address arithmetic fits signed i32: indexes, strides, coordinates,
+# LDS offsets, and pointer offsets must not overflow.  This module-level flag
+# encodes that target IR contract in emitted Wave ops; it is not a per-op proof
+# computed in emission.  Keep it restricted to backend-synthesized layout math.
+# Generic source arithmetic still flows through _emit_binary and only receives
+# overflow flags that were present on the source arith op.
 _LAYOUT_MATH_NSW = True
 
 

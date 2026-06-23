@@ -3977,10 +3977,10 @@ def _affine_source_offset_no_signed_wrap(
 ):
     if int(offset_upper) > 0x7FFFFFFF:
         return False
-    # Triton index/stride layout address arithmetic has UB on signed i32
-    # overflow.  We therefore only need scoped facts proving the reconstructed
-    # affine address expression stays nonnegative; dynamic scalar upper bounds
-    # are not required before marking the emitted layout math nsw.
+    # Layout-address overflow is outside TLX Wave target IR semantics.  Dynamic
+    # scalar upper bounds are therefore not required to emit nsw for the
+    # reconstructed affine address expression; the scoped facts checked here
+    # only establish that the non-overflowing expression is nonnegative.
     return _packet_affine_source_offset_nonnegative(
         conversion_input,
         fact_program,

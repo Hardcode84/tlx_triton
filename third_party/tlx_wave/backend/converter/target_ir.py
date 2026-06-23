@@ -1,4 +1,11 @@
-"""Closed target-program schema for the TLX Wave converter."""
+"""Closed target-program schema for the TLX Wave converter.
+
+Target programs inherit Triton's layout-address contract: backend-synthesized
+index, stride, coordinate, LDS-offset, and pointer-offset expressions are only
+defined when their signed i32 layout arithmetic does not overflow.  Overflowing
+executions are outside the target IR semantics rather than cases the emitter
+must preserve with wrapping arithmetic.
+"""
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
