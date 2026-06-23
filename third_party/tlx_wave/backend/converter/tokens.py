@@ -50,6 +50,15 @@ class TokenGroup:
 
 
 @dataclass(frozen=True)
+class LoopTokenCarry:
+    loop_op_index: int
+    init_source_value_id: int | None
+    yield_source_value_id: int
+    add_issue_dependency: bool
+    issue_dependency_op_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class MemoryEffect:
     effect_id: int
     op_index: int
@@ -76,6 +85,7 @@ class TokenProgram:
     memory_effects: tuple[MemoryEffect, ...]
     node_ids_by_value_id: dict[int, int]
     users_by_value_id: dict[int, tuple[int, ...]]
+    loop_token_carries_by_op: dict[int, tuple[LoopTokenCarry, ...]]
 
     def node_for_value(self, value_id):
         node_id = self.node_ids_by_value_id.get(value_id)
@@ -141,13 +151,157 @@ def build_token_program(source_program, type_layout_program):
                 )
             )
 
+    nodes = tuple(nodes)
+    groups = tuple(groups)
     return TokenProgram(
-        tuple(nodes),
-        tuple(groups),
+        nodes,
+        groups,
         tuple(memory_effects),
         node_ids_by_value,
         {value_id: tuple(node_ids) for value_id, node_ids in users_by_value.items()},
+        _loop_token_carries_by_op(source_program, nodes, groups),
     )
+
+
+def _loop_token_carries_by_op(source_program, nodes, groups):
+    groups_by_id = {group.group_id: group for group in groups}
+    groups_by_value_id = {
+        group.token_value_id: group
+        for group in groups
+        if group.token_value_id is not None
+    }
+    nodes_by_value_id = {
+        node.value_id: node for node in nodes if node.value_id is not None
+    }
+    carries_by_op = {}
+    for op in source_program.ops:
+        if op.name != "scf.for" or len(op.region_ids) != 1:
+            continue
+        body_op_indices = _region_op_indices_recursive(source_program, op.region_ids[0])
+        carries = _loop_token_carries_for_body(
+            op,
+            body_op_indices,
+            nodes,
+            groups,
+            groups_by_id,
+            groups_by_value_id,
+            nodes_by_value_id,
+        )
+        if carries:
+            carries_by_op[op.index] = carries
+    return carries_by_op
+
+
+def _loop_token_carries_for_body(
+    op,
+    body_op_indices,
+    nodes,
+    groups,
+    groups_by_id,
+    groups_by_value_id,
+    nodes_by_value_id,
+):
+    waited_external_tokens = []
+    for node in nodes:
+        if node.op_index not in body_op_indices or node.op_name != "ttg.async_wait":
+            continue
+        for group_id in node.waited_group_ids:
+            group = groups_by_id[group_id]
+            if group.commit_op_index in body_op_indices or group.token_value_id is None:
+                continue
+            waited_external_tokens.append(group.token_value_id)
+    committed_body_tokens = tuple(
+        group.token_value_id
+        for group in sorted(groups, key=lambda group: group.commit_op_index)
+        if group.commit_op_index in body_op_indices and group.token_value_id is not None
+    )
+    waited_external_tokens = _dedupe_preserving_order(waited_external_tokens)
+    externally_waited_body_tokens = _externally_waited_body_tokens(
+        nodes,
+        groups_by_id,
+        body_op_indices,
+    )
+    if waited_external_tokens:
+        if len(waited_external_tokens) != 1 or len(committed_body_tokens) != 1:
+            fail(
+                "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
+                STAGE,
+                "scf.for async token carry supports one external waited group "
+                "and one body commit group",
+                source_op_index=op.index,
+            )
+        yield_source_value_id = committed_body_tokens[0]
+        return (
+            LoopTokenCarry(
+                op.index,
+                waited_external_tokens[0],
+                yield_source_value_id,
+                True,
+                _group_issue_dependency_op_indices(
+                    groups_by_value_id,
+                    nodes_by_value_id,
+                    yield_source_value_id,
+                ),
+            ),
+        )
+    return tuple(
+        LoopTokenCarry(
+            op.index,
+            None,
+            body_token,
+            False,
+        )
+        for body_token in externally_waited_body_tokens
+    )
+
+
+def _externally_waited_body_tokens(nodes, groups_by_id, body_op_indices):
+    body_tokens = []
+    for node in sorted(nodes, key=lambda node: node.op_index):
+        if node.op_index in body_op_indices or node.op_name != "ttg.async_wait":
+            continue
+        for group_id in node.waited_group_ids:
+            group = groups_by_id[group_id]
+            if group.commit_op_index not in body_op_indices or group.token_value_id is None:
+                continue
+            body_tokens.append(group.token_value_id)
+    return _dedupe_preserving_order(body_tokens)
+
+
+def _group_issue_dependency_op_indices(
+    groups_by_value_id,
+    nodes_by_value_id,
+    token_value_id,
+):
+    group = groups_by_value_id.get(token_value_id)
+    if group is None:
+        return ()
+    return _dedupe_preserving_order(
+        node.op_index
+        for member_token_id in group.member_token_ids
+        for node in (nodes_by_value_id.get(member_token_id),)
+        if node is not None
+    )
+
+
+def _region_op_indices_recursive(source_program, region_id):
+    result = []
+    for op_index in source_program.regions[region_id].op_indices:
+        result.append(op_index)
+        for child_region_id in source_program.ops[op_index].region_ids:
+            result.extend(_region_op_indices_recursive(source_program, child_region_id))
+    return frozenset(result)
+
+
+def _dedupe_preserving_order(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return tuple(result)
 
 
 def _needs_token_node(source_program, op):

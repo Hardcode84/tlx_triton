@@ -91,6 +91,7 @@ class ConversionInput:
     token_nodes_by_op: dict[int, object]
     token_groups_by_commit: dict[int, object]
     token_groups_by_id: dict[int, object]
+    loop_token_carries_by_op: dict[int, tuple[object, ...]]
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
     local_alloc_byte_offsets: dict[int, int]
     lds_size: int
@@ -173,6 +174,7 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         {node.op_index: node for node in token_program.nodes},
         {group.commit_op_index: group for group in token_program.groups},
         {group.group_id: group for group in token_program.groups},
+        token_program.loop_token_carries_by_op,
         {},
         local_alloc_byte_offsets,
         int(lds_size),
@@ -975,7 +977,7 @@ def _convert_for(
         op,
     )
 
-    token_carries = _loop_token_carries(conversion_input, op)
+    token_carries = conversion_input.loop_token_carries_by_op.get(op.index, ())
     source_loop_operands = _operand_target_ids(builder, op)
     token_init_target_ids = tuple(
         _loop_token_init_target_id(
@@ -995,7 +997,7 @@ def _convert_for(
     token_result_target_ids = tuple(
         builder.add_value(
             target_ir.target_type_from_converted(
-                type_layout_program.values[carry["yield_source_value_id"]].type
+                type_layout_program.values[carry.yield_source_value_id].type
             ),
             debug_name=f"loop_token_result_{op.index}_{index}",
         )
@@ -1015,7 +1017,7 @@ def _convert_for(
     token_block_arg_target_ids = tuple(
         builder.add_value(
             target_ir.target_type_from_converted(
-                type_layout_program.values[carry["yield_source_value_id"]].type
+                type_layout_program.values[carry.yield_source_value_id].type
             ),
             debug_name=f"loop_token_arg_{op.index}_{index}",
         )
@@ -1028,9 +1030,11 @@ def _convert_for(
         token_block_arg_target_ids,
     )
     issue_dependencies = _loop_async_issue_dependencies(
-        conversion_input,
         tuple(carry for carry, _token_block_arg_target_id in token_issue_dependency_pairs),
-        tuple(token_block_arg_target_id for _carry, token_block_arg_target_id in token_issue_dependency_pairs),
+        tuple(
+            token_block_arg_target_id
+            for _carry, token_block_arg_target_id in token_issue_dependency_pairs
+        ),
     )
     body_conversion_input = replace(
         conversion_input,
@@ -1042,12 +1046,12 @@ def _convert_for(
     saved_token_targets = _replace_source_targets(
         builder,
         tuple(
-            (carry["init_source_value_id"], token_block_arg_target_id)
+            (carry.init_source_value_id, token_block_arg_target_id)
             for carry, token_block_arg_target_id in zip(
                 token_carries,
                 token_block_arg_target_ids,
             )
-            if carry.get("init_source_value_id") is not None
+            if carry.init_source_value_id is not None
         ),
     )
     with builder.insertion_region(target_region_id):
@@ -1081,7 +1085,7 @@ def _convert_for(
         for source_value_id in yielded_source_values
     )
     yielded_token_target_ids = tuple(
-        _single_source_target(builder, carry["yield_source_value_id"], op)
+        _single_source_target(builder, carry.yield_source_value_id, op)
         for carry in token_carries
     )
     builder.set_region_yields(
@@ -1103,7 +1107,7 @@ def _convert_for(
     _replace_source_targets(
         builder,
         tuple(
-            (carry["yield_source_value_id"], token_result_target_id)
+            (carry.yield_source_value_id, token_result_target_id)
             for carry, token_result_target_id in zip(
                 token_carries,
                 token_result_target_ids,
@@ -1112,77 +1116,11 @@ def _convert_for(
     )
 
 
-def _loop_token_carries(conversion_input, op):
-    body_op_indices = _region_op_indices_recursive(conversion_input, op.region_ids[0])
-    waited_external_tokens = []
-    for node in conversion_input.token_nodes_by_op.values():
-        if node.op_index not in body_op_indices or node.op_name != "ttg.async_wait":
-            continue
-        for group_id in node.waited_group_ids:
-            group = conversion_input.token_groups_by_id[group_id]
-            if group.commit_op_index in body_op_indices or group.token_value_id is None:
-                continue
-            waited_external_tokens.append(group.token_value_id)
-    committed_body_tokens = tuple(
-        group.token_value_id
-        for group in sorted(
-            conversion_input.token_groups_by_commit.values(),
-            key=lambda group: group.commit_op_index,
-        )
-        if group.commit_op_index in body_op_indices and group.token_value_id is not None
-    )
-    waited_external_tokens = _dedupe_preserving_order(waited_external_tokens)
-    externally_waited_body_tokens = _externally_waited_body_tokens(
-        conversion_input,
-        body_op_indices,
-    )
-    if waited_external_tokens:
-        if len(waited_external_tokens) != 1 or len(committed_body_tokens) != 1:
-            fail(
-                "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
-                STAGE,
-                "scf.for async token carry supports one external waited group "
-                "and one body commit group",
-                source_op_index=op.index,
-            )
-        return (
-            {
-                "init_source_value_id": waited_external_tokens[0],
-                "yield_source_value_id": committed_body_tokens[0],
-                "add_issue_dependency": True,
-            },
-        )
-    return tuple(
-        {
-            "init_source_value_id": None,
-            "yield_source_value_id": body_token,
-            "add_issue_dependency": False,
-        }
-        for body_token in externally_waited_body_tokens
-    )
-
-
-def _externally_waited_body_tokens(conversion_input, body_op_indices):
-    body_tokens = []
-    for node in sorted(
-        conversion_input.token_nodes_by_op.values(),
-        key=lambda node: node.op_index,
-    ):
-        if node.op_index in body_op_indices or node.op_name != "ttg.async_wait":
-            continue
-        for group_id in node.waited_group_ids:
-            group = conversion_input.token_groups_by_id[group_id]
-            if group.commit_op_index not in body_op_indices or group.token_value_id is None:
-                continue
-            body_tokens.append(group.token_value_id)
-    return _dedupe_preserving_order(body_tokens)
-
-
 def _loop_token_init_target_id(builder, type_layout_program, op, carry):
-    init_source_value_id = carry.get("init_source_value_id")
+    init_source_value_id = carry.init_source_value_id
     if init_source_value_id is not None:
         return _single_source_target(builder, init_source_value_id, op)
-    yield_source_value_id = carry["yield_source_value_id"]
+    yield_source_value_id = carry.yield_source_value_id
     token_target_id = builder.add_value(
         target_ir.target_type_from_converted(
             type_layout_program.values[yield_source_value_id].type
@@ -1204,47 +1142,20 @@ def _loop_token_carry_issue_dependencies(token_carries, token_block_arg_target_i
             token_carries,
             token_block_arg_target_ids,
         )
-        if carry.get("add_issue_dependency", True)
+        if carry.add_issue_dependency
     )
 
 
-def _loop_async_issue_dependencies(
-    conversion_input,
-    token_carries,
-    token_block_arg_target_ids,
-):
+def _loop_async_issue_dependencies(token_carries, token_block_arg_target_ids):
     dependencies_by_op = {}
     for carry, token_block_arg_target_id in zip(token_carries, token_block_arg_target_ids):
-        body_group = _token_group_by_value_id(
-            conversion_input,
-            carry["yield_source_value_id"],
-        )
-        if body_group is None:
-            continue
-        for member_token_id in body_group.member_token_ids:
-            member_node = _token_node_by_value_id(conversion_input, member_token_id)
-            if member_node is None:
-                continue
-            existing = dependencies_by_op.setdefault(member_node.op_index, tuple())
-            dependencies_by_op[member_node.op_index] = (
+        for op_index in carry.issue_dependency_op_indices:
+            existing = dependencies_by_op.setdefault(op_index, tuple())
+            dependencies_by_op[op_index] = (
                 *existing,
                 int(token_block_arg_target_id),
             )
     return dependencies_by_op
-
-
-def _token_group_by_value_id(conversion_input, value_id):
-    for group in conversion_input.token_groups_by_commit.values():
-        if group.token_value_id == value_id:
-            return group
-    return None
-
-
-def _token_node_by_value_id(conversion_input, value_id):
-    for node in conversion_input.token_nodes_by_op.values():
-        if node.value_id == value_id:
-            return node
-    return None
 
 
 def _region_op_indices_recursive(conversion_input, region_id):
@@ -1271,17 +1182,6 @@ def _restore_source_targets(builder, saved):
             builder.source_value_targets.pop(source_value_id, None)
         else:
             builder.source_value_targets[source_value_id] = targets
-
-
-def _dedupe_preserving_order(values):
-    seen = set()
-    result = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return tuple(result)
 
 
 def _convert_local_alloc(

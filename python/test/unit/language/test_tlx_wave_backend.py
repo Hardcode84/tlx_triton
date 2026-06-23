@@ -742,6 +742,100 @@ def test_tlx_wave_converter_token_stage_builds_async_groups_and_effects(tmp_path
     del ctx
 
 
+def test_tlx_wave_converter_token_stage_records_loop_async_issue_carry(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_token_loop_carry(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %warmup_group = ttg.async_commit_group tokens %warmup
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body_group = ttg.async_commit_group tokens %body
+      %wait = ttg.async_wait {num = 1 : i32}
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    for_op = next(op for op in source.ops if op.name == "scf.for")
+    warmup_group_op, body_group_op = [
+        op for op in source.ops if op.name == "ttg.async_commit_group"
+    ]
+    _warmup_load_op, body_load_op = [
+        op for op in source.ops if op.name == "amdg.buffer_load_to_local"
+    ]
+    (carry,) = token_program.loop_token_carries_by_op[for_op.index]
+    assert carry.loop_op_index == for_op.index
+    assert carry.init_source_value_id == warmup_group_op.results[0]
+    assert carry.yield_source_value_id == body_group_op.results[0]
+    assert carry.add_issue_dependency is True
+    assert carry.issue_dependency_op_indices == (body_load_op.index,)
+    del ctx
+
+
+def test_tlx_wave_converter_token_stage_records_loop_async_final_wait_carry(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_token_loop_final_wait(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body_group = ttg.async_commit_group tokens %body
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+
+    token_program = converter_tokens.build_token_program(source, converted)
+
+    for_op = next(op for op in source.ops if op.name == "scf.for")
+    (body_group_op,) = [
+        op for op in source.ops if op.name == "ttg.async_commit_group"
+    ]
+    (carry,) = token_program.loop_token_carries_by_op[for_op.index]
+    assert carry.loop_op_index == for_op.index
+    assert carry.init_source_value_id is None
+    assert carry.yield_source_value_id == body_group_op.results[0]
+    assert carry.add_issue_dependency is False
+    assert carry.issue_dependency_op_indices == ()
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_orders_generic_memory_effects(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
