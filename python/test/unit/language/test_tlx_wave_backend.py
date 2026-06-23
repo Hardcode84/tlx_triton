@@ -2191,6 +2191,7 @@ def test_tlx_wave_converter_emits_workgroup_shape_from_ttgir(tmp_path):
     assert "wave.workgroup_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "gpu.known_block_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "wave.waves_per_workgroup = 4 : i64" in wave_artifact
+    assert "waveamdmachine.target_waves = 1 : i64" in wave_artifact
     del ctx
 
 
@@ -2270,7 +2271,7 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
     second_hash = backend.hash()
 
-    assert "stage9-amd-ttgir-staged-converter-hsaco-static-lds" in first_hash
+    assert "stage10-amd-ttgir-wave-target-waves" in first_hash
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
@@ -2522,6 +2523,11 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
 
     assert "tlx_wave.new_converter" in wave_artifact
     assert "gpu.kernel" in wave_artifact
+    expected_target_waves = max(1, (case["num_warps"] + 3) // 4)
+    assert (
+        f"waveamdmachine.target_waves = {expected_target_waves} : i64"
+        in wave_artifact
+    )
     assert isinstance(hsaco, bytes)
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.kernel == hsaco

@@ -125,7 +125,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
 
     def hash(self):
         return (
-            f"{self.target}:stage9-amd-ttgir-staged-converter-hsaco-static-lds:"
+            f"{self.target}:stage10-amd-ttgir-wave-target-waves:"
             f"wave-opt-sha256={_wave_opt_sha256()}:"
             f"wave-pipelines-sha256={_wave_pipelines_sha256()}"
         )

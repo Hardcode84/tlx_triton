@@ -5320,6 +5320,7 @@ def _kernel_workgroup_size(kernel):
 
 def _function_attrs(dsl, ir, kernel):
     num_warps = _kernel_num_warps(kernel)
+    target_waves = max(1, (num_warps + 3) // 4)
     return {
         "tlx_wave.converter.stage": ir.StringAttr.get("structural-emission"),
         "tlx_wave.num_warps": ir.IntegerAttr.get(dsl.i32(), num_warps),
@@ -5331,6 +5332,9 @@ def _function_attrs(dsl, ir, kernel):
             "true" if kernel.noinline else "false"
         ),
         "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
+        # gfx9/gfx950 exposes four SIMD execution units per CU. Model the
+        # requested CTA waves as the resident wave target per SIMD.
+        "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
     }
 
 
