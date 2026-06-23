@@ -1401,6 +1401,13 @@ def _convert_buffer_load_to_local(
                 source_op_index=op.index,
                 source_value_id=fields["mask_value_id"],
             )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            type_layout_program.values[fields["offset_value_id"]],
+            "amdg.buffer_load_to_local mask",
+            op,
+        )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     operands.extend(issue_dependency_target_ids)
     packet_plan = None
@@ -1673,6 +1680,13 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "amdg.buffer_store value and offset components must match",
             source_op_index=op.index,
         )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        value,
+        offsets,
+        "amdg.buffer_store value and offsets",
+        op,
+    )
     base_target_id = _single_source_target(builder, fields["base_value_id"], op)
     operands = [
         _single_source_target(builder, fields["value_value_id"], op),
@@ -1688,6 +1702,13 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
                 "amdg.buffer_store mask and value components must match",
                 source_op_index=op.index,
             )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            value,
+            "amdg.buffer_store mask",
+            op,
+        )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
     element_byte_width = conversion_input.value_element_byte_widths.get(
         fields["value_value_id"]
@@ -2128,65 +2149,11 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
         op,
         type_layout_program,
     )
-    native_remap = layout_remap.mfma_native_accumulator_remap(
-        result,
-        result_layout,
-        op,
-    )
-    if native_remap is not None:
-        native_acc_remap = layout_remap.mfma_accumulator_to_native_remap(
-            acc,
-            acc_layout,
-            op,
-        )
-        if native_acc_remap is None:
-            fail(
-                "TLXW_OP_DOT",
-                STAGE,
-                "tt.dot requires a native accumulator input remap for this "
-                "MFMA result layout",
-                source_op_index=op.index,
-                source_value_id=op.operands[2],
-            )
-    mma_result_target_ids = result_target_ids
-    mma_result_layout_map_ids = result_layout_map_ids
     mma_operand_target_ids = list(_operand_target_ids(builder, op))
-    if native_remap is not None:
-        native_acc_target_id = builder.add_value(
-            target_ir.target_type_from_converted(acc.type),
-            debug_name=f"v{op.operands[2]}_native_mfma_acc",
-        )
-        attrs = {
-            "fact_policy": "invalidate_layout_sensitive",
-            "result_component_count": int(acc.type.component_count),
-            **native_acc_remap,
-        }
-        attrs = _add_layout_remap_scratch_attrs(
-            attrs,
-            conversion_input,
-            acc,
-            op,
-        )
-        builder.add_op(
-            "layout_convert",
-            operands=(mma_operand_target_ids[2],),
-            results=(native_acc_target_id,),
-            attrs=attrs,
-            layout_map_ids=(),
-            source_op_index=op.index,
-        )
-        mma_operand_target_ids[2] = native_acc_target_id
-        mma_result_target_ids = (
-            builder.add_value(
-                target_ir.target_type_from_converted(result.type),
-                debug_name=f"v{op.results[0]}_native_mfma",
-            ),
-        )
-        mma_result_layout_map_ids = ()
     builder.add_op(
         "mma",
         operands=tuple(mma_operand_target_ids),
-        results=mma_result_target_ids,
+        results=result_target_ids,
         attrs={
             "acc_columns": int(acc_columns),
             "acc_element_type": acc.type.element_type,
@@ -2209,29 +2176,9 @@ def _convert_dot(builder, conversion_input, type_layout_program, op):
             "rhs_role": 1,
             "rhs_rows": int(operand_rows),
         },
-        layout_map_ids=mma_result_layout_map_ids,
+        layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
-    if native_remap is not None:
-        attrs = {
-            "fact_policy": "invalidate_layout_sensitive",
-            "result_component_count": int(result.type.component_count),
-            **native_remap,
-        }
-        attrs = _add_layout_remap_scratch_attrs(
-            attrs,
-            conversion_input,
-            result,
-            op,
-        )
-        builder.add_op(
-            "layout_convert",
-            operands=mma_result_target_ids,
-            results=result_target_ids,
-            attrs=attrs,
-            layout_map_ids=result_layout_map_ids,
-            source_op_index=op.index,
-        )
 
 
 def _convert_fragment_truncf(builder, type_layout_program, op):
@@ -2259,6 +2206,13 @@ def _convert_fragment_truncf(builder, type_layout_program, op):
             source_op_index=op.index,
         )
     operand_layout = type_layout_program.layouts[int(operand.layout_map_id)]
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        operand,
+        result,
+        "fragment truncf operand and result",
+        op,
+    )
     registers = _acc_fragment_registers(operand_layout, op)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -2488,6 +2442,62 @@ def _same_layout_alias(operand, result, operand_layout, result_layout):
         and tuple(operand_layout.shape) == tuple(result_layout.shape)
         and operand_layout.element_type == result_layout.element_type
         and operand_layout.properties == result_layout.properties
+    )
+
+
+def _same_layout_except_element_type(operand_layout, result_layout):
+    if operand_layout is None or result_layout is None:
+        return operand_layout is result_layout
+    return (
+        operand_layout.kind == result_layout.kind
+        and tuple(operand_layout.shape) == tuple(result_layout.shape)
+        and int(operand_layout.component_count) == int(result_layout.component_count)
+        and int(operand_layout.lane_width) == int(result_layout.lane_width)
+        and operand_layout.properties == result_layout.properties
+    )
+
+
+def _layout_for_converted_value(type_layout_program, value):
+    if value.layout_map_id is None:
+        return None
+    return type_layout_program.layouts[int(value.layout_map_id)]
+
+
+def _require_same_layout_except_element_type(
+    type_layout_program,
+    operand,
+    result,
+    description,
+    op,
+):
+    operand_layout = _layout_for_converted_value(type_layout_program, operand)
+    result_layout = _layout_for_converted_value(type_layout_program, result)
+    if _same_layout_except_element_type(operand_layout, result_layout):
+        return
+    fail(
+        "TLXW_OP_LAYOUT_MISMATCH",
+        STAGE,
+        f"{description} layouts must match; use ttg.convert_layout for layout changes",
+        source_op_index=op.index,
+        source_value_id=result.value_id,
+    )
+
+
+def _require_mask_layout_compatible(
+    type_layout_program,
+    mask,
+    reference,
+    description,
+    op,
+):
+    if mask.layout_map_id is None:
+        return
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        mask,
+        reference,
+        description,
+        op,
     )
 
 

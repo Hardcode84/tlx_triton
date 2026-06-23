@@ -68,6 +68,51 @@ GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
 _TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
 
 
+def _fake_layout(
+    layout_map_id,
+    value_id,
+    *,
+    kind="blocked",
+    shape=(8, 8),
+    element_type="i32",
+    component_count=1,
+    lane_width=64,
+    properties=None,
+):
+    return converter_layouts.LayoutMap(
+        layout_map_id,
+        value_id,
+        kind,
+        tuple(shape),
+        element_type,
+        int(component_count),
+        int(lane_width),
+        dict(properties or {}),
+    )
+
+
+def _converted_value(
+    value_id,
+    *,
+    kind="tensor",
+    representation="simd",
+    element_type="i32",
+    component_count=1,
+    layout_map_id=None,
+):
+    return converter_types.ConvertedValue(
+        value_id,
+        converter_types.ConvertedType(
+            kind,
+            representation,
+            element_type,
+            64,
+            int(component_count),
+        ),
+        layout_map_id,
+    )
+
+
 def _asm_text(compiled, artifact):
     text = compiled.asm[artifact]
     if isinstance(text, bytes):
@@ -1630,6 +1675,39 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
     assert diagnostic.no_fallback is True
 
 
+def test_tlx_wave_converter_verifier_rejects_non_convert_layout_source():
+    builder = converter_target_ir.TargetBuilder()
+    tensor = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
+    operand = builder.add_value(tensor, source_value_id=0)
+    result = builder.add_value(tensor, source_value_id=1)
+    builder.add_op(
+        "layout_convert",
+        operands=(operand,),
+        results=(result,),
+        attrs={
+            "fact_policy": "preserve_equivalent",
+            "group_size": 1,
+            "mode": "alias",
+            "result_component_count": 1,
+        },
+        source_op_index=0,
+    )
+    source_program = SimpleNamespace(ops=(SimpleNamespace(name="tt.dot"),))
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(
+            builder.build(),
+            source_program=source_program,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_LAYOUT_CONVERT_SOURCE"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_op_id == 0
+    assert diagnostic.source_op_index == 0
+    assert diagnostic.no_fallback is True
+
+
 def test_tlx_wave_converter_verifier_rejects_unknown_target_value():
     target = converter_target_ir.TargetProgram(
         (),
@@ -1966,6 +2044,9 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     assert compiled.metadata.tlx_wave_lds_size_bytes > 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
     assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+    if case.get("id") == "v9_beyond_hotloop_transposed_b":
+        assert "layout_convert" not in wave_artifact
+        assert wave_artifact.count("wave.barrier") == 6
 
 
 @pytest.mark.parametrize(
@@ -2881,6 +2962,89 @@ def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_b16" in machine
     del ctx
+
+
+def test_tlx_wave_converter_rejects_buffer_load_to_local_mask_layout_mismatch():
+    offset_layout = _fake_layout(0, 2, element_type="i32", properties={"order": (0,)})
+    mask_layout = _fake_layout(1, 3, element_type="i1", properties={"order": (1,)})
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0: _converted_value(
+                0,
+                kind="memdesc",
+                representation="memdesc",
+                element_type="f16",
+            ),
+            1: _converted_value(
+                1,
+                kind="pointer",
+                representation="uniform_pointer",
+                element_type="f16",
+            ),
+            2: _converted_value(2, element_type="i32", layout_map_id=0),
+            3: _converted_value(
+                3,
+                kind="mask",
+                representation="mask",
+                element_type="i1",
+                layout_map_id=1,
+            ),
+            4: _converted_value(
+                4,
+                kind="token",
+                representation="token",
+                element_type=None,
+            ),
+        },
+        (offset_layout, mask_layout),
+    )
+    builder = converter_target_ir.TargetBuilder()
+    for source_value_id, value in type_layout_program.values.items():
+        if source_value_id == 4:
+            continue
+        builder.add_value(
+            converter_target_ir.target_type_from_converted(value.type),
+            source_value_id=source_value_id,
+        )
+    conversion_input = SimpleNamespace(
+        async_issue_dependency_target_ids_by_op={},
+        memdescs={
+            0: converter_op_conversion.MemdescInfo(
+                0,
+                "f16",
+                2,
+                (64,),
+                (64,),
+                128,
+            )
+        },
+        token_nodes_by_op={0: SimpleNamespace(value_id=4)},
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "pointer_byte_range", 1, "pointer_range", upper=128),),
+        {1: (0,)},
+    )
+    op = converter_source_ir.SourceOp(
+        0,
+        "amdg.buffer_load_to_local",
+        operands=(0, 1, 2, 3),
+        results=(4,),
+        attrs={"operandSegmentSizes": (1, 1, 1, 1, 0, 0)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_op_conversion._convert_buffer_load_to_local(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_LAYOUT_MISMATCH"
+    assert "amdg.buffer_load_to_local mask layouts must match" in str(diagnostic)
+    assert "ttg.convert_layout" in str(diagnostic)
 
 
 def test_tlx_wave_converter_lowers_splat_i1_buffer_load_to_local_mask(
@@ -4020,30 +4184,24 @@ def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
     ]
     assert attrs["mode"] == "mfma_vector_register_remap"
     assert attrs["scalar_mode"] == "cross_lane_register_remap"
-    native_convert_ops = [
+    dot_layout_convert_ops = [
         op
         for op in output.target_program.ops
         if op.kind == "layout_convert"
-        and "scratch_element_count" in converter_target_ir.attrs_dict(op)
+        and output.source_program.ops[op.source_op_index].name == "tt.dot"
     ]
-    native_convert_attrs = [
-        converter_target_ir.attrs_dict(op) for op in native_convert_ops
-    ]
-    assert [attrs["mode"] for attrs in native_convert_attrs] == [
-        "mfma_vector_register_remap",
-        "mfma_vector_register_remap",
-    ]
-    assert [attrs["result_component_count"] for attrs in native_convert_attrs] == [
-        1,
-        1,
-    ]
-    assert [attrs["scalar_result_component_count"] for attrs in native_convert_attrs] == [
-        4,
-        4,
-    ]
+    assert dot_layout_convert_ops == []
     (mma_op,) = [op for op in output.target_program.ops if op.kind == "mma"]
-    assert native_convert_ops[0].results[0] == mma_op.operands[2]
-    assert mma_op.results[0] == native_convert_ops[1].operands[0]
+    explicit_convert_ops = [
+        op for op in output.target_program.ops if op.kind == "layout_convert"
+    ]
+    assert len(explicit_convert_ops) == 1
+    assert explicit_convert_ops[0].results[0] == mma_op.operands[2]
+    dot_source_op = next(op for op in output.source_program.ops if op.name == "tt.dot")
+    assert (
+        output.target_program.values[mma_op.results[0]].source_value_id
+        == dot_source_op.results[0]
+    )
     wave = output.emitted_module.text
     assert 'waveamd.fragment_pack' in wave
     assert 'waveamd.mma "mfma.f32.16x16x32.f16"' in wave
@@ -4210,6 +4368,70 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_rejects_fragment_truncf_layout_relabel():
+    operand_layout = _fake_layout(
+        0,
+        0,
+        kind="amd_mfma",
+        shape=(16, 16),
+        element_type="f32",
+        properties={
+            "instr_shape": (16, 16, 32),
+            "is_transposed": True,
+            "warps_per_cta": (1, 1),
+        },
+    )
+    result_layout = _fake_layout(
+        1,
+        1,
+        kind="amd_mfma",
+        shape=(16, 16),
+        element_type="f16",
+        properties={
+            "instr_shape": (16, 16, 32),
+            "is_transposed": False,
+            "warps_per_cta": (1, 1),
+        },
+    )
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0: _converted_value(
+                0,
+                kind="fragment",
+                representation="fragment",
+                element_type="f32",
+                layout_map_id=0,
+            ),
+            1: _converted_value(
+                1,
+                kind="fragment",
+                representation="fragment",
+                element_type="f16",
+                layout_map_id=1,
+            ),
+        },
+        (operand_layout, result_layout),
+    )
+    op = converter_source_ir.SourceOp(
+        0,
+        "arith.truncf",
+        operands=(0,),
+        results=(1,),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_op_conversion._convert_fragment_truncf(
+            converter_target_ir.TargetBuilder(),
+            type_layout_program,
+            op,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_LAYOUT_MISMATCH"
+    assert "fragment truncf operand and result layouts must match" in str(diagnostic)
+    assert "ttg.convert_layout" in str(diagnostic)
+
+
 def test_tlx_wave_converter_lowers_same_lane_mfma_to_blocked_remap(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -4361,6 +4583,103 @@ def test_tlx_wave_converter_masks_wide_buffer_store_with_oob_select(
     assert attrs["inactive_offset"] == 1073741824
     assert "wave.select" in output.emitted_module.text
     del ctx
+
+
+def test_tlx_wave_converter_rejects_buffer_store_layout_mismatch():
+    offset_layout = _fake_layout(0, 2, element_type="i32", properties={"order": (0,)})
+    value_layout = _fake_layout(1, 0, element_type="f16", properties={"order": (1,)})
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0: _converted_value(0, element_type="f16", layout_map_id=1),
+            1: _converted_value(
+                1,
+                kind="pointer",
+                representation="uniform_pointer",
+                element_type="f16",
+            ),
+            2: _converted_value(2, element_type="i32", layout_map_id=0),
+        },
+        (offset_layout, value_layout),
+    )
+    op = converter_source_ir.SourceOp(
+        0,
+        "amdg.buffer_store",
+        operands=(0, 1, 2),
+        attrs={"operandSegmentSizes": (1, 1, 1, 0, 0)},
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "pointer_byte_range", 1, "pointer_range", upper=128),),
+        {1: (0,)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_op_conversion._convert_buffer_store(
+            converter_target_ir.TargetBuilder(),
+            SimpleNamespace(value_element_byte_widths={0: 2}),
+            type_layout_program,
+            fact_program,
+            op,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_LAYOUT_MISMATCH"
+    assert "amdg.buffer_store value and offsets layouts must match" in str(diagnostic)
+    assert "ttg.convert_layout" in str(diagnostic)
+
+
+def test_tlx_wave_converter_rejects_buffer_store_mask_layout_mismatch():
+    value_layout = _fake_layout(0, 0, element_type="f16", properties={"order": (0,)})
+    mask_layout = _fake_layout(1, 3, element_type="i1", properties={"order": (1,)})
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0: _converted_value(0, element_type="f16", layout_map_id=0),
+            1: _converted_value(
+                1,
+                kind="pointer",
+                representation="uniform_pointer",
+                element_type="f16",
+            ),
+            2: _converted_value(2, element_type="i32", layout_map_id=0),
+            3: _converted_value(
+                3,
+                kind="mask",
+                representation="mask",
+                element_type="i1",
+                layout_map_id=1,
+            ),
+        },
+        (value_layout, mask_layout),
+    )
+    builder = converter_target_ir.TargetBuilder()
+    for source_value_id, value in type_layout_program.values.items():
+        builder.add_value(
+            converter_target_ir.target_type_from_converted(value.type),
+            source_value_id=source_value_id,
+        )
+    op = converter_source_ir.SourceOp(
+        0,
+        "amdg.buffer_store",
+        operands=(0, 1, 2, 3),
+        attrs={"operandSegmentSizes": (1, 1, 1, 0, 1)},
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(0, "pointer_byte_range", 1, "pointer_range", upper=128),),
+        {1: (0,)},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_op_conversion._convert_buffer_store(
+            builder,
+            SimpleNamespace(value_element_byte_widths={0: 2}),
+            type_layout_program,
+            fact_program,
+            op,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_LAYOUT_MISMATCH"
+    assert "amdg.buffer_store mask layouts must match" in str(diagnostic)
+    assert "ttg.convert_layout" in str(diagnostic)
 
 
 def test_tlx_wave_converter_keeps_buffer_store_components_independent(
@@ -4803,21 +5122,7 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
         (0, 96),
         (32, 96),
     )
-    layout_converts = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "layout_convert"
-    ]
-    native_remaps = [
-        attrs
-        for attrs in layout_converts
-        if attrs["mode"] == "mfma_vector_register_remap"
-    ]
-    assert [attrs["result_component_count"] for attrs in native_remaps] == [16, 16]
-    assert [attrs["scalar_result_component_count"] for attrs in native_remaps] == [
-        64,
-        64,
-    ]
+    assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
     wave = output.emitted_module.text
     assert "128*floor(1/2*Mod(wi, 64))" in wave
     assert "vector<8xf16>" in wave
@@ -4924,17 +5229,6 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         for op in output.target_program.ops
         if op.kind == "local_load_mma_payload"
     ]
-    layout_converts = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "layout_convert"
-    ]
-    native_remaps = [
-        attrs
-        for attrs in layout_converts
-        if attrs["mode"] == "mfma_vector_register_remap"
-    ]
-
     assert [attrs["load_mode"] for attrs in local_load_attrs] == [
         "swizzled_mma_payload_load",
         "b16_transpose",
@@ -4947,11 +5241,7 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         attrs["shared_physical_swizzled_vec"] == 8 for attrs in local_load_attrs
     )
     assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
-    assert [attrs["result_component_count"] for attrs in native_remaps] == [1, 1]
-    assert [attrs["scalar_result_component_count"] for attrs in native_remaps] == [
-        16,
-        16,
-    ]
+    assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
     wave = output.emitted_module.text
     assert wave.count("wave.index_expr") == 6
     assert "xor(" in wave
@@ -4971,7 +5261,7 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         for line in lines
         if "waveamd.transpose_load" in line
     )
-    assert wave.count("wave.pack") == 5
+    assert wave.count("wave.pack") == 3
     assert "waveamd.fragment_fill" not in wave
     assert wave.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
     _run_waveamd_to_machine(wave)

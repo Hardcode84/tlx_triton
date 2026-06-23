@@ -18,7 +18,7 @@ def verify_target_program(
     token_program=None,
 ):
     _verify_target_value_ids(target_program)
-    _verify_ops(target_program, fact_program)
+    _verify_ops(target_program, fact_program, source_program)
     if source_program is not None:
         _verify_source_results_covered(source_program, target_program)
     if token_program is not None and source_program is not None:
@@ -38,7 +38,7 @@ def _verify_target_value_ids(target_program):
             )
 
 
-def _verify_ops(target_program, fact_program):
+def _verify_ops(target_program, fact_program, source_program):
     value_count = len(target_program.values)
     op_count = len(target_program.ops)
     facts_by_id = _facts_by_id(fact_program)
@@ -97,6 +97,8 @@ def _verify_ops(target_program, fact_program):
             )
         if op.kind == "layout_convert":
             _verify_layout_convert_fact_policy(op)
+            if source_program is not None:
+                _verify_layout_convert_source_op(op, source_program)
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
             fail(
                 "TLXW_VERIFY_MISSING_FACT",
@@ -124,6 +126,35 @@ def _verify_layout_convert_fact_policy(op):
             "layout_convert that invalidates layout-sensitive facts must not "
             "carry fact ids",
             target_op_id=op.target_op_id,
+        )
+
+
+def _verify_layout_convert_source_op(op, source_program):
+    if op.source_op_index is None:
+        fail(
+            "TLXW_VERIFY_LAYOUT_CONVERT_SOURCE",
+            STAGE,
+            "layout_convert target op must come from source ttg.convert_layout",
+            target_op_id=op.target_op_id,
+        )
+    try:
+        source_op = source_program.ops[int(op.source_op_index)]
+    except IndexError:
+        fail(
+            "TLXW_VERIFY_LAYOUT_CONVERT_SOURCE",
+            STAGE,
+            "layout_convert target op references an unknown source op",
+            target_op_id=op.target_op_id,
+            source_op_index=op.source_op_index,
+        )
+    if source_op.name != "ttg.convert_layout":
+        fail(
+            "TLXW_VERIFY_LAYOUT_CONVERT_SOURCE",
+            STAGE,
+            "layout_convert target op must come from source ttg.convert_layout, "
+            f"not {source_op.name}",
+            target_op_id=op.target_op_id,
+            source_op_index=op.source_op_index,
         )
 
 

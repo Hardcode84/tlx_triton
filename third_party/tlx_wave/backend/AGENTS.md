@@ -27,6 +27,9 @@ from-scratch converter.
   component/lane permutation, fragment conversion, CTA exchange, or a
   diagnostic. Do not forward it and reinterpret it later in stores, DMA, masks,
   dot, or local-memory lowering.
+- The only acceptable layout conversion boundary is an explicit
+  `ttg.convert_layout` op in the source TTGIR. If a conversion is needed
+  anywhere else, the layout model is wrong and the code must not be merged.
 - Facts need provenance. Range, divisibility, pow2, no-overflow, uniformity, and
   contiguity facts must identify the source guarantee and fixed-width semantics.
   Do not invent facts from unsafe identities such as "nonnegative *
