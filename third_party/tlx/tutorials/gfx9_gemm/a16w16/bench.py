@@ -1,9 +1,16 @@
-"""Benchmark harness matching Gluon's bench.py format."""
+"""Benchmark harness for the gfx9 TLX GEMM tutorial kernels."""
 
 import argparse
-import importlib
+from contextlib import contextmanager
+import importlib.util
+import os
+from pathlib import Path
+import time
+
 import torch
 import triton
+from triton import knobs
+
 
 VERSION_MAP = {
     0: "v0_naive",
@@ -18,7 +25,13 @@ VERSION_MAP = {
     9: "v9_beyond_hotloop",
 }
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+PROVIDER_LABELS = {
+    "rocblas": "rocBLAS",
+    "tlx": "TLX",
+    "wave": "Wave",
+}
+
+BENCH_DIR = Path(__file__).resolve().parent
 
 
 def get_x_vals():
@@ -30,40 +43,234 @@ def get_x_vals():
     ]
 
 
+def parse_shape(text):
+    parts = text.replace("x", ",").split(",")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"shape must be MxNxK or M,N,K, got {text!r}"
+        )
+    try:
+        shape = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"shape must contain integer M/N/K values, got {text!r}"
+        ) from exc
+    if any(dim <= 0 for dim in shape):
+        raise argparse.ArgumentTypeError(f"shape dimensions must be positive: {text!r}")
+    return shape
+
+
+def load_matmul_module(version_dir, suffix):
+    kernel_path = BENCH_DIR / version_dir / "matmul_kernel.py"
+    spec = importlib.util.spec_from_file_location(
+        f"_tlx_gfx9_gemm_{version_dir}_{suffix}_{time.time_ns()}",
+        kernel_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import benchmark kernel from {kernel_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_driver(provider):
+    if provider == "tlx":
+        from triton.backends.amd import driver as amd_driver
+
+        return amd_driver.HIPDriver()
+    if provider == "wave":
+        from triton.backends.tlx_wave import driver as tlx_wave_driver
+
+        return tlx_wave_driver.TLXWaveDriver()
+    return None
+
+
+@contextmanager
+def active_driver(driver):
+    if driver is None:
+        yield
+        return
+    previous_driver = triton.runtime.driver.active
+    triton.runtime.driver.set_active(driver)
+    try:
+        yield
+    finally:
+        triton.runtime.driver.set_active(previous_driver)
+
+
+def provider_defaults(version):
+    if version == 9:
+        return ["tlx", "wave"]
+    return ["rocblas", "tlx"]
+
+
+def make_inputs(M, N, K, device, b_layout):
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    if b_layout == "contiguous":
+        b = torch.randn((K, N), device=device, dtype=torch.float16)
+    else:
+        b = torch.randn((N, K), device=device, dtype=torch.float16).T
+    return a, b
+
+
+def provider_matmul(provider, module, a, b):
+    if provider == "rocblas":
+        return torch.matmul(a, b)
+    return module.matmul(a, b)
+
+
+def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
+    module = None
+    if provider != "rocblas":
+        module = load_matmul_module(version_dir, provider)
+    driver = make_driver(provider)
+    cache_dir = None
+    if args.cache_dir is not None:
+        cache_dir = Path(args.cache_dir) / version_dir / provider / f"M{M}_N{N}_K{K}"
+
+    with active_driver(driver), knobs.cache.scope(), knobs.runtime.scope():
+        if cache_dir is not None:
+            knobs.cache.dir = str(cache_dir)
+        if args.arch is not None:
+            knobs.runtime.override_arch = args.arch
+        c = provider_matmul(provider, module, a, b)
+        torch.cuda.synchronize()
+        ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
+        max_err = (c - ref).abs().max().item()
+        if not ok:
+            bad = int(
+                (~torch.isclose(c, ref, atol=args.atol, rtol=args.rtol)).sum().item()
+            )
+            return {
+                "ok": False,
+                "max_err": max_err,
+                "bad": bad,
+                "ms": None,
+                "tflops": None,
+            }
+        ms = triton.testing.do_bench(
+            lambda: provider_matmul(provider, module, a, b),
+            warmup=args.warmup,
+            rep=args.rep,
+        )
+    return {
+        "ok": True,
+        "max_err": max_err,
+        "bad": 0,
+        "ms": ms,
+        "tflops": tflops(ms, M, N, K),
+    }
+
+
+def tflops(ms, M, N, K):
+    return 2 * M * N * K * 1e-12 / (ms * 1e-3)
+
+
 def main():
     parser = argparse.ArgumentParser(description="TLX GEMM benchmark")
     parser.add_argument("--K", type=int, default=None)
     parser.add_argument("--version", type=int, default=0, choices=range(0, 10))
+    parser.add_argument(
+        "--providers",
+        nargs="+",
+        choices=tuple(PROVIDER_LABELS),
+        default=None,
+        help=(
+            "providers to benchmark. Defaults to rocblas tlx, except v9 defaults "
+            "to tlx wave."
+        ),
+    )
+    parser.add_argument(
+        "--shape",
+        action="append",
+        type=parse_shape,
+        default=None,
+        help="custom shape as MxNxK or M,N,K. Can be repeated.",
+    )
+    parser.add_argument(
+        "--b-layout",
+        choices=("transposed", "contiguous"),
+        default="transposed",
+        help="layout used for B input; transposed matches the tutorial benchmark.",
+    )
+    parser.add_argument("--rep", type=int, default=200)
+    parser.add_argument("--warmup", type=int, default=25)
+    parser.add_argument("--atol", type=float, default=1e-1)
+    parser.add_argument("--rtol", type=float, default=0.0)
+    parser.add_argument("--arch", default=None, help="optional Triton runtime arch override")
+    parser.add_argument("--cache-dir", default=None, help="optional Triton cache root")
+    parser.add_argument("--wave-opt", default=None, help="optional path to wave-opt")
     args = parser.parse_args()
 
-    version_dir = VERSION_MAP[args.version]
-    module = importlib.import_module(f"{version_dir}.matmul_kernel")
-    matmul = module.matmul
+    if args.wave_opt:
+        os.environ["TRITON_WAVE_OPT"] = args.wave_opt
 
-    sizes = get_x_vals()
+    version_dir = VERSION_MAP[args.version]
+    providers = (
+        list(args.providers)
+        if args.providers is not None
+        else provider_defaults(args.version)
+    )
+    sizes = list(args.shape) if args.shape is not None else get_x_vals()
     if args.K:
         sizes = [(m, n, k) for m, n, k in sizes if k == args.K]
+    if not sizes:
+        raise SystemExit("no shapes selected")
 
-    tflops = lambda ms, M, N, K: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    device = triton.runtime.driver.active.get_active_torch_device()
 
-    # Correctness
+    print(f"\n{version_dir} ({args.b_layout} B):")
+    header = f"{'M':>6s} {'N':>6s} {'K':>6s}"
+    for provider in providers:
+        label = PROVIDER_LABELS[provider]
+        header += f"  {label:>17s}"
+    if "tlx" in providers and "wave" in providers:
+        header += f"  {'Wave/TLX':>9s}"
+    print(header)
+
     for M, N, K in sizes:
-        a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-        b = torch.randn((N, K), device=DEVICE, dtype=torch.float16).T
+        a, b = make_inputs(M, N, K, device, args.b_layout)
         ref = torch.matmul(a, b)
-        c = matmul(a, b)
-        ok = torch.allclose(c, ref, atol=1e-1, rtol=0)
-        print(f"[{version_dir}] M={M} N={N} K={K}: {'OK' if ok else 'FAIL'}")
+        torch.cuda.synchronize()
 
-    # Performance
-    print(f"\n{version_dir}:")
-    print(f"{'M':>6s} {'N':>6s} {'K':>6s}  {'rocBLAS':>8s}  {'TLX':>8s}")
-    for M, N, K in sizes:
-        a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-        b = torch.randn((N, K), device=DEVICE, dtype=torch.float16).T
-        ms_ref = triton.testing.do_bench(lambda: torch.matmul(a, b), rep=200)
-        ms_tlx = triton.testing.do_bench(lambda: matmul(a, b), rep=200)
-        print(f"{M:6d} {N:6d} {K:6d}  {tflops(ms_ref,M,N,K):7.1f}T  {tflops(ms_tlx,M,N,K):7.1f}T")
+        row = f"{M:6d} {N:6d} {K:6d}"
+        results = {}
+        for provider in providers:
+            try:
+                result = benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "max_err": None,
+                    "bad": None,
+                    "ms": None,
+                    "tflops": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            results[provider] = result
+            if result["ok"]:
+                row += f"  {result['tflops']:8.1f}T/{result['ms']:6.3f}ms"
+            else:
+                row += f"  {'FAIL':>17s}"
+                if "error" in result:
+                    print(
+                        f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed: "
+                        f"{result['error']}"
+                    )
+                else:
+                    print(
+                        f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed "
+                        f"correctness: max_err={result['max_err']}, bad={result['bad']}"
+                    )
+        if (
+            "tlx" in results
+            and "wave" in results
+            and results["tlx"]["ok"]
+            and results["wave"]["ok"]
+        ):
+            ratio = results["wave"]["tflops"] / results["tlx"]["tflops"]
+            row += f"  {ratio:8.3f}x"
+        print(row, flush=True)
 
 
 if __name__ == "__main__":

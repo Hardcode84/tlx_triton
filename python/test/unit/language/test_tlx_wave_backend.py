@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import re
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -217,6 +218,23 @@ def _load_tlx_gfx9_gemm_kernel(version_dir, function_name):
         f"_tlx_wave_test_{version_dir}_{function_name}",
     )
     return getattr(module, function_name)
+
+
+def _load_tlx_gfx9_gemm_bench_module(module_name="_tlx_wave_test_gfx9_bench"):
+    repo_root = Path(__file__).resolve().parents[4]
+    bench_path = (
+        repo_root
+        / "third_party"
+        / "tlx"
+        / "tutorials"
+        / "gfx9_gemm"
+        / "a16w16"
+        / "bench.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
@@ -2332,6 +2350,62 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_binary_stage == "wave-compile-kernels"
+
+
+def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
+    bench = _load_tlx_gfx9_gemm_bench_module()
+
+    assert not hasattr(bench, "DEVICE")
+    assert bench.provider_defaults(9) == ["tlx", "wave"]
+    assert bench.provider_defaults(0) == ["rocblas", "tlx"]
+    assert bench.parse_shape("128x256x64") == (128, 256, 64)
+    assert bench.parse_shape("128,256,64") == (128, 256, 64)
+    with pytest.raises(Exception, match="shape dimensions must be positive"):
+        bench.parse_shape("128x0x64")
+    with pytest.raises(Exception, match="shape must be MxNxK"):
+        bench.parse_shape("128x256")
+
+
+def test_tlx_gfx9_gemm_bench_loads_modules_without_import_leaks():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_wave_test_gfx9_bench_imports")
+    before_path = list(sys.path)
+
+    module = bench.load_matmul_module("v0_naive", "test")
+
+    assert hasattr(module, "matmul")
+    assert list(sys.path) == before_path
+    assert module.__name__ not in sys.modules
+
+
+def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_wave_test_gfx9_bench_driver")
+
+    class FakeDriverState:
+        def __init__(self):
+            self.active = "previous"
+            self.transitions = []
+
+        def set_active(self, driver):
+            self.transitions.append(driver)
+            self.active = driver
+
+    driver_state = FakeDriverState()
+    monkeypatch.setattr(
+        bench.triton,
+        "runtime",
+        SimpleNamespace(driver=driver_state),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with bench.active_driver("next"):
+            assert driver_state.active == "next"
+            raise RuntimeError("boom")
+
+    assert driver_state.active == "previous"
+    assert driver_state.transitions == ["next", "previous"]
+    with bench.active_driver(None):
+        assert driver_state.active == "previous"
+    assert driver_state.transitions == ["next", "previous"]
 
 
 @pytest.mark.parametrize(
