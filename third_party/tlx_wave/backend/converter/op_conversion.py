@@ -61,6 +61,7 @@ class OpConversionView:
     fact_target_ids: tuple[int, ...]
     operand_fact_ids: tuple[int, ...]
     operand_fact_target_ids: tuple[int, ...]
+    operand_ranges: tuple[tuple[int | None, int | None], ...]
 
 
 @dataclass(frozen=True)
@@ -361,6 +362,7 @@ def _convert_source_op(
         _fact_target_ids(builder, fact_program, fact_ids, op),
         operand_fact_ids,
         _fact_target_ids(builder, fact_program, operand_fact_ids, op),
+        _operand_ranges(fact_program, op),
     )
     converter(builder, view)
 
@@ -447,8 +449,11 @@ def _convert_constant(builder, view):
 
 
 def _convert_binary(builder, view):
+    operation = _BINARY_OPS[view.op_name]
+    if operation in {"divsi", "remsi"} and _can_use_unsigned_div_rem(view):
+        operation = "divui" if operation == "divsi" else "remui"
     attrs = {
-        "operation": _BINARY_OPS[view.op_name],
+        "operation": operation,
         "source_width": _target_int_width(builder, view.result_target_ids),
     }
     nsw, nuw = _arith_overflow_flags(view)
@@ -465,6 +470,20 @@ def _convert_binary(builder, view):
         fact_target_ids=view.operand_fact_target_ids,
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
+    )
+
+
+def _can_use_unsigned_div_rem(view):
+    if len(view.operand_ranges) != 2:
+        return False
+    lhs_range, rhs_range = view.operand_ranges
+    lhs_lower = lhs_range[0]
+    rhs_lower = rhs_range[0]
+    return (
+        lhs_lower is not None
+        and lhs_lower >= 0
+        and rhs_lower is not None
+        and rhs_lower > 0
     )
 
 
@@ -2891,6 +2910,27 @@ def _op_precedes_in_region(
         return region_ops.index(lhs_op_index) < region_ops.index(rhs_op_index)
     except (IndexError, ValueError):
         return False
+
+
+def _operand_ranges(fact_program, op):
+    return tuple(
+        _combined_range_for_value(fact_program, source_value_id)
+        for source_value_id in op.operands
+    )
+
+
+def _combined_range_for_value(fact_program, value_id):
+    lower = None
+    upper = None
+    for fact_id in fact_program.by_value.get(value_id, ()):
+        fact = fact_program.facts[fact_id]
+        if fact.kind != "range":
+            continue
+        if fact.lower is not None:
+            lower = fact.lower if lower is None else max(lower, fact.lower)
+        if fact.upper is not None:
+            upper = fact.upper if upper is None else min(upper, fact.upper)
+    return lower, upper
 
 
 def _pointer_byte_range_fact(fact_program, value_id, op):

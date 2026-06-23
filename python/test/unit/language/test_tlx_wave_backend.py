@@ -659,6 +659,70 @@ def test_tlx_wave_converter_fact_stage_does_not_infer_overflowing_mul(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_lowers_nonnegative_signed_div_rem_as_unsigned(tmp_path):
+    local_func = """
+  tt.func public @converter_nonnegative_div_rem(%limit: i32) attributes {noinline = false} {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %c8 = arith.constant 8 : i32
+    %limit_positive = arith.cmpi sgt, %limit, %c0 : i32
+    llvm.intr.assume %limit_positive : i1
+    %first_rem = arith.remsi %pid, %c8 : i32
+    %first_div = arith.divsi %pid, %c8 : i32
+    %left = arith.addi %first_rem, %first_div : i32
+    %right = arith.addi %first_div, %c4 : i32
+    %use_left = arith.cmpi slt, %first_rem, %c4 : i32
+    %swizzled = scf.if %use_left -> (i32) {
+      scf.yield %left : i32
+    } else {
+      scf.yield %right : i32
+    }
+    %group_positive = arith.cmpi sgt, %c1, %c0 : i32
+    llvm.intr.assume %group_positive : i1
+    %inner = arith.remsi %swizzled, %c1 : i32
+    %tile = arith.divsi %swizzled, %c1 : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    operations = [
+        converter_target_ir.attrs_dict(op)["operation"]
+        for op in output.target_program.ops
+        if op.kind == "binary"
+    ]
+    assert "divui" in operations
+    assert "divsi" not in operations
+    assert "remsi" not in operations
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_unproven_signed_div_signed(tmp_path):
+    local_func = """
+  tt.func public @converter_unproven_signed_div(%arg0: i32) attributes {noinline = false} {
+    %one = arith.constant 1 : i32
+    %q = arith.divsi %arg0, %one : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    operations = [
+        converter_target_ir.attrs_dict(op)["operation"]
+        for op in output.target_program.ops
+        if op.kind == "binary"
+    ]
+    assert "divsi" in operations
+    assert "divui" not in operations
+    del ctx
+
+
 def test_tlx_wave_converter_fact_stage_invalidates_convert_layout_affine(tmp_path):
     preamble = """
 #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
