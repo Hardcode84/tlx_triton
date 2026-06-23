@@ -2546,8 +2546,9 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
         )
     else:
         assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
-    if case.get("id") == "v9_beyond_hotloop_transposed_b":
+    if case["version_dir"] == "v9_beyond_hotloop":
         assert "layout_convert" not in wave_artifact
+    if case.get("id") == "v9_beyond_hotloop_transposed_b":
         assert wave_artifact.count("wave.barrier") == 5
 
 
@@ -4981,6 +4982,10 @@ def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
             properties,
             64,
         )
+        assert tuple(name for name, _size in linear.out_dims) == (
+            "dim1",
+            "dim0",
+        ), name
         actual = tuple(
             converter_layouts.linear_layout_coords(
                 linear,
@@ -5584,6 +5589,18 @@ def test_tlx_wave_converter_rejects_non_affine_mfma_metadata_lane_remap():
         },
     )
     result_linear = converter_layouts.distributed_linear_layout(result_layout)
+
+    def bases_by_standard_dims(in_dim):
+        out_indices = {
+            str(name): index
+            for index, (name, _size) in enumerate(result_linear.out_dims)
+        }
+        rank = len(result_linear.out_dims)
+        return tuple(
+            tuple(int(basis[out_indices[f"dim{dim}"]]) for dim in range(rank))
+            for basis in converter_layouts.linear_layout_bases(result_linear, in_dim)
+        )
+
     source_layout = _fake_layout(
         0,
         0,
@@ -5592,26 +5609,10 @@ def test_tlx_wave_converter_rejects_non_affine_mfma_metadata_lane_remap():
         element_type="i32",
         component_count=4,
         properties={
-            "block_bases": converter_layouts.linear_layout_bases(
-                result_linear,
-                "block",
-            ),
-            "lane_bases": tuple(
-                reversed(
-                    converter_layouts.linear_layout_bases(
-                        result_linear,
-                        "lane",
-                    )
-                )
-            ),
-            "register_bases": converter_layouts.linear_layout_bases(
-                result_linear,
-                "register",
-            ),
-            "warp_bases": converter_layouts.linear_layout_bases(
-                result_linear,
-                "warp",
-            ),
+            "block_bases": bases_by_standard_dims("block"),
+            "lane_bases": tuple(reversed(bases_by_standard_dims("lane"))),
+            "register_bases": bases_by_standard_dims("register"),
+            "warp_bases": bases_by_standard_dims("warp"),
         },
     )
     operand = _converted_value(

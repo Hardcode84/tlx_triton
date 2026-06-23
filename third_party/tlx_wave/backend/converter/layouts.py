@@ -1658,6 +1658,7 @@ def _mfma_linear_layout(
             * LinearLayout.identity_1d(warp_size // n_dim, "lane", dim_m)
         )
         linear *= LinearLayout.identity_1d(tiles, "register", dim_m)
+    linear = _linear_layout_transpose_outs(linear, (dim_n, dim_m))
     tiles_per_warp = tuple(int(value) for value in properties.get("tiles_per_warp", ()))
     if len(tiles_per_warp) < 2:
         tiles_per_warp = (1, 1)
@@ -1686,6 +1687,30 @@ def _mfma_linear_layout(
         stage=stage,
         source_op_index=source_op_index,
         source_value_id=source_value_id,
+    )
+
+
+def _linear_layout_transpose_outs(linear, out_dim_names):
+    out_dim_names = tuple(str(name) for name in out_dim_names)
+    old_out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
+    old_index = {name: index for index, (name, _size) in enumerate(old_out_dims)}
+    old_size = {name: size for name, size in old_out_dims}
+    bases = []
+    for in_dim, in_bases in linear.bases:
+        bases.append(
+            (
+                str(in_dim),
+                [
+                    [int(basis[old_index[name]]) for name in out_dim_names]
+                    for basis in in_bases
+                ],
+            )
+        )
+    return LinearLayout.from_bases(
+        bases,
+        list(out_dim_names),
+        [old_size[name] for name in out_dim_names],
+        False,
     )
 
 
