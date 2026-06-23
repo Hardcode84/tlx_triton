@@ -43,6 +43,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
@@ -913,11 +914,17 @@ void init_triton_ir(py::module_ &m) {
            })
       .def("get_padded_shared_order",
            [](Attribute &self) -> py::object {
-              if (auto padded = ttg::getPaddedEncoding(self))
-                return py::cast(
-                    toInt64Vector(ArrayRef<unsigned>(padded.getOrder())));
-              return py::none();
-            })
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(
+                   toInt64Vector(ArrayRef<unsigned>(padded.getOrder())));
+             return py::none();
+           })
+      .def("get_padded_shared_linear_component",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(LinearLayout(padded.getLinearComponent()));
+             return py::none();
+           })
       .def("__str__", [](Attribute &self) {
         std::string str;
         llvm::raw_string_ostream os(str);

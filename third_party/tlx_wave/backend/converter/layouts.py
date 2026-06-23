@@ -54,6 +54,7 @@ class PhysicalOffsetExpressionPlan:
     swizzled_vec: int | None = None
     swizzled_per_phase: int | None = None
     swizzled_max_phase: int | None = None
+    linear_component_bases: tuple[tuple[int, ...], ...] = ()
 
 
 def build_layout_map(layout_map_id, value_id, source_type, lane_width):
@@ -171,6 +172,10 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
             "intervals": _int_tuple(_attr_value(attr, "get_padded_shared_intervals")),
             "paddings": _int_tuple(_attr_value(attr, "get_padded_shared_paddings")),
             "order": _int_tuple(_attr_value(attr, "get_padded_shared_order")),
+            "linear_component": _attr_value(
+                attr,
+                "get_padded_shared_linear_component",
+            ),
         }
     fail(
         "TLXW_TYPE_UNSUPPORTED_LAYOUT",
@@ -510,16 +515,23 @@ def shared_physical_offset(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-        _require_identity_padded_linear_component(
+        offset_bases = padded_shared_linear_component_bases(
             layout,
             shape,
-            order,
             stage=stage,
             diagnostic=diagnostic,
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-        logical_linear_offset = ordered_linear_offset(shape, coords, order)
+        logical_linear_offset = offset_from_linear_component_bases(
+            offset_bases,
+            coords,
+            layout,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
         element_offset = int(logical_linear_offset)
         for interval, padding in zip(intervals, paddings):
             element_offset += (logical_linear_offset // int(interval)) * int(padding)
@@ -665,10 +677,9 @@ def shared_physical_offset_expression_plan(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-        _require_identity_padded_linear_component(
+        offset_bases = padded_shared_linear_component_bases(
             layout,
             shape,
-            order,
             stage=stage,
             diagnostic=diagnostic,
             source_op_index=source_op_index,
@@ -684,6 +695,9 @@ def shared_physical_offset_expression_plan(
             provenance="padded_shared",
             intervals=tuple(int(value) for value in intervals),
             paddings=tuple(int(value) for value in paddings),
+            linear_component_bases=tuple(
+                tuple(int(value) for value in basis) for basis in offset_bases
+            ),
         )
     _shared_layout_fail(
         diagnostic,
@@ -727,6 +741,11 @@ def physical_offset_expression_plan_attrs(plan, prefix):
     if plan.swizzled_max_phase is not None:
         attrs[f"{prefix}_physical_swizzled_max_phase"] = int(
             plan.swizzled_max_phase
+        )
+    if plan.linear_component_bases:
+        attrs[f"{prefix}_physical_linear_component_bases"] = tuple(
+            tuple(int(value) for value in basis)
+            for basis in plan.linear_component_bases
         )
     return attrs
 
@@ -796,27 +815,263 @@ def shared_layout_physical_order(
     return default_physical_order(shape)
 
 
-def _require_identity_padded_linear_component(
+def padded_shared_linear_component_bases(
     layout,
     shape,
-    order,
     *,
     stage,
     diagnostic,
     source_op_index,
     source_value_id,
 ):
-    if tuple(order) == default_physical_order(shape):
-        return
-    _shared_layout_fail(
-        diagnostic,
-        stage,
-        "non-identity padded shared physical offsets require the full "
-        f"linearComponent; {padded_shared_description(layout)}",
-        layout=layout,
+    shape = tuple(int(dim) for dim in shape)
+    linear_component = layout.properties.get("linear_component")
+    if linear_component is not None:
+        bases = _padded_linear_component_offset_bases(
+            layout,
+            shape,
+            linear_component,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    else:
+        order = shared_layout_physical_order(
+            layout,
+            shape,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        bases = identity_offset_bases(shape, order)
+    _validate_padded_offset_bases(
+        layout,
+        shape,
+        bases,
+        stage=stage,
+        diagnostic=diagnostic,
         source_op_index=source_op_index,
         source_value_id=source_value_id,
     )
+    return tuple(tuple(int(value) for value in basis) for basis in bases)
+
+
+def _padded_linear_component_offset_bases(
+    layout,
+    shape,
+    linear_component,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    shape = tuple(int(dim) for dim in shape)
+    in_dims = tuple(str(dim) for dim in linear_component.get_in_dim_names())
+    if in_dims != ("offset", "block"):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "padded shared linearComponent must use [offset, block] input dims; "
+            f"got {in_dims}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    out_dims = tuple((str(name), int(size)) for name, size in linear_component.out_dims)
+    component_shape = tuple(int(size) for _name, size in out_dims)
+    component_rank = len(component_shape)
+    if component_rank > len(shape):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "padded shared linearComponent rank exceeds memdesc shape rank; "
+            f"linearComponent dims={out_dims}, shape={shape}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    expected_names = tuple(
+        (f"dim{dim}", int(extent)) for dim, extent in enumerate(component_shape)
+    )
+    if out_dims != expected_names or component_shape != shape[-component_rank:]:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "padded shared linearComponent output dims do not match trailing "
+            f"memdesc shape; got {out_dims}, shape={shape}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    prefix_rank = len(shape) - component_rank
+    bases = [
+        tuple((0,) * prefix_rank + tuple(int(value) for value in basis))
+        for basis in linear_layout_bases(linear_component, "offset")
+    ]
+    for dim in reversed(range(prefix_rank)):
+        bits = _power_of_two_log2(
+            int(shape[dim]),
+            layout=layout,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        for bit in range(bits):
+            basis = [0] * len(shape)
+            basis[dim] = 1 << bit
+            bases.append(tuple(basis))
+    return tuple(bases)
+
+
+def identity_offset_bases(shape, order):
+    shape = tuple(int(dim) for dim in shape)
+    bases = []
+    for dim in tuple(int(value) for value in order):
+        extent = int(shape[dim])
+        bits = _power_of_two_log2(extent)
+        for bit in range(bits):
+            basis = [0] * len(shape)
+            basis[dim] = 1 << bit
+            bases.append(tuple(basis))
+    return tuple(bases)
+
+
+def offset_from_linear_component_bases(
+    bases,
+    coords,
+    layout,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    offset = 0
+    for bit, dim, value in _iter_padded_offset_basis_bits(
+        layout,
+        bases,
+        len(tuple(coords)),
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    ):
+        if int(coords[dim]) & int(value):
+            offset += 1 << int(bit)
+    return int(offset)
+
+
+def _validate_padded_offset_bases(
+    layout,
+    shape,
+    bases,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    seen = set()
+    for _bit, dim, value in _iter_padded_offset_basis_bits(
+        layout,
+        bases,
+        len(tuple(shape)),
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    ):
+        key = (int(dim), int(value))
+        if key in seen:
+            _shared_layout_fail(
+                diagnostic,
+                stage,
+                "padded shared linearComponent repeats an offset basis bit; "
+                f"{padded_shared_description(layout)}",
+                layout=layout,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+        seen.add(key)
+
+
+def _iter_padded_offset_basis_bits(
+    layout,
+    bases,
+    rank,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    rank = int(rank)
+    for bit, basis in enumerate(tuple(bases)):
+        basis = tuple(int(value) for value in basis)
+        if len(basis) != rank:
+            _shared_layout_fail(
+                diagnostic,
+                stage,
+                "padded shared linearComponent basis rank does not match shape; "
+                f"basis={basis}, rank={rank}",
+                layout=layout,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+        nonzero = [(dim, value) for dim, value in enumerate(basis) if value]
+        if len(nonzero) != 1:
+            _shared_layout_fail(
+                diagnostic,
+                stage,
+                "padded shared linearComponent offset basis must move in "
+                f"exactly one dimension; basis={basis}",
+                layout=layout,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+        dim, value = nonzero[0]
+        if value <= 0 or not _is_power_of_two(value):
+            _shared_layout_fail(
+                diagnostic,
+                stage,
+                "padded shared linearComponent offset basis must be a "
+                f"positive power of two; basis={basis}",
+                layout=layout,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+        yield int(bit), int(dim), int(value)
+
+
+def _power_of_two_log2(
+    value,
+    *,
+    layout=None,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    value = int(value)
+    if value <= 0 or not _is_power_of_two(value):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"padded shared physical offset requires power-of-two shape dims; got {value}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return value.bit_length() - 1
+
+
+def _is_power_of_two(value):
+    value = int(value)
+    return value > 0 and value & (value - 1) == 0
 
 
 def static_linear_offset(shape, coords):

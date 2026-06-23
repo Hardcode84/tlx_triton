@@ -10,6 +10,7 @@ import pytest
 
 import triton
 from triton._C.libtriton import ir
+from triton._C.libtriton.linear_layout import LinearLayout
 import triton.language as tl
 from triton.backends import backends
 from triton.backends.compiler import GPUTarget
@@ -1929,10 +1930,6 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
             "disables_post_misched": True,
             "b_strides": (1, 256),
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
-            "expected_failure": (
-                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-                "non-identity padded shared physical offsets require the full linearComponent",
-            ),
         },
     ],
     ids=lambda case: case.get("id", case["version_dir"]),
@@ -3281,7 +3278,26 @@ def test_tlx_wave_layout_query_records_padded_physical_offset():
     assert empty_attrs["destination_physical_paddings"] == ()
 
 
-def test_tlx_wave_layout_query_rejects_non_identity_padded_physical_offset():
+def test_tlx_wave_layout_query_records_transposed_padded_physical_offset():
+    linear_component = LinearLayout.from_bases(
+        [
+            (
+                "offset",
+                (
+                    (1, 0),
+                    (2, 0),
+                    (4, 0),
+                    (0, 1),
+                    (0, 2),
+                    (0, 4),
+                ),
+            ),
+            ("block", ()),
+        ],
+        ("dim0", "dim1"),
+        (8, 8),
+        False,
+    )
     layout = converter_layouts.LayoutMap(
         3,
         10,
@@ -3292,26 +3308,48 @@ def test_tlx_wave_layout_query_rejects_non_identity_padded_physical_offset():
         64,
         {
             "intervals": (4,),
+            "linear_component": linear_component,
             "order": (0, 1),
             "paddings": (16,),
         },
     )
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_layouts.shared_physical_offset_expression_plan(
-            layout,
-            (8, 8),
-            2,
-            stage="op_conversion",
-            diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-            source_op_index=15,
-        )
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_LOCAL_LOAD"
-    assert "non-identity padded shared physical offsets require the full linearComponent" in str(
-        diagnostic
+    record = converter_layouts.shared_physical_offset(
+        layout,
+        (8, 8),
+        (2, 1),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        source_op_index=15,
     )
+    assert record.logical_linear_offset == 10
+    assert record.element_offset == 42
+    assert record.byte_offset == 84
+    assert record.dword_offset == 21
+
+    plan = converter_layouts.shared_physical_offset_expression_plan(
+        layout,
+        (8, 8),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        source_op_index=15,
+    )
+    assert plan.expression_kind == "padded_linear"
+    assert plan.linear_component_bases == (
+        (1, 0),
+        (2, 0),
+        (4, 0),
+        (0, 1),
+        (0, 2),
+        (0, 4),
+    )
+    attrs = converter_layouts.physical_offset_expression_plan_attrs(
+        plan,
+        "shared",
+    )
+    assert attrs["shared_physical_linear_component_bases"] == plan.linear_component_bases
 
 
 def test_tlx_wave_layout_query_rejects_shared_linear_as_dense():
@@ -4968,10 +5006,25 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     assert local_load_attrs[0]["shared_physical_offset_plan"] == "padded_linear"
     assert local_load_attrs[0]["shared_physical_intervals"] == (4,)
     assert local_load_attrs[0]["shared_physical_paddings"] == (16,)
+    assert local_load_attrs[0]["shared_physical_linear_component_bases"] == (
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (0, 8),
+        (0, 16),
+        (0, 32),
+        (0, 64),
+        (1, 0),
+        (2, 0),
+        (4, 0),
+        (8, 0),
+        (16, 0),
+        (32, 0),
+    )
     assert "shared_layout_kind" not in local_load_attrs[0]
     assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 2560),) * 8
     wave = output.emitted_module.text
-    assert '<"2560 + 5120*floor' in wave
+    assert "5120*Mod(" in wave
     assert '<"2560 + ' in wave
     assert '<"20 + ' not in wave
     assert '<"100 + 40*Mod' not in wave

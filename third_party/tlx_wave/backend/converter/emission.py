@@ -1762,19 +1762,14 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
     if plan == "dense_row_major":
         return _linearize_coordinates(state, coords, shape, lane_width)
     if plan == "padded_linear":
-        order = _physical_order_from_attrs(
+        physical = _linear_component_offset_from_simd_coords(
+            state,
             attrs,
-            "destination_physical_order",
-            shape,
+            "destination",
+            coords,
+            lane_width,
             op,
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
-        )
-        physical = _linearize_coordinates_with_order(
-            state,
-            coords,
-            shape,
-            order,
-            lane_width,
         )
         encoded = physical
         intervals = tuple(
@@ -2648,15 +2643,15 @@ def _swizzled_element_offset_expr(state, attrs, logical, op):
 
 def _padded_element_offset_expr(state, attrs, logical, op):
     shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
-    order = _physical_order_from_attrs(
+    coords = _delinearize_local_fragment_expr(state, logical, shape)
+    physical = _linear_component_offset_from_expr_coords(
+        state,
         attrs,
-        "shared_physical_order",
-        shape,
+        "shared",
+        coords,
         op,
         "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
     )
-    coords = _delinearize_local_fragment_expr(state, logical, shape)
-    physical = _linearize_local_fragment_coords_with_order(shape, coords, order)
     encoded = physical
     for interval, padding in zip(
         attrs.get("shared_physical_intervals", ()),
@@ -2664,6 +2659,122 @@ def _padded_element_offset_expr(state, attrs, logical, op):
     ):
         encoded += state.dsl.floor(physical / int(interval)) * int(padding)
     return encoded
+
+
+def _linear_component_offset_from_simd_coords(
+    state,
+    attrs,
+    prefix,
+    coords,
+    lane_width,
+    op,
+    diagnostic,
+):
+    bases = _physical_linear_component_bases(attrs, prefix, op, diagnostic)
+    result = state.builder.splat(
+        state.builder.constant(state.dsl.i32(), 0),
+        state.dsl.i32(),
+        int(lane_width),
+    )
+    for bit, dim, value in _iter_linear_component_basis_bits(
+        bases,
+        len(tuple(coords)),
+        op,
+        diagnostic,
+    ):
+        bit_value = _simd_binary_const(
+            state,
+            "divui",
+            coords[int(dim)],
+            int(value),
+            lane_width,
+        )
+        bit_value = _simd_binary_const(state, "remui", bit_value, 2, lane_width)
+        if int(bit):
+            bit_value = _simd_binary_const(
+                state,
+                "muli",
+                bit_value,
+                1 << int(bit),
+                lane_width,
+            )
+        result = state.builder.binary(state.dsl.BinaryKind.AddI, result, bit_value)
+    return result
+
+
+def _linear_component_offset_from_expr_coords(
+    state,
+    attrs,
+    prefix,
+    coords,
+    op,
+    diagnostic,
+):
+    bases = _physical_linear_component_bases(attrs, prefix, op, diagnostic)
+    result = 0
+    for bit, dim, value in _iter_linear_component_basis_bits(
+        bases,
+        len(tuple(coords)),
+        op,
+        diagnostic,
+    ):
+        bit_value = state.dsl.mod(
+            state.dsl.floor(coords[int(dim)] / int(value)),
+            2,
+        )
+        if int(bit):
+            bit_value *= 1 << int(bit)
+        result += bit_value
+    return result
+
+
+def _physical_linear_component_bases(attrs, prefix, op, diagnostic):
+    key = f"{prefix}_physical_linear_component_bases"
+    bases = tuple(
+        tuple(int(value) for value in basis)
+        for basis in attrs.get(key, ())
+    )
+    if not bases:
+        fail(
+            diagnostic,
+            STAGE,
+            f"padded shared physical offset is missing {key}",
+            target_op_id=op.target_op_id,
+        )
+    return bases
+
+
+def _iter_linear_component_basis_bits(bases, rank, op, diagnostic):
+    rank = int(rank)
+    for bit, basis in enumerate(tuple(bases)):
+        basis = tuple(int(value) for value in basis)
+        if len(basis) != rank:
+            fail(
+                diagnostic,
+                STAGE,
+                "padded shared linearComponent basis rank does not match "
+                f"coordinate rank; basis={basis}, rank={rank}",
+                target_op_id=op.target_op_id,
+            )
+        nonzero = [(dim, value) for dim, value in enumerate(basis) if value]
+        if len(nonzero) != 1:
+            fail(
+                diagnostic,
+                STAGE,
+                "padded shared linearComponent offset basis must move in "
+                f"exactly one dimension; basis={basis}",
+                target_op_id=op.target_op_id,
+            )
+        dim, value = nonzero[0]
+        if value <= 0 or not _is_power_of_two(value):
+            fail(
+                diagnostic,
+                STAGE,
+                "padded shared linearComponent offset basis must be a "
+                f"positive power of two; basis={basis}",
+                target_op_id=op.target_op_id,
+            )
+        yield int(bit), int(dim), int(value)
 
 
 def _simd_binary_const(state, operation, value, constant, lane_width):
