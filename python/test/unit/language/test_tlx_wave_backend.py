@@ -4706,6 +4706,356 @@ def test_tlx_wave_converter_dispatches_tiled_blocked_to_mfma_base_remap(tmp_path
     del ctx
 
 
+def test_tlx_wave_mfma_layout_import_preserves_extended_metadata(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true, tilesPerWarp = [2, 2], elementBitWidth = 64}>
+"""
+    local_func = """
+  tt.func public @converter_mfma_extended_metadata() attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<128x128xf64, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    constant_op = next(op for op in source.ops if op.name == "arith.constant")
+    converted_value = converted.values[constant_op.results[0]]
+    layout = converted.layouts[converted_value.layout_map_id]
+
+    assert layout.kind == "amd_mfma"
+    assert layout.shape == (128, 128)
+    assert layout.element_type == "f64"
+    assert layout.properties["version"] == 4
+    assert layout.properties["warps_per_cta"] == (2, 2)
+    assert layout.properties["instr_shape"] == (16, 16, 32)
+    assert layout.properties["is_transposed"] is True
+    assert layout.properties["tiles_per_warp"] == (2, 2)
+    assert layout.properties["element_bit_width"] == 64
+    del ctx
+
+
+def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
+    cases = (
+        (
+            "mfma16_t_warps4x2",
+            (256, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (4, 2),
+                "instr_shape": (16, 16, 32),
+                "is_transposed": True,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+                (15, 63, 7),
+                (31, 63, 7),
+                (63, 63, 7),
+            ),
+            (
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (0, 4),
+                (0, 16),
+                (23, 18),
+                (15, 52),
+                (31, 92),
+                (63, 127),
+                (127, 127),
+                (255, 127),
+            ),
+        ),
+        (
+            "mfma16_nt_warps4x2",
+            (256, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (4, 2),
+                "instr_shape": (16, 16, 32),
+                "is_transposed": False,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+                (15, 63, 7),
+                (31, 63, 7),
+                (63, 63, 7),
+            ),
+            (
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (4, 0),
+                (0, 16),
+                (18, 23),
+                (4, 63),
+                (28, 95),
+                (63, 127),
+                (127, 127),
+                (255, 127),
+            ),
+        ),
+        (
+            "mfma32_t_warps2x2",
+            (128, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (2, 2),
+                "instr_shape": (32, 32, 16),
+                "is_transposed": True,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+            ),
+            (
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (16, 0),
+                (0, 32),
+                (39, 34),
+                (31, 40),
+                (63, 52),
+            ),
+        ),
+        (
+            "mfma32_nt_warps2x2",
+            (128, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (2, 2),
+                "instr_shape": (32, 32, 16),
+                "is_transposed": False,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+            ),
+            (
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (0, 16),
+                (0, 32),
+                (34, 39),
+                (8, 63),
+                (52, 63),
+            ),
+        ),
+        (
+            "mfma16_t_tiles2x2",
+            (256, 256),
+            {
+                "version": 4,
+                "warps_per_cta": (2, 2),
+                "instr_shape": (16, 16, 32),
+                "is_transposed": True,
+                "tiles_per_warp": (2, 2),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+            ),
+            (
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (0, 4),
+                (0, 32),
+                (39, 34),
+                (15, 52),
+                (47, 108),
+            ),
+        ),
+        (
+            "mfma16_t_f64height",
+            (128, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (2, 2),
+                "instr_shape": (16, 16, 32),
+                "is_transposed": True,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 64,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+            ),
+            (
+                (0, 0),
+                (0, 4),
+                (1, 0),
+                (0, 1),
+                (0, 16),
+                (23, 24),
+                (15, 49),
+                (31, 83),
+            ),
+        ),
+    )
+
+    for name, shape, properties, samples, expected in cases:
+        linear = converter_layouts.distributed_linear_layout_from_parts(
+            "amd_mfma",
+            shape,
+            properties,
+            64,
+        )
+        actual = tuple(
+            converter_layouts.linear_layout_coords(
+                linear,
+                register,
+                lane,
+                warp=warp,
+            )
+            for register, lane, warp in samples
+        )
+        assert actual == expected, name
+
+        register_count = converter_layouts.linear_layout_in_dim_size(
+            linear,
+            "register",
+        )
+        warp_count = converter_layouts.linear_layout_in_dim_size(linear, "warp")
+        all_coords = tuple(
+            converter_layouts.linear_layout_coords(
+                linear,
+                register,
+                lane,
+                warp=warp,
+            )
+            for warp in range(warp_count)
+            for lane in range(64)
+            for register in range(register_count)
+        )
+        assert len(all_coords) == shape[0] * shape[1], name
+        assert len(set(all_coords)) == len(all_coords), name
+        assert all(
+            0 <= coord[0] < shape[0] and 0 <= coord[1] < shape[1]
+            for coord in all_coords
+        ), name
+
+
+def test_tlx_wave_converter_rejects_same_count_mfma_layout_relabel():
+    source_layout = _fake_layout(
+        0,
+        0,
+        kind="amd_mfma",
+        shape=(16, 16),
+        element_type="f32",
+        properties={
+            "element_bit_width": 32,
+            "instr_shape": (16, 16, 32),
+            "is_transposed": True,
+            "tiles_per_warp": (1, 1),
+            "version": 4,
+            "warps_per_cta": (1, 1),
+        },
+    )
+    result_layout = _fake_layout(
+        1,
+        1,
+        kind="amd_mfma",
+        shape=(16, 16),
+        element_type="f32",
+        properties={
+            "element_bit_width": 32,
+            "instr_shape": (16, 16, 32),
+            "is_transposed": False,
+            "tiles_per_warp": (1, 1),
+            "version": 4,
+            "warps_per_cta": (1, 1),
+        },
+    )
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0: _converted_value(
+                0,
+                representation="fragment",
+                element_type="f32",
+                layout_map_id=0,
+            ),
+            1: _converted_value(
+                1,
+                representation="fragment",
+                element_type="f32",
+                layout_map_id=1,
+            ),
+        },
+        (source_layout, result_layout),
+    )
+    op = converter_source_ir.SourceOp(
+        0,
+        "ttg.convert_layout",
+        operands=(0,),
+        results=(1,),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_op_conversion._convert_layout(
+            converter_target_ir.TargetBuilder(),
+            SimpleNamespace(value_element_byte_widths={}, lds_size=0),
+            type_layout_program,
+            op,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "amd_mfma to amd_mfma convert_layout has unknown movement class" in str(
+        diagnostic
+    )
+
+
 def test_tlx_wave_converter_rejects_blocked_to_mfma_without_fragment_plan():
     blocked_layout = _fake_layout(
         0,
