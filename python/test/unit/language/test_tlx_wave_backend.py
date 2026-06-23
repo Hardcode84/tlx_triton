@@ -1,5 +1,6 @@
 import ast
 from contextlib import contextmanager
+from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import re
@@ -133,6 +134,29 @@ def _tlx_wave_runtime_skip_reason(arch):
         "Wave HSACO generation failure. Compile-only TLX Wave tests may target "
         "gfx942/gfx950 without matching local hardware."
     )
+
+
+def _with_target_op_attrs(target_program, target_op_id, **attrs):
+    updated_ops = []
+    found = False
+    for op in target_program.ops:
+        if op.target_op_id != target_op_id:
+            updated_ops.append(op)
+            continue
+        found = True
+        updated_attrs = converter_target_ir.attrs_dict(op)
+        updated_attrs.update(attrs)
+        updated_ops.append(
+            replace(
+                op,
+                attrs=converter_target_ir._attrs_tuple(
+                    updated_attrs,
+                    op.target_op_id,
+                ),
+            )
+        )
+    assert found, target_op_id
+    return replace(target_program, ops=tuple(updated_ops))
 
 
 def _require_tlx_wave_runtime_target():
@@ -6095,6 +6119,60 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_oob_select(
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.buffer_store_b16" in machine
     assert "waveamdmachine.exec_if" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_buffer_store_exec_mask_adds_control_barrier(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_masked_buffer_store_modes(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}, %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    amdg.buffer_store %value, %arg0[%range], %mask {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op,) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["mask_mode"] == "select_oob_offset"
+
+    oob_wave = output.emitted_module.text
+    oob_machine = _run_waveamd_to_machine(oob_wave)
+    assert oob_wave.count("wave.ptr_add") == 2
+    assert "wave.select" in oob_wave
+    assert "wave.where" not in oob_wave
+    assert oob_machine.count("waveamdmachine.buffer_store_b16") == 1
+    assert "waveamdmachine.exec_if" not in oob_machine
+    assert "waveamdmachine.s_barrier" not in oob_machine
+    assert "waveamdmachine.s_waitcnt" not in oob_machine
+
+    exec_program = _with_target_op_attrs(
+        output.target_program,
+        store_op.target_op_id,
+        mask_mode="exec_where",
+    )
+    exec_wave = converter_emission.emit_wave_module(
+        exec_program,
+        output.fact_program,
+    ).text
+    exec_machine = _run_waveamd_to_machine(exec_wave)
+
+    assert exec_wave.count("wave.ptr_add") == 1
+    assert "wave.where" in exec_wave
+    assert exec_machine.count("waveamdmachine.buffer_store_b16") == 1
+    assert exec_machine.count("waveamdmachine.exec_if") == 1
+    assert exec_machine.count("waveamdmachine.s_barrier") == 1
+    assert "waveamdmachine.s_waitcnt" not in exec_machine
     del ctx
 
 
