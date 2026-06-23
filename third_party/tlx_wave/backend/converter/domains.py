@@ -102,7 +102,7 @@ LOWERING_DOMAINS = (
         (
             "local_alloc",
             "memdesc_index",
-            "local_load_fragment",
+            "local_load_mma_payload",
             "layout_convert",
         ),
     ),
@@ -114,7 +114,7 @@ LOWERING_DOMAINS = (
             "tt.dot",
         ),
         (
-            "fragment_fill",
+            "mma_zero_accumulator",
             "mma",
             "fragment_truncf",
         ),

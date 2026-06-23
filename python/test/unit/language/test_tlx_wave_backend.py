@@ -26,6 +26,8 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import emission as converter_emission
     from triton.backends.tlx_wave.converter import facts as converter_facts
     from triton.backends.tlx_wave.converter import coordinates as converter_coordinates
+    from triton.backends.tlx_wave.converter import layouts as converter_layouts
+    from triton.backends.tlx_wave.converter import layout_remap as converter_layout_remap
     from triton.backends.tlx_wave.converter import op_conversion as converter_op_conversion
     from triton.backends.tlx_wave.converter import pipeline as converter_pipeline
     from triton.backends.tlx_wave.converter import source_import as converter_source_import
@@ -44,6 +46,8 @@ else:
     converter_emission = None
     converter_facts = None
     converter_coordinates = None
+    converter_layouts = None
+    converter_layout_remap = None
     converter_op_conversion = None
     converter_pipeline = None
     converter_source_import = None
@@ -290,7 +294,7 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.source_domains_for_op("rocdl.sched.barrier") == (
         "arithmetic_control",
     )
-    assert converter_domains.target_domain_for_op("local_load_fragment") == (
+    assert converter_domains.target_domain_for_op("local_load_mma_payload") == (
         "local_memory_layout"
     )
     assert converter_domains.target_domain_for_op("mma") == "mfma_fragment"
@@ -1925,6 +1929,10 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
             "disables_post_misched": True,
             "b_strides": (1, 256),
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
+            "expected_failure": (
+                "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+                "non-identity padded shared physical offsets require the full linearComponent",
+            ),
         },
     ],
     ids=lambda case: case.get("id", case["version_dir"]),
@@ -1937,7 +1945,7 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     if "expected_failure" in case:
         try:
             compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
-        except RuntimeError as exc:
+        except (RuntimeError, converter_diagnostics.Diagnostic) as exc:
             detail = str(exc)
             for expected in case["expected_failure"]:
                 assert expected in detail
@@ -2950,10 +2958,23 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(
     assert attrs["mode"] == "scalarized_load_store"
     assert attrs["destination_offset_mode"] == "layout_coordinates"
     assert attrs["destination_coordinate_shape"] == (8, 8)
-    assert attrs["destination_shared_layout"] == "swizzled"
-    assert attrs["destination_swizzled_order"] == (0, 1)
-    assert attrs["destination_swizzled_vec"] == 2
+    assert attrs["destination_physical_offset_plan"] == "swizzled_xor"
+    assert attrs["destination_physical_offset_unit"] == "element"
+    assert attrs["destination_physical_element_byte_width"] == 2
+    assert attrs["destination_physical_layout_kind"] == "swizzled_shared"
+    assert attrs["destination_physical_order"] == (0, 1)
+    assert attrs["destination_physical_bindings"] == ("logical_coords",)
+    assert attrs["destination_physical_assumptions"] == (
+        "minor_extent_divisible_by_vec",
+    )
+    assert attrs["destination_physical_proof_status"] == "symbolic_verified"
+    assert attrs["destination_physical_provenance"] == "swizzled_shared"
+    assert attrs["destination_physical_swizzled_vec"] == 2
+    assert attrs["destination_physical_swizzled_per_phase"] == 1
+    assert attrs["destination_physical_swizzled_max_phase"] == 2
     assert "destination_component_offsets" not in attrs
+    assert "destination_shared_layout" not in attrs
+    assert "destination_swizzled_order" not in attrs
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
     assert wave.count("wave.load") == 1
@@ -3164,6 +3185,222 @@ def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
     del ctx
 
 
+def test_tlx_wave_layout_query_records_padded_physical_offset():
+    layout = converter_layouts.LayoutMap(
+        0,
+        7,
+        "padded_shared",
+        (64, 128),
+        "f16",
+        1,
+        64,
+        {
+            "intervals": (4,),
+            "order": (1, 0),
+            "paddings": (16,),
+        },
+    )
+
+    record = converter_layouts.shared_physical_offset(
+        layout,
+        (64, 128),
+        (0, 4),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        source_op_index=12,
+    )
+
+    assert record.layout_kind == "padded_shared"
+    assert record.order == (1, 0)
+    assert record.logical_linear_offset == 4
+    assert record.element_offset == 20
+    assert record.byte_offset == 40
+    assert record.dword_offset == 10
+    assert record.element_byte_width == 2
+    assert record.logical_coords == (0, 4)
+    assert record.assumptions == ("valid_padded_intervals",)
+    assert record.provenance == "padded_shared"
+
+    plan = converter_layouts.shared_physical_offset_expression_plan(
+        layout,
+        (64, 128),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        source_op_index=12,
+    )
+    assert plan.expression_kind == "padded_linear"
+    assert plan.offset_unit == "element"
+    assert plan.element_byte_width == 2
+    assert plan.layout_kind == "padded_shared"
+    assert plan.order == (1, 0)
+    assert plan.intervals == (4,)
+    assert plan.paddings == (16,)
+    assert plan.assumptions == ("valid_padded_intervals",)
+
+    attrs = converter_layouts.physical_offset_expression_plan_attrs(
+        plan,
+        "destination",
+    )
+    assert attrs["destination_physical_offset_plan"] == "padded_linear"
+    assert attrs["destination_physical_offset_unit"] == "element"
+    assert attrs["destination_physical_element_byte_width"] == 2
+    assert attrs["destination_physical_intervals"] == (4,)
+    assert attrs["destination_physical_paddings"] == (16,)
+
+    empty_layout = converter_layouts.LayoutMap(
+        2,
+        9,
+        "padded_shared",
+        (8, 8),
+        "f16",
+        1,
+        64,
+        {
+            "intervals": (),
+            "order": (1, 0),
+            "paddings": (),
+        },
+    )
+    empty_plan = converter_layouts.shared_physical_offset_expression_plan(
+        empty_layout,
+        (8, 8),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        source_op_index=14,
+    )
+    empty_attrs = converter_layouts.physical_offset_expression_plan_attrs(
+        empty_plan,
+        "destination",
+    )
+    assert empty_plan.expression_kind == "padded_linear"
+    assert empty_attrs["destination_physical_offset_plan"] == "padded_linear"
+    assert empty_attrs["destination_physical_intervals"] == ()
+    assert empty_attrs["destination_physical_paddings"] == ()
+
+
+def test_tlx_wave_layout_query_rejects_non_identity_padded_physical_offset():
+    layout = converter_layouts.LayoutMap(
+        3,
+        10,
+        "padded_shared",
+        (8, 8),
+        "f16",
+        1,
+        64,
+        {
+            "intervals": (4,),
+            "order": (0, 1),
+            "paddings": (16,),
+        },
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_layouts.shared_physical_offset_expression_plan(
+            layout,
+            (8, 8),
+            2,
+            stage="op_conversion",
+            diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            source_op_index=15,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_LOCAL_LOAD"
+    assert "non-identity padded shared physical offsets require the full linearComponent" in str(
+        diagnostic
+    )
+
+
+def test_tlx_wave_layout_query_rejects_shared_linear_as_dense():
+    layout = converter_layouts.LayoutMap(
+        4,
+        11,
+        "linear",
+        (8, 8),
+        "f16",
+        1,
+        64,
+        {
+            "block_bases": (),
+            "lane_bases": ((0, 1), (0, 2), (0, 4), (0, 8), (0, 16), (0, 32)),
+            "register_bases": (),
+            "warp_bases": (),
+        },
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_layouts.shared_physical_offset_expression_plan(
+            layout,
+            (8, 8),
+            2,
+            stage="op_conversion",
+            diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            source_op_index=16,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_LOCAL_LOAD"
+    assert "linear_shared" in str(diagnostic)
+
+
+def test_tlx_wave_layout_query_records_swizzled_physical_offset():
+    layout = converter_layouts.LayoutMap(
+        1,
+        8,
+        "swizzled_shared",
+        (8, 8),
+        "f16",
+        1,
+        64,
+        {
+            "max_phase": 2,
+            "order": (0, 1),
+            "per_phase": 1,
+            "vec": 2,
+        },
+    )
+
+    record = converter_layouts.shared_physical_offset(
+        layout,
+        (8, 8),
+        (2, 1),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        source_op_index=13,
+    )
+
+    assert record.layout_kind == "swizzled_shared"
+    assert record.order == (0, 1)
+    assert record.logical_linear_offset == 10
+    assert record.element_offset == 8
+    assert record.byte_offset == 16
+    assert record.dword_offset == 4
+    assert record.assumptions == ("minor_extent_divisible_by_vec",)
+    assert record.provenance == "swizzled_shared"
+
+    plan = converter_layouts.shared_physical_offset_expression_plan(
+        layout,
+        (8, 8),
+        2,
+        stage="op_conversion",
+        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        source_op_index=13,
+    )
+    assert plan.expression_kind == "swizzled_xor"
+    assert plan.offset_unit == "element"
+    assert plan.element_byte_width == 2
+    assert plan.layout_kind == "swizzled_shared"
+    assert plan.order == (0, 1)
+    assert plan.swizzled_vec == 2
+    assert plan.swizzled_per_phase == 1
+    assert plan.swizzled_max_phase == 2
+    assert plan.assumptions == ("minor_extent_divisible_by_vec",)
+
+
 def test_tlx_wave_converter_lowers_replicated_generic_linear_make_range(tmp_path):
     preamble = """
 #linear = #ttg.generic_linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [0]], warp = [[64], [128]], block = []}>
@@ -3181,6 +3418,7 @@ def test_tlx_wave_converter_lowers_replicated_generic_linear_make_range(tmp_path
     value = converted.values[range_op.results[0]]
     layout = converted.layouts[value.layout_map_id]
 
+    assert layout.kind == "generic_linear"
     assert value.type.component_count == 4
     assert layout.properties["coordinate_domain"]["coverage"] == "replicated"
     assert layout.properties["coordinate_domain"]["covered_elements"] == 256
@@ -3456,13 +3694,13 @@ def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_rejects_multi_warp_linear_remap(tmp_path):
+def test_tlx_wave_converter_rejects_generic_multi_warp_linear_remap(tmp_path):
     preamble = """
 #source = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 0]], block = []}>
 #result = #ttg.generic_linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], warp = [[64, 1]], block = []}>
 """
     local_func = """
-  tt.func public @converter_multi_warp_linear_remap() attributes {noinline = false} {
+  tt.func public @converter_generic_multi_warp_linear_remap() attributes {noinline = false} {
     %value = arith.constant dense<0> : tensor<128x2xi32, #source>
     %converted = ttg.convert_layout %value : tensor<128x2xi32, #source> -> tensor<128x2xi32, #result>
     tt.return
@@ -3475,9 +3713,8 @@ def test_tlx_wave_converter_rejects_multi_warp_linear_remap(tmp_path):
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "linear to linear convert_layout requires per-lane source component selection" in str(
-        diagnostic
-    )
+    assert "generic_linear" in str(diagnostic)
+    assert "representative semantics" in str(diagnostic)
     del ctx
 
 
@@ -3504,6 +3741,34 @@ def test_tlx_wave_converter_rejects_non_affine_linear_lane_remap(tmp_path):
         diagnostic
     )
     del ctx
+
+
+def test_tlx_wave_converter_rejects_lane_mux_as_cta_exchange():
+    result_sources = (
+        tuple((0, lane, lane & 1) for lane in range(64)),
+    )
+
+    assert (
+        converter_layout_remap._distributed_movement_class(
+            result_sources,
+            64,
+            1,
+        )
+        == "lane_mux"
+    )
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_layout_remap._reject_distributed_movement(
+            result_sources,
+            64,
+            1,
+            SimpleNamespace(index=0),
+            11,
+            "linear to linear convert_layout",
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "per-lane source component selection" in str(diagnostic)
 
 
 def test_tlx_wave_converter_rejects_slice_parent_layout_remap(tmp_path):
@@ -3638,7 +3903,7 @@ def test_tlx_wave_converter_layout_remap_scratch_attrs_are_mode_specific():
 
     dot_attrs = converter_op_conversion._add_layout_remap_scratch_attrs(
         {
-            "mode": "dot_operand_fragment_pack",
+            "mode": "dot_operand_vector_payload",
             "scratch_element_count": 16,
         },
         conversion_input,
@@ -3773,10 +4038,89 @@ def test_tlx_wave_converter_emits_mfma32_vector_accumulator_remap(tmp_path):
     assert attrs["scalar_result_component_count"] == 16
     assert attrs["vector_length"] == 16
     wave = output.emitted_module.text
-    assert "waveamd.fragment_pack" in wave
+    assert "waveamd.fragment_pack" not in wave
     assert "vector<16xf32>" in wave
     _run_wave_verify(wave)
     del ctx
+
+
+def test_tlx_wave_converter_classifies_mfma_to_linear_register_remap():
+    operand_layout = converter_layouts.LayoutMap(
+        0,
+        10,
+        "amd_mfma",
+        (16, 16),
+        "f32",
+        1,
+        64,
+        {
+            "element_bit_width": 32,
+            "instr_shape": (16, 16, 32),
+            "is_transposed": False,
+            "tiles_per_warp": (1, 1),
+            "version": 4,
+            "warps_per_cta": (1, 1),
+        },
+    )
+    source_linear = converter_layouts.distributed_linear_layout(operand_layout)
+    result_layout = converter_layouts.LayoutMap(
+        1,
+        11,
+        "linear",
+        (16, 16),
+        "f32",
+        4,
+        64,
+        {
+            "block_bases": converter_layouts.linear_layout_bases(
+                source_linear,
+                "block",
+            ),
+            "lane_bases": converter_layouts.linear_layout_bases(
+                source_linear,
+                "lane",
+            ),
+            "register_bases": converter_layouts.linear_layout_bases(
+                source_linear,
+                "register",
+            ),
+            "warp_bases": converter_layouts.linear_layout_bases(
+                source_linear,
+                "warp",
+            ),
+        },
+    )
+    operand = SimpleNamespace(
+        value_id=10,
+        type=SimpleNamespace(
+            component_count=1,
+            element_type="f32",
+            lane_width=64,
+            representation="fragment_tuple",
+        ),
+    )
+    result = SimpleNamespace(
+        value_id=11,
+        type=SimpleNamespace(
+            component_count=4,
+            element_type="f32",
+            lane_width=64,
+            representation="simd_tuple",
+        ),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_layout_remap.register_remap(
+            operand,
+            result,
+            operand_layout,
+            result_layout,
+            SimpleNamespace(index=0),
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
+    assert "explicit MMA payload unpack" in str(diagnostic)
 
 
 def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
@@ -3808,6 +4152,7 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     assert attrs["result_component_count"] == 256
     assert attrs["source_component_count"] == 64
     assert attrs["source_registers_per_component"] == 4
+    assert attrs["barrier_scope"] == "cta"
     assert attrs["cta_thread_count"] == 256
     assert attrs["scratch_element_count"] == 2048
     assert attrs["scratch_byte_offset"] == 0
@@ -4372,22 +4717,27 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
     attrs_by_kind = {
         op.kind: converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind in {"fragment_fill", "mma"}
+        if op.kind in {"mma_zero_accumulator", "mma"}
     }
-    assert attrs_by_kind["fragment_fill"]["component_count"] == 16
+    assert attrs_by_kind["mma_zero_accumulator"]["component_count"] == 16
     assert attrs_by_kind["mma"]["m_tiles"] == 4
     assert attrs_by_kind["mma"]["n_tiles"] == 4
     assert attrs_by_kind["mma"]["k_tiles"] == 2
     local_load_attrs = [
         converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind == "local_load_fragment"
+        if op.kind == "local_load_mma_payload"
     ]
     assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 8]
     assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "indexed_fragment_load",
-        "indexed_fragment_load",
+        "indexed_mma_payload_load",
+        "indexed_mma_payload_load",
     ]
+    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
+        "dense_row_major",
+        "dense_row_major",
+    ]
+    assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
     assert local_load_attrs[1]["source_shape"] == (32, 16)
     assert local_load_attrs[1]["memdesc_shape"] == (64, 128)
     assert [attrs["wave_tile_axis"] for attrs in local_load_attrs] == ["m", "n"]
@@ -4431,9 +4781,10 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
         64,
     ]
     wave = output.emitted_module.text
-    assert "64*floor(1/2*Mod(wi, 64))" in wave
+    assert "128*floor(1/2*Mod(wi, 64))" in wave
+    assert "vector<8xf16>" in wave
     assert "native_register_layout" not in wave
-    assert wave.count("waveamd.fragment_fill") == 16
+    assert "waveamd.fragment_fill" not in wave
     assert wave.count('waveamd.mma "mfma.f32.16x16x32.f16"') == 32
     del ctx
 
@@ -4465,18 +4816,19 @@ def test_tlx_wave_converter_packs_blocked_dot_operand_parent_layout(tmp_path):
         if op.kind == "layout_convert"
     ]
     assert [attrs["mode"] for attrs in layout_converts] == [
-        "dot_operand_fragment_pack",
-        "dot_operand_fragment_pack",
+        "dot_operand_vector_payload",
+        "dot_operand_vector_payload",
     ]
     assert [attrs["payload_mode"] for attrs in layout_converts] == ["vector", "vector"]
     assert [attrs["result_component_count"] for attrs in layout_converts] == [16, 16]
-    assert all(len(attrs["fragment_vector_load_bases"]) == 16 for attrs in layout_converts)
+    assert all(len(attrs["payload_vector_load_bases"]) == 16 for attrs in layout_converts)
+    assert all(attrs["barrier_scope"] == "cta" for attrs in layout_converts)
     wave = output.emitted_module.text
     assert wave.count("wave.store") == sum(
         attrs["source_component_count"] for attrs in layout_converts
     )
     assert wave.count("wave.load") == 32
-    assert wave.count("waveamd.fragment_pack") == 32
+    assert "waveamd.fragment_pack" not in wave
     assert "vector<8xf16>" in wave
     del ctx
 
@@ -4532,7 +4884,7 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     local_load_attrs = [
         converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind == "local_load_fragment"
+        if op.kind == "local_load_mma_payload"
     ]
     layout_converts = [
         converter_target_ir.attrs_dict(op)
@@ -4546,9 +4898,17 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     ]
 
     assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "swizzled_fragment_load",
+        "swizzled_mma_payload_load",
         "b16_transpose",
     ]
+    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
+        "swizzled_xor",
+        "swizzled_xor",
+    ]
+    assert all(
+        attrs["shared_physical_swizzled_vec"] == 8 for attrs in local_load_attrs
+    )
+    assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
     assert [attrs["result_component_count"] for attrs in native_remaps] == [1, 1]
     assert [attrs["scalar_result_component_count"] for attrs in native_remaps] == [
         16,
@@ -4573,7 +4933,8 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         for line in lines
         if "waveamd.transpose_load" in line
     )
-    assert wave.count("wave.pack") == 4
+    assert wave.count("wave.pack") == 5
+    assert "waveamd.fragment_fill" not in wave
     assert wave.count('waveamd.mma "mfma.f32.32x32x16.f16"') == 2
     _run_waveamd_to_machine(wave)
     del ctx
@@ -4599,11 +4960,15 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     local_load_attrs = [
         converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind == "local_load_fragment"
+        if op.kind == "local_load_mma_payload"
     ]
 
     assert len(local_load_attrs) == 1
     assert local_load_attrs[0]["load_mode"] == "b16_transpose"
+    assert local_load_attrs[0]["shared_physical_offset_plan"] == "padded_linear"
+    assert local_load_attrs[0]["shared_physical_intervals"] == (4,)
+    assert local_load_attrs[0]["shared_physical_paddings"] == (16,)
+    assert "shared_layout_kind" not in local_load_attrs[0]
     assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 2560),) * 8
     wave = output.emitted_module.text
     assert '<"2560 + 5120*floor' in wave

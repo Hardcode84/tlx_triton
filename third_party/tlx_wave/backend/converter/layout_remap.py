@@ -8,7 +8,7 @@ from . import layouts
 
 STAGE = "op_conversion"
 
-_DISTRIBUTED_REMAP_KINDS = frozenset({"blocked", "linear"})
+_DISTRIBUTED_REMAP_KINDS = frozenset({"blocked", "linear", "generic_linear"})
 _DISTRIBUTED_REMAP_REPRESENTATIONS = frozenset(
     {
         "mask",
@@ -24,13 +24,38 @@ _DISTRIBUTED_REMAP_REPRESENTATIONS = frozenset(
 def register_remap(operand, result, operand_layout, result_layout, op):
     if operand_layout is None or result_layout is None:
         return None
-    if not (operand_layout.kind == "amd_mfma" and result_layout.kind == "blocked"):
+    if not (
+        operand_layout.kind == "amd_mfma"
+        and result_layout.kind in {"blocked", "linear", "generic_linear"}
+    ):
         return None
     if operand.type.element_type != result.type.element_type:
         return None
     if result.type.representation not in {"simd", "simd_tuple"}:
         return None
 
+    description = f"MFMA to {result_layout.kind} convert_layout"
+    if result_layout.kind == "generic_linear":
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} involves #ttg.generic_linear; representative "
+            "semantics for non-alias convert_layout are not declared",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    if (
+        result_layout.kind in {"linear", "generic_linear"}
+        and operand.type.representation in {"fragment", "fragment_tuple"}
+    ):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} requires an explicit MMA payload unpack before "
+            "generic register remap",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
     source_layout = _distributed_linear_layout(operand_layout, op)
     result_layout_ll = _distributed_linear_layout(result_layout, op)
     source_register_count = layouts.linear_layout_in_dim_size(
@@ -53,7 +78,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA convert_layout source component model does not match "
+            f"{description} source component model does not match "
             "the source register layout",
             source_op_index=op.index,
             source_value_id=operand.value_id,
@@ -62,7 +87,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "MFMA to blocked convert_layout requires a warp-aware result "
+            f"{description} requires a warp-aware result "
             f"component model: result has {int(result.type.component_count)} "
             f"components but the per-wave register layout has "
             f"{result_register_count}",
@@ -82,6 +107,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         cta_warp_count,
         op,
         operand.value_id,
+        description=description,
     )
 
     result_sources = tuple(
@@ -93,6 +119,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
             cta_warp_count,
             op,
             result.value_id,
+            description=description,
         )
         for result_register in range(result_register_count)
     )
@@ -104,6 +131,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         source_registers_per_component,
         op,
         result.value_id,
+        description=description,
     )
     if simple_remap is not None:
         return {
@@ -118,6 +146,7 @@ def register_remap(operand, result, operand_layout, result_layout, op):
         cta_warp_count,
         op,
         result.value_id,
+        description=description,
     )
     return {
         "mode": "cta_exchange_register_remap",
@@ -148,6 +177,15 @@ def distributed_remap(operand, result, operand_layout, result_layout, op):
     description = (
         f"{operand_layout.kind} to {result_layout.kind} convert_layout"
     )
+    if "generic_linear" in {operand_layout.kind, result_layout.kind}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            f"{description} involves #ttg.generic_linear; representative "
+            "semantics for non-alias convert_layout are not declared",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
     _require_injective_layout(
         source_layout,
         op,
@@ -222,17 +260,64 @@ def distributed_remap(operand, result, operand_layout, result_layout, op):
         op,
         result.value_id,
         description=description,
+        allow_fallback=True,
     )
     if remap is None:
-        _reject_distributed_movement(
+        movement = _distributed_movement_class(
             result_sources,
             lane_width,
             cta_warp_count,
-            op,
-            result.value_id,
-            description,
         )
+        if movement != "cross_warp":
+            remap = _simple_register_remap(
+                result_sources,
+                lane_width,
+                cta_warp_count,
+                1,
+                op,
+                result.value_id,
+                description=description,
+            )
+            if remap is not None:
+                return remap
+            _reject_distributed_movement(
+                result_sources,
+                lane_width,
+                cta_warp_count,
+                op,
+                result.value_id,
+                description,
+            )
+        if result.type.representation not in {
+            "mask",
+            "mask_tuple",
+            "simd",
+            "simd_tuple",
+        }:
+            _reject_distributed_movement(
+                result_sources,
+                lane_width,
+                cta_warp_count,
+                op,
+                result.value_id,
+                description,
+            )
+        return {
+            "mode": "cta_exchange_register_remap",
+            "source_component_count": int(operand.type.component_count),
+            "source_registers_per_component": 1,
+            **_cta_exchange_register_remap(
+                result_sources,
+                lane_width,
+                cta_warp_count,
+                op,
+                result.value_id,
+                description=description,
+            ),
+        }
     if remap["mode"] == "cross_lane_register_remap" and result.type.representation not in {
+        "mask",
+        "mask_tuple",
         "simd",
         "simd_tuple",
     }:
@@ -252,13 +337,22 @@ def distributed_remap(operand, result, operand_layout, result_layout, op):
     }
 
 
-def dot_operand_fragment_pack(operand, result, operand_layout, result_layout, op):
+def dot_operand_vector_payload(operand, result, operand_layout, result_layout, op):
     if operand_layout is None or result_layout is None:
         return None
     if operand_layout.kind not in _DISTRIBUTED_REMAP_KINDS:
         return None
     if result_layout.kind != "dot_operand":
         return None
+    if operand_layout.kind == "generic_linear":
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "generic_linear to dot_operand convert_layout requires declared "
+            "representative semantics before MMA payload packing",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
     if operand.type.element_type != result.type.element_type:
         return None
     if operand.type.representation not in {"simd", "simd_tuple"}:
@@ -428,13 +522,14 @@ def dot_operand_fragment_pack(operand, result, operand_layout, result_layout, op
         )
 
     return {
+        "barrier_scope": "cta",
         "cta_thread_count": int(cta_thread_count),
         "element_type": result.type.element_type,
         "elements_per_lane": int(elements_per_lane),
-        "fragment_vector_load_bases": tuple(component_vector_load_bases),
-        "fragment_vector_load_coefficients": tuple(component_vector_load_coefficients),
-        "mode": "dot_operand_fragment_pack",
+        "mode": "dot_operand_vector_payload",
         "payload_mode": "vector",
+        "payload_vector_load_bases": tuple(component_vector_load_bases),
+        "payload_vector_load_coefficients": tuple(component_vector_load_coefficients),
         "registers": int(registers),
         "role": int(result_layout.properties["op_idx"]),
         "rows": int(instr_shape[0]),
@@ -1210,6 +1305,7 @@ def _cta_exchange_register_remap(
             )
         )
     return {
+        "barrier_scope": "cta",
         "cta_thread_count": int(cta_thread_count),
         "exchange_groups": tuple(exchange_groups),
         "scratch_element_count": int(max_group_slots) * int(cta_thread_count),
@@ -1254,6 +1350,31 @@ def _reject_distributed_movement(
         source_op_index=op.index,
         source_value_id=result_value_id,
     )
+
+
+def _distributed_movement_class(
+    result_sources,
+    lane_width,
+    cta_warp_count,
+):
+    has_cross_warp = False
+    has_lane_mux = False
+    for sources in result_sources:
+        for result_warp in range(int(cta_warp_count)):
+            for lane in range(int(lane_width)):
+                source_warp, _source_lane, _source_register = sources[
+                    result_warp * int(lane_width) + lane
+                ]
+                if int(source_warp) != int(result_warp):
+                    has_cross_warp = True
+        source_registers = {int(source[2]) for source in sources}
+        if len(source_registers) > 1:
+            has_lane_mux = True
+    if has_cross_warp:
+        return "cross_warp"
+    if has_lane_mux:
+        return "lane_mux"
+    return "unknown"
 
 
 def _require_injective_layout(linear, op, source_value_id, description):
@@ -1611,7 +1732,7 @@ def _lane_width_factors(lane_width):
 
 
 def _distributed_linear_layout(layout, op):
-    if layout.kind not in {"blocked", "linear", "amd_mfma"}:
+    if layout.kind not in {"blocked", "linear", "generic_linear", "amd_mfma"}:
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,

@@ -22,12 +22,50 @@ class LayoutMap:
     properties: dict
 
 
+@dataclass(frozen=True)
+class PhysicalOffsetRecord:
+    element_offset: int
+    byte_offset: int
+    dword_offset: int | None
+    element_byte_width: int
+    layout_kind: str
+    order: tuple[int, ...]
+    logical_coords: tuple[int, ...]
+    logical_linear_offset: int
+    bindings: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    proof_status: str = "static"
+    provenance: str = "shared_physical_offset"
+
+
+@dataclass(frozen=True)
+class PhysicalOffsetExpressionPlan:
+    expression_kind: str
+    offset_unit: str
+    element_byte_width: int
+    layout_kind: str
+    order: tuple[int, ...]
+    bindings: tuple[str, ...] = ("logical_coords",)
+    assumptions: tuple[str, ...] = ()
+    proof_status: str = "symbolic_verified"
+    provenance: str = "shared_physical_offset"
+    intervals: tuple[int, ...] = ()
+    paddings: tuple[int, ...] = ()
+    swizzled_vec: int | None = None
+    swizzled_per_phase: int | None = None
+    swizzled_max_phase: int | None = None
+
+
 def build_layout_map(layout_map_id, value_id, source_type, lane_width):
     if source_type.kind not in {"tensor", "memdesc"}:
         return None
     attr = source_type.encoding_attr
-    kind, properties = _layout_kind_and_properties(attr, value_id)
-    if kind in {"blocked", "linear"}:
+    kind, properties = _layout_kind_and_properties(
+        attr,
+        value_id,
+        encoding=str(source_type.encoding or ""),
+    )
+    if kind in {"blocked", "linear", "generic_linear"}:
         coordinate_domain = _layout_coordinate_domain(
             kind,
             source_type.shape,
@@ -64,7 +102,7 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
     )
 
 
-def _layout_kind_and_properties(attr, value_id):
+def _layout_kind_and_properties(attr, value_id, *, encoding=None):
     if attr is None:
         return "none", {}
     if _attr_bool(attr, "is_blocked_encoding"):
@@ -75,15 +113,25 @@ def _layout_kind_and_properties(attr, value_id):
             "order": _int_tuple(_attr_value(attr, "get_blocked_order")),
         }
     if _attr_bool(attr, "is_linear_encoding"):
-        return "linear", {
+        kind = (
+            "generic_linear"
+            if str(encoding or "").startswith("#ttg.generic_linear")
+            else "linear"
+        )
+        return kind, {
             "register_bases": _basis_tuple(_attr_value(attr, "get_linear_register_bases")),
             "lane_bases": _basis_tuple(_attr_value(attr, "get_linear_lane_bases")),
             "warp_bases": _basis_tuple(_attr_value(attr, "get_linear_warp_bases")),
             "block_bases": _basis_tuple(_attr_value(attr, "get_linear_block_bases")),
+            "linear_encoding_kind": kind,
         }
     if _attr_bool(attr, "is_slice_encoding"):
         parent = _attr_value(attr, "get_slice_parent")
-        parent_kind, parent_properties = _layout_kind_and_properties(parent, value_id)
+        parent_kind, parent_properties = _layout_kind_and_properties(
+            parent,
+            value_id,
+            encoding=str(parent or ""),
+        )
         return "slice", {
             "dim": int(_attr_value(attr, "get_slice_dim")),
             "parent_kind": parent_kind,
@@ -91,7 +139,11 @@ def _layout_kind_and_properties(attr, value_id):
         }
     if _attr_bool(attr, "is_dot_operand_encoding"):
         parent = _attr_value(attr, "get_dot_operand_parent")
-        parent_kind, parent_properties = _layout_kind_and_properties(parent, value_id)
+        parent_kind, parent_properties = _layout_kind_and_properties(
+            parent,
+            value_id,
+            encoding=str(parent or ""),
+        )
         return "dot_operand", {
             "op_idx": int(_attr_value(attr, "get_dot_operand_op_idx")),
             "k_width": int(_attr_value(attr, "get_dot_operand_k_width")),
@@ -129,7 +181,7 @@ def _layout_kind_and_properties(attr, value_id):
 
 
 def _layout_component_count(source_type, kind, properties, lane_width, value_id):
-    if kind in {"blocked", "linear"}:
+    if kind in {"blocked", "linear", "generic_linear"}:
         coordinate_domain = _layout_coordinate_domain(
             kind,
             source_type.shape,
@@ -171,7 +223,7 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
     if kind == "slice":
         parent_kind = properties.get("parent_kind")
         parent_properties = properties.get("parent_properties", {})
-        if parent_kind in {"blocked", "linear"}:
+        if parent_kind in {"blocked", "linear", "generic_linear"}:
             dim = int(properties.get("dim", 0))
             parent_shape = list(int(value) for value in source_type.shape)
             if dim < 0 or dim > len(parent_shape):
@@ -263,7 +315,7 @@ def distributed_linear_layout_from_parts(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    if kind == "linear":
+    if kind in {"linear", "generic_linear"}:
         return _linear_encoding_layout(
             shape,
             properties,
@@ -337,7 +389,7 @@ def linear_layout_bases(linear, in_dim):
 
 
 def layout_warp_count(layout):
-    if layout.kind == "linear":
+    if layout.kind in {"linear", "generic_linear"}:
         return 1 << len(tuple(layout.properties.get("warp_bases", ())))
     if layout.kind == "slice":
         return _layout_warp_count_from_parts(
@@ -351,6 +403,643 @@ def layout_warp_count(layout):
     for value in warps_per_cta:
         result *= max(1, int(value))
     return result
+
+
+def shared_physical_offset(
+    layout,
+    shape,
+    coords,
+    element_byte_width,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    coords = tuple(int(coord) for coord in coords)
+    element_byte_width = int(element_byte_width)
+    if element_byte_width <= 0:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "shared physical offset requires a positive element byte width",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if len(coords) != len(shape):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "shared physical offset coordinate rank does not match shape rank",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    for coord, extent in zip(coords, shape):
+        if int(coord) < 0 or int(coord) >= int(extent):
+            _shared_layout_fail(
+                diagnostic,
+                stage,
+                f"shared physical offset coordinate {coords} exceeds shape {shape}",
+                layout=layout,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+
+    kind = shared_layout_kind(layout)
+    assumptions = ()
+    if kind == "dense":
+        order = default_physical_order(shape)
+        element_offset = static_linear_offset(shape, coords)
+        logical_linear_offset = element_offset
+        provenance = "dense_row_major"
+    elif kind == "swizzled_shared":
+        if is_identity_swizzled_shared(layout):
+            order = default_physical_order(shape)
+            element_offset = static_linear_offset(shape, coords)
+            logical_linear_offset = element_offset
+            provenance = "identity_swizzled_row_major"
+        else:
+            order, vec, per_phase, max_phase = swizzled_shared_parameters(
+                layout,
+                shape,
+                stage=stage,
+                diagnostic=diagnostic,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+            minor_dim = int(order[0])
+            major_dim = int(order[1])
+            minor_extent = int(shape[minor_dim])
+            major = int(coords[major_dim])
+            minor = int(coords[minor_dim])
+            phase = (major // int(per_phase)) % int(max_phase)
+            swizzled_minor = ((minor // int(vec)) ^ phase) * int(vec) + (
+                minor % int(vec)
+            )
+            if swizzled_minor >= minor_extent:
+                _shared_layout_fail(
+                    diagnostic,
+                    stage,
+                    "swizzled shared physical offset produces an "
+                    f"out-of-bounds minor coordinate {swizzled_minor}; "
+                    f"{swizzled_shared_description(layout)}",
+                    layout=layout,
+                    source_op_index=source_op_index,
+                    source_value_id=source_value_id,
+                )
+            element_offset = major * minor_extent + swizzled_minor
+            logical_linear_offset = ordered_linear_offset(shape, coords, order)
+            provenance = "swizzled_shared"
+            assumptions = ("minor_extent_divisible_by_vec",)
+    elif kind == "padded_shared":
+        intervals, paddings = padded_shared_parameters(
+            layout,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        order = shared_layout_physical_order(
+            layout,
+            shape,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        _require_identity_padded_linear_component(
+            layout,
+            shape,
+            order,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        logical_linear_offset = ordered_linear_offset(shape, coords, order)
+        element_offset = int(logical_linear_offset)
+        for interval, padding in zip(intervals, paddings):
+            element_offset += (logical_linear_offset // int(interval)) * int(padding)
+        provenance = "padded_shared"
+        assumptions = ("valid_padded_intervals",)
+    else:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"shared physical offset does not support layout {kind}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+
+    byte_offset = int(element_offset) * int(element_byte_width)
+    dword_offset = byte_offset // 4 if byte_offset % 4 == 0 else None
+    return PhysicalOffsetRecord(
+        element_offset=int(element_offset),
+        byte_offset=int(byte_offset),
+        dword_offset=dword_offset,
+        element_byte_width=int(element_byte_width),
+        layout_kind=kind,
+        order=tuple(int(dim) for dim in order),
+        logical_coords=coords,
+        logical_linear_offset=int(logical_linear_offset),
+        assumptions=tuple(assumptions),
+        provenance=provenance,
+    )
+
+
+def shared_physical_offset_from_linear(
+    layout,
+    shape,
+    linear,
+    element_byte_width,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    linear = int(linear)
+    if linear < 0 or linear >= _product(shape):
+        return None
+    coords = static_delinearize_row_major(
+        linear,
+        shape,
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+        layout=layout,
+    )
+    return shared_physical_offset(
+        layout,
+        shape,
+        coords,
+        int(element_byte_width),
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def shared_physical_offset_expression_plan(
+    layout,
+    shape,
+    element_byte_width,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    element_byte_width = int(element_byte_width)
+    if element_byte_width <= 0:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "shared physical offset expression requires a positive element byte width",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    kind = shared_layout_kind(layout)
+    if kind == "dense":
+        return PhysicalOffsetExpressionPlan(
+            expression_kind="dense_row_major",
+            offset_unit="element",
+            element_byte_width=element_byte_width,
+            layout_kind=kind,
+            order=default_physical_order(shape),
+            provenance="dense_row_major",
+        )
+    if kind == "swizzled_shared":
+        if is_identity_swizzled_shared(layout):
+            return PhysicalOffsetExpressionPlan(
+                expression_kind="dense_row_major",
+                offset_unit="element",
+                element_byte_width=element_byte_width,
+                layout_kind=kind,
+                order=default_physical_order(shape),
+                assumptions=("identity_swizzled_shared",),
+                provenance="identity_swizzled_row_major",
+            )
+        order, vec, per_phase, max_phase = swizzled_shared_parameters(
+            layout,
+            shape,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        return PhysicalOffsetExpressionPlan(
+            expression_kind="swizzled_xor",
+            offset_unit="element",
+            element_byte_width=element_byte_width,
+            layout_kind=kind,
+            order=tuple(int(dim) for dim in order),
+            assumptions=("minor_extent_divisible_by_vec",),
+            provenance="swizzled_shared",
+            swizzled_vec=int(vec),
+            swizzled_per_phase=int(per_phase),
+            swizzled_max_phase=int(max_phase),
+        )
+    if kind == "padded_shared":
+        intervals, paddings = padded_shared_parameters(
+            layout,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        order = shared_layout_physical_order(
+            layout,
+            shape,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        _require_identity_padded_linear_component(
+            layout,
+            shape,
+            order,
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+        return PhysicalOffsetExpressionPlan(
+            expression_kind="padded_linear",
+            offset_unit="element",
+            element_byte_width=element_byte_width,
+            layout_kind=kind,
+            order=tuple(int(dim) for dim in order),
+            assumptions=("valid_padded_intervals",),
+            provenance="padded_shared",
+            intervals=tuple(int(value) for value in intervals),
+            paddings=tuple(int(value) for value in paddings),
+        )
+    _shared_layout_fail(
+        diagnostic,
+        stage,
+        f"shared physical offset expression does not support layout {kind}",
+        layout=layout,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def physical_offset_expression_plan_attrs(plan, prefix):
+    prefix = str(prefix)
+    attrs = {
+        f"{prefix}_physical_offset_plan": plan.expression_kind,
+        f"{prefix}_physical_offset_unit": plan.offset_unit,
+        f"{prefix}_physical_element_byte_width": int(plan.element_byte_width),
+        f"{prefix}_physical_layout_kind": plan.layout_kind,
+        f"{prefix}_physical_order": tuple(int(dim) for dim in plan.order),
+        f"{prefix}_physical_bindings": tuple(str(name) for name in plan.bindings),
+        f"{prefix}_physical_assumptions": tuple(
+            str(assumption) for assumption in plan.assumptions
+        ),
+        f"{prefix}_physical_proof_status": plan.proof_status,
+        f"{prefix}_physical_provenance": plan.provenance,
+    }
+    if plan.expression_kind == "padded_linear" or plan.intervals:
+        attrs[f"{prefix}_physical_intervals"] = tuple(
+            int(value) for value in plan.intervals
+        )
+    if plan.expression_kind == "padded_linear" or plan.paddings:
+        attrs[f"{prefix}_physical_paddings"] = tuple(
+            int(value) for value in plan.paddings
+        )
+    if plan.swizzled_vec is not None:
+        attrs[f"{prefix}_physical_swizzled_vec"] = int(plan.swizzled_vec)
+    if plan.swizzled_per_phase is not None:
+        attrs[f"{prefix}_physical_swizzled_per_phase"] = int(
+            plan.swizzled_per_phase
+        )
+    if plan.swizzled_max_phase is not None:
+        attrs[f"{prefix}_physical_swizzled_max_phase"] = int(
+            plan.swizzled_max_phase
+        )
+    return attrs
+
+
+def shared_layout_kind(layout):
+    if layout is None or layout.kind == "none":
+        return "dense"
+    if layout.kind in {"linear", "generic_linear"}:
+        return "linear_shared"
+    return str(layout.kind)
+
+
+def default_physical_order(shape):
+    return tuple(reversed(range(len(tuple(shape)))))
+
+
+def expand_physical_order(
+    order,
+    rank,
+    *,
+    layout=None,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    order = tuple(int(dim) for dim in order)
+    rank = int(rank)
+    if len(order) > rank or sorted(order) != list(range(len(order))):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"shared layout order {order} cannot be applied to rank-{rank} shape",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    prefix_rank = rank - len(order)
+    mapped = tuple(prefix_rank + int(dim) for dim in order)
+    return mapped + tuple(reversed(range(prefix_rank)))
+
+
+def shared_layout_physical_order(
+    layout,
+    shape,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    if not shape:
+        return ()
+    if layout is not None and layout.kind == "padded_shared":
+        order = tuple(int(dim) for dim in layout.properties.get("order", ()))
+        if order:
+            return expand_physical_order(
+                order,
+                len(shape),
+                layout=layout,
+                stage=stage,
+                diagnostic=diagnostic,
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+    return default_physical_order(shape)
+
+
+def _require_identity_padded_linear_component(
+    layout,
+    shape,
+    order,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    if tuple(order) == default_physical_order(shape):
+        return
+    _shared_layout_fail(
+        diagnostic,
+        stage,
+        "non-identity padded shared physical offsets require the full "
+        f"linearComponent; {padded_shared_description(layout)}",
+        layout=layout,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def static_linear_offset(shape, coords):
+    offset = 0
+    shape = tuple(int(dim) for dim in shape)
+    for dim, coord in enumerate(coords):
+        stride = _product(shape[dim + 1 :])
+        offset += int(coord) * stride
+    return int(offset)
+
+
+def ordered_linear_offset(shape, coords, order):
+    offset = 0
+    stride = 1
+    shape = tuple(int(dim) for dim in shape)
+    for dim in order:
+        offset += int(coords[int(dim)]) * stride
+        stride *= int(shape[int(dim)])
+    return int(offset)
+
+
+def ordered_coords_from_linear(linear, shape, order):
+    coords = [0] * len(shape)
+    remainder = int(linear)
+    for dim in order:
+        extent = int(shape[int(dim)])
+        coords[int(dim)] = remainder % extent
+        remainder //= extent
+    return tuple(coords)
+
+
+def static_delinearize_row_major(
+    linear,
+    shape,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+    layout=None,
+):
+    shape = tuple(int(dim) for dim in shape)
+    coords = [0] * len(shape)
+    remainder = int(linear)
+    for dim in reversed(range(len(shape))):
+        extent = int(shape[dim])
+        coords[dim] = remainder % extent
+        remainder //= extent
+    if remainder:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"linear index {linear} exceeds shape {shape}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return tuple(coords)
+
+
+def swizzled_shared_parameters(
+    layout,
+    shape,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    order = tuple(int(dim) for dim in layout.properties.get("order", ()))
+    shape = tuple(int(dim) for dim in shape)
+    if len(shape) != 2 or order not in {(1, 0), (0, 1)}:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "swizzled shared physical offsets support only rank-2 "
+            f"order=[1,0] or order=[0,1]; got {swizzled_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    vec = int(layout.properties["vec"])
+    per_phase = int(layout.properties["per_phase"])
+    max_phase = int(layout.properties["max_phase"])
+    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "swizzled shared layout requires positive vec/perPhase/maxPhase; "
+            f"got {swizzled_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    minor_extent = int(shape[int(order[0])])
+    if minor_extent % vec:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"swizzled shared minor extent {minor_extent} is not divisible "
+            f"by vec={vec}; {swizzled_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return order, vec, per_phase, max_phase
+
+
+def padded_shared_parameters(
+    layout,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0,), ()}:
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            f"unsupported padded shared order; {padded_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    intervals = tuple(int(value) for value in layout.properties.get("intervals", ()))
+    paddings = tuple(int(value) for value in layout.properties.get("paddings", ()))
+    if len(intervals) != len(paddings):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "padded shared layout requires matching interval/padding counts; "
+            f"{padded_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if any(interval <= 0 for interval in intervals):
+        _shared_layout_fail(
+            diagnostic,
+            stage,
+            "padded shared intervals must be positive; "
+            f"{padded_shared_description(layout)}",
+            layout=layout,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return intervals, paddings
+
+
+def is_identity_swizzled_shared(layout):
+    props = layout.properties
+    order = tuple(props.get("order", ()))
+    return (
+        int(props.get("vec", 0)) == 1
+        and int(props.get("per_phase", 0)) == 1
+        and int(props.get("max_phase", 0)) == 1
+        and order in {(1, 0), (0,), ()}
+    )
+
+
+def require_identity_swizzled_shared(
+    layout,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    props = layout.properties
+    if (
+        int(props.get("vec", 0)) == 1
+        and int(props.get("per_phase", 0)) == 1
+        and int(props.get("max_phase", 0)) == 1
+    ):
+        return
+    _shared_layout_fail(
+        diagnostic,
+        stage,
+        "swizzled shared layout requires an explicit remap target op",
+        layout=layout,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
+def swizzled_shared_description(layout):
+    props = layout.properties
+    return (
+        f"order={tuple(props.get('order', ()))}, "
+        f"vec={int(props.get('vec', 0))}, "
+        f"per_phase={int(props.get('per_phase', 0))}, "
+        f"max_phase={int(props.get('max_phase', 0))}"
+    )
+
+
+def padded_shared_description(layout):
+    props = layout.properties
+    return (
+        f"order={tuple(props.get('order', ()))}, "
+        f"intervals={tuple(int(value) for value in props.get('intervals', ()))}, "
+        f"paddings={tuple(int(value) for value in props.get('paddings', ()))}"
+    )
+
+
+def _shared_layout_fail(
+    code,
+    stage,
+    message,
+    *,
+    layout=None,
+    source_op_index=None,
+    source_value_id=None,
+):
+    if source_value_id is None and layout is not None:
+        source_value_id = layout.value_id
+    fail(
+        code,
+        stage,
+        message,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
 
 
 def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_id):
@@ -430,7 +1119,7 @@ def _require_supported_coordinate_domain(
 
 
 def _layout_warp_count_from_parts(kind, properties):
-    if kind == "linear":
+    if kind in {"linear", "generic_linear"}:
         return 1 << len(tuple(properties.get("warp_bases", ())))
     if kind == "slice":
         return _layout_warp_count_from_parts(
@@ -445,7 +1134,7 @@ def _layout_warp_count_from_parts(kind, properties):
 
 
 def _basis_pattern(kind, properties):
-    if kind == "linear":
+    if kind in {"linear", "generic_linear"}:
         return {
             "register": tuple(properties.get("register_bases", ())),
             "lane": tuple(properties.get("lane_bases", ())),
@@ -563,7 +1252,7 @@ def _slice_linear_layout(
 ):
     parent_kind = properties.get("parent_kind")
     parent_properties = properties.get("parent_properties", {})
-    if parent_kind not in {"blocked", "linear"}:
+    if parent_kind not in {"blocked", "linear", "generic_linear"}:
         _layout_fail(
             "TLXW_TYPE_UNSUPPORTED_LAYOUT",
             stage,

@@ -1733,13 +1733,38 @@ def _local_destination_lane_offset(
 
 
 def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, op):
-    layout = attrs.get("destination_shared_layout", "dense")
-    if layout == "dense":
+    plan = attrs.get("destination_physical_offset_plan")
+    if plan is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized shared destination is missing a physical offset plan",
+            target_op_id=op.target_op_id,
+        )
+    unit = attrs.get("destination_physical_offset_unit")
+    if unit != "element":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            f"unsupported scalarized shared destination offset unit {unit}",
+            target_op_id=op.target_op_id,
+        )
+    if int(attrs.get("destination_physical_element_byte_width", 0)) != int(
+        attrs.get("element_byte_width", 0)
+    ):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized shared destination offset element width does not match "
+            "the op element width",
+            target_op_id=op.target_op_id,
+        )
+    if plan == "dense_row_major":
         return _linearize_coordinates(state, coords, shape, lane_width)
-    if layout == "padded":
+    if plan == "padded_linear":
         order = _physical_order_from_attrs(
             attrs,
-            "destination_padded_order",
+            "destination_physical_order",
             shape,
             op,
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
@@ -1752,22 +1777,26 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
             lane_width,
         )
         encoded = physical
-        intervals = tuple(int(value) for value in attrs["destination_padded_intervals"])
-        paddings = tuple(int(value) for value in attrs["destination_padded_paddings"])
+        intervals = tuple(
+            int(value) for value in attrs.get("destination_physical_intervals", ())
+        )
+        paddings = tuple(
+            int(value) for value in attrs.get("destination_physical_paddings", ())
+        )
         for interval, padding in zip(intervals, paddings):
             term = _simd_binary_const(state, "divui", physical, interval, lane_width)
             if padding != 1:
                 term = _simd_binary_const(state, "muli", term, padding, lane_width)
             encoded = state.builder.binary(state.dsl.BinaryKind.AddI, encoded, term)
         return encoded
-    if layout == "swizzled":
-        order = tuple(int(value) for value in attrs["destination_swizzled_order"])
+    if plan == "swizzled_xor":
+        order = tuple(int(value) for value in attrs["destination_physical_order"])
         minor_dim = int(order[0])
         major_dim = int(order[1])
         minor_extent = int(shape[minor_dim])
-        vec = int(attrs["destination_swizzled_vec"])
-        per_phase = int(attrs["destination_swizzled_per_phase"])
-        max_phase = int(attrs["destination_swizzled_max_phase"])
+        vec = int(attrs["destination_physical_swizzled_vec"])
+        per_phase = int(attrs["destination_physical_swizzled_per_phase"])
+        max_phase = int(attrs["destination_physical_swizzled_max_phase"])
         major = coords[major_dim]
         minor = coords[minor_dim]
         phase = _simd_binary_const(state, "divui", major, per_phase, lane_width)
@@ -1809,7 +1838,8 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
     fail(
         "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
         STAGE,
-        f"unsupported scalarized shared destination layout {layout}",
+        f"unsupported scalarized shared destination physical offset plan {plan}",
+        target_op_id=op.target_op_id,
     )
 
 
@@ -2030,7 +2060,7 @@ def _emit_async_wait(state, op):
         state.values[_single_result(op)] = token
 
 
-def _emit_local_load_fragment(state, op):
+def _emit_local_load_mma_payload(state, op):
     attrs = target_ir.attrs_dict(op)
     base = _operand_values(state, op, 1)[0]
     element_type = _scalar_type(state.dsl, attrs["element_type"])
@@ -2040,65 +2070,60 @@ def _emit_local_load_fragment(state, op):
     warps_per_cta = tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1)))
     wave_tile_axis = attrs.get("wave_tile_axis", "none")
     wave_tile_stride_dwords = int(attrs.get("wave_tile_stride_dwords", 0))
-    load_mode = attrs.get("load_mode", "fragment_load")
+    load_mode = attrs.get("load_mode", "mma_payload_load")
     offset_attr = (
         "component_dword_offsets"
-        if load_mode == "fragment_load"
+        if load_mode == "mma_payload_load"
         else "component_tile_offsets"
     )
     if len(attrs[offset_attr]) != expected_components:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
-            "local_load_fragment component offsets do not match attrs",
+            "local_load_mma_payload component offsets do not match attrs",
             target_op_id=op.target_op_id,
     )
-    i32_shared = state.dsl.ptr_type(state.dsl.i32(), state.dsl.shared_address_space())
-    base_i32 = _ptr_cast(state, base, i32_shared)
     wi = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
-    fragment_type = state.dsl.fragment_type(
-        int(attrs["role"]),
-        element_type,
-        int(attrs["rows"]),
-        int(attrs["columns"]),
-        lane_width,
-        registers,
-    )
     if load_mode == "b16_transpose":
-        state.values[_single_result(op)] = _emit_b16_transpose_fragment_load(
+        state.values[_single_result(op)] = _emit_b16_transpose_mma_payload_load(
             state,
             op,
             attrs,
             base,
             element_type,
-            fragment_type,
             wi,
         )
         return
-    if load_mode in {"swizzled_fragment_load", "indexed_fragment_load"}:
-        state.values[_single_result(op)] = _emit_swizzled_fragment_load(
+    if load_mode in {"swizzled_mma_payload_load", "indexed_mma_payload_load"}:
+        state.values[_single_result(op)] = _emit_swizzled_mma_payload_load(
             state,
             op,
             attrs,
             base,
-            fragment_type,
+            element_type,
             wi,
         )
         return
-    if load_mode != "fragment_load":
+    if load_mode != "mma_payload_load":
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
-            f"unsupported local_load_fragment mode {load_mode}",
+            f"unsupported local_load_mma_payload mode {load_mode}",
             target_op_id=op.target_op_id,
         )
     component_offsets = tuple(int(value) for value in attrs["component_dword_offsets"])
+    element_byte_width = _element_byte_width(attrs["element_type"], op)
+    elements_per_register = 4 // int(element_byte_width)
     ptr_type = state.dsl.simd_ptr_type(
-        state.dsl.i32(),
+        element_type,
         state.dsl.shared_address_space(),
         lane_width,
     )
-    fragments = []
+    load_type = state.dsl.simd_type(
+        state.dsl.vector_type(registers * elements_per_register, element_type),
+        width=lane_width,
+    )
+    payloads = []
     for component_offset in component_offsets:
         offset = _linear_local_fragment_index_offset(
             state,
@@ -2111,19 +2136,26 @@ def _emit_local_load_fragment(state, op):
             extra_elements=component_offset,
             op=op,
         )
-        ptr = state.builder.ptr_add(base_i32, offset, result_type=ptr_type)
-        fragment, _token = state.builder.fragment_load(ptr, fragment_type)
-        fragments.append(fragment)
-    state.values[_single_result(op)] = _pack_components(tuple(fragments))
+        if elements_per_register != 1:
+            offset = _simd_binary_const(
+                state,
+                "muli",
+                offset,
+                elements_per_register,
+                lane_width,
+            )
+        ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
+        payload, _token = state.builder.load(ptr, load_type)
+        payloads.append(payload)
+    state.values[_single_result(op)] = _pack_components(tuple(payloads))
 
 
-def _emit_b16_transpose_fragment_load(
+def _emit_b16_transpose_mma_payload_load(
     state,
     op,
     attrs,
     base,
     element_type,
-    fragment_type,
     wi,
 ):
     lane_width = int(attrs["lane_width"])
@@ -2140,7 +2172,7 @@ def _emit_b16_transpose_fragment_load(
     )
     component_type = state.dsl.simd_type(element_type, lane_width)
     chunk_element_deltas = attrs.get("chunk_element_deltas")
-    fragments = []
+    payloads = []
     for component_index, tile_offsets in enumerate(attrs["component_tile_offsets"]):
         components = []
         component_deltas = None
@@ -2190,27 +2222,31 @@ def _emit_b16_transpose_fragment_load(
             width=lane_width,
         )
         packed = state.dsl.wave.PackOp(packed_type, components).result
-        fragments.append(state.builder.fragment_pack(packed, fragment_type))
-    return _pack_components(tuple(fragments))
+        payloads.append(packed)
+    return _pack_components(tuple(payloads))
 
 
-def _emit_swizzled_fragment_load(
+def _emit_swizzled_mma_payload_load(
     state,
     op,
     attrs,
     base,
-    fragment_type,
+    element_type,
     wi,
 ):
     lane_width = int(attrs["lane_width"])
-    i32_shared = state.dsl.ptr_type(state.dsl.i32(), state.dsl.shared_address_space())
-    base_i32 = _ptr_cast(state, base, i32_shared)
+    base_type = state.dsl.ptr_type(element_type, state.dsl.shared_address_space())
+    base = _ptr_cast(state, base, base_type)
     ptr_type = state.dsl.simd_ptr_type(
-        state.dsl.i32(),
+        element_type,
         state.dsl.shared_address_space(),
         lane_width,
     )
-    fragments = []
+    load_type = state.dsl.simd_type(
+        state.dsl.vector_type(int(attrs["elements_per_lane"]), element_type),
+        width=lane_width,
+    )
+    payloads = []
     for tile_offsets in attrs["component_tile_offsets"]:
         offset = _local_fragment_element_offset(
             state,
@@ -2226,12 +2262,11 @@ def _emit_swizzled_fragment_load(
             ),
             wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
             op=op,
-            elements_per_offset_unit=2,
         )
-        ptr = state.builder.ptr_add(base_i32, offset, result_type=ptr_type)
-        fragment, _token = state.builder.fragment_load(ptr, fragment_type)
-        fragments.append(fragment)
-    return _pack_components(tuple(fragments))
+        ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
+        payload, _token = state.builder.load(ptr, load_type)
+        payloads.append(payload)
+    return _pack_components(tuple(payloads))
 
 
 def _local_fragment_element_offset(
@@ -2250,15 +2285,30 @@ def _local_fragment_element_offset(
     elements_per_offset_unit=1,
     physical_extra_elements=0,
 ):
-    layout_kind = attrs.get("shared_layout_kind", "dense")
-    lane_layout = attrs.get("fragment_lane_layout", "row_major_linear")
+    plan = attrs.get("shared_physical_offset_plan")
+    if plan is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "local_load shared access is missing a physical offset plan",
+            target_op_id=op.target_op_id,
+        )
+    unit = attrs.get("shared_physical_offset_unit")
+    if unit != "element":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            f"unsupported local_load shared offset unit {unit}",
+            target_op_id=op.target_op_id,
+        )
+    lane_layout = attrs.get("mma_access_lane_layout", "row_major_linear")
     source_shape = tuple(int(dim) for dim in attrs["source_shape"])
     memdesc_shape = tuple(
         int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
     )
     if (
         lane_layout == "row_major_linear"
-        and layout_kind in {"dense", "swizzled_shared"}
+        and plan in {"dense_row_major", "swizzled_xor"}
         and source_shape == memdesc_shape
     ):
         tile_base = _dense_tile_base_elements(
@@ -2289,17 +2339,18 @@ def _local_fragment_element_offset(
             wave_tile_stride=wave_tile_stride,
             op=op,
         )
-    if layout_kind == "dense":
+    if plan == "dense_row_major":
         encoded = logical
-    elif layout_kind == "swizzled_shared":
-        encoded = _swizzled_element_offset_expr(state, attrs, logical)
-    elif layout_kind == "padded_shared":
+    elif plan == "swizzled_xor":
+        encoded = _swizzled_element_offset_expr(state, attrs, logical, op)
+    elif plan == "padded_linear":
         encoded = _padded_element_offset_expr(state, attrs, logical, op)
     else:
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
-            f"unsupported local_load shared layout {layout_kind}",
+            f"unsupported local_load shared physical offset plan {plan}",
+            target_op_id=op.target_op_id,
         )
     if int(elements_per_offset_unit) != 1:
         encoded = state.dsl.floor(encoded / int(elements_per_offset_unit))
@@ -2330,7 +2381,7 @@ def _local_fragment_logical_offset_expr(
     memdesc_shape = tuple(
         int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
     )
-    lane_layout = attrs.get("fragment_lane_layout", "row_major_linear")
+    lane_layout = attrs.get("mma_access_lane_layout", "row_major_linear")
     source_coords = _local_fragment_source_coords_expr(
         state,
         lane,
@@ -2431,7 +2482,7 @@ def _local_fragment_source_coords_expr(
     fail(
         "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
         STAGE,
-        f"unsupported fragment lane layout {lane_layout}",
+        f"unsupported MMA access lane layout {lane_layout}",
         target_op_id=op.target_op_id,
     )
 
@@ -2539,7 +2590,7 @@ def _wave_tile_offset_expr(
         fail(
             "TLXW_EMIT_LOCAL_LOAD_TILE_MAP",
             STAGE,
-            "local_load_fragment requires a valid warps_per_cta mapping",
+            "local_load_mma_payload requires a valid warps_per_cta mapping",
             target_op_id=op.target_op_id,
         )
     wave_id = state.dsl.floor(wi / int(lane_width))
@@ -2551,30 +2602,55 @@ def _wave_tile_offset_expr(
         fail(
             "TLXW_EMIT_LOCAL_LOAD_TILE_MAP",
             STAGE,
-            f"unsupported local_load_fragment wave axis {wave_tile_axis}",
+            f"unsupported local_load_mma_payload wave axis {wave_tile_axis}",
             target_op_id=op.target_op_id,
         )
     return wave_coord * int(wave_tile_stride)
 
 
-def _swizzled_element_offset_expr(state, attrs, logical):
-    cols = int(attrs.get("memdesc_shape", attrs["source_shape"])[-1])
-    vec = int(attrs["swizzled_vec"])
-    row = state.dsl.floor(logical / cols)
-    col = state.dsl.mod(logical, cols)
-    row_phase = state.dsl.floor(row / int(attrs["swizzled_per_phase"]))
-    phase = state.dsl.mod(row_phase, int(attrs["swizzled_max_phase"]))
-    col_group = state.dsl.floor(col / vec)
+def _swizzled_element_offset_expr(state, attrs, logical, op):
+    shape = tuple(
+        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
+    )
+    order = _physical_order_from_attrs(
+        attrs,
+        "shared_physical_order",
+        shape,
+        op,
+        "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+    )
+    if len(order) != 2:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "swizzled local_load physical offset requires a rank-2 order",
+            target_op_id=op.target_op_id,
+        )
+    coords = _delinearize_local_fragment_expr(state, logical, shape)
+    minor_dim = int(order[0])
+    major_dim = int(order[1])
+    minor_extent = int(shape[minor_dim])
+    major = coords[major_dim]
+    minor = coords[minor_dim]
+    vec = int(attrs["shared_physical_swizzled_vec"])
+    row_phase = state.dsl.floor(
+        major / int(attrs["shared_physical_swizzled_per_phase"])
+    )
+    phase = state.dsl.mod(
+        row_phase,
+        int(attrs["shared_physical_swizzled_max_phase"]),
+    )
+    col_group = state.dsl.floor(minor / vec)
     swizzled_group = state.dsl.xor(col_group, phase)
-    swizzled_col = swizzled_group * vec + state.dsl.mod(col, vec)
-    return row * cols + swizzled_col
+    swizzled_minor = swizzled_group * vec + state.dsl.mod(minor, vec)
+    return major * minor_extent + swizzled_minor
 
 
 def _padded_element_offset_expr(state, attrs, logical, op):
     shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
     order = _physical_order_from_attrs(
         attrs,
-        "padded_order",
+        "shared_physical_order",
         shape,
         op,
         "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
@@ -2583,8 +2659,8 @@ def _padded_element_offset_expr(state, attrs, logical, op):
     physical = _linearize_local_fragment_coords_with_order(shape, coords, order)
     encoded = physical
     for interval, padding in zip(
-        attrs.get("padded_intervals", ()),
-        attrs.get("padded_paddings", ()),
+        attrs.get("shared_physical_intervals", ()),
+        attrs.get("shared_physical_paddings", ()),
     ):
         encoded += state.dsl.floor(physical / int(interval)) * int(padding)
     return encoded
@@ -2592,13 +2668,16 @@ def _padded_element_offset_expr(state, attrs, logical, op):
 
 def _simd_binary_const(state, operation, value, constant, lane_width):
     constant = int(constant)
+    simd = state.dsl.SimdType(value.type)
+    element_type = simd.element_type
+    lane_width = int(simd.width)
     if operation == "divui" and constant == 1:
         return value
     if operation == "remui" and constant == 1:
         return state.builder.splat(
-            state.builder.constant(state.dsl.i32(), 0),
-            state.dsl.i32(),
-            int(lane_width),
+            state.builder.constant(element_type, 0),
+            element_type,
+            lane_width,
         )
     if operation == "divui" and _is_power_of_two(constant):
         operation_kind = state.dsl.BinaryKind.ShRUI
@@ -2609,9 +2688,9 @@ def _simd_binary_const(state, operation, value, constant, lane_width):
     else:
         operation_kind = _binary_kind(state.dsl, operation)
     rhs = state.builder.splat(
-        state.builder.constant(state.dsl.i32(), constant),
-        state.dsl.i32(),
-        int(lane_width),
+        state.builder.constant(element_type, constant),
+        element_type,
+        lane_width,
     )
     return state.builder.binary(operation_kind, value, rhs)
 
@@ -2636,24 +2715,30 @@ def _add_optional_offset(state, base, offset):
     return state.builder.binary(state.dsl.BinaryKind.AddI, base, offset)
 
 
-def _emit_fragment_fill(state, op):
+def _emit_mma_zero_accumulator(state, op):
     attrs = target_ir.attrs_dict(op)
     lane_width = int(attrs["lane_width"])
     registers = int(attrs["registers"])
-    fragment_type = state.dsl.fragment_type(
-        int(attrs["role"]),
-        _scalar_type(state.dsl, attrs["element_type"]),
-        int(attrs["rows"]),
-        int(attrs["columns"]),
-        lane_width,
-        registers,
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
+    scalar_payload_type = state.dsl.simd_type(element_type, width=lane_width)
+    payload_type = state.dsl.simd_type(
+        state.dsl.vector_type(registers, element_type),
+        width=lane_width,
     )
-    fill = state.builder.constant(state.dsl.i32(), int(attrs["fill_value"]))
+    scalar_zero = _wave_constant(
+        state,
+        scalar_payload_type,
+        element_type,
+        attrs["element_type"],
+        int(attrs["fill_value"]),
+        op,
+    )
+    payload = state.dsl.wave.PackOp(
+        payload_type,
+        tuple(scalar_zero for _ in range(registers)),
+    ).result
     state.values[_single_result(op)] = _pack_components(
-        tuple(
-            state.builder.fragment_fill(fill, fragment_type)
-            for _ in range(int(attrs["component_count"]))
-        )
+        tuple(payload for _ in range(int(attrs["component_count"])))
     )
 
 
@@ -2663,6 +2748,7 @@ def _emit_mma(state, op):
     lhs_components = _as_components(lhs)
     rhs_components = _as_components(rhs)
     acc_components = _as_components(acc)
+    lane_width = int(attrs["lane_width"])
     m_tiles = int(attrs["m_tiles"])
     n_tiles = int(attrs["n_tiles"])
     k_tiles = int(attrs.get("k_tiles", 1))
@@ -2680,6 +2766,45 @@ def _emit_mma(state, op):
             "mma accumulator component count does not match tile attrs",
             target_op_id=op.target_op_id,
         )
+    lhs_components = tuple(
+        _ensure_mma_fragment(
+            state,
+            component,
+            role=int(attrs["lhs_role"]),
+            element_type=attrs["lhs_element_type"],
+            rows=int(attrs["lhs_rows"]),
+            columns=int(attrs["lhs_columns"]),
+            lane_width=lane_width,
+            registers=int(attrs["lhs_registers"]),
+        )
+        for component in lhs_components
+    )
+    rhs_components = tuple(
+        _ensure_mma_fragment(
+            state,
+            component,
+            role=int(attrs["rhs_role"]),
+            element_type=attrs["rhs_element_type"],
+            rows=int(attrs["rhs_rows"]),
+            columns=int(attrs["rhs_columns"]),
+            lane_width=lane_width,
+            registers=int(attrs["rhs_registers"]),
+        )
+        for component in rhs_components
+    )
+    acc_components = tuple(
+        _ensure_mma_fragment(
+            state,
+            component,
+            role=int(attrs["acc_role"]),
+            element_type=attrs["acc_element_type"],
+            rows=int(attrs["acc_rows"]),
+            columns=int(attrs["acc_columns"]),
+            lane_width=lane_width,
+            registers=int(attrs["acc_registers"]),
+        )
+        for component in acc_components
+    )
     results = []
     for m_tile in range(m_tiles):
         for n_tile in range(n_tiles):
@@ -2694,6 +2819,30 @@ def _emit_mma(state, op):
                 )
             results.append(acc_value)
     state.values[_single_result(op)] = _pack_components(tuple(results))
+
+
+def _ensure_mma_fragment(
+    state,
+    value,
+    *,
+    role,
+    element_type,
+    rows,
+    columns,
+    lane_width,
+    registers,
+):
+    if state.dsl.FragmentType.isinstance(value.type):
+        return value
+    fragment_type = state.dsl.fragment_type(
+        int(role),
+        _scalar_type(state.dsl, element_type),
+        int(rows),
+        int(columns),
+        int(lane_width),
+        int(registers),
+    )
+    return state.builder.fragment_pack(value, fragment_type)
 
 
 def _emit_fragment_truncf(state, op):
@@ -2720,7 +2869,10 @@ def _emit_fragment_truncf(state, op):
     )
     packed = []
     for fragment in fragments:
-        regs = state.dsl.waveamd.FragmentUnpackOp(f32_regs, fragment).result
+        if state.dsl.FragmentType.isinstance(fragment.type):
+            regs = state.dsl.waveamd.FragmentUnpackOp(f32_regs, fragment).result
+        else:
+            regs = fragment
         packed.append(state.builder.fpconvert(regs, f16_regs))
     state.values[_single_result(op)] = _pack_components(tuple(packed))
 
@@ -2868,13 +3020,13 @@ def _emit_layout_convert(state, op):
     if mode == "mfma_vector_register_remap":
         _emit_mfma_vector_register_remap(state, op, attrs, value)
         return
-    if mode == "dot_operand_fragment_pack":
+    if mode == "dot_operand_vector_payload":
         result_count = int(attrs["result_component_count"])
         if len(components) != int(attrs["source_component_count"]):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
-                "dot_operand fragment pack source component count does not "
+                "dot_operand vector payload source component count does not "
                 "match attrs",
                 target_op_id=op.target_op_id,
             )
@@ -2887,8 +3039,15 @@ def _emit_layout_convert(state, op):
             fail(
                 "TLXW_EMIT_LAYOUT_REMAP",
                 STAGE,
-                "dot_operand fragment pack CTA thread count must be a "
+                "dot_operand vector payload CTA thread count must be a "
                 "multiple of lane width",
+                target_op_id=op.target_op_id,
+            )
+        if attrs.get("barrier_scope") != "cta":
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "dot_operand vector payload requires barrier_scope=cta",
                 target_op_id=op.target_op_id,
             )
         scratch_base = state.builder.lds_base(
@@ -2910,7 +3069,7 @@ def _emit_layout_convert(state, op):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
-                "dot_operand fragment pack source store attrs do not match "
+                "dot_operand vector payload source store attrs do not match "
                 "source component count",
                 target_op_id=op.target_op_id,
             )
@@ -2939,26 +3098,18 @@ def _emit_layout_convert(state, op):
                 )
             )
         barrier_token = state.builder.barrier(*store_tokens)
-        fragment_type = state.dsl.fragment_type(
-            int(attrs["role"]),
-            element_type,
-            int(attrs["rows"]),
-            int(attrs["columns"]),
-            lane_width,
-            int(attrs["registers"]),
-        )
         element_count = int(attrs["elements_per_lane"])
         load_tokens = []
-        fragments = []
+        payloads = []
         if attrs.get("payload_mode") != "vector":
             fail(
                 "TLXW_EMIT_LAYOUT_REMAP",
                 STAGE,
-                "dot_operand fragment pack requires vector payload attrs",
+                "dot_operand vector payload requires vector payload attrs",
                 target_op_id=op.target_op_id,
             )
-        vector_load_bases = tuple(attrs["fragment_vector_load_bases"])
-        vector_load_coefficients = tuple(attrs["fragment_vector_load_coefficients"])
+        vector_load_bases = tuple(attrs["payload_vector_load_bases"])
+        vector_load_coefficients = tuple(attrs["payload_vector_load_coefficients"])
         if (
             len(vector_load_bases) != result_count
             or len(vector_load_coefficients) != result_count
@@ -2966,7 +3117,7 @@ def _emit_layout_convert(state, op):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
-                "dot_operand fragment pack vector attrs do not match "
+                "dot_operand vector payload attrs do not match "
                 "result component count",
                 target_op_id=op.target_op_id,
             )
@@ -2996,9 +3147,9 @@ def _emit_layout_convert(state, op):
                 after=barrier_token,
             )
             load_tokens.append(load_token)
-            fragments.append(state.builder.fragment_pack(loaded, fragment_type))
+            payloads.append(loaded)
         state.scratch_token = state.builder.barrier(*load_tokens)
-        state.values[_single_result(op)] = _pack_components(tuple(fragments))
+        state.values[_single_result(op)] = _pack_components(tuple(payloads))
         return
     if mode == "cta_exchange_register_remap":
         result_count = int(attrs["result_component_count"])
@@ -3097,19 +3248,6 @@ def _emit_mfma_vector_register_remap(state, op, attrs, value):
                 scalar_components[start : start + vector_length],
             ).result
         )
-    if target_type.representation in {"fragment", "fragment_tuple"}:
-        fragment_type = state.dsl.fragment_type(
-            int(attrs["role"]),
-            element_type,
-            int(attrs["rows"]),
-            int(attrs["columns"]),
-            lane_width,
-            int(attrs["registers"]),
-        )
-        packed_components = [
-            state.builder.fragment_pack(component, fragment_type)
-            for component in packed_components
-        ]
     if mask_exchange:
         state.values[result_id] = _I32MaskPayload(tuple(packed_components))
     else:
@@ -3251,6 +3389,13 @@ def _emit_cta_exchange_scalar_components(
             "TLXW_EMIT_LAYOUT_REMAP",
             STAGE,
             "CTA exchange thread count must be a multiple of lane width",
+            target_op_id=op.target_op_id,
+        )
+    if attrs.get("barrier_scope") != "cta":
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "CTA exchange layout remap requires barrier_scope=cta",
             target_op_id=op.target_op_id,
         )
     if target_type.representation in {"fragment", "fragment_tuple"} or mask_exchange:
@@ -4385,8 +4530,8 @@ _TARGET_EMITTERS = {
     "local_alloc": _emit_local_alloc,
     "memdesc_index": _emit_memdesc_index,
     "buffer_load_to_local": _emit_buffer_load_to_local,
-    "local_load_fragment": _emit_local_load_fragment,
-    "fragment_fill": _emit_fragment_fill,
+    "local_load_mma_payload": _emit_local_load_mma_payload,
+    "mma_zero_accumulator": _emit_mma_zero_accumulator,
     "mma": _emit_mma,
     "fragment_truncf": _emit_fragment_truncf,
     "layout_convert": _emit_layout_convert,
@@ -4955,6 +5100,27 @@ def _scalar_type(dsl, element_type):
         "bf16": dsl.bf16,
         "f32": dsl.f32,
     }[element_type]()
+
+
+def _element_byte_width(element_type, op):
+    widths = {
+        "i8": 1,
+        "i16": 2,
+        "i32": 4,
+        "i64": 8,
+        "f16": 2,
+        "bf16": 2,
+        "f32": 4,
+    }
+    width = widths.get(element_type)
+    if width is None:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_TYPE",
+            STAGE,
+            f"cannot determine byte width for {element_type}",
+            target_op_id=op.target_op_id,
+        )
+    return int(width)
 
 
 def _binary_kind(dsl, operation):

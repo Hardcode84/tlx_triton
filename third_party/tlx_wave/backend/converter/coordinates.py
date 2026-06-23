@@ -24,7 +24,7 @@ def layout_coordinate_plan(
     op,
     source_value_id,
 ):
-    if layout.kind not in {"blocked", "linear", "slice"}:
+    if layout.kind not in {"blocked", "linear", "generic_linear", "slice"}:
         return None
     shape = tuple(int(dim) for dim in layout.shape)
     if not shape:
