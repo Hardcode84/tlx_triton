@@ -170,8 +170,8 @@ def _derived_ranges_for_op(source_program, facts, op):
         "arith.minsi",
     }:
         return
-    lhs = _combined_range(facts, op.operands[0])
-    rhs = _combined_range(facts, op.operands[1])
+    lhs = _combined_range(source_program, facts, op.operands[0], op.index)
+    rhs = _combined_range(source_program, facts, op.operands[1], op.index)
     if lhs is None or rhs is None:
         return
     bounds = _signed_bounds(_integer_width(source_program.values[op.results[0]].type.raw))
@@ -227,11 +227,11 @@ def _derive_if_ranges(source_program, facts, op):
         yield_op = source_program.ops[region.op_indices[-1]]
         if yield_op.name != "scf.yield" or len(yield_op.operands) != len(op.results):
             return
-        region_yields.append(yield_op.operands)
+        region_yields.append((yield_op.index, yield_op.operands))
     for result_index, result_id in enumerate(op.results):
         ranges = [
-            _combined_range(facts, yielded[result_index])
-            for yielded in region_yields
+            _combined_range(source_program, facts, yielded[result_index], yield_op_index)
+            for yield_op_index, yielded in region_yields
         ]
         if any(value_range is None for value_range in ranges):
             continue
@@ -257,7 +257,7 @@ def _append_improving_range_fact(
     provenance,
     source_op_index,
 ):
-    current = _combined_range(facts, value_id)
+    current = _combined_range(source_program, facts, value_id, source_op_index)
     if current is not None:
         current_lower, current_upper = current
         improves_lower = lower is not None and (
@@ -284,12 +284,14 @@ def _append_improving_range_fact(
     return True
 
 
-def _combined_range(facts, value_id):
+def _combined_range(source_program, facts, value_id, user_op_index):
     lower = None
     upper = None
     found = False
     for fact in facts:
         if fact.kind != "range" or fact.subject_value_id != value_id:
+            continue
+        if not _range_fact_is_in_scope(source_program, fact, user_op_index):
             continue
         found = True
         if fact.lower is not None:
@@ -297,6 +299,71 @@ def _combined_range(facts, value_id):
         if fact.upper is not None:
             upper = fact.upper if upper is None else min(upper, fact.upper)
     return None if not found else (lower, upper)
+
+
+def _range_fact_is_in_scope(source_program, fact, user_op_index):
+    if user_op_index is None:
+        return fact.provenance != "llvm.intr.assume"
+    if fact.source_op_index is None:
+        return fact.provenance != "llvm.intr.assume"
+    return _source_fact_is_in_scope(
+        source_program,
+        fact.source_op_index,
+        user_op_index,
+    )
+
+
+def _source_fact_is_in_scope(source_program, fact_op_index, user_op_index):
+    if fact_op_index is None:
+        return False
+    if fact_op_index == user_op_index:
+        return True
+    try:
+        fact_op = source_program.ops[fact_op_index]
+    except IndexError:
+        return False
+    fact_region_id = fact_op.parent_region_id
+    if fact_region_id is None:
+        return False
+    user_anchor = _op_anchor_in_region(source_program, user_op_index, fact_region_id)
+    if user_anchor is None:
+        return False
+    if user_anchor == user_op_index:
+        return True
+    if user_anchor == fact_op_index:
+        return True
+    return _op_precedes_in_region(
+        source_program,
+        fact_region_id,
+        fact_op_index,
+        user_anchor,
+    )
+
+
+def _op_anchor_in_region(source_program, op_index, region_id):
+    current_op_index = op_index
+    while True:
+        try:
+            current_op = source_program.ops[current_op_index]
+        except IndexError:
+            return None
+        current_region_id = current_op.parent_region_id
+        if current_region_id == region_id:
+            return current_op_index
+        if current_region_id is None:
+            return None
+        parent_op_index = source_program.regions[current_region_id].parent_op_index
+        if parent_op_index is None:
+            return None
+        current_op_index = parent_op_index
+
+
+def _op_precedes_in_region(source_program, region_id, lhs_op_index, rhs_op_index):
+    try:
+        region_ops = source_program.regions[region_id].op_indices
+        return region_ops.index(lhs_op_index) < region_ops.index(rhs_op_index)
+    except (IndexError, ValueError):
+        return False
 
 
 def _has_bounds(value_range):

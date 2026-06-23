@@ -362,7 +362,7 @@ def _convert_source_op(
         _fact_target_ids(builder, fact_program, fact_ids, op),
         operand_fact_ids,
         _fact_target_ids(builder, fact_program, operand_fact_ids, op),
-        _operand_ranges(fact_program, op),
+        _operand_ranges(conversion_input, fact_program, op),
     )
     converter(builder, view)
 
@@ -2912,25 +2912,42 @@ def _op_precedes_in_region(
         return False
 
 
-def _operand_ranges(fact_program, op):
+def _operand_ranges(conversion_input, fact_program, op):
     return tuple(
-        _combined_range_for_value(fact_program, source_value_id)
+        _combined_range_for_value(
+            conversion_input,
+            fact_program,
+            source_value_id,
+            op.index,
+        )
         for source_value_id in op.operands
     )
 
 
-def _combined_range_for_value(fact_program, value_id):
+def _combined_range_for_value(conversion_input, fact_program, value_id, user_op_index):
     lower = None
     upper = None
     for fact_id in fact_program.by_value.get(value_id, ()):
         fact = fact_program.facts[fact_id]
         if fact.kind != "range":
             continue
+        if not _range_fact_is_in_scope(conversion_input, fact, user_op_index):
+            continue
         if fact.lower is not None:
             lower = fact.lower if lower is None else max(lower, fact.lower)
         if fact.upper is not None:
             upper = fact.upper if upper is None else min(upper, fact.upper)
     return lower, upper
+
+
+def _range_fact_is_in_scope(conversion_input, fact, user_op_index):
+    if fact.source_op_index is None:
+        return fact.provenance != "llvm.intr.assume"
+    return _source_fact_is_in_scope(
+        conversion_input,
+        fact.source_op_index,
+        user_op_index,
+    )
 
 
 def _pointer_byte_range_fact(fact_program, value_id, op):

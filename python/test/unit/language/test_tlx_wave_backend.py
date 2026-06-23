@@ -723,6 +723,66 @@ def test_tlx_wave_converter_keeps_unproven_signed_div_signed(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_keeps_branch_assume_out_of_later_div(tmp_path):
+    local_func = """
+  tt.func public @converter_branch_assume_later_div(%arg0: i32, %cond: i1) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    scf.if %cond {
+      %nonnegative = arith.cmpi sge, %arg0, %zero : i32
+      llvm.intr.assume %nonnegative : i1
+      scf.yield
+    } else {
+      scf.yield
+    }
+    %one = arith.constant 1 : i32
+    %q = arith.divsi %arg0, %one : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    operations = [
+        converter_target_ir.attrs_dict(op)["operation"]
+        for op in output.target_program.ops
+        if op.kind == "binary"
+    ]
+    assert "divsi" in operations
+    assert "divui" not in operations
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_branch_assume_out_of_if_result_range(tmp_path):
+    local_func = """
+  tt.func public @converter_if_result_assume_scope(%arg0: i32, %cond: i1) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %selected = scf.if %cond -> (i32) {
+      %nonnegative = arith.cmpi sge, %arg0, %zero : i32
+      llvm.intr.assume %nonnegative : i1
+      scf.yield %arg0 : i32
+    } else {
+      scf.yield %arg0 : i32
+    }
+    %q = arith.divsi %selected, %one : i32
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    operations = [
+        converter_target_ir.attrs_dict(op)["operation"]
+        for op in output.target_program.ops
+        if op.kind == "binary"
+    ]
+    assert "divsi" in operations
+    assert "divui" not in operations
+    del ctx
+
+
 def test_tlx_wave_converter_fact_stage_invalidates_convert_layout_affine(tmp_path):
     preamble = """
 #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
