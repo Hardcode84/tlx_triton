@@ -372,31 +372,158 @@ def mfma_component_metadata_remap(operand, result, operand_layout, result_layout
             source_op_index=op.index,
             source_value_id=result.value_id,
         )
-    group_size = layouts.mfma_registers_per_component(
+    registers_per_component = layouts.mfma_registers_per_component(
         result_layout,
         stage=STAGE,
         source_op_index=op.index,
     )
     result_count = int(result.type.component_count)
     source_count = int(operand.type.component_count)
-    if source_count != result_count * int(group_size):
+    source_layout = _distributed_linear_layout(operand_layout, op)
+    result_layout_ll = _distributed_linear_layout(result_layout, op)
+    source_register_count = layouts.linear_layout_in_dim_size(
+        source_layout,
+        "register",
+    )
+    if source_count != int(source_register_count):
         fail(
             "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
             STAGE,
-            "distributed to MFMA metadata convert_layout requires source "
-            "components to be grouped by the MFMA vector width",
+            "distributed to MFMA metadata source component model does not "
+            "match the source register layout",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    result_register_count = layouts.linear_layout_in_dim_size(
+        result_layout_ll,
+        "register",
+    )
+    if result_count * int(registers_per_component) != int(result_register_count):
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA metadata result component model does not "
+            "match the MFMA register layout",
             source_op_index=op.index,
             source_value_id=result.value_id,
         )
-    return {
-        "metadata_group_size": int(group_size),
-        "mode": "same_lane_register_remap",
+
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    cta_warp_count = max(
+        _layout_warp_count(operand_layout),
+        _layout_warp_count(result_layout),
+    )
+    source_by_coord = _source_slots_by_coord(
+        source_layout,
+        source_register_count,
+        lane_width,
+        cta_warp_count,
+        op,
+        operand.value_id,
+        description="distributed to MFMA metadata convert_layout",
+    )
+    result_sources = []
+    component_vectors_are_contiguous = True
+    vector_axis = (
+        1 if bool(result_layout.properties.get("is_transposed", False)) else 0
+    )
+    for component in range(result_count):
+        base_register = int(component) * int(registers_per_component)
+        if not _mfma_component_vector_is_contiguous(
+            result_layout_ll,
+            base_register,
+            int(registers_per_component),
+            vector_axis,
+            lane_width,
+            cta_warp_count,
+        ):
+            component_vectors_are_contiguous = False
+        result_sources.append(
+            _sources_for_result_slot(
+                result_layout_ll,
+                base_register,
+                source_by_coord,
+                lane_width,
+                cta_warp_count,
+                op,
+                result.value_id,
+                description="distributed to MFMA metadata convert_layout",
+            )
+        )
+    result_sources = tuple(result_sources)
+
+    if not component_vectors_are_contiguous:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
+            STAGE,
+            "distributed to MFMA metadata convert_layout requires each "
+            "MFMA component vector to cover its logical vector dimension",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+
+    base_attrs = {
         "source_component_count": int(source_count),
-        "source_element_indices": tuple(0 for _ in range(result_count)),
-        "source_indices": tuple(
-            int(component) * int(group_size) for component in range(result_count)
-        ),
         "source_registers_per_component": 1,
+    }
+    simple_remap = _simple_register_remap(
+        result_sources,
+        lane_width,
+        cta_warp_count,
+        1,
+        op,
+        result.value_id,
+        description="distributed to MFMA metadata convert_layout",
+        allow_fallback=True,
+    )
+    if simple_remap is not None:
+        return {**base_attrs, **simple_remap}
+
+    movement = _distributed_movement_class(
+        result_sources,
+        lane_width,
+        cta_warp_count,
+    )
+    if movement == "unknown":
+        strict_remap = _simple_register_remap(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            1,
+            op,
+            result.value_id,
+            description="distributed to MFMA metadata convert_layout",
+        )
+        if strict_remap is not None:
+            return {**base_attrs, **strict_remap}
+        _reject_distributed_movement(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            "distributed to MFMA metadata convert_layout",
+        )
+    if movement not in {"cross_warp", "lane_mux"}:
+        _reject_distributed_movement(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            "distributed to MFMA metadata convert_layout",
+        )
+    return {
+        "mode": "cta_exchange_register_remap",
+        **base_attrs,
+        **_cta_exchange_register_remap(
+            result_sources,
+            lane_width,
+            cta_warp_count,
+            op,
+            result.value_id,
+            description="distributed to MFMA metadata convert_layout",
+        ),
     }
 
 
@@ -694,12 +821,16 @@ def distributed_to_mfma_base_remap(operand, result, operand_layout, result_layou
     )
     result_sources = []
     component_vectors_are_contiguous = True
+    vector_axis = (
+        1 if bool(result_layout.properties.get("is_transposed", False)) else 0
+    )
     for component in range(int(result.type.component_count)):
         base_register = int(component) * int(registers_per_component)
         if not _mfma_component_vector_is_contiguous(
             result_layout_ll,
             base_register,
             int(registers_per_component),
+            vector_axis,
             lane_width,
             cta_warp_count,
         ):
@@ -1005,6 +1136,7 @@ def _mfma_component_vector_is_contiguous(
     result_layout,
     base_register,
     registers_per_component,
+    vector_axis,
     lane_width,
     cta_warp_count,
 ):
@@ -1025,11 +1157,9 @@ def _mfma_component_vector_is_contiguous(
                     lane,
                     warp=result_warp,
                 )
-                expected = (
-                    base_coords[0],
-                    base_coords[1] + int(element),
-                )
-                if tuple(coords) != expected:
+                expected = list(base_coords)
+                expected[int(vector_axis)] += int(element)
+                if tuple(coords) != tuple(expected):
                     return False
     return True
 
