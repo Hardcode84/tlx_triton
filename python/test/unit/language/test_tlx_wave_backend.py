@@ -1998,13 +1998,30 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     "case",
     [
         {
+            "version_dir": "v0_naive",
+            "function_name": "v0_naive",
+            "num_warps": 4,
+            "expected_dma_load_lds": 0,
+        },
+        {
+            "version_dir": "v2_async_copy",
+            "function_name": "v2_async_copy",
+            "num_warps": 4,
+        },
+        {
+            "version_dir": "v3_lds",
+            "function_name": "v3_lds",
+            "num_warps": 4,
+        },
+        {
+            "version_dir": "v4_global_prefetch",
+            "function_name": "v4_global_prefetch",
+            "num_warps": 4,
+        },
+        {
             "version_dir": "v6_loop_unroll",
             "function_name": "v6_loop_unroll",
             "num_warps": 4,
-            "expected_failure": (
-                "waveamd-reg-alloc",
-                "wave.lds_size = 139136",
-            ),
         },
         {
             "version_dir": "v7_slice",
@@ -2036,21 +2053,12 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
     ],
     ids=lambda case: case.get("id", case["version_dir"]),
 )
-def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
+def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
     tmp_path,
     monkeypatch,
     case,
 ):
-    if "expected_failure" in case:
-        try:
-            compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
-        except (RuntimeError, converter_diagnostics.Diagnostic) as exc:
-            detail = str(exc)
-            for expected in case["expected_failure"]:
-                assert expected in detail
-            return
-    else:
-        compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
+    compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
     wave_artifact = _asm_text(compiled, "wave")
     hsaco = compiled.asm["hsaco"]
 
@@ -2067,7 +2075,13 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_v6_to_v9_to_hsaco(
     assert compiled.metadata.tlx_wave_launch_shared_bytes == 0
     assert compiled.metadata.tlx_wave_lds_size_bytes > 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
-    assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+    if "expected_dma_load_lds" in case:
+        assert (
+            compiled.metadata.tlx_wave_num_dma_load_lds
+            == case["expected_dma_load_lds"]
+        )
+    else:
+        assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
         assert "layout_convert" not in wave_artifact
         assert wave_artifact.count("wave.barrier") == 6
@@ -2410,6 +2424,46 @@ def test_tlx_wave_converter_pipeline_lowers_dynamic_for_with_iter_args(tmp_path)
     assert "scf.for" in output.emitted_module.text
     assert "iter_args" in output.emitted_module.text
     assert "scf.yield" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_loop_carried_mma_values_as_payloads(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_loop_carried_mma_payload() attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<16x32xf16, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #shared, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<16x32xf16, #shared, #smem, mutable> -> tensor<16x32xf16, #dot0>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x16xf16, #shared, #smem, mutable> -> tensor<32x16xf16, #dot1>
+    %init = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %loop = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %init) -> (tensor<16x16xf32, #mma>) {
+      %dot = tt.dot %lhs, %rhs, %acc : tensor<16x32xf16, #dot0> * tensor<32x16xf16, #dot1> -> tensor<16x16xf32, #mma>
+      scf.yield %dot : tensor<16x16xf32, #mma>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    assert "scf.for" in wave
+    assert "waveamd.fragment_pack" in wave
+    assert "waveamd.fragment_unpack" in wave
+    yield_lines = [line for line in wave.splitlines() if "scf.yield" in line]
+    assert yield_lines
+    assert all("!waveamd.fragment" not in line for line in yield_lines)
+    _run_wave_verify(wave)
     del ctx
 
 

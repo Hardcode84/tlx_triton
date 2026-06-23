@@ -2916,6 +2916,13 @@ def _emit_mma(state, op):
         )
         for component in acc_components
     )
+    acc_payload_type = state.dsl.simd_type(
+        state.dsl.vector_type(
+            int(attrs["acc_registers"]),
+            _scalar_type(state.dsl, attrs["acc_element_type"]),
+        ),
+        width=lane_width,
+    )
     results = []
     for m_tile in range(m_tiles):
         for n_tile in range(n_tiles):
@@ -2928,6 +2935,14 @@ def _emit_mma(state, op):
                     rhs_components[n_tile * k_tiles + k_tile],
                     acc_value,
                 )
+            # Fragments are only MMA-local values. The bridge state carries the
+            # accumulator as the SIMD vector payload so control-flow values do
+            # not become WaveAMD fragment carriers.
+            if state.dsl.FragmentType.isinstance(acc_value.type):
+                acc_value = state.dsl.waveamd.FragmentUnpackOp(
+                    acc_payload_type,
+                    acc_value,
+                ).result
             results.append(acc_value)
     state.values[_single_result(op)] = _pack_components(tuple(results))
 
