@@ -153,9 +153,15 @@ def is_flat_bit_affine_make_range(plan):
 
 
 def _workitem_coefficients(linear, lane_bits, warp_bits):
-    lane_bases = layouts.linear_layout_bases(linear, "lane")
-    warp_bases = layouts.linear_layout_bases(linear, "warp")
-    rank = _basis_rank(linear)
+    lane_bases = tuple(
+        _basis_in_standard_dim_order(linear, basis)
+        for basis in layouts.linear_layout_bases(linear, "lane")
+    )
+    warp_bases = tuple(
+        _basis_in_standard_dim_order(linear, basis)
+        for basis in layouts.linear_layout_bases(linear, "warp")
+    )
+    rank = len(linear.out_dims)
     zero = tuple(0 for _ in range(rank))
     coefficients = []
     for bit in range(int(lane_bits)):
@@ -165,11 +171,13 @@ def _workitem_coefficients(linear, lane_bits, warp_bits):
     return tuple(tuple(int(value) for value in basis) for basis in coefficients)
 
 
-def _basis_rank(linear):
-    for _name, bases in linear.bases:
-        if bases:
-            return len(bases[0])
-    return len(linear.out_dims)
+def _basis_in_standard_dim_order(linear, basis):
+    out_indices = {
+        str(name): index for index, (name, _size) in enumerate(linear.out_dims)
+    }
+    return tuple(
+        int(basis[out_indices[f"dim{dim}"]]) for dim in range(len(linear.out_dims))
+    )
 
 
 def _validate_physical_domain(

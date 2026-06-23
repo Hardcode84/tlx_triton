@@ -4419,6 +4419,49 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     del ctx
 
 
+@pytest.mark.parametrize(
+    "is_transposed,expected_coefficients",
+    [
+        (True, ((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8))),
+        (False, ((0, 1), (0, 2), (0, 4), (0, 8), (4, 0), (8, 0))),
+    ],
+)
+def test_tlx_wave_layout_coordinate_plan_handles_mfma_out_dim_order(
+    is_transposed,
+    expected_coefficients,
+):
+    layout = converter_layouts.LayoutMap(
+        0,
+        7,
+        "amd_mfma",
+        (16, 16),
+        "f32",
+        1,
+        64,
+        {
+            "element_bit_width": 32,
+            "instr_shape": (16, 16, 32),
+            "is_transposed": is_transposed,
+            "tiles_per_warp": (1, 1),
+            "version": 4,
+            "warps_per_cta": (1, 1),
+        },
+    )
+
+    plan = converter_coordinates.layout_coordinate_plan(
+        layout,
+        1,
+        64,
+        1,
+        SimpleNamespace(index=0),
+        7,
+    )
+
+    assert plan.shape == (16, 16)
+    assert plan.component_bases == ((0, 0),)
+    assert plan.workitem_coefficients == expected_coefficients
+
+
 def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [], lane = [[0], [0], [0], [0], [0], [0]], warp = [], block = []}>
