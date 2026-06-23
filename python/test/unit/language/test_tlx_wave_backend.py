@@ -7142,6 +7142,62 @@ def test_tlx_wave_converter_pipeline_lowers_same_representation_expand_dims(tmp_
     del ctx
 
 
+def test_tlx_wave_emit_expand_dims_preserves_component_count_diagnostic():
+    source_type = converter_target_ir.TargetType(
+        "tensor",
+        "simd",
+        "i32",
+        64,
+        component_count=1,
+    )
+    result_type = converter_target_ir.TargetType(
+        "tensor",
+        "simd_tuple",
+        "i32",
+        64,
+        component_count=2,
+    )
+    target = converter_target_ir.TargetProgram(
+        values=(
+            converter_target_ir.TargetValue(0, source_type),
+            converter_target_ir.TargetValue(1, result_type),
+        ),
+        ops=(
+            converter_target_ir.TargetOp(
+                0,
+                "constant",
+                results=(0,),
+                attrs=(converter_target_ir.TargetAttr("value", 0),),
+            ),
+            converter_target_ir.TargetOp(
+                1,
+                "expand_dims",
+                operands=(0,),
+                results=(1,),
+            ),
+        ),
+        regions=(converter_target_ir.TargetRegion(0, (0, 1)),),
+        source_value_targets={},
+        erased_source_values={},
+        kernel=converter_target_ir.TargetKernel(
+            "converter_expand_dims_mismatch",
+            "hip:gfx950",
+            num_warps=1,
+            threads_per_warp=64,
+        ),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_emission.emit_wave_module(target)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_EMIT_UNSUPPORTED_REMAP"
+    assert diagnostic.stage == "emission"
+    assert diagnostic.target_op_id == 1
+    assert diagnostic.target_value_id == 1
+    assert "tt.expand_dims changed component count" in str(diagnostic)
+
+
 def test_tlx_wave_converter_pipeline_lowers_pointer_splat_expand_dims(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>

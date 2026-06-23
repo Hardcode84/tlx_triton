@@ -843,8 +843,9 @@ def _emit_expand_dims(state, op):
     operand = _operand_values(state, op, 1)[0]
     operand_id = op.operands[0]
     result_id = _single_result(op)
+    target_count = _component_count(state, result_id)
     if isinstance(operand, _I32MaskPayload):
-        if len(operand.components) != _component_count(state, result_id):
+        if len(operand.components) != target_count:
             fail(
                 "TLXW_EMIT_UNSUPPORTED_REMAP",
                 STAGE,
@@ -865,7 +866,7 @@ def _emit_expand_dims(state, op):
             target_op_id=op.target_op_id,
             target_value_id=result_id,
         )
-    if len(components) != _component_count(state, result_id):
+    if len(components) != target_count:
         fail(
             "TLXW_EMIT_UNSUPPORTED_REMAP",
             STAGE,
