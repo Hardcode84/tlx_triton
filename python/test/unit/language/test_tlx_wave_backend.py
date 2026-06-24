@@ -1780,6 +1780,86 @@ def test_tlx_wave_converter_marks_layout_integer_math_nsw(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_marks_scalar_address_math_nsw(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_scalar_address_math_nsw(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %tile: i32) attributes {noinline = false} {
+    %c256 = arith.constant 256 : i32
+    %base = arith.muli %tile, %c256 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %base_splat = tt.splat %base : i32 -> tensor<64xi32, #blocked>
+    %offset = arith.addi %base_splat, %range : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    scalar_mul_attrs = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "binary"
+        and not op.layout_map_ids
+        and converter_target_ir.attrs_dict(op)["operation"] == "muli"
+    ]
+    assert any(attrs["nsw"] is True for attrs in scalar_mul_attrs)
+    assert output.emitted_module.text.count("overflow<nsw>") >= 2
+    del ctx
+
+
+def test_tlx_wave_converter_marks_loop_carried_scalar_address_math_nsw(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_loop_carried_scalar_address_math_nsw(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %tile: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %c64 = arith.constant 64 : i32
+    %base0 = arith.muli %tile, %c64 : i32
+    %base = scf.for %i = %c0 to %c4 step %c1 iter_args(%acc = %base0) -> (i32)  : i32 {
+      %next = arith.addi %acc, %c64 : i32
+      scf.yield %next : i32
+    }
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %base_splat = tt.splat %base : i32 -> tensor<64xi32, #blocked>
+    %offset = arith.addi %base_splat, %range : tensor<64xi32, #blocked>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    scalar_binary_attrs = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "binary" and not op.layout_map_ids
+    ]
+    assert any(
+        attrs["operation"] == "muli" and attrs["nsw"] is True
+        for attrs in scalar_binary_attrs
+    )
+    assert any(
+        attrs["operation"] == "addi" and attrs["nsw"] is True
+        for attrs in scalar_binary_attrs
+    )
+    assert output.emitted_module.text.count("overflow<nsw>") >= 3
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>

@@ -57,6 +57,8 @@ class OpConversionView:
     operand_target_ids: tuple[int, ...]
     result_target_ids: tuple[int, ...]
     result_layout_map_ids: tuple[int, ...]
+    result_source_value_ids: tuple[int, ...]
+    layout_address_value_ids: frozenset[int]
     fact_ids: tuple[int, ...]
     fact_target_ids: tuple[int, ...]
     operand_fact_ids: tuple[int, ...]
@@ -97,6 +99,7 @@ class ConversionInput:
     local_alloc_byte_offsets: dict[int, int]
     lds_size: int
     static_memdesc_byte_offsets: dict[int, int]
+    layout_address_value_ids: frozenset[int]
 
 
 def convert_ops(source_program, type_layout_program, fact_program, token_program):
@@ -180,6 +183,117 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         local_alloc_byte_offsets,
         int(lds_size),
         static_memdesc_byte_offsets,
+        _layout_address_value_ids(source_program),
+    )
+
+
+def _layout_address_value_ids(source_program):
+    deps = {
+        int(value_id): set()
+        for value_id in source_program.values
+    }
+    roots = set()
+
+    for op in source_program.ops:
+        roots.update(_layout_address_root_value_ids(op))
+        if op.name == "scf.for":
+            _record_for_address_deps(deps, source_program, op)
+            continue
+        if op.name == "scf.if":
+            _record_if_address_deps(deps, source_program, op)
+            continue
+        for result_value_id in op.results:
+            _add_address_deps(deps, result_value_id, op.operands)
+
+    address_value_ids = set()
+    worklist = list(roots)
+    while worklist:
+        value_id = int(worklist.pop())
+        if value_id in address_value_ids:
+            continue
+        address_value_ids.add(value_id)
+        worklist.extend(
+            int(dep_value_id)
+            for dep_value_id in deps.get(value_id, ())
+            if int(dep_value_id) not in address_value_ids
+        )
+    return frozenset(address_value_ids)
+
+
+def _layout_address_root_value_ids(op):
+    if op.name == "amdg.buffer_load_to_local":
+        fields = _buffer_load_to_local_fields(op)
+        roots = [fields["offset_value_id"]]
+        if fields["stride_value_id"] is not None:
+            roots.append(fields["stride_value_id"])
+        return tuple(roots)
+    if op.name == "amdg.buffer_load":
+        fields = _buffer_load_fields(op)
+        roots = [fields["offset_value_id"]]
+        if fields["stride_value_id"] is not None:
+            roots.append(fields["stride_value_id"])
+        return tuple(roots)
+    if op.name == "amdg.buffer_store":
+        return (_buffer_store_fields(op)["offset_value_id"],)
+    if op.name == "tt.load":
+        return (_load_fields(op)["pointer_value_id"],)
+    if op.name == "tt.store":
+        return (_store_fields(op)["pointer_value_id"],)
+    if op.name == "ttg.memdesc_index" and len(op.operands) >= 2:
+        return (op.operands[1],)
+    return ()
+
+
+def _record_for_address_deps(deps, source_program, op):
+    if not op.region_ids:
+        return
+    yielded_value_ids = _region_yield_value_ids(source_program, op.region_ids[0])
+    region = source_program.regions[op.region_ids[0]]
+    if region.block_arg_ids:
+        _add_address_deps(deps, region.block_arg_ids[0], op.operands[:3])
+        for index, block_arg_value_id in enumerate(region.block_arg_ids[1:]):
+            iter_arg_value_ids = []
+            init_operand_index = 3 + index
+            if init_operand_index < len(op.operands):
+                iter_arg_value_ids.append(op.operands[init_operand_index])
+            if index < len(yielded_value_ids):
+                iter_arg_value_ids.append(yielded_value_ids[index])
+            _add_address_deps(deps, block_arg_value_id, iter_arg_value_ids)
+    for index, result_value_id in enumerate(op.results):
+        if index < len(yielded_value_ids):
+            _add_address_deps(deps, result_value_id, (yielded_value_ids[index],))
+
+
+def _record_if_address_deps(deps, source_program, op):
+    yielded_by_region = tuple(
+        _region_yield_value_ids(source_program, region_id)
+        for region_id in op.region_ids
+    )
+    for index, result_value_id in enumerate(op.results):
+        _add_address_deps(
+            deps,
+            result_value_id,
+            tuple(
+                yielded_value_ids[index]
+                for yielded_value_ids in yielded_by_region
+                if index < len(yielded_value_ids)
+            ),
+        )
+
+
+def _region_yield_value_ids(source_program, region_id):
+    region = source_program.regions[region_id]
+    for op_index in reversed(region.op_indices):
+        op = source_program.ops[op_index]
+        if op.name == "scf.yield":
+            return tuple(op.operands)
+    return ()
+
+
+def _add_address_deps(deps, value_id, dep_value_ids):
+    deps.setdefault(int(value_id), set()).update(
+        int(dep_value_id)
+        for dep_value_id in dep_value_ids
     )
 
 
@@ -358,6 +472,8 @@ def _convert_source_op(
         operand_target_ids,
         result_target_ids,
         result_layout_map_ids,
+        tuple(op.results),
+        conversion_input.layout_address_value_ids,
         fact_ids,
         _fact_target_ids(builder, fact_program, fact_ids, op),
         operand_fact_ids,
@@ -483,12 +599,22 @@ def _layout_address_binary_no_signed_wrap(view, operation, source_width):
         return False
     if source_width is None or int(source_width) <= 0:
         return False
-    if not view.result_layout_map_ids:
-        return False
-    # Integer tensors with layout maps are layout-address values in the TLX Wave
-    # target contract. Their add/sub/mul overflow is UB, so the bridge records
-    # the no-wrap provenance where the layout association is still explicit.
-    return True
+    if view.result_layout_map_ids:
+        # Integer tensors with layout maps are layout-address values in the TLX
+        # Wave target contract. Their add/sub/mul overflow is UB, so the bridge
+        # records the no-wrap provenance where the layout association is still
+        # explicit.
+        return True
+    if any(
+        int(value_id) in view.layout_address_value_ids
+        for value_id in view.result_source_value_ids
+    ):
+        # Scalar layout bases often lose the explicit layout map before they are
+        # splatted or attached as affine bindings.  Keep the same address
+        # no-overflow provenance for arithmetic in the transitive backward slice
+        # from load/store/DMA offsets and memdesc indices.
+        return True
+    return False
 
 
 def _can_use_unsigned_div_rem(view):
