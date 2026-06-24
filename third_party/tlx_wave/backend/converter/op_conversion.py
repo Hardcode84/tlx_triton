@@ -458,6 +458,8 @@ def _convert_binary(builder, view):
         "source_width": source_width,
     }
     nsw, nuw = _arith_overflow_flags(view)
+    if not nsw and _layout_address_binary_no_signed_wrap(view, operation, source_width):
+        nsw = True
     if not nsw and _range_proves_no_signed_wrap(view, operation, source_width):
         nsw = True
     if nsw:
@@ -474,6 +476,19 @@ def _convert_binary(builder, view):
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
+
+
+def _layout_address_binary_no_signed_wrap(view, operation, source_width):
+    if operation not in {"addi", "subi", "muli"}:
+        return False
+    if source_width is None or int(source_width) <= 0:
+        return False
+    if not view.result_layout_map_ids:
+        return False
+    # Integer tensors with layout maps are layout-address values in the TLX Wave
+    # target contract. Their add/sub/mul overflow is UB, so the bridge records
+    # the no-wrap provenance where the layout association is still explicit.
+    return True
 
 
 def _can_use_unsigned_div_rem(view):
@@ -3975,38 +3990,14 @@ def _affine_source_offset_no_signed_wrap(
     op,
     offset_upper,
 ):
+    del conversion_input, fact_program, affine, op
     if int(offset_upper) > 0x7FFFFFFF:
         return False
-    # Layout-address overflow is outside TLX Wave target IR semantics.  Dynamic
-    # scalar upper bounds are therefore not required to emit nsw for the
-    # reconstructed affine address expression; the scoped facts checked here
-    # only establish that the non-overflowing expression is nonnegative.
-    return _packet_affine_source_offset_nonnegative(
-        conversion_input,
-        fact_program,
-        affine,
-        op,
-    )
-
-
-def _packet_affine_source_offset_nonnegative(
-    conversion_input,
-    fact_program,
-    affine,
-    op,
-):
-    for term in affine.terms:
-        if int(term.coefficient) < 0:
-            return False
-        for value_id in term.scalar_value_ids:
-            lower, _upper = _combined_range_for_value(
-                conversion_input,
-                fact_program,
-                value_id,
-                op.index,
-            )
-            if lower is None or int(lower) < 0:
-                return False
+    # Affine DMA/buffer offsets are layout-address expressions.  The target IR
+    # is only defined for executions where that address math does not overflow;
+    # dynamic scalar leaf ranges are not the no-wrap provenance.  The packet
+    # offset range limits the final reconstructed i32 offset, and overflow of
+    # any intermediate add/mul on the way there is outside the target semantics.
     return True
 
 

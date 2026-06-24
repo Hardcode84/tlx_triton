@@ -1751,6 +1751,35 @@ def test_tlx_wave_converter_derives_arith_nsw_from_scoped_ranges(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_marks_layout_integer_math_nsw(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_layout_math_nsw(%stride: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked>
+    %scaled = arith.muli %range, %stride_splat : tensor<64xi32, #blocked>
+    %offset = arith.addi %scaled, %range : tensor<64xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    layout_math = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "binary"
+        and converter_target_ir.attrs_dict(op)["operation"] in {"muli", "addi"}
+    ]
+    assert any(attrs["operation"] == "muli" and attrs["nsw"] is True for attrs in layout_math)
+    assert any(attrs["operation"] == "addi" and attrs["nsw"] is True for attrs in layout_math)
+    assert output.emitted_module.text.count("overflow<nsw>") >= 2
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -3559,6 +3588,7 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert attrs["packet_elements"] == 8
     assert attrs["range_bytes"] == 2147483647
     assert attrs["source_offset_range"] == (0, 1073741816)
+    assert attrs["source_offset_no_signed_wrap"] is True
     assert "waveamd.make_buffer" in output.emitted_module.text
     assert "wave.assume" in output.emitted_module.text
     assert "wave.load" not in output.emitted_module.text
@@ -3566,6 +3596,53 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert "waveamd.dma_load_lds" in output.emitted_module.text
     assert "wave.wait" in output.emitted_module.text
     assert "wave.barrier" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#shared = #ttg.padded_shared<[512:+16] {order = [1, 0], shape = [256, 64]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_dma_affine_nsw(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %stride: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
+    %rows = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %row = tt.expand_dims %rows {axis = 1 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xi32, #blocked>
+    %stride_splat = tt.splat %stride : i32 -> tensor<256x1xi32, #blocked>
+    %row_scaled = arith.muli %row, %stride_splat : tensor<256x1xi32, #blocked>
+    %col = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %row_b = tt.broadcast %row_scaled : tensor<256x1xi32, #blocked> -> tensor<256x64xi32, #blocked>
+    %col_b = tt.broadcast %col : tensor<1x64xi32, #blocked> -> tensor<256x64xi32, #blocked>
+    %offset = arith.addi %row_b, %col_b : tensor<256x64xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%offset] into %alloc : <f16>[tensor<256x64xi32, #blocked>] -> <256x64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op,) = [
+        op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["source_offset_no_signed_wrap"] is True
+    assert attrs["source_offset_terms"] == (
+        ("dim", 1, 1, ()),
+        ("dim_scalar", 1, 0, (0,)),
+    )
+    # The stride leaf has no scalar range fact here.  Layout-address overflow is
+    # outside target IR semantics, so the reconstructed packet source offset is
+    # still emitted as no-signed-wrap math.
+    assert "overflow<nsw>" in output.emitted_module.text
     del ctx
 
 
@@ -6323,7 +6400,7 @@ def test_tlx_wave_converter_buffer_store_affine_offset_uses_scoped_facts(tmp_pat
     assert attrs["offset_mode"] == "affine"
     assert attrs["offset_scalar_count"] == 1
     # This intentionally has no upper bound on %stride.  Layout address
-    # overflow is UB, so a scoped nonnegative stride fact is enough for nsw.
+    # overflow is UB, so dynamic scalar upper bounds are not required for nsw.
     assert attrs["offset_no_signed_wrap"] is True
     assert attrs["offset_terms"] == (
         ("dim", 1, 0, ()),
@@ -6334,7 +6411,7 @@ def test_tlx_wave_converter_buffer_store_affine_offset_uses_scoped_facts(tmp_pat
     del ctx
 
 
-def test_tlx_wave_converter_branch_local_fact_does_not_mark_store_offset_nsw(
+def test_tlx_wave_converter_buffer_store_affine_offset_marks_layout_math_nsw(
     tmp_path,
 ):
     preamble = """
@@ -6369,7 +6446,7 @@ def test_tlx_wave_converter_branch_local_fact_does_not_mark_store_offset_nsw(
     attrs = converter_target_ir.attrs_dict(store_op)
     assert attrs["offset_mode"] == "affine"
     assert attrs["offset_scalar_count"] == 1
-    assert attrs["offset_no_signed_wrap"] is False
+    assert attrs["offset_no_signed_wrap"] is True
     del ctx
 
 
