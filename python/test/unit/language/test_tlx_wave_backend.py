@@ -4156,8 +4156,10 @@ def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
     assert attrs["coordinate_mode"] == "bit_affine_workitem"
     assert attrs["component_bases"] == (0,)
     assert attrs["workitem_coefficients"] == (32, 16, 8, 4, 2, 1)
-    assert "wave.binary shrui" in output.emitted_module.text
-    assert "wave.binary andi" in output.emitted_module.text
+    assert "wave.binary divui" in output.emitted_module.text
+    assert "wave.binary remui" in output.emitted_module.text
+    assert "wave.binary shrui" not in output.emitted_module.text
+    assert "wave.binary andi" not in output.emitted_module.text
     del ctx
 
 
@@ -4565,8 +4567,10 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     )
     emitted = converter_emission.emit_wave_module(target)
 
-    assert "wave.binary shrui" in emitted.text
-    assert "wave.binary andi" in emitted.text
+    assert "wave.binary divui" in emitted.text
+    assert "wave.binary remui" in emitted.text
+    assert "wave.binary shrui" not in emitted.text
+    assert "wave.binary andi" not in emitted.text
     assert "wave.binary muli" in emitted.text
     assert "overflow<nsw>" in emitted.text
     del ctx
@@ -7071,7 +7075,9 @@ def test_tlx_wave_converter_pipeline_groups_mult_warp_padded_dma(tmp_path):
     assert output.emitted_module.text.count("waveamd.dma_load_lds") == 1
     assert "wave.read_first" in output.emitted_module.text
     assert "wave.index_expr" not in output.emitted_module.text
-    assert "wave.binary shrui" in output.emitted_module.text
+    assert "wave.binary divui" in output.emitted_module.text
+    assert "wave.binary shrui" not in output.emitted_module.text
+    assert "wave.binary andi" not in output.emitted_module.text
     assert "wave.binary muli" in output.emitted_module.text
     assert "c264_i32" in output.emitted_module.text
     del ctx

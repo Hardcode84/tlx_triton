@@ -2905,14 +2905,7 @@ def _simd_binary_const(state, operation, value, constant, lane_width, *, nsw=Fal
             element_type,
             lane_width,
         )
-    if operation == "divui" and _is_power_of_two(constant):
-        operation_kind = state.dsl.BinaryKind.ShRUI
-        constant = constant.bit_length() - 1
-    elif operation == "remui" and _is_power_of_two(constant):
-        operation_kind = state.dsl.BinaryKind.AndI
-        constant -= 1
-    else:
-        operation_kind = _binary_kind(state.dsl, operation)
+    operation_kind = _binary_kind(state.dsl, operation)
     rhs = state.builder.splat(
         state.builder.constant(element_type, constant),
         element_type,
@@ -5250,14 +5243,7 @@ def _scalar_binary_const_i32(state, operation, value, constant, *, nsw=False):
         return value
     if operation == "remui" and constant == 1:
         return state.builder.constant(state.dsl.i32(), 0)
-    if operation == "divui" and _is_power_of_two(constant):
-        operation_kind = state.dsl.BinaryKind.ShRUI
-        constant = constant.bit_length() - 1
-    elif operation == "remui" and _is_power_of_two(constant):
-        operation_kind = state.dsl.BinaryKind.AndI
-        constant -= 1
-    else:
-        operation_kind = _binary_kind(state.dsl, operation)
+    operation_kind = _binary_kind(state.dsl, operation)
     rhs = state.builder.constant(state.dsl.i32(), constant)
     return state.builder.binary(operation_kind, value, rhs, nsw=bool(nsw))
 
