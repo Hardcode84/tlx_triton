@@ -570,6 +570,8 @@ class HIPBackend(BaseBackend):
         flags = []
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
+        if knobs.amd.enable_static_simulator:
+            flags.append("amdgpu-enable-static-simulator")
         features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + '_' + ir_hash
