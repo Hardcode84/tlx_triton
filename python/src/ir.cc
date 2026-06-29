@@ -268,7 +268,8 @@ std::vector<std::vector<int64_t>> toNestedInt64Vector(Range &&values) {
   return result;
 }
 
-template <typename Range> std::vector<std::string> toStringVector(Range values) {
+template <typename Range>
+std::vector<std::string> toStringVector(Range values) {
   std::vector<std::string> result;
   for (StringAttr value : values)
     result.push_back(value.str());
@@ -290,7 +291,7 @@ py::object printAttribute(Attribute attr) {
   std::string str;
   llvm::raw_string_ostream os(str);
   attr.print(os);
-  return py::str(os.str());
+  return py::str(str.c_str(), str.size());
 }
 
 py::object attributeToPython(Attribute attr) {
@@ -299,7 +300,7 @@ py::object attributeToPython(Attribute attr) {
   if (auto boolAttr = dyn_cast<BoolAttr>(attr))
     return py::bool_(boolAttr.getValue());
   if (auto stringAttr = dyn_cast<StringAttr>(attr))
-    return py::str(stringAttr.getValue().str());
+    return py::str(stringAttr.getValue().data(), stringAttr.getValue().size());
   if (auto integerAttr = dyn_cast<IntegerAttr>(attr)) {
     if (integerAttr.getType().isInteger(1))
       return py::bool_(!integerAttr.getValue().isZero());
@@ -321,7 +322,8 @@ py::object attributeToPython(Attribute attr) {
 py::dict operationAttrsToPython(Operation &op) {
   py::dict attrs;
   for (NamedAttribute attr : op.getAttrs()) {
-    attrs[py::str(attr.getName().getValue().str())] =
+    StringRef name = attr.getName().getValue();
+    attrs[py::str(name.data(), name.size())] =
         attributeToPython(attr.getValue());
   }
   return attrs;
@@ -464,8 +466,7 @@ void init_triton_ir(py::module_ &m) {
       .def("is_ptr", [](Type &self) { return isa<PointerType>(self); })
       .def("is_ranked_tensor",
            [](Type &self) { return isa<RankedTensorType>(self); })
-      .def("is_memdesc",
-           [](Type &self) { return isa<ttg::MemDescType>(self); })
+      .def("is_memdesc", [](Type &self) { return isa<ttg::MemDescType>(self); })
       .def("is_async_token",
            [](Type &self) { return isa<ttg::AsyncTokenType>(self); })
       .def("get_shape",
@@ -631,7 +632,7 @@ void init_triton_ir(py::module_ &m) {
           "get_block",
           [](Region &self, unsigned index) -> Block & {
             if (index >= self.getBlocks().size())
-              throw pybind11::index_error("Region block index out of range");
+              throw py::index_error("Region block index out of range");
             auto it = self.begin();
             std::advance(it, index);
             return *it;
@@ -665,7 +666,7 @@ void init_triton_ir(py::module_ &m) {
           "get_operation",
           [](Block &self, unsigned index) -> Operation & {
             if (index >= self.getOperations().size())
-              throw pybind11::index_error("Block operation index out of range");
+              throw py::index_error("Block operation index out of range");
             auto it = self.begin();
             std::advance(it, index);
             return *it;
@@ -723,7 +724,9 @@ void init_triton_ir(py::module_ &m) {
 
   py::class_<Attribute>(m, "attribute")
       .def("is_dot_operand_encoding",
-           [](Attribute &self) { return isa<ttg::DotOperandEncodingAttr>(self); })
+           [](Attribute &self) {
+             return isa<ttg::DotOperandEncodingAttr>(self);
+           })
       .def("get_dot_operand_op_idx",
            [](Attribute &self) -> py::object {
              if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
@@ -894,12 +897,14 @@ void init_triton_ir(py::module_ &m) {
       .def("get_swizzled_shared_order",
            [](Attribute &self) -> py::object {
              if (auto swizzled =
-                      dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
-                return py::cast(toInt64Vector(swizzled.getOrder()));
-              return py::none();
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::cast(toInt64Vector(swizzled.getOrder()));
+             return py::none();
            })
       .def("is_padded_shared_encoding",
-           [](Attribute &self) { return static_cast<bool>(ttg::getPaddedEncoding(self)); })
+           [](Attribute &self) {
+             return static_cast<bool>(ttg::getPaddedEncoding(self));
+           })
       .def("get_padded_shared_intervals",
            [](Attribute &self) -> py::object {
              if (auto padded = ttg::getPaddedEncoding(self))
@@ -950,9 +955,7 @@ void init_triton_ir(py::module_ &m) {
              return self->getResult(idx);
            })
       .def("get_attrs",
-           [](OpState &self) {
-             return operationAttrsToPython(*self);
-           })
+           [](OpState &self) { return operationAttrsToPython(*self); })
       .def(
           "get_region",
           [](OpState &self, unsigned idx) -> Region & {
@@ -1028,9 +1031,7 @@ void init_triton_ir(py::module_ &m) {
       .def("get_region", &Operation::getRegion, ret::reference)
       .def("get_block", &Operation::getBlock, ret::reference)
       .def("get_attrs",
-           [](Operation &self) {
-             return operationAttrsToPython(self);
-           })
+           [](Operation &self) { return operationAttrsToPython(self); })
       .def("get_str_attr",
            [](Operation &self, const std::string &name) -> py::object {
              auto ret = self.getAttrOfType<StringAttr>(name);
