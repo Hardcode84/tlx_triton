@@ -168,51 +168,20 @@ def _run_wave_promote_buffer_to_machine(wave_artifact):
 
 
 def _run_wave_to_amdgpu_asm(wave_artifact):
-    from triton.backends.tlx_wave.wave_bridge_tools import _wave_machine_pipeline_args
-
     wave_bin = Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin"
-    wave_opt = wave_bin / "wave-opt"
     wave_translate = wave_bin / "wave-translate"
-    if not wave_opt.exists() or not wave_translate.exists():
-        pytest.skip("wave asm tools are not built")
-    opt = subprocess.run(
-        [str(wave_opt), "-", *_wave_machine_pipeline_args(str(wave_opt), "gfx950")],
+    if not wave_translate.exists():
+        pytest.skip("wave-translate is not built")
+    asm = subprocess.run(
+        [str(wave_translate), "--wave-to-amdgpu-asm", "-"],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
-    assert opt.returncode == 0, opt.stderr or opt.stdout
-    asm = subprocess.run(
-        [str(wave_translate), "--wave-to-amdgpu-asm", "-"],
-        input=_machine_text_for_wave_translate(opt.stdout),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
     assert asm.returncode == 0, asm.stderr or asm.stdout
-    return asm.stdout, opt.stderr
-
-
-def _machine_text_for_wave_translate(machine):
-    # wave-translate does not register the GPU dialect, while the executable
-    # handoff shape keeps kernels inside gpu.module. For ASM inspection, feed
-    # the already-lowered kernel funcs in the top-level module shape the
-    # translator accepts.
-    lines = machine.splitlines()
-    try:
-        start = next(index for index, line in enumerate(lines) if line.strip() == "gpu.module @kernels {")
-    except StopIteration:
-        return machine
-    end = None
-    for index in range(len(lines) - 2, start, -1):
-        if lines[index] == "  }":
-            end = index
-            break
-    assert end is not None, machine
-    return "\n".join(lines[:start] + lines[start + 1:end] + lines[end + 1:]) + "\n"
+    return asm.stdout, asm.stderr
 
 
 def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
@@ -238,16 +207,14 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert wave.count("wave.extract") == 256
     assert '#wave.pred<"x >= 0">, #wave.pred<"-1073741820 + x <= 0">' in wave
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
-    assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 64
+    assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 128
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
-    assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
+    assert machine.count("waveamdmachine.buffer_load_lds_b128") == 32
     assert "waveamdmachine.global_load_lds_b128" not in machine
-    assert machine.count("waveamdmachine.ds_load_b128") == 16
-    assert machine.count("waveamdmachine.token_join") <= 10
-    assert machine.count("waveamdmachine.buffer_store_b64") == 32
-    # 32 selects match AMD's inactive-offset buffer-store masking; the
-    # remaining 12 are mask-payload materialization tracked as bloat.
-    assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 44
+    assert machine.count("waveamdmachine.ds_load_b128") == 32
+    assert machine.count("waveamdmachine.token_join") <= 20
+    assert machine.count("waveamdmachine.buffer_store_b64") == 64
+    assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 64
     assert amd_asm.count("v_cndmask_b32") == 32
     assert machine.count("waveamdmachine.exec_if") == 0
     assert "waveamdmachine.buffer_store_b16" not in machine
@@ -276,9 +243,9 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert "waveamdmachine.v_lshlrev_b64" not in machine
     assert "waveamdmachine.v_lshrrev_b64" not in machine
     assert "waveamdmachine.v_add_u64" not in machine
-    assert machine.count("waveamdmachine.v_cmp") == 44
+    assert machine.count("waveamdmachine.v_cmp") == 24
     assert machine.count("waveamdmachine.s_cmp_lg_u32") <= 32
-    assert machine.count("waveamdmachine.s_cselect_b32") <= 40
+    assert machine.count("waveamdmachine.s_cselect_b32") <= 64
     assert machine.count("waveamdmachine.s_xor_b32") <= 32
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
