@@ -6,7 +6,6 @@ from triton._C.libtriton.linear_layout import LinearLayout
 
 from .diagnostics import fail
 
-
 STAGE = "type_layout"
 
 
@@ -45,7 +44,7 @@ class PhysicalOffsetExpressionPlan:
     element_byte_width: int
     layout_kind: str
     order: tuple[int, ...]
-    bindings: tuple[str, ...] = ("logical_coords",)
+    bindings: tuple[str, ...] = ("logical_coords", )
     assumptions: tuple[str, ...] = ()
     proof_status: str = "symbolic_verified"
     provenance: str = "shared_physical_offset"
@@ -114,11 +113,7 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
             "order": _int_tuple(_attr_value(attr, "get_blocked_order")),
         }
     if _attr_bool(attr, "is_linear_encoding"):
-        kind = (
-            "generic_linear"
-            if str(encoding or "").startswith("#ttg.generic_linear")
-            else "linear"
-        )
+        kind = ("generic_linear" if str(encoding or "").startswith("#ttg.generic_linear") else "linear")
         return kind, {
             "register_bases": _basis_tuple(_attr_value(attr, "get_linear_register_bases")),
             "lane_bases": _basis_tuple(_attr_value(attr, "get_linear_lane_bases")),
@@ -383,9 +378,7 @@ def linear_layout_coords(linear, register, lane, *, warp):
         "lane": int(lane),
         "warp": int(warp),
     }
-    coords = linear.apply(
-        {name: available[name] for name in linear.get_in_dim_names()}
-    )
+    coords = linear.apply({name: available[name] for name in linear.get_in_dim_names()})
     return tuple(int(coords[f"dim{dim}"]) for dim in range(len(coords)))
 
 
@@ -446,9 +439,7 @@ def layout_warp_count(layout):
             layout.properties.get("parent_kind"),
             layout.properties.get("parent_properties", {}),
         )
-    warps_per_cta = tuple(
-        int(value) for value in layout.properties.get("warps_per_cta", ())
-    )
+    warps_per_cta = tuple(int(value) for value in layout.properties.get("warps_per_cta", ()))
     result = 1
     for value in warps_per_cta:
         result *= max(1, int(value))
@@ -526,9 +517,7 @@ def shared_physical_offset(
             major = int(coords[major_dim])
             minor = int(coords[minor_dim])
             phase = (major // int(per_phase)) % int(max_phase)
-            swizzled_minor = ((minor // int(vec)) ^ phase) * int(vec) + (
-                minor % int(vec)
-            )
+            swizzled_minor = ((minor // int(vec)) ^ phase) * int(vec) + (minor % int(vec))
             if swizzled_minor >= minor_extent:
                 _shared_layout_fail(
                     diagnostic,
@@ -543,7 +532,7 @@ def shared_physical_offset(
             element_offset = major * minor_extent + swizzled_minor
             logical_linear_offset = ordered_linear_offset(shape, coords, order)
             provenance = "swizzled_shared"
-            assumptions = ("minor_extent_divisible_by_vec",)
+            assumptions = ("minor_extent_divisible_by_vec", )
     elif kind == "padded_shared":
         intervals, paddings = padded_shared_parameters(
             layout,
@@ -581,7 +570,7 @@ def shared_physical_offset(
         for interval, padding in zip(intervals, paddings):
             element_offset += (logical_linear_offset // int(interval)) * int(padding)
         provenance = "padded_shared"
-        assumptions = ("valid_padded_intervals",)
+        assumptions = ("valid_padded_intervals", )
     else:
         _shared_layout_fail(
             diagnostic,
@@ -683,7 +672,7 @@ def shared_physical_offset_expression_plan(
                 element_byte_width=element_byte_width,
                 layout_kind=kind,
                 order=default_physical_order(shape),
-                assumptions=("identity_swizzled_shared",),
+                assumptions=("identity_swizzled_shared", ),
                 provenance="identity_swizzled_row_major",
             )
         order, vec, per_phase, max_phase = swizzled_shared_parameters(
@@ -700,7 +689,7 @@ def shared_physical_offset_expression_plan(
             element_byte_width=element_byte_width,
             layout_kind=kind,
             order=tuple(int(dim) for dim in order),
-            assumptions=("minor_extent_divisible_by_vec",),
+            assumptions=("minor_extent_divisible_by_vec", ),
             provenance="swizzled_shared",
             swizzled_vec=int(vec),
             swizzled_per_phase=int(per_phase),
@@ -736,13 +725,11 @@ def shared_physical_offset_expression_plan(
             element_byte_width=element_byte_width,
             layout_kind=kind,
             order=tuple(int(dim) for dim in order),
-            assumptions=("valid_padded_intervals",),
+            assumptions=("valid_padded_intervals", ),
             provenance="padded_shared",
             intervals=tuple(int(value) for value in intervals),
             paddings=tuple(int(value) for value in paddings),
-            linear_component_bases=tuple(
-                tuple(int(value) for value in basis) for basis in offset_bases
-            ),
+            linear_component_bases=tuple(tuple(int(value) for value in basis) for basis in offset_bases),
         )
     _shared_layout_fail(
         diagnostic,
@@ -763,35 +750,23 @@ def physical_offset_expression_plan_attrs(plan, prefix):
         f"{prefix}_physical_layout_kind": plan.layout_kind,
         f"{prefix}_physical_order": tuple(int(dim) for dim in plan.order),
         f"{prefix}_physical_bindings": tuple(str(name) for name in plan.bindings),
-        f"{prefix}_physical_assumptions": tuple(
-            str(assumption) for assumption in plan.assumptions
-        ),
+        f"{prefix}_physical_assumptions": tuple(str(assumption) for assumption in plan.assumptions),
         f"{prefix}_physical_proof_status": plan.proof_status,
         f"{prefix}_physical_provenance": plan.provenance,
     }
     if plan.expression_kind == "padded_linear" or plan.intervals:
-        attrs[f"{prefix}_physical_intervals"] = tuple(
-            int(value) for value in plan.intervals
-        )
+        attrs[f"{prefix}_physical_intervals"] = tuple(int(value) for value in plan.intervals)
     if plan.expression_kind == "padded_linear" or plan.paddings:
-        attrs[f"{prefix}_physical_paddings"] = tuple(
-            int(value) for value in plan.paddings
-        )
+        attrs[f"{prefix}_physical_paddings"] = tuple(int(value) for value in plan.paddings)
     if plan.swizzled_vec is not None:
         attrs[f"{prefix}_physical_swizzled_vec"] = int(plan.swizzled_vec)
     if plan.swizzled_per_phase is not None:
-        attrs[f"{prefix}_physical_swizzled_per_phase"] = int(
-            plan.swizzled_per_phase
-        )
+        attrs[f"{prefix}_physical_swizzled_per_phase"] = int(plan.swizzled_per_phase)
     if plan.swizzled_max_phase is not None:
-        attrs[f"{prefix}_physical_swizzled_max_phase"] = int(
-            plan.swizzled_max_phase
-        )
+        attrs[f"{prefix}_physical_swizzled_max_phase"] = int(plan.swizzled_max_phase)
     if plan.linear_component_bases:
         attrs[f"{prefix}_physical_linear_component_bases"] = tuple(
-            tuple(int(value) for value in basis)
-            for basis in plan.linear_component_bases
-        )
+            tuple(int(value) for value in basis) for basis in plan.linear_component_bases)
     return attrs
 
 
@@ -938,9 +913,7 @@ def _padded_linear_component_offset_bases(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    expected_names = tuple(
-        (f"dim{dim}", int(extent)) for dim, extent in enumerate(component_shape)
-    )
+    expected_names = tuple((f"dim{dim}", int(extent)) for dim, extent in enumerate(component_shape))
     if out_dims != expected_names or component_shape != shape[-component_rank:]:
         _shared_layout_fail(
             diagnostic,
@@ -953,7 +926,8 @@ def _padded_linear_component_offset_bases(
         )
     prefix_rank = len(shape) - component_rank
     bases = [
-        tuple((0,) * prefix_rank + tuple(int(value) for value in basis))
+        tuple((0, ) * prefix_rank + tuple(int(value)
+                                          for value in basis))
         for basis in linear_layout_bases(linear_component, "offset")
     ]
     for dim in reversed(range(prefix_rank)):
@@ -997,13 +971,13 @@ def offset_from_linear_component_bases(
 ):
     offset = 0
     for bit, dim, value in _iter_padded_offset_basis_bits(
-        layout,
-        bases,
-        len(tuple(coords)),
-        stage=stage,
-        diagnostic=diagnostic,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
+            layout,
+            bases,
+            len(tuple(coords)),
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
     ):
         if int(coords[dim]) & int(value):
             offset += 1 << int(bit)
@@ -1022,13 +996,13 @@ def _validate_padded_offset_bases(
 ):
     seen = set()
     for _bit, dim, value in _iter_padded_offset_basis_bits(
-        layout,
-        bases,
-        len(tuple(shape)),
-        stage=stage,
-        diagnostic=diagnostic,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
+            layout,
+            bases,
+            len(tuple(shape)),
+            stage=stage,
+            diagnostic=diagnostic,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
     ):
         key = (int(dim), int(value))
         if key in seen:
@@ -1123,7 +1097,7 @@ def static_linear_offset(shape, coords):
     offset = 0
     shape = tuple(int(dim) for dim in shape)
     for dim, coord in enumerate(coords):
-        stride = _product(shape[dim + 1 :])
+        stride = _product(shape[dim + 1:])
         offset += int(coord) * stride
     return int(offset)
 
@@ -1233,7 +1207,7 @@ def padded_shared_parameters(
     source_op_index=None,
     source_value_id=None,
 ):
-    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0,), ()}:
+    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0, ), ()}:
         _shared_layout_fail(
             diagnostic,
             stage,
@@ -1270,12 +1244,8 @@ def padded_shared_parameters(
 def is_identity_swizzled_shared(layout):
     props = layout.properties
     order = tuple(props.get("order", ()))
-    return (
-        int(props.get("vec", 0)) == 1
-        and int(props.get("per_phase", 0)) == 1
-        and int(props.get("max_phase", 0)) == 1
-        and order in {(1, 0), (0,), ()}
-    )
+    return (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1
+            and int(props.get("max_phase", 0)) == 1 and order in {(1, 0), (0, ), ()})
 
 
 def require_identity_swizzled_shared(
@@ -1287,11 +1257,7 @@ def require_identity_swizzled_shared(
     source_value_id=None,
 ):
     props = layout.properties
-    if (
-        int(props.get("vec", 0)) == 1
-        and int(props.get("per_phase", 0)) == 1
-        and int(props.get("max_phase", 0)) == 1
-    ):
+    if (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1 and int(props.get("max_phase", 0)) == 1):
         return
     _shared_layout_fail(
         diagnostic,
@@ -1305,21 +1271,17 @@ def require_identity_swizzled_shared(
 
 def swizzled_shared_description(layout):
     props = layout.properties
-    return (
-        f"order={tuple(props.get('order', ()))}, "
-        f"vec={int(props.get('vec', 0))}, "
-        f"per_phase={int(props.get('per_phase', 0))}, "
-        f"max_phase={int(props.get('max_phase', 0))}"
-    )
+    return (f"order={tuple(props.get('order', ()))}, "
+            f"vec={int(props.get('vec', 0))}, "
+            f"per_phase={int(props.get('per_phase', 0))}, "
+            f"max_phase={int(props.get('max_phase', 0))}")
 
 
 def padded_shared_description(layout):
     props = layout.properties
-    return (
-        f"order={tuple(props.get('order', ()))}, "
-        f"intervals={tuple(int(value) for value in props.get('intervals', ()))}, "
-        f"paddings={tuple(int(value) for value in props.get('paddings', ()))}"
-    )
+    return (f"order={tuple(props.get('order', ()))}, "
+            f"intervals={tuple(int(value) for value in props.get('intervals', ()))}, "
+            f"paddings={tuple(int(value) for value in props.get('paddings', ()))}")
 
 
 def _shared_layout_fail(
@@ -1363,9 +1325,7 @@ def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_
             for lane in range(int(lane_width)):
                 coords = linear_layout_coords(linear, component, lane, warp=warp)
                 if len(coords) != len(shape) or any(
-                    int(coord) < 0 or int(coord) >= int(extent)
-                    for coord, extent in zip(coords, shape)
-                ):
+                        int(coord) < 0 or int(coord) >= int(extent) for coord, extent in zip(coords, shape)):
                     out_of_bounds_slots += 1
                     continue
                 if coords in seen:
@@ -1484,13 +1444,7 @@ def _blocked_linear_layout(
     threads_per_warp = tuple(int(value) for value in properties["threads_per_warp"])
     warps_per_cta = tuple(int(value) for value in properties["warps_per_cta"])
     order = tuple(int(value) for value in properties["order"])
-    if not (
-        len(size_per_thread)
-        == len(threads_per_warp)
-        == len(warps_per_cta)
-        == len(order)
-        == rank
-    ):
+    if not (len(size_per_thread) == len(threads_per_warp) == len(warps_per_cta) == len(order) == rank):
         _layout_fail(
             "TLXW_TYPE_MALFORMED_LAYOUT",
             stage,
@@ -1498,11 +1452,9 @@ def _blocked_linear_layout(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    linear = (
-        _identity_standard_nd("register", size_per_thread, order)
-        * _identity_standard_nd("lane", threads_per_warp, order)
-        * _identity_standard_nd("warp", warps_per_cta, order)
-    )
+    linear = (_identity_standard_nd("register", size_per_thread, order) *
+              _identity_standard_nd("lane", threads_per_warp, order) *
+              _identity_standard_nd("warp", warps_per_cta, order))
     return _ensure_layout_matches_shape(
         linear,
         shape,
@@ -1581,24 +1533,15 @@ def _slice_linear_layout(
         source_op_index=source_op_index,
         source_value_id=source_value_id,
     )
-    parent_dim_to_basis_index = {
-        str(name): index for index, (name, _size) in enumerate(parent.out_dims)
-    }
-    kept_parent_dims = [
-        f"dim{index}" for index in range(len(parent_shape)) if index != dim
-    ]
+    parent_dim_to_basis_index = {str(name): index for index, (name, _size) in enumerate(parent.out_dims)}
+    kept_parent_dims = [f"dim{index}" for index in range(len(parent_shape)) if index != dim]
     out_dims = [f"dim{index}" for index in range(len(shape))]
     bases = []
     for in_dim, in_bases in parent.bases:
         projected = []
         for basis in in_bases:
             basis = tuple(int(value) for value in basis)
-            projected.append(
-                [
-                    basis[parent_dim_to_basis_index[parent_dim]]
-                    for parent_dim in kept_parent_dims
-                ]
-            )
+            projected.append([basis[parent_dim_to_basis_index[parent_dim]] for parent_dim in kept_parent_dims])
         bases.append((in_dim, projected))
     return LinearLayout.from_bases(bases, out_dims, list(shape), False)
 
@@ -1646,17 +1589,13 @@ def _mfma_linear_layout(
     dim_n = "dim1"
     if bool(properties.get("is_transposed", False)):
         linear = LinearLayout.identity_1d(height, "register", dim_n)
-        linear *= (
-            LinearLayout.identity_1d(m_dim, "lane", dim_m)
-            * LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n)
-        )
+        linear *= (LinearLayout.identity_1d(m_dim, "lane", dim_m) *
+                   LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n))
         linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
     else:
         linear = LinearLayout.identity_1d(height, "register", dim_m)
-        linear *= (
-            LinearLayout.identity_1d(n_dim, "lane", dim_n)
-            * LinearLayout.identity_1d(warp_size // n_dim, "lane", dim_m)
-        )
+        linear *= (LinearLayout.identity_1d(n_dim, "lane", dim_n) *
+                   LinearLayout.identity_1d(warp_size // n_dim, "lane", dim_m))
         linear *= LinearLayout.identity_1d(tiles, "register", dim_m)
     linear = _linear_layout_transpose_outs(linear, (dim_n, dim_m))
     tiles_per_warp = tuple(int(value) for value in properties.get("tiles_per_warp", ()))
@@ -1697,15 +1636,10 @@ def _linear_layout_transpose_outs(linear, out_dim_names):
     old_size = {name: size for name, size in old_out_dims}
     bases = []
     for in_dim, in_bases in linear.bases:
-        bases.append(
-            (
-                str(in_dim),
-                [
-                    [int(basis[old_index[name]]) for name in out_dim_names]
-                    for basis in in_bases
-                ],
-            )
-        )
+        bases.append((
+            str(in_dim),
+            [[int(basis[old_index[name]]) for name in out_dim_names] for basis in in_bases],
+        ))
     return LinearLayout.from_bases(
         bases,
         list(out_dim_names),

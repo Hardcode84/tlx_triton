@@ -173,10 +173,8 @@ def _validate_dma_packet_shape(a, b, n, k, bm, bn, bk, nb, gm):
         raise ValueError("gemm_wp requires BLOCK_N/BLOCK_K to be divisible by 2 for f16 dword DMA packets")
     k_iters = (k + bk - 1) // bk
     if k_iters < nb:
-        raise ValueError(
-            "gemm_wp requires ceil(K / BLOCK_K) to be at least NUM_BUFFERS "
-            "because the fixed prologue/epilogue pipeline preloads NUM_BUFFERS tiles"
-        )
+        raise ValueError("gemm_wp requires ceil(K / BLOCK_K) to be at least NUM_BUFFERS "
+                         "because the fixed prologue/epilogue pipeline preloads NUM_BUFFERS tiles")
 
 
 def run(a, b, c, bm, bn, bk, nb, nw, gm, wpeu=0, nonk=0, xcd=4):

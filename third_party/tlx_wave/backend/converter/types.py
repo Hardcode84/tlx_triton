@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from .layouts import LayoutMap, build_layout_map
 
-
 _MMA_FRAGMENT_ELEMENT_TYPES = frozenset({"bf16", "f16", "f32"})
 
 
@@ -75,11 +74,8 @@ def _convert_type(source_type, layout, lane_width):
                 lane_width,
                 component_count,
             )
-        if (
-            layout is not None
-            and layout.kind in {"dot_operand", "amd_mfma"}
-            and source_type.element_type in _MMA_FRAGMENT_ELEMENT_TYPES
-        ):
+        if (layout is not None and layout.kind in {"dot_operand", "amd_mfma"}
+                and source_type.element_type in _MMA_FRAGMENT_ELEMENT_TYPES):
             return ConvertedType(
                 "fragment",
                 "fragment" if component_count == 1 else "fragment_tuple",

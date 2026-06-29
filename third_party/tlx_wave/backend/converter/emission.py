@@ -9,7 +9,6 @@ from .diagnostics import fail
 from . import domains
 from . import target_ir
 
-
 STAGE = "emission"
 
 # TLX Wave target programs are only defined for executions where synthesized
@@ -54,9 +53,7 @@ class _EmissionState:
     fact_program: object | None
     values: dict[int, object]
     uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
-    shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(
-        default_factory=dict
-    )
+    shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(default_factory=dict)
     scratch_token: object | None = None
 
 
@@ -67,16 +64,15 @@ def emit_wave_module(target_program, fact_program=None):
     with dsl.ModuleBuilder() as module_builder:
         _set_module_attrs(module_builder, dsl, ir, kernel)
         arg_types = [
-            _wave_type(dsl, target_program.values[target_value_id].type)
-            for target_value_id in kernel.arg_target_ids
+            _wave_type(dsl, target_program.values[target_value_id].type) for target_value_id in kernel.arg_target_ids
         ]
         with module_builder.gpu_module("kernels") as gpu_module:
             with gpu_module.kernel(
-                kernel.name,
-                arg_types,
-                lds_size=lds_size or None,
-                workgroup_size=_kernel_workgroup_size(kernel),
-                attrs=_function_attrs(dsl, ir, kernel),
+                    kernel.name,
+                    arg_types,
+                    lds_size=lds_size or None,
+                    workgroup_size=_kernel_workgroup_size(kernel),
+                    attrs=_function_attrs(dsl, ir, kernel),
             ) as builder:
                 state = _EmissionState(
                     dsl,
@@ -112,10 +108,7 @@ def _emit_region(state, region_id):
                 target_op_id=target_op_id,
             )
         _emit_target_op(state, op)
-    return tuple(
-        _require_value(state, target_value_id, None)
-        for target_value_id in region.yield_value_ids
-    )
+    return tuple(_require_value(state, target_value_id, None) for target_value_id in region.yield_value_ids)
 
 
 def _emit_target_op(state, op):
@@ -166,18 +159,14 @@ def _emit_constant(state, op):
             literal,
             op,
         )
-        state.values[result_id] = _pack_components(
-            tuple(value for _ in range(_component_count(state, result_id)))
-        )
+        state.values[result_id] = _pack_components(tuple(value for _ in range(_component_count(state, result_id))))
         return
     if target_type.representation in {"mask", "mask_tuple"}:
         value = state.dsl.wave.ConstantOp(
             result_type,
             state.ir.Attribute.parse("true" if _literal_bool(literal, op) else "false"),
         ).result
-        state.values[result_id] = _pack_components(
-            tuple(value for _ in range(_component_count(state, result_id)))
-        )
+        state.values[result_id] = _pack_components(tuple(value for _ in range(_component_count(state, result_id))))
         return
     fail(
         "TLXW_EMIT_UNSUPPORTED_CONSTANT",
@@ -212,8 +201,8 @@ def _emit_binary(state, op):
             components = []
             for lhs_component, rhs_component in zip(lhs_components, rhs_components):
                 if _is_scalar_i1_value(state, lhs_component) and _is_scalar_i1_value(
-                    state,
-                    rhs_component,
+                        state,
+                        rhs_component,
                 ):
                     if false_i1 is None:
                         false_i1 = _scalar_constant(
@@ -240,8 +229,7 @@ def _emit_binary(state, op):
                             reused,
                             (lhs_component, rhs_component, false_i1),
                             emit_scalar_mask_and,
-                        )
-                    )
+                        ))
                     continue
                 if _is_scalar_i1_value(state, rhs_component):
                     lhs_component, rhs_component = rhs_component, lhs_component
@@ -260,8 +248,7 @@ def _emit_binary(state, op):
                             rhs_component,
                             false_mask,
                         ),
-                    )
-                )
+                    ))
             state.values[result_id] = _pack_components(tuple(components))
             return
         lane_width = int(result_type.lane_width or 64)
@@ -278,10 +265,7 @@ def _emit_binary(state, op):
                         lhs_component,
                         rhs_component,
                     ),
-                )
-                for lhs_component, rhs_component in zip(lhs_components, rhs_components)
-            )
-        )
+                ) for lhs_component, rhs_component in zip(lhs_components, rhs_components)))
         return
     lhs_components, rhs_components = _broadcast_components((lhs, rhs), count, op)
     reused = []
@@ -297,10 +281,7 @@ def _emit_binary(state, op):
                     nsw=bool(attrs.get("nsw", False)),
                     nuw=bool(attrs.get("nuw", False)),
                 ),
-            )
-            for lhs_component, rhs_component in zip(lhs_components, rhs_components)
-        )
-    )
+            ) for lhs_component, rhs_component in zip(lhs_components, rhs_components)))
 
 
 def _emit_float_binary(state, op):
@@ -333,10 +314,7 @@ def _emit_float_binary(state, op):
                     lhs_component,
                     rhs_component,
                 ),
-            )
-            for lhs_component, rhs_component in zip(lhs_components, rhs_components)
-        )
-    )
+            ) for lhs_component, rhs_component in zip(lhs_components, rhs_components)))
 
 
 def _emit_cmpi(state, op):
@@ -357,17 +335,11 @@ def _emit_cmpi(state, op):
                 lhs_component,
                 rhs_component,
             ),
-        )
-        for lhs_component, rhs_component in zip(lhs_components, rhs_components)
-    )
+        ) for lhs_component, rhs_component in zip(lhs_components, rhs_components))
     if result_type.representation in {"mask", "mask_tuple"}:
         lane_width = int(result_type.lane_width or 64)
         state.values[result_id] = _I32MaskPayload(
-            tuple(
-                _mask_to_i32_payload(state, component, lane_width)
-                for component in components
-            )
-        )
+            tuple(_mask_to_i32_payload(state, component, lane_width) for component in components))
         return
     state.values[result_id] = _pack_components(components)
 
@@ -389,8 +361,7 @@ def _emit_minsi(state, op):
                     lhs_component,
                     rhs_component,
                 ),
-            )
-        )
+            ))
     state.values[result_id] = _pack_components(tuple(components))
 
 
@@ -479,9 +450,7 @@ def _emit_make_range(state, op):
         return
     if attrs.get("coordinate_mode") == "bit_affine_workitem":
         component_bases = tuple(int(value) for value in attrs["component_bases"])
-        coefficients = tuple(
-            int(value) for value in attrs["workitem_coefficients"]
-        )
+        coefficients = tuple(int(value) for value in attrs["workitem_coefficients"])
         if len(component_bases) != _component_count(state, result_id):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
@@ -505,20 +474,14 @@ def _emit_make_range(state, op):
                     element_type,
                     width,
                     nsw=_LAYOUT_MATH_NSW,
-                )
-            )
+                ))
         state.values[result_id] = _pack_components(tuple(components))
         return
     if attrs.get("coordinate_mode") == "layout_coordinates":
         shape = tuple(int(value) for value in attrs["coordinate_shape"])
-        component_bases = tuple(
-            tuple(int(value) for value in bases)
-            for bases in attrs["component_coordinate_bases"]
-        )
+        component_bases = tuple(tuple(int(value) for value in bases) for bases in attrs["component_coordinate_bases"])
         workitem_coefficients = tuple(
-            tuple(int(value) for value in coefficients)
-            for coefficients in attrs["workitem_coordinate_coefficients"]
-        )
+            tuple(int(value) for value in coefficients) for coefficients in attrs["workitem_coordinate_coefficients"])
         if len(component_bases) != _component_count(state, result_id):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
@@ -548,9 +511,7 @@ def _emit_make_range(state, op):
                     int(base),
                     tuple(coefficients[dim] for coefficients in workitem_coefficients),
                     width,
-                )
-                for dim, base in enumerate(component_base)
-            )
+                ) for dim, base in enumerate(component_base))
             value = _linearize_coordinates(state, coords, shape, width)
             value = _add_simd_const(
                 state,
@@ -597,7 +558,7 @@ def _linearize_coordinates(state, coords, shape, lane_width):
         int(lane_width),
     )
     for dim, coord in enumerate(coords):
-        stride = _product(shape[dim + 1 :])
+        stride = _product(shape[dim + 1:])
         term = coord
         if int(stride) != 1:
             term = _simd_binary_const(
@@ -726,9 +687,7 @@ def _emit_splat(state, op):
                 target_op_id=op.target_op_id,
                 target_value_id=result_id,
             )
-        state.values[result_id] = _pack_components(
-            tuple(operand for _ in range(_component_count(state, result_id)))
-        )
+        state.values[result_id] = _pack_components(tuple(operand for _ in range(_component_count(state, result_id))))
         return
     splat = state.builder.splat(
         operand,
@@ -736,13 +695,9 @@ def _emit_splat(state, op):
         int(target_type.lane_width or 64),
     )
     component_count = _component_count(state, result_id)
-    state.values[result_id] = _pack_components(
-        tuple(splat for _ in range(component_count))
-    )
+    state.values[result_id] = _pack_components(tuple(splat for _ in range(component_count)))
     if target_type.representation in {"per_lane_pointer", "pointer_tuple"}:
-        state.uniform_pointer_bases[result_id] = tuple(
-            operand for _ in range(component_count)
-        )
+        state.uniform_pointer_bases[result_id] = tuple(operand for _ in range(component_count))
 
 
 def _emit_broadcast(state, op):
@@ -765,10 +720,7 @@ def _emit_broadcast(state, op):
                     target_op_id=op.target_op_id,
                     target_value_id=result_id,
                 )
-            if any(
-                source < 0 or source >= len(source_components)
-                for source in component_sources
-            ):
+            if any(source < 0 or source >= len(source_components) for source in component_sources):
                 fail(
                     "TLXW_EMIT_UNSUPPORTED_BROADCAST",
                     STAGE,
@@ -777,9 +729,7 @@ def _emit_broadcast(state, op):
                     target_op_id=op.target_op_id,
                     target_value_id=result_id,
                 )
-            state.values[result_id] = _I32MaskPayload(
-                tuple(source_components[source] for source in component_sources)
-            )
+            state.values[result_id] = _I32MaskPayload(tuple(source_components[source] for source in component_sources))
             return
         if target_count == len(source_components):
             state.values[result_id] = operand
@@ -795,12 +745,7 @@ def _emit_broadcast(state, op):
             )
         repeat = target_count // len(source_components)
         state.values[result_id] = _I32MaskPayload(
-            tuple(
-                component
-                for source_component in source_components
-                for component in (source_component,) * repeat
-            )
-        )
+            tuple(component for source_component in source_components for component in (source_component, ) * repeat))
         return
     source_components = _as_components(operand)
     component_sources = attrs.get("component_sources")
@@ -815,10 +760,7 @@ def _emit_broadcast(state, op):
                 target_op_id=op.target_op_id,
                 target_value_id=result_id,
             )
-        if any(
-            source < 0 or source >= len(source_components)
-            for source in component_sources
-        ):
+        if any(source < 0 or source >= len(source_components) for source in component_sources):
             fail(
                 "TLXW_EMIT_UNSUPPORTED_BROADCAST",
                 STAGE,
@@ -827,14 +769,10 @@ def _emit_broadcast(state, op):
                 target_op_id=op.target_op_id,
                 target_value_id=result_id,
             )
-        state.values[result_id] = _pack_components(
-            tuple(source_components[source] for source in component_sources)
-        )
+        state.values[result_id] = _pack_components(tuple(source_components[source] for source in component_sources))
         source_bases = state.uniform_pointer_bases.get(operand_id)
         if source_bases is not None:
-            state.uniform_pointer_bases[result_id] = tuple(
-                source_bases[source] for source in component_sources
-            )
+            state.uniform_pointer_bases[result_id] = tuple(source_bases[source] for source in component_sources)
         return
     if target_count == len(source_components):
         state.values[result_id] = operand
@@ -850,18 +788,12 @@ def _emit_broadcast(state, op):
             target_value_id=result_id,
         )
     repeat = target_count // len(source_components)
-    state.values[result_id] = tuple(
-        component
-        for source_component in source_components
-        for component in (source_component,) * repeat
-    )
+    state.values[result_id] = tuple(component for source_component in source_components
+                                    for component in (source_component, ) * repeat)
     source_bases = state.uniform_pointer_bases.get(operand_id)
     if source_bases is not None:
-        state.uniform_pointer_bases[result_id] = tuple(
-            base
-            for source_base in source_bases
-            for base in (source_base,) * repeat
-        )
+        state.uniform_pointer_bases[result_id] = tuple(base for source_base in source_bases
+                                                       for base in (source_base, ) * repeat)
 
 
 def _emit_addptr(state, op):
@@ -881,18 +813,11 @@ def _emit_addptr(state, op):
                     state,
                     base_component,
                     offset_component,
-                    uniform_base_components[index]
-                    if uniform_base_components is not None
-                    else None,
+                    uniform_base_components[index] if uniform_base_components is not None else None,
                 ),
                 offset_component,
                 result_type=result_type,
-            )
-            for index, (base_component, offset_component) in enumerate(
-                zip(base_components, offset_components)
-            )
-        )
-    )
+            ) for index, (base_component, offset_component) in enumerate(zip(base_components, offset_components))))
 
 
 def _emit_expand_dims(state, op):
@@ -985,19 +910,17 @@ def _emit_select(state, op):
                 _reuse_component_result(
                     reused,
                     (condition_component, true_component, false_component),
-                    lambda condition_component=condition_component, true_component=true_component, false_component=false_component: state.builder.select(
+                    lambda condition_component=condition_component, true_component=true_component, false_component=
+                    false_component: state.builder.select(
                         condition_component,
                         true_component,
                         false_component,
                     ),
-                )
-                for condition_component, true_component, false_component in zip(
+                ) for condition_component, true_component, false_component in zip(
                     cond_components,
                     true_components,
                     false_components,
-                )
-            )
-        )
+                )))
         return
     true_components, false_components = _broadcast_components(
         (true_value, false_value),
@@ -1010,19 +933,17 @@ def _emit_select(state, op):
             _reuse_component_result(
                 reused,
                 (condition_component, true_component, false_component),
-                lambda condition_component=condition_component, true_component=true_component, false_component=false_component: state.builder.select(
+                lambda condition_component=condition_component, true_component=true_component, false_component=
+                false_component: state.builder.select(
                     condition_component,
                     true_component,
                     false_component,
                 ),
-            )
-            for condition_component, true_component, false_component in zip(
+            ) for condition_component, true_component, false_component in zip(
                 cond_components,
                 true_components,
                 false_components,
-            )
-        )
-        )
+            )))
 
 
 def _emit_if(state, op):
@@ -1114,7 +1035,7 @@ def _emit_if(state, op):
     cursor = 0
     for result_id, shape in zip(op.results, result_shapes):
         state.values[result_id] = _pack_structured_value_components(
-            flat_results[cursor : cursor + shape.component_count],
+            flat_results[cursor:cursor + shape.component_count],
             shape,
             "if",
             op,
@@ -1139,10 +1060,7 @@ def _emit_for_loop(state, op):
             "for_loop operand count must be lower, upper, step, and init args",
             target_op_id=op.target_op_id,
         )
-    lower, upper, step = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands[:3]
-    )
+    lower, upper, step = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands[:3])
     init_target_ids = op.operands[3:]
     init_values = tuple(_require_value(state, target_value_id, op) for target_value_id in init_target_ids)
     flat_init_values, init_shapes = _flatten_structured_values(
@@ -1172,11 +1090,11 @@ def _emit_for_loop(state, op):
     outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
     outer_scratch_token = state.scratch_token
     with state.builder.for_loop(
-        lower,
-        upper,
-        step,
-        init_args=flat_init_values,
-        nonzero_trip=bool(attrs.get("nonzero_trip", False)),
+            lower,
+            upper,
+            step,
+            init_args=flat_init_values,
+            nonzero_trip=bool(attrs.get("nonzero_trip", False)),
     ) as loop:
         if flat_init_values:
             induction_value = loop.induction_variable
@@ -1239,7 +1157,7 @@ def _emit_for_loop(state, op):
         cursor = 0
         for result_id, shape in zip(op.results, init_shapes):
             state.values[result_id] = _pack_loop_value_components(
-                flat_results[cursor : cursor + shape.component_count],
+                flat_results[cursor:cursor + shape.component_count],
                 shape,
                 op,
             )
@@ -1295,27 +1213,23 @@ def _structured_result_types_and_shapes(state, target_value_ids, op):
         component_count = int(target_type.component_count)
         if target_type.representation in {"mask", "mask_tuple"}:
             lane_width = int(target_type.lane_width or 64)
-            shapes.append(
-                _LoopValueShape(
-                    component_count,
-                    is_mask_payload=True,
-                )
-            )
-            result_types.extend(
-                [state.dsl.simd_type(state.dsl.i32(), lane_width)] * component_count
-            )
+            shapes.append(_LoopValueShape(
+                component_count,
+                is_mask_payload=True,
+            ))
+            result_types.extend([state.dsl.simd_type(state.dsl.i32(), lane_width)] * component_count)
             continue
         if target_type.representation == "token":
             shapes.append(_LoopValueShape(component_count))
             result_types.extend([state.dsl.mem_token_type()] * component_count)
             continue
         if target_type.representation in {
-            "scalar",
-            "uniform_pointer",
-            "simd",
-            "simd_tuple",
-            "per_lane_pointer",
-            "pointer_tuple",
+                "scalar",
+                "uniform_pointer",
+                "simd",
+                "simd_tuple",
+                "per_lane_pointer",
+                "pointer_tuple",
         }:
             shapes.append(_LoopValueShape(component_count))
             result_types.extend([_wave_type(state.dsl, target_type)] * component_count)
@@ -1364,12 +1278,10 @@ def _flatten_structured_values(state, values, target_value_ids, context, op):
                 int(target_type.lane_width or 64),
                 op,
             )
-            shapes.append(
-                _LoopValueShape(
-                    len(components),
-                    is_mask_payload=True,
-                )
-            )
+            shapes.append(_LoopValueShape(
+                len(components),
+                is_mask_payload=True,
+            ))
         else:
             components = _as_components(value)
             shapes.append(_LoopValueShape(len(components)))
@@ -1407,7 +1319,7 @@ def _bind_loop_region_args(
     cursor = 0
     for block_arg_id, shape in zip(block_arg_ids[1:], init_shapes):
         state.values[block_arg_id] = _pack_loop_value_components(
-            flat_iter_values[cursor : cursor + shape.component_count],
+            flat_iter_values[cursor:cursor + shape.component_count],
             shape,
             op,
         )
@@ -1525,8 +1437,8 @@ def _emit_buffer_load_to_local(state, op):
         scalar_count = int(attrs["source_scalar_count"])
         operands = _operand_values(state, op, 2 + scalar_count + issue_dependency_count)
         dest_base, source_base = operands[:2]
-        scalar_values = operands[2 : 2 + scalar_count]
-        issue_dependencies = operands[2 + scalar_count :]
+        scalar_values = operands[2:2 + scalar_count]
+        issue_dependencies = operands[2 + scalar_count:]
         element_type = _scalar_type(state.dsl, attrs["element_type"])
         lane_width = int(attrs["lane_width"])
         range_bytes = state.builder.constant(state.dsl.i32(), int(attrs["range_bytes"]))
@@ -1575,9 +1487,7 @@ def _emit_buffer_load_to_local(state, op):
         )
     destination_offset_mode = attrs.get("destination_offset_mode", "affine")
     if destination_offset_mode == "affine":
-        destination_offsets = tuple(
-            int(value) for value in attrs["destination_component_offsets"]
-        )
+        destination_offsets = tuple(int(value) for value in attrs["destination_component_offsets"])
         if len(destination_offsets) != expected_components:
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
@@ -1589,21 +1499,14 @@ def _emit_buffer_load_to_local(state, op):
     elif destination_offset_mode == "layout_coordinates":
         destination_shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
         destination_component_bases = tuple(
-            tuple(int(value) for value in bases)
-            for bases in attrs["destination_component_coordinate_bases"]
-        )
+            tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
         destination_workitem_coefficients = tuple(
-            tuple(int(value) for value in coefficients)
-            for coefficients in attrs["destination_workitem_coordinate_coefficients"]
-        )
-        if (
-            len(destination_component_bases) != expected_components
-            or any(len(bases) != len(destination_shape) for bases in destination_component_bases)
-            or any(
-                len(coefficients) != len(destination_shape)
-                for coefficients in destination_workitem_coefficients
-            )
-        ):
+            tuple(int(value)
+                  for value in coefficients)
+            for coefficients in attrs["destination_workitem_coordinate_coefficients"])
+        if (len(destination_component_bases) != expected_components
+                or any(len(bases) != len(destination_shape) for bases in destination_component_bases) or any(
+                    len(coefficients) != len(destination_shape) for coefficients in destination_workitem_coefficients)):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
@@ -1679,6 +1582,7 @@ def _emit_buffer_load_to_local(state, op):
         state.dsl.shared_address_space(),
         lane_width,
     )
+
     def component_destination_offset(component_index):
         if destination_offset_mode == "affine":
             dest_offset = lane_offset
@@ -1704,14 +1608,9 @@ def _emit_buffer_load_to_local(state, op):
                 state,
                 workitem,
                 int(base),
-                tuple(
-                    coefficients[dim]
-                    for coefficients in destination_workitem_coefficients
-                ),
+                tuple(coefficients[dim] for coefficients in destination_workitem_coefficients),
                 lane_width,
-            )
-            for dim, base in enumerate(destination_component_bases[component_index])
-        )
+            ) for dim, base in enumerate(destination_component_bases[component_index]))
         return _shared_destination_element_offset(
             state,
             attrs,
@@ -1748,9 +1647,7 @@ def _emit_buffer_load_to_local(state, op):
 
     for index, offset_component in enumerate(offset_components):
         if mask_components is None:
-            component_tokens.append(
-                emit_component_load_store(index, offset_component)
-            )
+            component_tokens.append(emit_component_load_store(index, offset_component))
             continue
         if mask_mode != "exec_where":
             fail(
@@ -1768,8 +1665,7 @@ def _emit_buffer_load_to_local(state, op):
                     index,
                     offset_component,
                 ),
-            )
-        )
+            ))
     state.values[_single_result(op)] = _join_memory_tokens(state, component_tokens)
 
 
@@ -1839,9 +1735,7 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
             f"unsupported scalarized shared destination offset unit {unit}",
             target_op_id=op.target_op_id,
         )
-    if int(attrs.get("destination_physical_element_byte_width", 0)) != int(
-        attrs.get("element_byte_width", 0)
-    ):
+    if int(attrs.get("destination_physical_element_byte_width", 0)) != int(attrs.get("element_byte_width", 0)):
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
@@ -1862,12 +1756,8 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
         )
         encoded = physical
-        intervals = tuple(
-            int(value) for value in attrs.get("destination_physical_intervals", ())
-        )
-        paddings = tuple(
-            int(value) for value in attrs.get("destination_physical_paddings", ())
-        )
+        intervals = tuple(int(value) for value in attrs.get("destination_physical_intervals", ()))
+        paddings = tuple(int(value) for value in attrs.get("destination_physical_paddings", ()))
         for interval, padding in zip(intervals, paddings):
             term = _simd_binary_const(state, "divui", physical, interval, lane_width)
             if padding != 1:
@@ -1999,7 +1889,8 @@ def _emit_buffer_load_to_local_packet_dma(
         wave_first = _assume_value_range(
             state,
             wave_first,
-            (0, max(0, int(component_thread_count) - 1)),
+            (0, max(0,
+                    int(component_thread_count) - 1)),
             op,
         )
     dependency = _memory_dependency_token(state, issue_dependencies)
@@ -2056,14 +1947,12 @@ def _emit_buffer_load_to_local_packet_dma(
                 dest_offset,
                 result_type=i32_shared,
             )
-        component_tokens.append(
-            state.builder.dma_load_lds(
-                source_ptr,
-                dest_ptr,
-                after=dependency,
-                bytes=packet_bytes,
-            )
-        )
+        component_tokens.append(state.builder.dma_load_lds(
+            source_ptr,
+            dest_ptr,
+            after=dependency,
+            bytes=packet_bytes,
+        ))
     return _join_memory_tokens(state, component_tokens)
 
 
@@ -2096,8 +1985,8 @@ def _emit_buffer_load_to_local_dma(
     )
     dest_ptr_type = state.dsl.ptr_type(element_type, state.dsl.shared_address_space())
     for offset_component, destination_base_offset in zip(
-        offset_components,
-        destination_offsets,
+            offset_components,
+            destination_offsets,
     ):
         source_ptr = state.builder.ptr_add(
             buffer_base,
@@ -2111,14 +2000,12 @@ def _emit_buffer_load_to_local_dma(
                 state.builder.constant(state.dsl.i32(), destination_base_offset),
                 result_type=dest_ptr_type,
             )
-        component_tokens.append(
-            state.builder.dma_load_lds(
-                source_ptr,
-                dest_ptr,
-                after=dependency,
-                bytes=packet_bytes,
-            )
-        )
+        component_tokens.append(state.builder.dma_load_lds(
+            source_ptr,
+            dest_ptr,
+            after=dependency,
+            bytes=packet_bytes,
+        ))
     return _join_memory_tokens(state, component_tokens)
 
 
@@ -2174,18 +2061,14 @@ def _emit_local_load_mma_payload(state, op):
     wave_tile_axis = attrs.get("wave_tile_axis", "none")
     wave_tile_stride_dwords = int(attrs.get("wave_tile_stride_dwords", 0))
     load_mode = attrs.get("load_mode", "mma_payload_load")
-    offset_attr = (
-        "component_dword_offsets"
-        if load_mode == "mma_payload_load"
-        else "component_tile_offsets"
-    )
+    offset_attr = ("component_dword_offsets" if load_mode == "mma_payload_load" else "component_tile_offsets")
     if len(attrs[offset_attr]) != expected_components:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
             "local_load_mma_payload component offsets do not match attrs",
             target_op_id=op.target_op_id,
-    )
+        )
     wi = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
     if load_mode == "b16_transpose":
         state.values[_single_result(op)] = _emit_b16_transpose_mma_payload_load(
@@ -2281,20 +2164,10 @@ def _emit_b16_transpose_mma_payload_load(
         components = []
         component_deltas = None
         if chunk_element_deltas is not None:
-            component_deltas = tuple(
-                int(value) for value in chunk_element_deltas[component_index]
-            )
+            component_deltas = tuple(int(value) for value in chunk_element_deltas[component_index])
         for chunk in range(int(attrs["chunks_per_component"])):
-            logical_extra_elements = (
-                0
-                if component_deltas is not None
-                else int(attrs["chunk_elements"]) * chunk
-            )
-            physical_extra_elements = (
-                int(component_deltas[chunk])
-                if component_deltas is not None
-                else 0
-            )
+            logical_extra_elements = (0 if component_deltas is not None else int(attrs["chunk_elements"]) * chunk)
+            physical_extra_elements = (int(component_deltas[chunk]) if component_deltas is not None else 0)
             offset = _local_fragment_element_offset(
                 state,
                 attrs,
@@ -2304,9 +2177,7 @@ def _emit_b16_transpose_mma_payload_load(
                 lane_width,
                 elements_per_lane=int(attrs["elements_per_lane"]),
                 wave_tile_axis=attrs.get("wave_tile_axis", "none"),
-                warps_per_cta=tuple(
-                    int(value) for value in attrs.get("warps_per_cta", (1, 1))
-                ),
+                warps_per_cta=tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1))),
                 wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
                 op=op,
                 physical_extra_elements=physical_extra_elements,
@@ -2314,13 +2185,11 @@ def _emit_b16_transpose_mma_payload_load(
             ptr = state.builder.ptr_add(base, offset, result_type=ptr_type)
             loaded, _token = state.builder.transpose_load(ptr, load_type)
             for component in range(int(attrs["chunk_elements"])):
-                components.append(
-                    state.dsl.wave.ExtractOp(
-                        component_type,
-                        loaded,
-                        int(component),
-                    ).result
-                )
+                components.append(state.dsl.wave.ExtractOp(
+                    component_type,
+                    loaded,
+                    int(component),
+                ).result)
         packed_type = state.dsl.simd_type(
             state.dsl.vector_type(len(components), element_type),
             width=lane_width,
@@ -2361,9 +2230,7 @@ def _emit_swizzled_mma_payload_load(
             lane_width,
             elements_per_lane=int(attrs["elements_per_lane"]),
             wave_tile_axis=attrs.get("wave_tile_axis", "none"),
-            warps_per_cta=tuple(
-                int(value) for value in attrs.get("warps_per_cta", (1, 1))
-            ),
+            warps_per_cta=tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1))),
             wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
             op=op,
         )
@@ -2407,14 +2274,9 @@ def _local_fragment_element_offset(
         )
     lane_layout = attrs.get("mma_access_lane_layout", "row_major_linear")
     source_shape = tuple(int(dim) for dim in attrs["source_shape"])
-    memdesc_shape = tuple(
-        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
-    )
-    if (
-        lane_layout == "row_major_linear"
-        and plan in {"dense_row_major", "swizzled_xor"}
-        and source_shape == memdesc_shape
-    ):
+    memdesc_shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
+    if (lane_layout == "row_major_linear" and plan in {"dense_row_major", "swizzled_xor"}
+            and source_shape == memdesc_shape):
         tile_base = _dense_tile_base_elements(
             memdesc_shape,
             tile_offsets,
@@ -2482,9 +2344,7 @@ def _local_fragment_logical_offset_expr(
     wi_sym = state.dsl.sym("wi")
     lane = state.dsl.mod(wi_sym, int(lane_width))
     source_shape = tuple(int(dim) for dim in attrs["source_shape"])
-    memdesc_shape = tuple(
-        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
-    )
+    memdesc_shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
     lane_layout = attrs.get("mma_access_lane_layout", "row_major_linear")
     source_coords = _local_fragment_source_coords_expr(
         state,
@@ -2495,9 +2355,7 @@ def _local_fragment_logical_offset_expr(
         lane_layout,
         op,
     )
-    coords = tuple(
-        int(tile_offsets[dim]) + source_coords[dim] for dim in range(len(source_shape))
-    )
+    coords = tuple(int(tile_offsets[dim]) + source_coords[dim] for dim in range(len(source_shape)))
     logical = _linearize_local_fragment_coords(memdesc_shape, coords)
     wave_tile = _wave_tile_offset_expr(
         state,
@@ -2576,11 +2434,7 @@ def _local_fragment_source_coords_expr(
         k_group = state.dsl.floor(lane / non_k_dim)
         chunk_k = (int(extra_elements) // 4) * 4
         packet_col = int(extra_elements) % 4
-        row = (
-            k_group * int(elements_per_lane)
-            + chunk_k
-            + state.dsl.floor(lane_in_group / 4)
-        )
+        row = (k_group * int(elements_per_lane) + chunk_k + state.dsl.floor(lane_in_group / 4))
         col = non_k_group * 16 + 4 * state.dsl.mod(lane_in_group, 4) + packet_col
         return (row, col)
     fail(
@@ -2595,7 +2449,7 @@ def _delinearize_local_fragment_expr(state, linear, shape):
     coords = []
     remainder = linear
     for dim, extent in enumerate(shape):
-        stride = _product(shape[dim + 1 :])
+        stride = _product(shape[dim + 1:])
         if stride == 1:
             coord = state.dsl.mod(remainder, int(extent))
         else:
@@ -2713,9 +2567,7 @@ def _wave_tile_offset_expr(
 
 
 def _swizzled_element_offset_expr(state, attrs, logical, op):
-    shape = tuple(
-        int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"])
-    )
+    shape = tuple(int(dim) for dim in attrs.get("memdesc_shape", attrs["source_shape"]))
     order = _physical_order_from_attrs(
         attrs,
         "shared_physical_order",
@@ -2737,9 +2589,7 @@ def _swizzled_element_offset_expr(state, attrs, logical, op):
     major = coords[major_dim]
     minor = coords[minor_dim]
     vec = int(attrs["shared_physical_swizzled_vec"])
-    row_phase = state.dsl.floor(
-        major / int(attrs["shared_physical_swizzled_per_phase"])
-    )
+    row_phase = state.dsl.floor(major / int(attrs["shared_physical_swizzled_per_phase"]))
     phase = state.dsl.mod(
         row_phase,
         int(attrs["shared_physical_swizzled_max_phase"]),
@@ -2763,8 +2613,8 @@ def _padded_element_offset_expr(state, attrs, logical, op):
     )
     encoded = physical
     for interval, padding in zip(
-        attrs.get("shared_physical_intervals", ()),
-        attrs.get("shared_physical_paddings", ()),
+            attrs.get("shared_physical_intervals", ()),
+            attrs.get("shared_physical_paddings", ()),
     ):
         encoded += state.dsl.floor(physical / int(interval)) * int(padding)
     return encoded
@@ -2786,10 +2636,10 @@ def _linear_component_offset_from_simd_coords(
         int(lane_width),
     )
     for bit, dim, value in _iter_linear_component_basis_bits(
-        bases,
-        len(tuple(coords)),
-        op,
-        diagnostic,
+            bases,
+            len(tuple(coords)),
+            op,
+            diagnostic,
     ):
         bit_value = _simd_binary_const(
             state,
@@ -2828,10 +2678,10 @@ def _linear_component_offset_from_expr_coords(
     bases = _physical_linear_component_bases(attrs, prefix, op, diagnostic)
     result = 0
     for bit, dim, value in _iter_linear_component_basis_bits(
-        bases,
-        len(tuple(coords)),
-        op,
-        diagnostic,
+            bases,
+            len(tuple(coords)),
+            op,
+            diagnostic,
     ):
         bit_value = state.dsl.mod(
             state.dsl.floor(coords[int(dim)] / int(value)),
@@ -2845,10 +2695,7 @@ def _linear_component_offset_from_expr_coords(
 
 def _physical_linear_component_bases(attrs, prefix, op, diagnostic):
     key = f"{prefix}_physical_linear_component_bases"
-    bases = tuple(
-        tuple(int(value) for value in basis)
-        for basis in attrs.get(key, ())
-    )
+    bases = tuple(tuple(int(value) for value in basis) for basis in attrs.get(key, ()))
     if not bases:
         fail(
             diagnostic,
@@ -2956,9 +2803,7 @@ def _emit_mma_zero_accumulator(state, op):
         payload_type,
         tuple(scalar_zero for _ in range(registers)),
     ).result
-    state.values[_single_result(op)] = _pack_components(
-        tuple(payload for _ in range(int(attrs["component_count"])))
-    )
+    state.values[_single_result(op)] = _pack_components(tuple(payload for _ in range(int(attrs["component_count"]))))
 
 
 def _emit_mma(state, op):
@@ -2998,9 +2843,7 @@ def _emit_mma(state, op):
             columns=int(attrs["lhs_columns"]),
             lane_width=lane_width,
             registers=int(attrs["lhs_registers"]),
-        )
-        for component in lhs_components
-    )
+        ) for component in lhs_components)
     rhs_components = tuple(
         _ensure_mma_fragment(
             state,
@@ -3011,9 +2854,7 @@ def _emit_mma(state, op):
             columns=int(attrs["rhs_columns"]),
             lane_width=lane_width,
             registers=int(attrs["rhs_registers"]),
-        )
-        for component in rhs_components
-    )
+        ) for component in rhs_components)
     acc_components = tuple(
         _ensure_mma_fragment(
             state,
@@ -3024,9 +2865,7 @@ def _emit_mma(state, op):
             columns=int(attrs["acc_columns"]),
             lane_width=lane_width,
             registers=int(attrs["acc_registers"]),
-        )
-        for component in acc_components
-    )
+        ) for component in acc_components)
     acc_payload_type = state.dsl.simd_type(
         state.dsl.vector_type(
             int(attrs["acc_registers"]),
@@ -3085,13 +2924,9 @@ def _ensure_mma_fragment(
         current = state.dsl.FragmentType(value.type)
         if value.type == fragment_type:
             return value
-        if (
-            int(current.wave_size) != int(lane_width)
-            or int(current.registers) != int(registers)
-            or int(current.rows) != int(rows)
-            or int(current.columns) != int(columns)
-            or str(current.element_type) != str(_scalar_type(state.dsl, element_type))
-        ):
+        if (int(current.wave_size) != int(lane_width) or int(current.registers) != int(registers)
+                or int(current.rows) != int(rows) or int(current.columns) != int(columns)
+                or str(current.element_type) != str(_scalar_type(state.dsl, element_type))):
             fail(
                 "TLXW_EMIT_FRAGMENT_TYPE",
                 STAGE,
@@ -3110,7 +2945,7 @@ def _ensure_mma_fragment(
 
 def _emit_fragment_truncf(state, op):
     attrs = target_ir.attrs_dict(op)
-    (fragment_value,) = _operand_values(state, op, 1)
+    (fragment_value, ) = _operand_values(state, op, 1)
     fragments = _as_components(fragment_value)
     component_count = int(attrs["component_count"])
     if len(fragments) != component_count:
@@ -3142,7 +2977,7 @@ def _emit_fragment_truncf(state, op):
 
 def _emit_layout_convert(state, op):
     attrs = target_ir.attrs_dict(op)
-    (value,) = _operand_values(state, op, 1)
+    (value, ) = _operand_values(state, op, 1)
     components = _as_components(value)
     mode = attrs["mode"]
     if mode == "alias":
@@ -3154,9 +2989,7 @@ def _emit_layout_convert(state, op):
         lane_width = int(target_type.lane_width or 64)
         result_count = int(attrs["result_component_count"])
         source_indices = tuple(int(index) for index in attrs["source_indices"])
-        source_element_indices = tuple(
-            int(index) for index in attrs["source_element_indices"]
-        )
+        source_element_indices = tuple(int(index) for index in attrs["source_element_indices"])
         registers_per_component = int(attrs["source_registers_per_component"])
         source_component_count = int(attrs["source_component_count"])
         if len(source_indices) != result_count or len(source_element_indices) != result_count:
@@ -3182,11 +3015,7 @@ def _emit_layout_convert(state, op):
                 "layout_convert remap source component count does not match attrs",
                 target_op_id=op.target_op_id,
             )
-        element_type = (
-            state.dsl.i32()
-            if mask_exchange
-            else _scalar_type(state.dsl, target_type.element_type)
-        )
+        element_type = (state.dsl.i32() if mask_exchange else _scalar_type(state.dsl, target_type.element_type))
         if target_type.representation in {"fragment", "fragment_tuple"} or mask_exchange:
             result_type = state.dsl.simd_type(element_type, lane_width)
         else:
@@ -3241,12 +3070,10 @@ def _emit_layout_convert(state, op):
             return _shuffle_component(state, component, source_lane, op)
 
         remapped = tuple(
-            remapped_component(component_index, element_index)
-            for component_index, element_index in zip(
+            remapped_component(component_index, element_index) for component_index, element_index in zip(
                 source_indices,
                 source_element_indices,
-            )
-        )
+            ))
         if mask_exchange:
             state.values[result_id] = _I32MaskPayload(remapped)
         else:
@@ -3265,9 +3092,7 @@ def _emit_layout_convert(state, op):
                 "match attrs",
                 target_op_id=op.target_op_id,
             )
-        lane_width = int(
-            state.target_program.values[_single_result(op)].type.lane_width or 64
-        )
+        lane_width = int(state.target_program.values[_single_result(op)].type.lane_width or 64)
         element_type = _scalar_type(state.dsl, attrs["element_type"])
         cta_thread_count = int(attrs["cta_thread_count"])
         if cta_thread_count % lane_width:
@@ -3297,10 +3122,7 @@ def _emit_layout_convert(state, op):
         workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
         source_store_bases = tuple(attrs["source_store_bases"])
         source_store_coefficients = tuple(attrs["source_store_coefficients"])
-        if (
-            len(source_store_bases) != len(components)
-            or len(source_store_coefficients) != len(components)
-        ):
+        if (len(source_store_bases) != len(components) or len(source_store_coefficients) != len(components)):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
@@ -3310,9 +3132,8 @@ def _emit_layout_convert(state, op):
             )
         group_dependency = state.scratch_token
         store_tokens = []
-        for source_component, (store_base, coefficients) in enumerate(
-            zip(source_store_bases, source_store_coefficients)
-        ):
+        for source_component, (store_base, coefficients) in enumerate(zip(source_store_bases,
+                                                                          source_store_coefficients)):
             store_offset = _bit_affine_thread_offset(
                 state,
                 workitem,
@@ -3325,13 +3146,11 @@ def _emit_layout_convert(state, op):
                 store_offset,
                 result_type=ptr_type,
             )
-            store_tokens.append(
-                state.builder.store(
-                    components[source_component],
-                    ptr,
-                    after=group_dependency,
-                )
-            )
+            store_tokens.append(state.builder.store(
+                components[source_component],
+                ptr,
+                after=group_dependency,
+            ))
         barrier_token = state.builder.barrier(*store_tokens)
         element_count = int(attrs["elements_per_lane"])
         load_tokens = []
@@ -3345,10 +3164,7 @@ def _emit_layout_convert(state, op):
             )
         vector_load_bases = tuple(attrs["payload_vector_load_bases"])
         vector_load_coefficients = tuple(attrs["payload_vector_load_coefficients"])
-        if (
-            len(vector_load_bases) != result_count
-            or len(vector_load_coefficients) != result_count
-        ):
+        if (len(vector_load_bases) != result_count or len(vector_load_coefficients) != result_count):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
@@ -3361,8 +3177,8 @@ def _emit_layout_convert(state, op):
             width=lane_width,
         )
         for load_base, coefficients in zip(
-            vector_load_bases,
-            vector_load_coefficients,
+                vector_load_bases,
+                vector_load_coefficients,
         ):
             load_offset = _bit_affine_thread_offset(
                 state,
@@ -3391,11 +3207,7 @@ def _emit_layout_convert(state, op):
         result_id = _single_result(op)
         target_type = state.target_program.values[result_id].type
         mask_exchange = target_type.representation in {"mask", "mask_tuple"}
-        element_type = (
-            state.dsl.i32()
-            if mask_exchange
-            else _scalar_type(state.dsl, target_type.element_type)
-        )
+        element_type = (state.dsl.i32() if mask_exchange else _scalar_type(state.dsl, target_type.element_type))
         result_components = _emit_cta_exchange_scalar_components(
             state,
             op,
@@ -3435,11 +3247,7 @@ def _emit_mfma_vector_register_remap(state, op, attrs, value):
         )
     lane_width = int(target_type.lane_width or 64)
     mask_exchange = target_type.representation in {"mask", "mask_tuple"}
-    element_type = (
-        state.dsl.i32()
-        if mask_exchange
-        else _scalar_type(state.dsl, target_type.element_type)
-    )
+    element_type = (state.dsl.i32() if mask_exchange else _scalar_type(state.dsl, target_type.element_type))
     scalar_mode = attrs.get("scalar_mode")
     if scalar_mode in {"same_lane_register_remap", "cross_lane_register_remap"}:
         scalar_components = _emit_simple_scalar_remap_components(
@@ -3480,9 +3288,8 @@ def _emit_mfma_vector_register_remap(state, op, attrs, value):
         packed_components.append(
             state.dsl.wave.PackOp(
                 packed_type,
-                scalar_components[start : start + vector_length],
-            ).result
-        )
+                scalar_components[start:start + vector_length],
+            ).result)
     if mask_exchange:
         state.values[result_id] = _I32MaskPayload(tuple(packed_components))
     else:
@@ -3521,12 +3328,8 @@ def _emit_simple_scalar_remap_components(
                 target_op_id=op.target_op_id,
             )
     source_indices = tuple(int(index) for index in attrs["scalar_source_indices"])
-    source_element_indices = tuple(
-        int(index) for index in attrs["scalar_source_element_indices"]
-    )
-    if len(source_indices) != int(result_count) or len(source_element_indices) != int(
-        result_count
-    ):
+    source_element_indices = tuple(int(index) for index in attrs["scalar_source_element_indices"])
+    if len(source_indices) != int(result_count) or len(source_element_indices) != int(result_count):
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
@@ -3709,15 +3512,13 @@ def _emit_cta_exchange_scalar_components(
                 source_slot // registers_per_component,
                 source_slot % registers_per_component,
             )
-            store_tokens.append(
-                state.builder.store(source_value, ptr, after=group_dependency)
-            )
+            store_tokens.append(state.builder.store(source_value, ptr, after=group_dependency))
         barrier_token = state.builder.barrier(*store_tokens)
         load_tokens = []
         for result_index, load_base, coefficients in zip(
-            result_indices,
-            load_bases,
-            load_coefficients,
+                result_indices,
+                load_bases,
+                load_coefficients,
         ):
             load_offset = _bit_affine_thread_offset(
                 state,
@@ -3740,9 +3541,7 @@ def _emit_cta_exchange_scalar_components(
             load_tokens.append(load_token)
         group_dependency = state.builder.barrier(*load_tokens)
     state.scratch_token = group_dependency
-    missing = [
-        index for index, component in enumerate(result_components) if component is None
-    ]
+    missing = [index for index, component in enumerate(result_components) if component is None]
     if missing:
         fail(
             "TLXW_EMIT_LAYOUT_REMAP",
@@ -3829,11 +3628,7 @@ def _bit_affine_thread_offset(state, workitem, base, coefficients, lane_width):
 
 
 def _packed_bit_affine_coefficients(coefficients):
-    nonzero = [
-        (bit, int(coefficient))
-        for bit, coefficient in enumerate(coefficients)
-        if int(coefficient)
-    ]
+    nonzero = [(bit, int(coefficient)) for bit, coefficient in enumerate(coefficients) if int(coefficient)]
     if not nonzero:
         return 0, 1, 0
     first_bit, first_coefficient = nonzero[0]
@@ -3929,13 +3724,13 @@ def _require_shuffle_simd(state, component, op):
         )
     element_type = str(simd.element_type)
     if element_type.startswith("vector<") or element_type not in {
-        "i8",
-        "i16",
-        "i32",
-        "index",
-        "f16",
-        "bf16",
-        "f32",
+            "i8",
+            "i16",
+            "i32",
+            "index",
+            "f16",
+            "bf16",
+            "f32",
     }:
         fail(
             "TLXW_EMIT_LAYOUT_REMAP",
@@ -3959,17 +3754,13 @@ def _emit_buffer_store(state, op):
     value_components = _as_components(value)
     offset_components = _as_components(offsets)
     mask_payload = masks if isinstance(masks, _I32MaskPayload) else None
-    mask_components = (
-        None
-        if masks is None or mask_payload is not None
-        else _as_mask_predicate_components(
-            state,
-            masks,
-            int(attrs["component_count"]),
-            int(attrs["lane_width"]),
-            op,
-        )
-    )
+    mask_components = (None if masks is None or mask_payload is not None else _as_mask_predicate_components(
+        state,
+        masks,
+        int(attrs["component_count"]),
+        int(attrs["lane_width"]),
+        op,
+    ))
     component_count = int(attrs["component_count"])
     if len(value_components) != component_count or len(offset_components) != component_count:
         fail(
@@ -4015,12 +3806,8 @@ def _emit_buffer_store(state, op):
         op,
     )
     zero_mask_payload = None
-    for index, (value_component, offset_component) in enumerate(
-        zip(value_components, offset_components)
-    ):
-        affine_offset_component = (
-            None if affine_offset_components is None else affine_offset_components[index]
-        )
+    for index, (value_component, offset_component) in enumerate(zip(value_components, offset_components)):
+        affine_offset_component = (None if affine_offset_components is None else affine_offset_components[index])
         mask_payload_component = None
         direct_mask_component = None
         if mask_payload is not None:
@@ -4033,11 +3820,7 @@ def _emit_buffer_store(state, op):
         if value_vector is not None and offset_vector is not None:
             value_length, value_element_type, value_width = value_vector
             offset_length, offset_element_type, offset_width = offset_vector
-            if (
-                value_length != offset_length
-                or value_width != lane_width
-                or offset_width != lane_width
-            ):
+            if (value_length != offset_length or value_width != lane_width or offset_width != lane_width):
                 fail(
                     "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
                     STAGE,
@@ -4045,15 +3828,10 @@ def _emit_buffer_store(state, op):
                     "matching shapes",
                     target_op_id=op.target_op_id,
                 )
-            mask_payload_vector = (
-                None
-                if mask_payload_component is None
-                else _simd_1d_vector_payload(state, mask_payload_component)
-            )
-            if mask_payload_vector is not None and (
-                mask_payload_vector[0] != value_length
-                or mask_payload_vector[2] != lane_width
-            ):
+            mask_payload_vector = (None if mask_payload_component is None else _simd_1d_vector_payload(
+                state, mask_payload_component))
+            if mask_payload_vector is not None and (mask_payload_vector[0] != value_length
+                                                    or mask_payload_vector[2] != lane_width):
                 fail(
                     "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
                     STAGE,
@@ -4090,15 +3868,11 @@ def _emit_buffer_store(state, op):
                 ).result
                 scalar_mask = direct_mask_component
                 if mask_payload_component is not None:
-                    scalar_mask_payload = (
-                        state.dsl.wave.ExtractOp(
-                            mask_payload_scalar_type,
-                            mask_payload_component,
-                            int(element_index),
-                        ).result
-                        if mask_payload_vector is not None
-                        else mask_payload_component
-                    )
+                    scalar_mask_payload = (state.dsl.wave.ExtractOp(
+                        mask_payload_scalar_type,
+                        mask_payload_component,
+                        int(element_index),
+                    ).result if mask_payload_vector is not None else mask_payload_component)
                     if zero_mask_payload is None:
                         zero_mask_payload = _simd_i32_constant(state, lane_width, 0)
                     scalar_mask = _cmpi(
@@ -4181,13 +3955,11 @@ def _buffer_store_affine_offset_components(
         )
     shape = tuple(int(value) for value in attrs["offset_shape"])
     component_bases = tuple(
-        tuple(int(value) for value in bases)
-        for bases in attrs["offset_component_coordinate_bases"]
-    )
+        tuple(int(value) for value in bases) for bases in attrs["offset_component_coordinate_bases"])
     workitem_coefficients = tuple(
-        tuple(int(value) for value in coefficients)
-        for coefficients in attrs["offset_workitem_coordinate_coefficients"]
-    )
+        tuple(int(value)
+              for value in coefficients)
+        for coefficients in attrs["offset_workitem_coordinate_coefficients"])
     if len(component_bases) != int(component_count):
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
@@ -4219,9 +3991,7 @@ def _buffer_store_affine_offset_components(
                 int(base),
                 tuple(coefficients[dim] for coefficients in workitem_coefficients),
                 lane_width,
-            )
-            for dim, base in enumerate(component_base)
-        )
+            ) for dim, base in enumerate(component_base))
         components.append(
             _affine_offset_value(
                 state,
@@ -4230,8 +4000,7 @@ def _buffer_store_affine_offset_components(
                 scalar_values,
                 op,
                 no_signed_wrap=bool(attrs.get("offset_no_signed_wrap", False)),
-            )
-        )
+            ))
     return tuple(components)
 
 
@@ -4331,17 +4100,13 @@ def _emit_buffer_load(state, op):
         operand_index += 1
     other = operands[operand_index] if attrs["has_other"] else None
     offset_components = _as_components(offsets)
-    mask_components = (
-        None
-        if masks is None
-        else _as_mask_predicate_components(
-            state,
-            masks,
-            int(attrs["component_count"]),
-            int(attrs["lane_width"]),
-            op,
-        )
-    )
+    mask_components = (None if masks is None else _as_mask_predicate_components(
+        state,
+        masks,
+        int(attrs["component_count"]),
+        int(attrs["lane_width"]),
+        op,
+    ))
     other_components = None if other is None else _as_components(other)
     component_count = int(attrs["component_count"])
     if len(offset_components) != component_count:
@@ -4393,11 +4158,11 @@ def _emit_buffer_load(state, op):
     index = 0
     while index < component_count:
         if _can_vectorize_buffer_load_packet(
-            index,
-            packet_elements,
-            component_count,
-            mask_components,
-            other_components,
+                index,
+                packet_elements,
+                component_count,
+                mask_components,
+                other_components,
         ):
             loaded_components.extend(
                 _emit_buffer_load_vector_packet(
@@ -4413,8 +4178,7 @@ def _emit_buffer_load(state, op):
                     element_type,
                     result_type,
                     lane_width,
-                )
-            )
+                ))
             index += packet_elements
             continue
         loaded_components.append(
@@ -4430,8 +4194,7 @@ def _emit_buffer_load(state, op):
                 other_components,
                 result_type,
                 mask_mode,
-            )
-        )
+            ))
         index += 1
     state.values[result_id] = _pack_components(tuple(loaded_components))
 
@@ -4445,11 +4208,8 @@ def _buffer_load_packet_elements(attrs):
     packet_elements = min(access_elements, max_elements)
     while packet_elements > 1:
         payload_bits = packet_elements * element_byte_width * 8
-        if (
-            access_elements % packet_elements == 0
-            and payload_bits <= 128
-            and (payload_bits == 16 or payload_bits % 32 == 0)
-        ):
+        if (access_elements % packet_elements == 0 and payload_bits <= 128
+                and (payload_bits == 16 or payload_bits % 32 == 0)):
             return packet_elements
         packet_elements -= 1
     return 1
@@ -4473,10 +4233,7 @@ def _can_vectorize_buffer_load_packet(
     if mask_components is None:
         return True
     packet_mask = mask_components[int(index)]
-    return all(
-        mask_components[int(index) + element] is packet_mask
-        for element in range(int(packet_elements))
-    )
+    return all(mask_components[int(index) + element] is packet_mask for element in range(int(packet_elements)))
 
 
 def _emit_buffer_load_scalar_component(
@@ -4532,19 +4289,13 @@ def _emit_buffer_load_scalar_component(
 
     other_component = None
     if other_components is not None:
-        other_component = (
-            other_components[0]
-            if len(other_components) == 1
-            else other_components[int(index)]
-        )
+        other_component = (other_components[0] if len(other_components) == 1 else other_components[int(index)])
     if _is_scalar_i1_value(state, mask_components[int(index)]):
         return _emit_masked_value_region(
             state,
             mask_components[int(index)],
             result_type,
-            other_component
-            if other_component is not None
-            else _zero_simd_value(
+            other_component if other_component is not None else _zero_simd_value(
                 state,
                 result_type,
                 attrs["element_type"],
@@ -4553,7 +4304,7 @@ def _emit_buffer_load_scalar_component(
             emit_active_load,
         )
     with state.builder.where(
-        mask_components[int(index)],
+            mask_components[int(index)],
         [result_type],
     ) as where:
         loaded = emit_active_load()
@@ -4632,9 +4383,7 @@ def _emit_buffer_load_vector_packet(
             component_type,
             loaded,
             element,
-        ).result
-        for element in range(packet_elements)
-    )
+        ).result for element in range(packet_elements))
 
 
 def _zero_vector_simd_value(
@@ -4670,9 +4419,7 @@ def _emit_store(state, op):
             int(attrs["lane_width"]),
             op,
             splat_cache,
-        )
-        for value_component in value_components
-    )
+        ) for value_component in value_components)
     mask_components = None
     if masks is not None:
         mask_components = _as_mask_predicate_components(
@@ -4690,9 +4437,7 @@ def _emit_store(state, op):
             target_op_id=op.target_op_id,
         )
     mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
-    for index, (ptr_component, value_component) in enumerate(
-        zip(ptr_components, value_components)
-    ):
+    for index, (ptr_component, value_component) in enumerate(zip(ptr_components, value_components)):
         if mask_components is None:
             state.builder.store(value_component, ptr_component)
             continue
@@ -4747,9 +4492,7 @@ def _emit_load(state, op):
                 int(attrs["lane_width"]),
                 op,
                 splat_cache,
-            )
-            for other_component in other_components
-        )
+            ) for other_component in other_components)
     if len(ptr_components) != component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
@@ -4779,21 +4522,18 @@ def _emit_load(state, op):
                     f"unsupported load mask mode {mask_mode}",
                     target_op_id=op.target_op_id,
                 )
+
             def emit_active_load(ptr_component=ptr_component):
                 loaded, _token = state.builder.load(ptr_component, result_type)
                 return loaded
 
-            other_component = (
-                None if other_components is None else other_components[index]
-            )
+            other_component = (None if other_components is None else other_components[index])
             if _is_scalar_i1_value(state, mask_components[index]):
                 loaded = _emit_masked_value_region(
                     state,
                     mask_components[index],
                     result_type,
-                    other_component
-                    if other_component is not None
-                    else _zero_simd_value(
+                    other_component if other_component is not None else _zero_simd_value(
                         state,
                         result_type,
                         attrs["element_type"],
@@ -4803,15 +4543,15 @@ def _emit_load(state, op):
                 )
             else:
                 with state.builder.where(
-                    mask_components[index],
+                        mask_components[index],
                     [result_type],
                 ) as where:
                     loaded = emit_active_load()
                     state.builder.yield_([loaded])
                 loaded = where.results[0]
             if other_component is not None and not _is_scalar_i1_value(
-                state,
-                mask_components[index],
+                    state,
+                    mask_components[index],
             ):
                 loaded = state.builder.select(
                     mask_components[index],
@@ -4835,7 +4575,7 @@ def _memory_simd_component(state, value, element_type, lane_width, op, splat_cac
         )
     return _reuse_component_result(
         splat_cache,
-        (value,),
+        (value, ),
         lambda: state.builder.splat(value, scalar_type, int(lane_width)),
     )
 
@@ -4962,10 +4702,8 @@ def _wave_mask_constant(state, result_type, value):
 def _reuse_component_result(reused, operands, create):
     operands = tuple(operands)
     for existing_operands, value in reused:
-        if len(existing_operands) == len(operands) and all(
-            existing is operand
-            for existing, operand in zip(existing_operands, operands)
-        ):
+        if len(existing_operands) == len(operands) and all(existing is operand
+                                                           for existing, operand in zip(existing_operands, operands)):
             return value
     value = create()
     reused.append((operands, value))
@@ -5102,9 +4840,7 @@ def _affine_offset_value(
     no_signed_wrap=False,
 ):
     lane_width = int(state.dsl.SimdType(coords[0].type).width) if coords else 64
-    scalar_components = tuple(
-        _splat_i32_scalar(state, value, lane_width, op) for value in scalar_values
-    )
+    scalar_components = tuple(_splat_i32_scalar(state, value, lane_width, op) for value in scalar_values)
     result = state.builder.splat(
         state.builder.constant(state.dsl.i32(), 0),
         state.dsl.i32(),
@@ -5189,8 +4925,8 @@ def _affine_term_i32(
                 "scalar_product affine term requires two scalar operands",
                 target_op_id=op.target_op_id,
             )
-        lhs = scalar_components[_require_scalar_slot((slots[0],), scalar_components, op)]
-        rhs = scalar_components[_require_scalar_slot((slots[1],), scalar_components, op)]
+        lhs = scalar_components[_require_scalar_slot((slots[0], ), scalar_components, op)]
+        rhs = scalar_components[_require_scalar_slot((slots[1], ), scalar_components, op)]
         product = state.builder.binary(
             state.dsl.BinaryKind.MulI,
             lhs,
@@ -5297,9 +5033,7 @@ def _target_lds_size(target_program):
         if op.kind == "local_alloc":
             end = int(attrs.get("byte_offset", 0)) + int(attrs.get("allocation_bytes", 0))
         elif op.kind == "layout_convert" and "scratch_allocation_bytes" in attrs:
-            end = int(attrs.get("scratch_byte_offset", 0)) + int(
-                attrs.get("scratch_allocation_bytes", 0)
-            )
+            end = int(attrs.get("scratch_byte_offset", 0)) + int(attrs.get("scratch_allocation_bytes", 0))
         else:
             continue
         size = max(size, end)
@@ -5381,7 +5115,7 @@ def _component_count(state, target_value_id):
 
 
 def _as_components(value):
-    return value if isinstance(value, tuple) else (value,)
+    return value if isinstance(value, tuple) else (value, )
 
 
 def _pack_components(components):
@@ -5392,19 +5126,13 @@ def _as_mask_payload_components(state, value, count, lane_width, op):
     if isinstance(value, _I32MaskPayload):
         components = value.components
     else:
-        components = tuple(
-            _mask_to_i32_payload(state, component, lane_width)
-            for component in _as_components(value)
-        )
+        components = tuple(_mask_to_i32_payload(state, component, lane_width) for component in _as_components(value))
     return _broadcast_component_count(components, count, "mask payload", op)
 
 
 def _as_mask_predicate_components(state, value, count, lane_width, op):
     if isinstance(value, _I32MaskPayload):
-        components = tuple(
-            _i32_payload_to_mask(state, component, lane_width)
-            for component in value.components
-        )
+        components = tuple(_i32_payload_to_mask(state, component, lane_width) for component in value.components)
     else:
         components = _as_components(value)
     return _broadcast_component_count(components, count, "mask", op)
@@ -5606,9 +5334,7 @@ def _set_module_attrs(module_builder, dsl, ir, kernel):
     )
     if kernel.target:
         attrs["tlx_wave.source_target"] = ir.StringAttr.get(kernel.target)
-        attrs["waveamdmachine.target"] = ir.StringAttr.get(
-            kernel.target.replace("hip:", "amdgcn-amd-amdhsa--")
-        )
+        attrs["waveamdmachine.target"] = ir.StringAttr.get(kernel.target.replace("hip:", "amdgcn-amd-amdhsa--"))
 
 
 def _kernel_num_warps(kernel):
@@ -5636,9 +5362,7 @@ def _function_attrs(dsl, ir, kernel):
             dsl.i32(),
             _kernel_threads_per_warp(kernel),
         ),
-        "tlx_wave.ttgir.noinline": ir.Attribute.parse(
-            "true" if kernel.noinline else "false"
-        ),
+        "tlx_wave.ttgir.noinline": ir.Attribute.parse("true" if kernel.noinline else "false"),
         "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
         # gfx9/gfx950 exposes four SIMD execution units per CU. Model the
         # requested CTA waves as the resident wave target per SIMD.
@@ -5648,14 +5372,7 @@ def _function_attrs(dsl, ir, kernel):
 
 def _load_wave_dsl():
     third_party = Path(__file__).resolve().parents[3]
-    wave_python = (
-        third_party
-        / "wave"
-        / "build"
-        / "wave-build"
-        / "python_packages"
-        / "wave_mlir"
-    )
+    wave_python = (third_party / "wave" / "build" / "wave-build" / "python_packages" / "wave_mlir")
     if not wave_python.exists():
         fail(
             "TLXW_EMIT_BINDINGS_UNAVAILABLE",

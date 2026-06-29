@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from .diagnostics import fail
 from . import layouts
 
-
 STAGE = "op_conversion"
 
 
@@ -25,11 +24,11 @@ def layout_coordinate_plan(
     source_value_id,
 ):
     if layout.kind not in {
-        "blocked",
-        "linear",
-        "generic_linear",
-        "slice",
-        "amd_mfma",
+            "blocked",
+            "linear",
+            "generic_linear",
+            "slice",
+            "amd_mfma",
     }:
         return None
     shape = tuple(int(dim) for dim in layout.shape)
@@ -73,9 +72,7 @@ def layout_coordinate_plan(
     warp_bits = warp_count.bit_length() - 1
     workitem_coefficients = _workitem_coefficients(linear, lane_bits, warp_bits)
     component_bases = tuple(
-        layouts.linear_layout_coords(linear, register, 0, warp=0)
-        for register in component_registers
-    )
+        layouts.linear_layout_coords(linear, register, 0, warp=0) for register in component_registers)
     _validate_physical_domain(
         linear,
         shape,
@@ -90,27 +87,19 @@ def layout_coordinate_plan(
     )
     return CoordinatePlan(
         shape=shape,
-        component_bases=tuple(
-            tuple(int(value) for value in bases) for bases in component_bases
-        ),
+        component_bases=tuple(tuple(int(value) for value in bases) for bases in component_bases),
         workitem_coefficients=tuple(
-            tuple(int(value) for value in coefficients)
-            for coefficients in workitem_coefficients
-        ),
+            tuple(int(value) for value in coefficients) for coefficients in workitem_coefficients),
     )
 
 
 def is_default_flat_make_range(plan, lane_width):
     if len(plan.shape) != 1:
         return False
-    if plan.workitem_coefficients != tuple(
-        (1 << bit,) for bit in range(int(lane_width).bit_length() - 1)
-    ):
+    if plan.workitem_coefficients != tuple((1 << bit, ) for bit in range(int(lane_width).bit_length() - 1)):
         return False
     return plan.component_bases == tuple(
-        (component * int(lane_width),)
-        for component in range(len(plan.component_bases))
-    )
+        (component * int(lane_width), ) for component in range(len(plan.component_bases)))
 
 
 def is_flat_affine_make_range(plan, lane_width, warp_count):
@@ -125,14 +114,10 @@ def is_flat_affine_make_range(plan, lane_width, warp_count):
         return None
     else:
         stride = int(plan.workitem_coefficients[0][0])
-    if plan.workitem_coefficients != tuple(
-        ((stride * (1 << bit)),) for bit in range(total_bits)
-    ):
+    if plan.workitem_coefficients != tuple(((stride * (1 << bit)), ) for bit in range(total_bits)):
         return None
     bases = tuple(int(base[0]) for base in plan.component_bases)
-    coefficients = tuple(
-        int(coefficient[0]) for coefficient in plan.workitem_coefficients
-    )
+    coefficients = tuple(int(coefficient[0]) for coefficient in plan.workitem_coefficients)
     if not _xor_masks_are_additive(bases, coefficients):
         return None
     if not bases:
@@ -144,9 +129,7 @@ def is_flat_bit_affine_make_range(plan):
     if len(plan.shape) != 1:
         return None
     bases = tuple(int(base[0]) for base in plan.component_bases)
-    coefficients = tuple(
-        int(coefficient[0]) for coefficient in plan.workitem_coefficients
-    )
+    coefficients = tuple(int(coefficient[0]) for coefficient in plan.workitem_coefficients)
     if not _xor_masks_are_additive(bases, coefficients):
         return None
     return bases, coefficients
@@ -166,10 +149,7 @@ def _workitem_coefficients(linear, lane_bits, warp_bits):
 
 
 def _logical_dim_bases(linear, in_dim):
-    return tuple(
-        _basis_in_logical_dim_order(linear, basis)
-        for basis in layouts.linear_layout_bases(linear, in_dim)
-    )
+    return tuple(_basis_in_logical_dim_order(linear, basis) for basis in layouts.linear_layout_bases(linear, in_dim))
 
 
 def _basis_in_logical_dim_order(linear, basis):

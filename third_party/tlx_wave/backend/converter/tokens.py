@@ -4,24 +4,19 @@ from dataclasses import dataclass
 
 from .diagnostics import fail
 
-
 STAGE = "tokens"
 
-_ASYNC_COPY_OPS = frozenset(
-    {"ttg.async_copy_global_to_local", "amdg.buffer_load_to_local"}
-)
+_ASYNC_COPY_OPS = frozenset({"ttg.async_copy_global_to_local", "amdg.buffer_load_to_local"})
 _TOKEN_CONTROL_OPS = frozenset({"ttg.async_commit_group", "ttg.async_wait"})
 _TOKEN_OPS = _ASYNC_COPY_OPS | _TOKEN_CONTROL_OPS
-_MEMORY_OPS = _ASYNC_COPY_OPS | frozenset(
-    {
-        "amdg.buffer_load",
-        "amdg.buffer_store",
-        "tt.load",
-        "tt.store",
-        "ttg.local_load",
-        "ttg.local_store",
-    }
-)
+_MEMORY_OPS = _ASYNC_COPY_OPS | frozenset({
+    "amdg.buffer_load",
+    "amdg.buffer_store",
+    "tt.load",
+    "tt.store",
+    "ttg.local_load",
+    "ttg.local_store",
+})
 
 
 @dataclass(frozen=True)
@@ -148,8 +143,7 @@ def build_token_program(source_program, type_layout_program):
                     token_node_id,
                     len(memory_effects),
                     dependency_frontier,
-                )
-            )
+                ))
 
     nodes = tuple(nodes)
     groups = tuple(groups)
@@ -158,21 +152,16 @@ def build_token_program(source_program, type_layout_program):
         groups,
         tuple(memory_effects),
         node_ids_by_value,
-        {value_id: tuple(node_ids) for value_id, node_ids in users_by_value.items()},
+        {value_id: tuple(node_ids)
+         for value_id, node_ids in users_by_value.items()},
         _loop_token_carries_by_op(source_program, nodes, groups),
     )
 
 
 def _loop_token_carries_by_op(source_program, nodes, groups):
     groups_by_id = {group.group_id: group for group in groups}
-    groups_by_value_id = {
-        group.token_value_id: group
-        for group in groups
-        if group.token_value_id is not None
-    }
-    nodes_by_value_id = {
-        node.value_id: node for node in nodes if node.value_id is not None
-    }
+    groups_by_value_id = {group.token_value_id: group for group in groups if group.token_value_id is not None}
+    nodes_by_value_id = {node.value_id: node for node in nodes if node.value_id is not None}
     carries_by_op = {}
     for op in source_program.ops:
         if op.name != "scf.for" or len(op.region_ids) != 1:
@@ -208,8 +197,7 @@ def _loop_token_carries_for_body(
         body_op_indices,
     )
     waited_external_tokens = _dedupe_preserving_order(
-        init_token_id for init_token_id, _issue_token_id in external_wait_issue_pairs
-    )
+        init_token_id for init_token_id, _issue_token_id in external_wait_issue_pairs)
     externally_waited_body_tokens = _externally_waited_body_tokens(
         nodes,
         groups_by_id,
@@ -220,10 +208,8 @@ def _loop_token_carries_for_body(
             init_token_id: issue_token_id
             for init_token_id, issue_token_id in external_wait_issue_pairs
         }
-        if (
-            len(externally_waited_body_tokens) != len(waited_external_tokens)
-            or len(issue_tokens_by_init) != len(waited_external_tokens)
-        ):
+        if (len(externally_waited_body_tokens) != len(waited_external_tokens)
+                or len(issue_tokens_by_init) != len(waited_external_tokens)):
             fail(
                 "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
                 STAGE,
@@ -242,29 +228,21 @@ def _loop_token_carries_for_body(
                     nodes_by_value_id,
                     issue_tokens_by_init[init_source_value_id],
                 ),
-            )
-            for init_source_value_id, yield_source_value_id in zip(
+            ) for init_source_value_id, yield_source_value_id in zip(
                 waited_external_tokens,
                 externally_waited_body_tokens,
-            )
-        )
-    return tuple(
-        LoopTokenCarry(
-            op.index,
-            None,
-            body_token,
-            False,
-        )
-        for body_token in externally_waited_body_tokens
-    )
+            ))
+    return tuple(LoopTokenCarry(
+        op.index,
+        None,
+        body_token,
+        False,
+    ) for body_token in externally_waited_body_tokens)
 
 
 def _loop_external_wait_issue_pairs(nodes, groups, groups_by_id, body_op_indices):
-    body_groups = tuple(
-        group
-        for group in sorted(groups, key=lambda group: group.commit_op_index)
-        if group.commit_op_index in body_op_indices and group.token_value_id is not None
-    )
+    body_groups = tuple(group for group in sorted(groups, key=lambda group: group.commit_op_index)
+                        if group.commit_op_index in body_op_indices and group.token_value_id is not None)
     body_groups_after_index = 0
     assigned_body_tokens = set()
     committed_queue = []
@@ -282,31 +260,21 @@ def _loop_external_wait_issue_pairs(nodes, groups, groups_by_id, body_op_indices
         external_waited_tokens = []
         for group_id in node.waited_group_ids:
             waited_group = groups_by_id[group_id]
-            if (
-                node.op_index not in body_op_indices
-                or waited_group.commit_op_index in body_op_indices
-                or waited_group.token_value_id is None
-            ):
+            if (node.op_index not in body_op_indices or waited_group.commit_op_index in body_op_indices
+                    or waited_group.token_value_id is None):
                 continue
             external_waited_tokens.append(waited_group.token_value_id)
         for init_token_id in external_waited_tokens:
             issue_group = next(
-                (
-                    queued_group
-                    for queued_group in committed_queue
-                    if queued_group.commit_op_index in body_op_indices
-                    and queued_group.token_value_id is not None
-                    and queued_group.token_value_id not in assigned_body_tokens
-                ),
+                (queued_group for queued_group in committed_queue
+                 if queued_group.commit_op_index in body_op_indices and queued_group.token_value_id is not None
+                 and queued_group.token_value_id not in assigned_body_tokens),
                 None,
             )
             while issue_group is None and body_groups_after_index < len(body_groups):
                 candidate = body_groups[body_groups_after_index]
                 body_groups_after_index += 1
-                if (
-                    candidate.commit_op_index <= node.op_index
-                    or candidate.token_value_id in assigned_body_tokens
-                ):
+                if (candidate.commit_op_index <= node.op_index or candidate.token_value_id in assigned_body_tokens):
                     continue
                 issue_group = candidate
             if issue_group is None:
@@ -322,9 +290,7 @@ def _loop_external_wait_issue_pairs(nodes, groups, groups_by_id, body_op_indices
         if node.waited_group_ids:
             waited_group_ids = set(node.waited_group_ids)
             committed_queue = [
-                queued_group
-                for queued_group in committed_queue
-                if queued_group.group_id not in waited_group_ids
+                queued_group for queued_group in committed_queue if queued_group.group_id not in waited_group_ids
             ]
     return tuple(pairs)
 
@@ -350,12 +316,10 @@ def _group_issue_dependency_op_indices(
     group = groups_by_value_id.get(token_value_id)
     if group is None:
         return ()
-    return _dedupe_preserving_order(
-        node.op_index
-        for member_token_id in group.member_token_ids
-        for node in (nodes_by_value_id.get(member_token_id),)
-        if node is not None
-    )
+    return _dedupe_preserving_order(node.op_index
+                                    for member_token_id in group.member_token_ids
+                                    for node in (nodes_by_value_id.get(member_token_id), )
+                                    if node is not None)
 
 
 def _region_op_indices_recursive(source_program, region_id):
@@ -379,11 +343,8 @@ def _dedupe_preserving_order(values):
 
 
 def _needs_token_node(source_program, op):
-    return (
-        op.name in _TOKEN_OPS
-        or _first_token_result(source_program, op) is not None
-        or bool(_input_token_ids(source_program, op))
-    )
+    return (op.name in _TOKEN_OPS or _first_token_result(source_program, op) is not None
+            or bool(_input_token_ids(source_program, op)))
 
 
 def _build_token_node(
@@ -420,11 +381,7 @@ def _build_token_node(
         if input_token_ids:
             member_token_ids = input_token_ids
             committed = set(member_token_ids)
-            next_open_async_tokens = [
-                token_id
-                for token_id in next_open_async_tokens
-                if token_id not in committed
-            ]
+            next_open_async_tokens = [token_id for token_id in next_open_async_tokens if token_id not in committed]
         else:
             member_token_ids = tuple(next_open_async_tokens)
             next_open_async_tokens = []
@@ -450,9 +407,7 @@ def _build_token_node(
             waited_group_ids = _waited_group_ids(next_committed_groups, wait_group)
             if waited_group_ids:
                 waited = set(waited_group_ids)
-                next_committed_groups = [
-                    group for group in next_committed_groups if group.group_id not in waited
-                ]
+                next_committed_groups = [group for group in next_committed_groups if group.group_id not in waited]
 
     node = TokenNode(
         node_id,
@@ -501,12 +456,8 @@ def _global_async_copy_fields(op):
         "source_address_value_id": _operand_or_none(op, 0),
         "source_offset_value_id": None,
         "memdesc_value_id": _operand_or_none(op, 1),
-        "mask_value_id": (
-            _operand_or_none(op, mask_index) if int(segments[2]) else None
-        ),
-        "other_value_id": (
-            _operand_or_none(op, other_index) if int(segments[3]) else None
-        ),
+        "mask_value_id": (_operand_or_none(op, mask_index) if int(segments[2]) else None),
+        "other_value_id": (_operand_or_none(op, other_index) if int(segments[3]) else None),
         "wait_group": None,
     }
 
@@ -526,17 +477,14 @@ def _buffer_async_copy_fields(op):
         "source_address_value_id": _operand_or_none(op, base_index),
         "source_offset_value_id": _operand_or_none(op, offset_index),
         "memdesc_value_id": _operand_or_none(op, 0),
-        "mask_value_id": (
-            _operand_or_none(op, mask_index) if int(segments[3]) else None
-        ),
-        "other_value_id": (
-            _operand_or_none(op, other_index) if int(segments[4]) else None
-        ),
+        "mask_value_id": (_operand_or_none(op, mask_index) if int(segments[3]) else None),
+        "other_value_id": (_operand_or_none(op, other_index) if int(segments[4]) else None),
         "wait_group": None,
     }
 
 
 class _DependencyFrontier:
+
     def __init__(self):
         self._last_writes_by_domain = {}
         self._reads_since_write_by_domain = {}
@@ -552,42 +500,31 @@ class _DependencyFrontier:
     ):
         domains = _alias_domains_for_query(address_space, self._known_domains())
         if _effect_is_barrier_like(volatile, ordering, sync_scope):
-            return _dedupe_effect_ids(
-                effect_id
-                for domain in domains
-                for effect_id in (
-                    *self._last_writes_by_domain.get(domain, ()),
-                    *self._reads_since_write_by_domain.get(domain, ()),
-                )
-            )
+            return _dedupe_effect_ids(effect_id for domain in domains for effect_id in (
+                *self._last_writes_by_domain.get(domain, ()),
+                *self._reads_since_write_by_domain.get(domain, ()),
+            ))
         if kind == "read":
-            return _dedupe_effect_ids(
-                effect_id
-                for domain in domains
-                for effect_id in self._last_writes_by_domain.get(domain, ())
-            )
+            return _dedupe_effect_ids(effect_id for domain in domains
+                                      for effect_id in self._last_writes_by_domain.get(domain, ()))
         if kind == "write":
-            return _dedupe_effect_ids(
-                effect_id
-                for domain in domains
-                for effect_id in (
-                    *self._last_writes_by_domain.get(domain, ()),
-                    *self._reads_since_write_by_domain.get(domain, ()),
-                )
-            )
+            return _dedupe_effect_ids(effect_id for domain in domains for effect_id in (
+                *self._last_writes_by_domain.get(domain, ()),
+                *self._reads_since_write_by_domain.get(domain, ()),
+            ))
         return ()
 
     def record(self, effect):
         domain = _alias_domain(effect.address_space)
         if _effect_is_barrier_like(
-            effect.volatile,
-            effect.ordering,
-            effect.sync_scope,
+                effect.volatile,
+                effect.ordering,
+                effect.sync_scope,
         ) or effect.kind == "write":
             if domain == "unknown":
                 self._last_writes_by_domain.clear()
                 self._reads_since_write_by_domain.clear()
-            self._last_writes_by_domain[domain] = (effect.effect_id,)
+            self._last_writes_by_domain[domain] = (effect.effect_id, )
             self._reads_since_write_by_domain[domain] = ()
             return
         if effect.kind == "read":
@@ -597,12 +534,10 @@ class _DependencyFrontier:
             )
 
     def _known_domains(self):
-        return frozenset(
-            (
-                *self._last_writes_by_domain.keys(),
-                *self._reads_since_write_by_domain.keys(),
-            )
-        )
+        return frozenset((
+            *self._last_writes_by_domain.keys(),
+            *self._reads_since_write_by_domain.keys(),
+        ))
 
 
 def _memory_effects_for_op(
@@ -641,104 +576,92 @@ def _memory_effects_for_op(
         )
     if op.name == "tt.load":
         mask_value_id = _operand_or_none(op, 1) if len(op.operands) > 1 else None
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "read",
-                _pointer_address_space(source_program, _operand_or_none(op, 0)),
-                _operand_or_none(op, 0),
-                None,
-                None,
-                mask_value_id,
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "read",
+            _pointer_address_space(source_program, _operand_or_none(op, 0)),
+            _operand_or_none(op, 0),
+            None,
+            None,
+            mask_value_id,
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     if op.name == "tt.store":
         mask_value_id = _operand_or_none(op, 2) if len(op.operands) > 2 else None
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "write",
-                _pointer_address_space(source_program, _operand_or_none(op, 0)),
-                _operand_or_none(op, 0),
-                None,
-                _operand_or_none(op, 1),
-                mask_value_id,
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "write",
+            _pointer_address_space(source_program, _operand_or_none(op, 0)),
+            _operand_or_none(op, 0),
+            None,
+            _operand_or_none(op, 1),
+            mask_value_id,
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     if op.name == "ttg.local_load":
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "read",
-                "local",
-                _operand_or_none(op, 0),
-                None,
-                _operand_or_none(op, 1) if len(op.operands) > 1 else None,
-                None,
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "read",
+            "local",
+            _operand_or_none(op, 0),
+            None,
+            _operand_or_none(op, 1) if len(op.operands) > 1 else None,
+            None,
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     if op.name == "ttg.local_store":
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "write",
-                "local",
-                _operand_or_none(op, 1),
-                None,
-                _operand_or_none(op, 0),
-                None,
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "write",
+            "local",
+            _operand_or_none(op, 1),
+            None,
+            _operand_or_none(op, 0),
+            None,
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     if op.name == "amdg.buffer_load":
         fields = _buffer_load_fields(op)
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "read",
-                "buffer",
-                fields["base_value_id"],
-                fields["offset_value_id"],
-                None,
-                fields["mask_value_id"],
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "read",
+            "buffer",
+            fields["base_value_id"],
+            fields["offset_value_id"],
+            None,
+            fields["mask_value_id"],
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     if op.name == "amdg.buffer_store":
         fields = _buffer_store_fields(op)
-        return (
-            _memory_effect(
-                source_program,
-                op,
-                "write",
-                "buffer",
-                fields["base_value_id"],
-                fields["offset_value_id"],
-                fields["value_value_id"],
-                fields["mask_value_id"],
-                token_node_id,
-                next_effect_id,
-                dependency_frontier,
-            ),
-        )
+        return (_memory_effect(
+            source_program,
+            op,
+            "write",
+            "buffer",
+            fields["base_value_id"],
+            fields["offset_value_id"],
+            fields["value_value_id"],
+            fields["mask_value_id"],
+            token_node_id,
+            next_effect_id,
+            dependency_frontier,
+        ), )
     return ()
 
 
@@ -780,24 +703,24 @@ def _effect_pair(
         token_node_id,
         next_effect_id + 1,
         dependency_frontier,
-        explicit_dependency_ids=(read.effect_id,),
+        explicit_dependency_ids=(read.effect_id, ),
     )
     return read, write
 
 
 def _memory_effect(
-    source_program,
-    op,
-    kind,
-    address_space,
-    address_value_id,
-    offset_value_id,
-    value_value_id,
-    mask_value_id,
-    token_node_id,
-    effect_id,
-    dependency_frontier,
-    explicit_dependency_ids=(),
+        source_program,
+        op,
+        kind,
+        address_space,
+        address_value_id,
+        offset_value_id,
+        value_value_id,
+        mask_value_id,
+        token_node_id,
+        effect_id,
+        dependency_frontier,
+        explicit_dependency_ids=(),
 ):
     del source_program
     volatile = bool(op.attrs.get("volatile", False))
@@ -819,18 +742,16 @@ def _memory_effect(
         ordering,
         sync_scope,
         "unknown",
-        _dedupe_effect_ids(
-            (
-                *dependency_frontier.dependencies_for(
-                    kind=kind,
-                    address_space=address_space,
-                    volatile=volatile,
-                    ordering=ordering,
-                    sync_scope=sync_scope,
-                ),
-                *explicit_dependency_ids,
-            )
-        ),
+        _dedupe_effect_ids((
+            *dependency_frontier.dependencies_for(
+                kind=kind,
+                address_space=address_space,
+                volatile=volatile,
+                ordering=ordering,
+                sync_scope=sync_scope,
+            ),
+            *explicit_dependency_ids,
+        )),
     )
     dependency_frontier.record(effect)
     return effect
@@ -918,9 +839,7 @@ def _first_token_result(source_program, op):
 
 
 def _input_token_ids(source_program, op):
-    return tuple(
-        value_id for value_id in op.operands if _value_is_token(source_program, value_id)
-    )
+    return tuple(value_id for value_id in op.operands if _value_is_token(source_program, value_id))
 
 
 def _require_token_operands(source_program, op):

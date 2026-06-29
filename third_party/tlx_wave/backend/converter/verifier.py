@@ -3,12 +3,9 @@
 from . import domains
 from .diagnostics import fail
 
-
 STAGE = "verification"
 
-_PROOF_DEPENDENT_OPS = frozenset(
-    {"assume", "buffer_load_to_local", "buffer_load", "buffer_store"}
-)
+_PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_load", "buffer_store"})
 
 
 def verify_target_program(
@@ -253,14 +250,14 @@ def _verify_memory_effects_tokenized(source_program, token_program):
     effect_op_indices = {effect.op_index for effect in token_program.memory_effects}
     for op in source_program.ops:
         if op.name in {
-            "tt.load",
-            "tt.store",
-            "ttg.async_copy_global_to_local",
-            "amdg.buffer_load",
-            "amdg.buffer_load_to_local",
-            "amdg.buffer_store",
-            "ttg.local_load",
-            "ttg.local_store",
+                "tt.load",
+                "tt.store",
+                "ttg.async_copy_global_to_local",
+                "amdg.buffer_load",
+                "amdg.buffer_load_to_local",
+                "amdg.buffer_store",
+                "ttg.local_load",
+                "ttg.local_store",
         }:
             if op.index not in effect_op_indices:
                 fail(

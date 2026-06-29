@@ -174,21 +174,15 @@ def _validate_group_divisor(m, n, k, bm, bn, bk, nb, gm):
         raise ValueError("gemm_wp requires ceil(K / BLOCK_K) to be at least NUM_BUFFERS")
     num_pid_m = (m + bm - 1) // bm
     if not _has_power_of_two_group_size_divisors(num_pid_m, gm):
-        raise ValueError(
-            "gemm_wp requires GROUP_M and the final M-group size to be powers "
-            "of two for the current TLX Wave integer division proof"
-        )
+        raise ValueError("gemm_wp requires GROUP_M and the final M-group size to be powers "
+                         "of two for the current TLX Wave integer division proof")
     num_pid_in_group = gm * ((n + bn - 1) // bn)
     if not _is_power_of_two(num_pid_in_group):
-        raise ValueError(
-            "gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to be a positive power of two "
-            "for the current TLX Wave integer division proof"
-        )
+        raise ValueError("gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to be a positive power of two "
+                         "for the current TLX Wave integer division proof")
     if num_pid_in_group > 2147483647:
-        raise ValueError(
-            "gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to fit in signed 32 bits "
-            "for the current TLX Wave integer division proof"
-        )
+        raise ValueError("gemm_wp requires GROUP_M * ceil(N / BLOCK_N) to fit in signed 32 bits "
+                         "for the current TLX Wave integer division proof")
 
 
 def run(a, b, c, bm, bn, bk, nb, nw, gm):

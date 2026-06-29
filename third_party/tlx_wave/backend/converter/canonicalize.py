@@ -17,10 +17,8 @@ def _share_div_rem_pairs(target_program):
             divs_by_key.setdefault((_div_rem_flavor(operation), op.operands), op)
 
     if not any(
-        _binary_operation(op) in {"remsi", "remui"}
-        and (_div_rem_flavor(_binary_operation(op)), op.operands) in divs_by_key
-        for op in target_program.ops
-    ):
+            _binary_operation(op) in {"remsi", "remui"} and (_div_rem_flavor(_binary_operation(op)),
+                                                             op.operands) in divs_by_key for op in target_program.ops):
         return target_program
 
     values = list(target_program.values)
@@ -73,8 +71,7 @@ def _share_div_rem_pairs(target_program):
                 product_value_id,
                 target_program.values[rem_result].type,
                 debug_name=f"rem_product_{rem_result}",
-            )
-        )
+            ))
         attrs = target_ir.attrs_dict(op)
         source_width = attrs.get("source_width")
         binary_attrs = {}
@@ -83,7 +80,7 @@ def _share_div_rem_pairs(target_program):
         append_op(
             op,
             operands=(div_op.results[0], rhs),
-            results=(product_value_id,),
+            results=(product_value_id, ),
             attrs={**binary_attrs, "operation": "muli"},
             fact_ids=(),
             fact_target_ids=(),
@@ -140,6 +137,4 @@ def _single_result(op):
 
 
 def _attrs_tuple(attrs):
-    return tuple(
-        target_ir.TargetAttr(str(name), value) for name, value in sorted(attrs.items())
-    )
+    return tuple(target_ir.TargetAttr(str(name), value) for name, value in sorted(attrs.items()))

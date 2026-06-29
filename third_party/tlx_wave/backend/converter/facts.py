@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 import re
 
-
 STAGE = "facts"
 
 
@@ -57,7 +56,8 @@ def analyze_facts(source_program, type_layout_program):
         by_value.setdefault(fact.subject_value_id, []).append(fact.fact_id)
     return FactProgram(
         tuple(facts),
-        {value_id: tuple(fact_ids) for value_id, fact_ids in by_value.items()},
+        {value_id: tuple(fact_ids)
+         for value_id, fact_ids in by_value.items()},
         tensor_affine,
     )
 
@@ -109,11 +109,7 @@ def _add_pointer_range_facts(source_program, facts):
 
 
 def _add_assume_facts(source_program, facts):
-    op_by_result = {
-        result_id: op
-        for op in source_program.ops
-        for result_id in op.results
-    }
+    op_by_result = {result_id: op for op in source_program.ops for result_id in op.results}
     for op in source_program.ops:
         if op.name != "llvm.intr.assume" or len(op.operands) != 1:
             continue
@@ -129,18 +125,18 @@ def _add_derived_range_facts(source_program, facts):
         changed = False
         for op in source_program.ops:
             for value_id, lower, upper, provenance in _derived_ranges_for_op(
-                source_program,
-                facts,
-                op,
-            ):
-                if _append_improving_range_fact(
                     source_program,
                     facts,
-                    value_id,
-                    lower,
-                    upper,
-                    provenance,
-                    op.index,
+                    op,
+            ):
+                if _append_improving_range_fact(
+                        source_program,
+                        facts,
+                        value_id,
+                        lower,
+                        upper,
+                        provenance,
+                        op.index,
                 ):
                     changed = True
 
@@ -160,14 +156,14 @@ def _derived_ranges_for_op(source_program, facts, op):
     if len(op.results) != 1 or len(op.operands) != 2:
         return
     if op.name not in {
-        "arith.addi",
-        "arith.subi",
-        "arith.muli",
-        "arith.divsi",
-        "arith.divui",
-        "arith.remsi",
-        "arith.remui",
-        "arith.minsi",
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "arith.divsi",
+            "arith.divui",
+            "arith.remsi",
+            "arith.remui",
+            "arith.minsi",
     }:
         return
     lhs = _combined_range(source_program, facts, op.operands[0], op.index)
@@ -187,12 +183,7 @@ def _derived_ranges_for_op(source_program, facts, op):
             if not _fits_signed_range(lower, upper, bounds):
                 return
     elif op.name == "arith.muli":
-        if (
-            _is_nonnegative(lhs)
-            and _is_nonnegative(rhs)
-            and lhs[1] is not None
-            and rhs[1] is not None
-        ):
+        if (_is_nonnegative(lhs) and _is_nonnegative(rhs) and lhs[1] is not None and rhs[1] is not None):
             lower, upper = 0, lhs[1] * rhs[1]
             if not _fits_signed_range(lower, upper, bounds):
                 return
@@ -235,12 +226,8 @@ def _derive_if_ranges(source_program, facts, op):
         ]
         if any(value_range is None for value_range in ranges):
             continue
-        lowers = [
-            value_range[0] for value_range in ranges if value_range[0] is not None
-        ]
-        uppers = [
-            value_range[1] for value_range in ranges if value_range[1] is not None
-        ]
+        lowers = [value_range[0] for value_range in ranges if value_range[0] is not None]
+        uppers = [value_range[1] for value_range in ranges if value_range[1] is not None]
         lower = min(lowers) if len(lowers) == len(ranges) else None
         upper = max(uppers) if len(uppers) == len(ranges) else None
         if lower is None and upper is None:
@@ -260,12 +247,8 @@ def _append_improving_range_fact(
     current = _combined_range(source_program, facts, value_id, source_op_index)
     if current is not None:
         current_lower, current_upper = current
-        improves_lower = lower is not None and (
-            current_lower is None or lower > current_lower
-        )
-        improves_upper = upper is not None and (
-            current_upper is None or upper < current_upper
-        )
+        improves_lower = lower is not None and (current_lower is None or lower > current_lower)
+        improves_upper = upper is not None and (current_upper is None or upper < current_upper)
         if not improves_lower and not improves_upper:
             return False
     width = _integer_width(source_program.values[value_id].type.raw)
@@ -426,7 +409,7 @@ def _record_constant_affine(source_program, op, tensor_affine, scalar_constants)
         tensor_affine[value_id] = TensorAffine(
             value_id,
             tuple(source_type.shape),
-            (TensorAffineTerm("const", value),),
+            (TensorAffineTerm("const", value), ),
         )
 
 
@@ -454,12 +437,9 @@ def _record_splat_affine(source_program, op, tensor_affine, scalar_constants):
         return
     operand = op.operands[0]
     constant = scalar_constants.get(operand)
-    term = (
-        TensorAffineTerm("const", constant)
-        if constant is not None
-        else TensorAffineTerm("scalar", 1, None, (operand,))
-    )
-    tensor_affine[value_id] = TensorAffine(value_id, tuple(source_type.shape), (term,))
+    term = (TensorAffineTerm("const", constant) if constant is not None else TensorAffineTerm(
+        "scalar", 1, None, (operand, )))
+    tensor_affine[value_id] = TensorAffine(value_id, tuple(source_type.shape), (term, ))
 
 
 def _record_expand_dims_affine(source_program, op, tensor_affine):
@@ -483,8 +463,7 @@ def _record_expand_dims_affine(source_program, op, tensor_affine):
                 term.coefficient,
                 dim if dim < axis else dim + 1,
                 term.scalar_value_ids,
-            )
-        )
+            ))
     tensor_affine[value_id] = TensorAffine(value_id, tuple(result_type.shape), tuple(terms))
 
 
@@ -562,7 +541,7 @@ def _scalar_operand_term(value_id, scalar_constants):
     constant = scalar_constants.get(value_id)
     if constant is not None:
         return TensorAffineTerm("const", constant)
-    return TensorAffineTerm("scalar", 1, None, (value_id,))
+    return TensorAffineTerm("scalar", 1, None, (value_id, ))
 
 
 def _uniform_affine_term(affine):
@@ -594,9 +573,9 @@ def _scale_affine_term(term, factor):
         return None
     scalar = factor.scalar_value_ids[0]
     if term.kind == "const":
-        return TensorAffineTerm("scalar", term.coefficient * factor.coefficient, None, (scalar,))
+        return TensorAffineTerm("scalar", term.coefficient * factor.coefficient, None, (scalar, ))
     if term.kind == "dim":
-        return TensorAffineTerm("dim_scalar", term.coefficient * factor.coefficient, term.dim, (scalar,))
+        return TensorAffineTerm("dim_scalar", term.coefficient * factor.coefficient, term.dim, (scalar, ))
     if term.kind == "scalar":
         ids = (*term.scalar_value_ids, scalar)
         return TensorAffineTerm("scalar_product", term.coefficient * factor.coefficient, None, ids)
@@ -732,8 +711,7 @@ def _append_fact(
             provenance,
             source_op_index,
             mask_scope,
-        )
-    )
+        ))
 
 
 _CMPI_PREDICATES = {

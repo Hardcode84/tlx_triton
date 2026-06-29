@@ -13,7 +13,6 @@ from .source_ir import (
     SourceValue,
 )
 
-
 STAGE = "import"
 
 
@@ -100,10 +99,7 @@ def _resolve_kernel_name(mod, kernel_name):
 
     mod.walk(visit)
     if len(funcs) != 1:
-        names = (
-            ", ".join(func.get_str_attr("sym_name") or "<unnamed>" for func in funcs)
-            or "none"
-        )
+        names = (", ".join(func.get_str_attr("sym_name") or "<unnamed>" for func in funcs) or "none")
         fail(
             "TLXW_IMPORT_KERNEL_COUNT",
             STAGE,
@@ -175,9 +171,7 @@ def _collect_region(
                     values,
                     parent_op_index=op_index,
                     region_index=child_index,
-                )
-                for child_index in range(op.get_num_regions())
-            )
+                ) for child_index in range(op.get_num_regions()))
             source_op = SourceOp(
                 op_index,
                 op.get_name(),
@@ -299,14 +293,10 @@ def _require_supported_source_type(source_type, value_id):
 
 
 def _is_scalar_type(type_obj):
-    return (
-        _type_predicate(type_obj, "is_index")
-        or _type_predicate(type_obj, "is_fp16")
-        or _type_predicate(type_obj, "is_bf16")
-        or _type_predicate(type_obj, "is_fp32")
-        or _type_predicate(type_obj, "is_fp64")
-        or any(_type_is_integer_width(type_obj, width) for width in (1, 8, 16, 32, 64))
-    )
+    return (_type_predicate(type_obj, "is_index") or _type_predicate(type_obj, "is_fp16")
+            or _type_predicate(type_obj, "is_bf16") or _type_predicate(type_obj, "is_fp32")
+            or _type_predicate(type_obj, "is_fp64")
+            or any(_type_is_integer_width(type_obj, width) for width in (1, 8, 16, 32, 64)))
 
 
 def _scalar_byte_width(type_obj):
@@ -314,19 +304,13 @@ def _scalar_byte_width(type_obj):
         return None
     if _type_is_integer_width(type_obj, 1) or _type_is_integer_width(type_obj, 8):
         return 1
-    if (
-        _type_is_integer_width(type_obj, 16)
-        or _type_predicate(type_obj, "is_fp16")
-        or _type_predicate(type_obj, "is_bf16")
-    ):
+    if (_type_is_integer_width(type_obj, 16) or _type_predicate(type_obj, "is_fp16")
+            or _type_predicate(type_obj, "is_bf16")):
         return 2
     if _type_is_integer_width(type_obj, 32) or _type_predicate(type_obj, "is_fp32"):
         return 4
-    if (
-        _type_is_integer_width(type_obj, 64)
-        or _type_predicate(type_obj, "is_fp64")
-        or _type_predicate(type_obj, "is_index")
-    ):
+    if (_type_is_integer_width(type_obj, 64) or _type_predicate(type_obj, "is_fp64")
+            or _type_predicate(type_obj, "is_index")):
         return 8
     return None
 

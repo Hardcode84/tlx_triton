@@ -11,7 +11,6 @@ import torch
 import triton
 from triton import knobs
 
-
 VERSION_MAP = {
     0: "v0_naive",
     1: "v1_buffer_load",
@@ -53,15 +52,11 @@ def get_x_vals():
 def parse_shape(text):
     parts = text.replace("x", ",").split(",")
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError(
-            f"shape must be MxNxK or M,N,K, got {text!r}"
-        )
+        raise argparse.ArgumentTypeError(f"shape must be MxNxK or M,N,K, got {text!r}")
     try:
         shape = tuple(int(part) for part in parts)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"shape must contain integer M/N/K values, got {text!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"shape must contain integer M/N/K values, got {text!r}") from exc
     if any(dim <= 0 for dim in shape):
         raise argparse.ArgumentTypeError(f"shape dimensions must be positive: {text!r}")
     return shape
@@ -72,24 +67,16 @@ def validate_shape_for_providers(shape, version, providers):
         return
     M, N, K = shape
     if M % TILE_M:
-        raise argparse.ArgumentTypeError(
-            f"tutorial kernels require M to be a multiple of {TILE_M}, got {M}"
-        )
+        raise argparse.ArgumentTypeError(f"tutorial kernels require M to be a multiple of {TILE_M}, got {M}")
     if N % TILE_N:
-        raise argparse.ArgumentTypeError(
-            f"tutorial kernels require N to be a multiple of {TILE_N}, got {N}"
-        )
+        raise argparse.ArgumentTypeError(f"tutorial kernels require N to be a multiple of {TILE_N}, got {N}")
     if version not in UNTILED_K_VERSIONS and K % TILE_K:
-        raise argparse.ArgumentTypeError(
-            f"tutorial kernels v{version} require K to be a multiple of "
-            f"{TILE_K}, got {K}"
-        )
+        raise argparse.ArgumentTypeError(f"tutorial kernels v{version} require K to be a multiple of "
+                                         f"{TILE_K}, got {K}")
     if version in TWO_STAGE_K_VERSIONS and (K < TWO_STAGE_K or K % TWO_STAGE_K):
-        raise argparse.ArgumentTypeError(
-            f"tutorial kernels v{version} prefetch two {TILE_K}-wide K tiles; "
-            f"K must be at least {TWO_STAGE_K} and a multiple of {TWO_STAGE_K}, "
-            f"got {K}"
-        )
+        raise argparse.ArgumentTypeError(f"tutorial kernels v{version} prefetch two {TILE_K}-wide K tiles; "
+                                         f"K must be at least {TWO_STAGE_K} and a multiple of {TWO_STAGE_K}, "
+                                         f"got {K}")
 
 
 def validate_shapes_for_providers(shapes, version, providers):
@@ -175,9 +162,7 @@ def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
         ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
         max_err = (c - ref).abs().max().item()
         if not ok:
-            bad = int(
-                (~torch.isclose(c, ref, atol=args.atol, rtol=args.rtol)).sum().item()
-            )
+            bad = int((~torch.isclose(c, ref, atol=args.atol, rtol=args.rtol)).sum().item())
             return {
                 "ok": False,
                 "max_err": max_err,
@@ -212,20 +197,16 @@ def main():
         nargs="+",
         choices=tuple(PROVIDER_LABELS),
         default=None,
-        help=(
-            "providers to benchmark. Defaults to rocblas tlx, except v9 defaults "
-            "to tlx wave."
-        ),
+        help=("providers to benchmark. Defaults to rocblas tlx, except v9 defaults "
+              "to tlx wave."),
     )
     parser.add_argument(
         "--shape",
         action="append",
         type=parse_shape,
         default=None,
-        help=(
-            "custom shape as MxNxK or M,N,K. Can be repeated. TLX/Wave "
-            "providers require tutorial tile-compatible shapes."
-        ),
+        help=("custom shape as MxNxK or M,N,K. Can be repeated. TLX/Wave "
+              "providers require tutorial tile-compatible shapes."),
     )
     parser.add_argument(
         "--b-layout",
@@ -246,11 +227,7 @@ def main():
         os.environ["TRITON_WAVE_OPT"] = args.wave_opt
 
     version_dir = VERSION_MAP[args.version]
-    providers = (
-        list(args.providers)
-        if args.providers is not None
-        else provider_defaults(args.version)
-    )
+    providers = (list(args.providers) if args.providers is not None else provider_defaults(args.version))
     sizes = list(args.shape) if args.shape is not None else get_x_vals()
     if args.K:
         sizes = [(m, n, k) for m, n, k in sizes if k == args.K]
@@ -297,21 +274,12 @@ def main():
             else:
                 row += f"  {'FAIL':>17s}"
                 if "error" in result:
-                    print(
-                        f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed: "
-                        f"{result['error']}"
-                    )
+                    print(f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed: "
+                          f"{result['error']}")
                 else:
-                    print(
-                        f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed "
-                        f"correctness: max_err={result['max_err']}, bad={result['bad']}"
-                    )
-        if (
-            "tlx" in results
-            and "wave" in results
-            and results["tlx"]["ok"]
-            and results["wave"]["ok"]
-        ):
+                    print(f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed "
+                          f"correctness: max_err={result['max_err']}, bad={result['bad']}")
+        if ("tlx" in results and "wave" in results and results["tlx"]["ok"] and results["wave"]["ok"]):
             ratio = results["wave"]["tflops"] / results["tlx"]["tflops"]
             row += f"  {ratio:8.3f}x"
         print(row, flush=True)

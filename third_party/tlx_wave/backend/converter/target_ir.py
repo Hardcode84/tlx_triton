@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 
 from .diagnostics import fail
 
-
 STAGE = "target_ir"
 
 
@@ -83,6 +82,7 @@ class TargetProgram:
 
 
 class TargetBuilder:
+
     def __init__(self, kernel=None):
         self.values = []
         self.ops = []
@@ -98,14 +98,12 @@ class TargetBuilder:
 
     def add_value(self, target_type, *, source_value_id=None, debug_name=None):
         value_id = len(self.values)
-        self.values.append(
-            TargetValue(
-                value_id,
-                target_type,
-                source_value_id,
-                debug_name,
-            )
-        )
+        self.values.append(TargetValue(
+            value_id,
+            target_type,
+            source_value_id,
+            debug_name,
+        ))
         if source_value_id is not None:
             self.source_value_targets.setdefault(source_value_id, tuple())
             self.source_value_targets[source_value_id] = (
@@ -130,14 +128,12 @@ class TargetBuilder:
 
     def add_region(self, *, block_arg_ids=()):
         region_id = len(self.regions)
-        self.regions.append(
-            TargetRegion(
-                region_id,
-                (),
-                tuple(int(value_id) for value_id in block_arg_ids),
-                (),
-            )
-        )
+        self.regions.append(TargetRegion(
+            region_id,
+            (),
+            tuple(int(value_id) for value_id in block_arg_ids),
+            (),
+        ))
         return region_id
 
     @contextmanager
@@ -164,17 +160,17 @@ class TargetBuilder:
         )
 
     def add_op(
-        self,
-        kind,
-        *,
-        operands=(),
-        results=(),
-        attrs=None,
-        fact_ids=(),
-        fact_target_ids=(),
-        layout_map_ids=(),
-        region_ids=(),
-        source_op_index=None,
+            self,
+            kind,
+            *,
+            operands=(),
+            results=(),
+            attrs=None,
+            fact_ids=(),
+            fact_target_ids=(),
+            layout_map_ids=(),
+            region_ids=(),
+            source_op_index=None,
     ):
         op_id = len(self.ops)
         self.ops.append(
@@ -189,8 +185,7 @@ class TargetBuilder:
                 tuple(int(layout_map_id) for layout_map_id in layout_map_ids),
                 tuple(int(region_id) for region_id in region_ids),
                 source_op_index,
-            )
-        )
+            ))
         region_id = self.current_region_id
         region = self.regions[region_id]
         self.regions[region_id] = TargetRegion(

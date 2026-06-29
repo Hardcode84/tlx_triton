@@ -7,13 +7,7 @@ import torch
 
 
 def _load_gfx9_v9_module(module_name="tlx_wave_gfx9_v9_tutorial"):
-    path = (
-        Path(__file__).parent
-        / "gfx9_gemm"
-        / "a16w16"
-        / "v9_beyond_hotloop"
-        / "matmul_kernel.py"
-    )
+    path = (Path(__file__).parent / "gfx9_gemm" / "a16w16" / "v9_beyond_hotloop" / "matmul_kernel.py")
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -23,9 +17,7 @@ def _load_gfx9_v9_module(module_name="tlx_wave_gfx9_v9_tutorial"):
 _TLX_WAVE_STOP_AFTER_WAVE_KEY = "tlx-wave-v9-asm-stop-after-wave-v1"
 
 
-def _tlx_wave_stop_after_wave_hook(
-    self=None, stages=None, options=None, language=None, capability=None
-):
+def _tlx_wave_stop_after_wave_hook(self=None, stages=None, options=None, language=None, capability=None):
     if all(arg is None for arg in (stages, options, language, capability)):
         return _TLX_WAVE_STOP_AFTER_WAVE_KEY, _TLX_WAVE_STOP_AFTER_WAVE_KEY
 
@@ -64,14 +56,7 @@ def _warmup_gfx9_v9_backend(
 
     monkeypatch.setenv("TRITON_DEFAULT_BACKEND", backend_name)
     if backend_name == "tlx_wave":
-        wave_opt = (
-            Path(__file__).parents[2]
-            / "wave"
-            / "build"
-            / "wave-build"
-            / "bin"
-            / "wave-opt"
-        )
+        wave_opt = (Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt")
         if wave_opt.exists():
             monkeypatch.setenv("TRITON_WAVE_OPT", str(wave_opt))
 
@@ -124,7 +109,7 @@ def _warmup_gfx9_v9_backend(
             num_stages=1,
             waves_per_eu=0,
             matrix_instr_nonkdim=16,
-            grid=(grid_mn,),
+            grid=(grid_mn, ),
         )
     return compiled
 
@@ -167,9 +152,7 @@ def _wave_text(compiled):
 def _run_wave_promote_buffer_to_machine(wave_artifact):
     from triton.backends.tlx_wave.wave_bridge_tools import _wave_machine_pipeline_args
 
-    wave_opt = (
-        Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt"
-    )
+    wave_opt = (Path(__file__).parents[2] / "wave" / "build" / "wave-build" / "bin" / "wave-opt")
     if not wave_opt.exists():
         pytest.skip("wave-opt is not built")
     result = subprocess.run(
@@ -220,11 +203,7 @@ def _machine_text_for_wave_translate(machine):
     # translator accepts.
     lines = machine.splitlines()
     try:
-        start = next(
-            index
-            for index, line in enumerate(lines)
-            if line.strip() == "gpu.module @kernels {"
-        )
+        start = next(index for index, line in enumerate(lines) if line.strip() == "gpu.module @kernels {")
     except StopIteration:
         return machine
     end = None
@@ -233,7 +212,7 @@ def _machine_text_for_wave_translate(machine):
             end = index
             break
     assert end is not None, machine
-    return "\n".join(lines[:start] + lines[start + 1 : end] + lines[end + 1 :]) + "\n"
+    return "\n".join(lines[:start] + lines[start + 1:end] + lines[end + 1:]) + "\n"
 
 
 def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):

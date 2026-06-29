@@ -6,6 +6,7 @@ from triton import knobs
 
 
 class _TLXWaveUtils:
+
     def __init__(self, hip_utils):
         self._hip_utils = hip_utils
 
@@ -14,19 +15,15 @@ class _TLXWaveUtils:
 
     def load_binary(self, name, kernel, shared, device):
         if not isinstance(kernel, (bytes, bytearray, memoryview)):
-            raise RuntimeError(
-                "tlx_wave expected HSACO bytes for executable loading, got "
-                f"{type(kernel).__name__}. Inspect compiled.asm['wave'] and "
-                "compiled.asm['hsaco'] to verify the compiler pipeline reached "
-                "the hsaco stage."
-            )
+            raise RuntimeError("tlx_wave expected HSACO bytes for executable loading, got "
+                               f"{type(kernel).__name__}. Inspect compiled.asm['wave'] and "
+                               "compiled.asm['hsaco'] to verify the compiler pipeline reached "
+                               "the hsaco stage.")
         kernel = bytes(kernel)
         if not kernel.startswith(b"\x7fELF"):
-            raise RuntimeError(
-                "tlx_wave expected an ELF HSACO object for executable loading. "
-                "The cached artifact is not executable; inspect compiled.asm['wave'] "
-                "and compiled.asm['hsaco']."
-            )
+            raise RuntimeError("tlx_wave expected an ELF HSACO object for executable loading. "
+                               "The cached artifact is not executable; inspect compiled.asm['wave'] "
+                               "and compiled.asm['hsaco'].")
         return self._hip_utils.load_binary(name, kernel, shared, device)
 
 
@@ -52,7 +49,5 @@ class TLXWaveDriver(amd_driver.HIPDriver):
         arch = knobs.runtime.override_arch or device_properties["arch"]
         arch = arch.split(":")[0]
         if arch not in {"gfx942", "gfx950"}:
-            raise RuntimeError(
-                f"tlx_wave stage-1 scaffold only supports gfx942/gfx950, got {arch}"
-            )
+            raise RuntimeError(f"tlx_wave stage-1 scaffold only supports gfx942/gfx950, got {arch}")
         return GPUTarget("tlx_wave", arch, 64)

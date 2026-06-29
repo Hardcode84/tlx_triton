@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 
-
 STAGE = "domains"
 
 
@@ -121,8 +120,8 @@ LOWERING_DOMAINS = (
     ),
     LoweringDomain(
         "store_epilogue",
-        ("amdg.buffer_store",),
-        ("buffer_store",),
+        ("amdg.buffer_store", ),
+        ("buffer_store", ),
     ),
 )
 
@@ -131,9 +130,7 @@ _DOMAINS_BY_NAME = {domain.name: domain for domain in LOWERING_DOMAINS}
 
 
 def source_domains_for_op(op_name):
-    return tuple(
-        domain.name for domain in LOWERING_DOMAINS if op_name in domain.source_ops
-    )
+    return tuple(domain.name for domain in LOWERING_DOMAINS if op_name in domain.source_ops)
 
 
 def target_domain_for_op(op_kind):
@@ -152,12 +149,8 @@ def target_ops_for_domain(domain_name):
 
 
 def all_source_ops():
-    return frozenset(
-        op_name for domain in LOWERING_DOMAINS for op_name in domain.source_ops
-    )
+    return frozenset(op_name for domain in LOWERING_DOMAINS for op_name in domain.source_ops)
 
 
 def all_target_ops():
-    return frozenset(
-        op_kind for domain in LOWERING_DOMAINS for op_kind in domain.target_ops
-    )
+    return frozenset(op_kind for domain in LOWERING_DOMAINS for op_kind in domain.target_ops)
