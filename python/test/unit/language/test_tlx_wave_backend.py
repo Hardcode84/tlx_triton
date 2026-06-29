@@ -2597,6 +2597,12 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
             "expected_dma_load_lds": 0,
         },
         {
+            "version_dir": "v1_buffer_load",
+            "function_name": "v1_buffer_load",
+            "num_warps": 4,
+            "expected_dma_load_lds": 0,
+        },
+        {
             "version_dir": "v2_async_copy",
             "function_name": "v2_async_copy",
             "num_warps": 4,
@@ -2655,7 +2661,7 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
     ],
     ids=lambda case: case.get("id", case["version_dir"]),
 )
-def test_tlx_wave_backend_compiles_gfx9_gemm_v0_to_v9_to_hsaco(
+def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     tmp_path,
     monkeypatch,
     case,
