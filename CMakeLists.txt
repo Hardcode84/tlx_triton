@@ -327,21 +327,16 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   # Python Interpreter is used to run lit tests
   find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
-  # nanobind expects find_package(Python) which sets Python::Module target
-  # and Python_* variables. Triton uses find_package(Python3) instead.
-  # Bridge the two by aliasing the target and forwarding variables.
-  if(NOT TARGET Python::Module)
-    add_library(Python::Module ALIAS Python3::Module)
-    set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
-    set(Python_INCLUDE_DIRS "${Python3_INCLUDE_DIRS}")
-    set(Python_SOABI "${Python3_SOABI}")
-    set(Python_VERSION "${Python3_VERSION}")
-    set(Python_INTERPRETER_ID "${Python3_INTERPRETER_ID}")
-  endif()
+  # Current nanobind CMake packages require the non-versioned FindPython
+  # targets, including Python::Interpreter. Seed it with the interpreter
+  # already selected by Triton's Python3 discovery so both packages agree.
+  set(Python_EXECUTABLE "${Python3_EXECUTABLE}" CACHE FILEPATH
+      "Python interpreter used by nanobind" FORCE)
+  find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
   find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
   nanobind_build_library(nanobind-static)
-  target_link_libraries(nanobind-static PRIVATE Python3::Module)
+  target_link_libraries(nanobind-static PRIVATE Python::Module)
 
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
