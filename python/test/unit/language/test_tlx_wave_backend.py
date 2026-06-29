@@ -364,6 +364,10 @@ def test_tlx_wave_converter_op_rewriters_do_not_accept_source_program():
         "_build_conversion_input",
         "_memdesc_infos",
         "_constant_ints",
+        "_layout_address_value_ids",
+        "_record_for_address_deps",
+        "_record_if_address_deps",
+        "_region_yield_value_ids",
     }
     offenders = []
     for node in ast.walk(tree):
@@ -5964,6 +5968,7 @@ def test_tlx_wave_converter_rejects_if_yield_layout_relabel():
         fact_ids_by_op={},
         token_nodes_by_op={},
         token_groups_by_id={},
+        layout_address_value_ids=frozenset(),
     )
     builder = converter_target_ir.TargetBuilder()
     builder.add_value(
@@ -7385,8 +7390,9 @@ def _parse_ttgir(
 
 
 def _run_waveamd_to_machine(wave_artifact):
+    wave_opt = wave_bridge_tools._wave_opt()
     result = subprocess.run(
-        [wave_bridge_tools._wave_opt(), "-", "--waveamd-to-machine"],
+        [wave_opt, "-", "--wave-expand-integer-div-rem", "--waveamd-to-machine"],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
