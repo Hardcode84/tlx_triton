@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark wrapper for the TLX AMD f16 warp-pipelined GEMM tutorial."""
+"""Benchmark wrapper for TLX AMD f16 GEMM tutorials."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 
 
-def _load_f16_gemm_module():
-    module_path = Path(__file__).with_name("amd-gemm-warp-pipeline_test.py")
-    spec = importlib.util.spec_from_file_location("tlx_amd_f16_gemm_warp_pipeline", module_path)
+def _load_module(name, filename):
+    module_path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, module_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     assert spec.loader is not None
@@ -38,7 +38,9 @@ def _static_profile(kernel):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Benchmark TLX AMD f16 warp-pipelined GEMM.")
+    parser = argparse.ArgumentParser(description="Benchmark TLX AMD f16 GEMM.")
+    parser.add_argument("--variant", choices=["warp", "single"], default="warp",
+                        help="warp: amd-gemm-warp-pipeline_test.py; single: AM-guide single-warp TDM schedule.")
     parser.add_argument("-M", type=int, default=8192)
     parser.add_argument("-N", type=int, default=8192)
     parser.add_argument("-K", type=int, default=8192)
@@ -54,6 +56,9 @@ def parse_args():
                         default=16)
     parser.add_argument("--num-xcds", "--num_xcds", dest="num_xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", "--xcd_chunk", dest="xcd_chunk", type=int, default=4)
+    parser.add_argument("--l2-prefetch-distance", "--l2_prefetch_distance", dest="l2_prefetch_distance", type=int,
+                        default=0)
+    parser.add_argument("--transpose-b", dest="transpose_b", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--benchmark-mode", choices=["none", "eager", "graph"], default="none",
                         help="Timing method. graph uses triton.testing.do_bench_cudagraph.")
     parser.add_argument("--benchmark-num-iters", type=int, default=200)
@@ -75,20 +80,55 @@ def main():
     import torch
     import triton
 
-    mod = _load_f16_gemm_module()
+    if args.variant == "warp":
+        mod = _load_module("tlx_amd_f16_gemm_warp_pipeline", "amd-gemm-warp-pipeline_test.py")
+    else:
+        mod = _load_module("tlx_amd_f16_gemm_tdm_pipelined", "amd-tdm-gemm-pipelined_test.py")
+        assert args.BK == 128, "single-warp TDM schedule requires BK=128"
+        assert args.num_warps == 4, "single-warp TDM schedule requires num_warps=4"
     torch.manual_seed(args.seed)
 
     a = torch.randn((args.M, args.K), device=mod.DEVICE, dtype=torch.float16)
-    b = torch.randn((args.K, args.N), device=mod.DEVICE, dtype=torch.float16)
-    c = torch.empty((args.M, args.N), device=mod.DEVICE, dtype=torch.float16)
+    b_base = torch.randn((args.K, args.N), device=mod.DEVICE, dtype=torch.float16)
+    if args.variant == "single" and args.transpose_b:
+        b = b_base.T.contiguous()
+    else:
+        b = b_base
+    c_dtype = torch.bfloat16 if args.variant == "single" else torch.float16
+    c = torch.empty((args.M, args.N), device=mod.DEVICE, dtype=c_dtype)
 
     ref = None
     if args.check:
-        ref = torch.matmul(a, b)
+        ref_b = b.T if args.variant == "single" and args.transpose_b else b
+        ref = torch.matmul(a.to(torch.float32), ref_b.to(torch.float32)).to(c_dtype)
 
     grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), )
 
     def run():
+        if args.variant == "single":
+            stride_bk, stride_bn = (b.stride(1), b.stride(0)) if args.transpose_b else (b.stride(0), b.stride(1))
+            return mod.matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel[grid](
+                a,
+                b,
+                c,
+                args.M,
+                args.N,
+                args.K,
+                a.stride(0),
+                a.stride(1),
+                stride_bk,
+                stride_bn,
+                c.stride(0),
+                c.stride(1),
+                BLOCK_M=args.BM,
+                BLOCK_N=args.BN,
+                BLOCK_K=args.BK,
+                NUM_BUFFERS=args.num_buffers,
+                TRANSPOSE_B=args.transpose_b,
+                L2_PREFETCH_DISTANCE=args.l2_prefetch_distance,
+                num_warps=args.num_warps,
+                waves_per_eu=max(1, args.num_warps // 4),
+            )
         return mod.gemm_wp[grid](
             a,
             b,
