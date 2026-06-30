@@ -59,3 +59,53 @@ To compare variants, rerun the recommended command with:
 --tdm-fusion 4way
 --tdm-fusion partial
 ```
+
+# TLX F16 GEMM Benchmark
+
+Local wrapper:
+
+```bash
+third_party/tlx/tutorials/amd-f16-gemm-warp-pipeline_bench.py
+```
+
+Recommended starting config for the TLX AMD f16 warp-pipelined GEMM:
+
+- Problem: `M=N=K=8192`
+- Tile: `BM=256`, `BN=256`, `BK=32`
+- Pipeline: `num_warps=8`, `num_buffers=2`
+- Grouping: `GROUP_M=16`
+- AMD codegen knobs: `matrix_instr_nonkdim=16`, `waves_per_eu=0`
+- XCD remap: `num_xcds=8`, `xcd_chunk=4`
+
+Copy-paste benchmark command:
+
+```bash
+PYTHONPATH=build/lib.linux-x86_64-cpython-311:python \
+python third_party/tlx/tutorials/amd-f16-gemm-warp-pipeline_bench.py \
+  -M 8192 -N 8192 -K 8192 \
+  -BM 256 -BN 256 -BK 32 \
+  --num-warps 8 --num-buffers 2 \
+  --group-m 16 \
+  --matrix-instr-nonkdim 16 --waves-per-eu 0 \
+  --num-xcds 8 --xcd-chunk 4 \
+  --benchmark-mode eager --benchmark-num-iters 200
+```
+
+For a quick correctness smoke, use:
+
+```bash
+PYTHONPATH=build/lib.linux-x86_64-cpython-311:python \
+python third_party/tlx/tutorials/amd-f16-gemm-warp-pipeline_bench.py \
+  -M 256 -N 256 -K 256 \
+  -BM 128 -BN 128 -BK 32 \
+  --num-warps 4 --num-buffers 2 \
+  --group-m 4 \
+  --matrix-instr-nonkdim 16 \
+  --benchmark-mode none --check
+```
+
+To compare against `torch.matmul`, add:
+
+```bash
+--bench-ref
+```
