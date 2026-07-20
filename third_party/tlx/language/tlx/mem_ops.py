@@ -1029,14 +1029,44 @@ def async_load(
 @tl.builtin
 def async_load_commit_group(
     tokens: list[tlx.async_token] = [],
+    issue_group_size: tl.constexpr = None,
+    issue_delay_cycles: tl.constexpr = None,
+    issue_delay_overlap_cycles: tl.constexpr = None,
+    issue_delay_skip_thread_threshold: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.async_token:
     """
     Commits all prior initiated but uncommitted async_load ops an async group.
     Each token represents a tracked async load operation.
+
+    The optional issue-delay fields are structural scheduling metadata for the
+    group's DMA requests. A delay is attached to every ``issue_group_size``-th
+    request. Overlap and thread-threshold fields require a positive delay.
     """
     handles = [t.handle for t in tokens]
-    return tlx.async_token(_semantic.builder.create_async_commit_group(handles))
+    schedule = {
+        "issue_group_size": tl._unwrap_if_constexpr(issue_group_size),
+        "issue_delay_cycles": tl._unwrap_if_constexpr(issue_delay_cycles),
+        "issue_delay_overlap_cycles": tl._unwrap_if_constexpr(issue_delay_overlap_cycles),
+        "issue_delay_skip_thread_threshold": tl._unwrap_if_constexpr(issue_delay_skip_thread_threshold),
+    }
+    if any(value is not None for value in schedule.values()):
+        if schedule["issue_group_size"] is None or int(schedule["issue_group_size"]) <= 0:
+            raise ValueError("issue_group_size must be positive when issue-delay metadata is present")
+        if schedule["issue_delay_cycles"] is None or int(schedule["issue_delay_cycles"]) <= 0:
+            raise ValueError("issue_delay_cycles must be positive when issue-delay metadata is present")
+        overlap = schedule["issue_delay_overlap_cycles"]
+        if overlap is not None and not (0 <= int(overlap) <= int(schedule["issue_delay_cycles"])):
+            raise ValueError("issue_delay_overlap_cycles must be between zero and issue_delay_cycles")
+        threshold = schedule["issue_delay_skip_thread_threshold"]
+        if threshold is not None and int(threshold) <= 0:
+            raise ValueError("issue_delay_skip_thread_threshold must be positive")
+
+    handle = _semantic.builder.create_async_commit_group(handles)
+    for name, value in schedule.items():
+        if value is not None:
+            handle.set_attr(f"tlx.async_{name}", _semantic.builder.get_int32_attr(int(value)))
+    return tlx.async_token(handle)
 
 
 @tl.builtin
@@ -1126,7 +1156,8 @@ def local_load(
         return tl.tensor(output, block_type)
     else:
         is_hip = _semantic.builder.options.backend_name == "hip"
-        synced_via_async_wait = (token is not None or relaxed) and is_hip
+        is_amd = _semantic.builder.options.backend_name in {"hip", "tlx_wave"}
+        synced_via_async_wait = (token is not None or relaxed) and is_amd
         rematerialize_coordinates = rematerialize_coordinates and is_hip
         rematerialize_coordinates_group = rematerialize_coordinates_group if is_hip else None
         if layout is not None:
