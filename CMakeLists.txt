@@ -401,6 +401,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRNVVMToLLVMIRTranslation
     MLIRGPUToNVVMTransforms
     MLIRIR
+    MLIRControlFlowToSCF
     MLIRControlFlowToLLVM
     MLIRPass
     MLIRTransforms

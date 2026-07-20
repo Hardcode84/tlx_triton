@@ -1,9 +1,11 @@
+#include "Analysis/AMDGPUAllocation.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -12,6 +14,7 @@
 #include "passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
+#include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LLVMOptions.h"
 #include "llvm/ADT/SmallString.h"
@@ -378,6 +381,23 @@ void init_triton_amd(py::module_ &m) {
   auto passes = m.def_submodule("passes");
   auto ttgpuir_m = passes.def_submodule("ttgpuir");
   init_triton_amd_passes_ttgpuir(ttgpuir_m);
+
+  m.def("run_membar", [](mlir::ModuleOp mod, const std::string &arch) {
+    mlir::triton::AMD::TargetInfo targetInfo(arch);
+    if (targetInfo.getISAFamily() == mlir::triton::amdgpu::ISAFamily::Unknown)
+      throw std::invalid_argument("unsupported AMDGPU target: " + arch);
+    auto allocationFn = [&targetInfo](mlir::Operation *op) {
+      return mlir::triton::AMD::AMDAllocationAnalysisScratchSizeFn(op,
+                                                                   targetInfo);
+    };
+    mlir::ModuleAllocation allocation(
+        mod, allocationFn, targetInfo.getSharedMemoryPartitionSize());
+    if (targetInfo.requiresAliasInfoForAsyncOps())
+      mlir::triton::AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
+    mlir::ModuleMembarAnalysis analysis(allocation,
+                                        mlir::triton::AMD::membarFilter);
+    analysis.run();
+  });
 
   m.attr("TARGET_TRIPLE") = amdTargetTriple;
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =

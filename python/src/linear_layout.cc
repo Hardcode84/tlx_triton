@@ -7,6 +7,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/STLExtras.h"
 #include <iostream>
@@ -19,8 +20,7 @@ using LinearLayout = mlir::triton::LinearLayout;
 namespace {
 
 mlir::MLIRContext *getLinearLayoutContext() {
-  // Process-lifetime singleton: LinearLayout objects hold attributes uniqued in
-  // this context, so the context must outlive every Python LinearLayout object.
+  // Process-lifetime context for layouts built without a source context.
   // We also deliberately avoid running its destructor during interpreter
   // shutdown (to avoid segfaults).
   //
@@ -32,6 +32,19 @@ mlir::MLIRContext *getLinearLayoutContext() {
   static auto *ctx =
       new mlir::MLIRContext(mlir::MLIRContext::Threading::DISABLED);
   return ctx;
+}
+
+mlir::MLIRContext *getLayoutContext(const LinearLayout &layout) {
+  if (layout.getNumInDims())
+    return (*layout.getInDimNames().begin()).getContext();
+  if (layout.getNumOutDims())
+    return (*layout.getOutDimNames().begin()).getContext();
+  return getLinearLayoutContext();
+}
+
+void requireSameContext(const LinearLayout &lhs, const LinearLayout &rhs) {
+  if (getLayoutContext(lhs) != getLayoutContext(rhs))
+    throw std::invalid_argument("linear layouts must use the same context");
 }
 
 } // namespace
@@ -76,8 +89,11 @@ void init_linear_layout(py::module_ &m) {
                  std::string, std::vector<std::vector<int32_t>>>> &bases,
              const std::vector<std::string> &outDimNames,
              std::optional<std::vector<int32_t>> outDimSizes,
-             bool requireSurjective) {
-            auto *ctx = getLinearLayoutContext();
+             bool requireSurjective, py::object contextOwner) {
+            auto *ctx =
+                contextOwner.is_none()
+                    ? getLinearLayoutContext()
+                    : getLayoutContext(py::cast<LinearLayout &>(contextOwner));
 
             std::vector<
                 std::pair<mlir::StringAttr, std::vector<std::vector<int32_t>>>>
@@ -117,11 +133,25 @@ void init_linear_layout(py::module_ &m) {
           },
           py::arg("bases"), py::arg("out_dim_names"),
           (py::arg("out_dim_sizes").none() = py::none()),
-          py::arg("require_surjective") = true)
-      .def("compose", &LinearLayout::compose)
-      .def("invert_and_compose", &LinearLayout::invertAndCompose)
-      .def("invert", &LinearLayout::invert)
-      .def("pseudoinvert", &LinearLayout::pseudoinvert)
+          py::arg("require_surjective") = true,
+          (py::arg("context_owner").none() = py::none()),
+          py::keep_alive<0, 5>())
+      .def(
+          "compose",
+          [](const LinearLayout &lhs, const LinearLayout &rhs) {
+            requireSameContext(lhs, rhs);
+            return lhs.compose(rhs);
+          },
+          py::keep_alive<0, 1>(), py::keep_alive<0, 2>())
+      .def(
+          "invert_and_compose",
+          [](const LinearLayout &lhs, const LinearLayout &rhs) {
+            requireSameContext(lhs, rhs);
+            return lhs.invertAndCompose(rhs);
+          },
+          py::keep_alive<0, 1>(), py::keep_alive<0, 2>())
+      .def("invert", &LinearLayout::invert, py::keep_alive<0, 1>())
+      .def("pseudoinvert", &LinearLayout::pseudoinvert, py::keep_alive<0, 1>())
       .def("is_surjective", &LinearLayout::isSurjective)
       .def("is_injective", &LinearLayout::isInjective)
       .def("is_invertible", &LinearLayout::isInvertible)
@@ -164,11 +194,17 @@ void init_linear_layout(py::module_ &m) {
                    })
       .def_prop_ro("num_in_dims", &LinearLayout::getNumInDims)
       .def_prop_ro("num_out_dims", &LinearLayout::getNumOutDims)
-      .def("__mul__", [](const LinearLayout &lhs,
-                         const LinearLayout &rhs) { return lhs * rhs; })
+      .def(
+          "__mul__",
+          [](const LinearLayout &lhs, const LinearLayout &rhs) {
+            requireSameContext(lhs, rhs);
+            return lhs * rhs;
+          },
+          py::keep_alive<0, 1>(), py::keep_alive<0, 2>())
       .def(
           "__imul__",
           [](LinearLayout &lhs, const LinearLayout &rhs) -> LinearLayout & {
+            requireSameContext(lhs, rhs);
             lhs *= rhs;
             return lhs;
           },
@@ -198,7 +234,7 @@ void init_linear_layout(py::module_ &m) {
               inputs.emplace_back(py::cast<std::string>(item.first),
                                   py::cast<int32_t>(item.second));
             }
-            auto *ctx = getLinearLayoutContext();
+            auto *ctx = getLayoutContext(self);
             std::vector<std::pair<mlir::StringAttr, int32_t>> converted;
             converted.reserve(inputs.size());
             for (const auto &it : inputs) {
@@ -226,4 +262,14 @@ void init_linear_layout(py::module_ &m) {
         }
         return result;
       });
+  m.def(
+      "to_linear_layout",
+      [](const std::vector<int64_t> &shape, mlir::Attribute layout,
+         mlir::MLIRContext &contextOwner) {
+        if (layout.getContext() != &contextOwner)
+          throw std::invalid_argument("layout and context must match");
+        return mlir::triton::gpu::toLinearLayout(shape, layout);
+      },
+      py::arg("shape"), py::arg("layout"), py::arg("context"),
+      py::keep_alive<0, 3>());
 }
