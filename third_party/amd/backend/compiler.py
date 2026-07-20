@@ -117,6 +117,7 @@ class HIPOptions:
     backend_name: str = "hip"
     instrumentation_mode: str = ""
     fpsan_homomorphic_casts: bool = False
+    disable_vector_combine: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -663,7 +664,7 @@ class HIPBackend(BaseBackend):
 
         # gfx950 requires VectorCombine for stable BF16 and FP8 code generation.
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
-                             disable_vector_combine=options.arch != "gfx950")
+                             disable_vector_combine=options.disable_vector_combine or options.arch != "gfx950")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during

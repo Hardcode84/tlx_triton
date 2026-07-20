@@ -736,13 +736,11 @@ unsigned getContiguity(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
 
 unsigned getContiguity(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
-
-  Type type = getPointerTypeWithShape(ptr, offset);
-  RankedTensorType tensorTy = cast<RankedTensorType>(type);
+  auto offsetTy = cast<RankedTensorType>(offset.getType());
 
   // To compute the contiguity of the scalar/warp-uniform ptr and offset pair we
   // need to look at the contiguity of the offsets and the alignment of the ptr
-  auto elemNumBits = triton::getPointeeBitWidth(tensorTy);
+  auto elemNumBits = triton::getPointeeBitWidth(ptr.getType());
   auto contiguity = axisAnalysisPass.getContiguity(offset, elemNumBits);
 
   // To get the alignment of the scalar ptr we need to look at the divisibility
@@ -752,19 +750,11 @@ unsigned getContiguity(Value ptr, Value offset,
   auto align = std::max<unsigned>(maxMultipleBytes / elemNumBytes, 1);
 
   // FIXME (Alex): this should not be needed anymore because it's done inside
-  // getContiguity, but we have an order issues with LL, so we keep this
+  // getContiguity, but we have an order issue with LL, so we keep this
   // until the LL order issue is fixed
-  SmallVector<unsigned> contigPerThread;
-  if (auto llAttr =
-          dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
-    contigPerThread = llAttr.getContigPerThread();
-  } else {
-    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
-    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
-        tensorTy.getContext(), std::move(linearLayout));
-    contigPerThread = fallbackAttr.getContigPerThread();
-  }
-  auto order = triton::gpu::getOrder(tensorTy);
+  SmallVector<unsigned> contigPerThread =
+      triton::gpu::getContigPerThread(offsetTy);
+  auto order = triton::gpu::getOrder(offsetTy);
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
   contiguity = std::min(contiguity, contigPerThread[order[0]]);
@@ -806,9 +796,8 @@ unsigned getVectorSize(Value ptr, Value offset,
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
   unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
-  auto tensorTy =
-      dyn_cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
-  return clampVecSizeForNpot(vec, tensorTy);
+  auto offsetTy = cast<RankedTensorType>(offset.getType());
+  return clampVecSizeForNpot(vec, offsetTy);
 }
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t) {

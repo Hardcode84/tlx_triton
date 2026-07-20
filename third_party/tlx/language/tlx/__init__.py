@@ -90,11 +90,14 @@ from .mma_ops import (
 )
 from .types import (
     async_token,
+    amd_mfma_layout_encoding,
     buffered_tensor,
     buffered_tensor_type,
     clc_response,
     clc_response_type,
     CLCPipelineContext,
+    distributed_linear_layout_encoding,
+    dot_operand_layout_encoding,
     DummyRegisterLayoutEncoding,
     layout_encoding,
     mbarrier,
@@ -144,6 +147,9 @@ __all__ = [
     "async_task",
     # types
     "layout_encoding",
+    "distributed_linear_layout_encoding",
+    "amd_mfma_layout_encoding",
+    "dot_operand_layout_encoding",
     "shared_layout_encoding",
     "swizzled_layout",
     "swizzled_shared_layout_encoding",

@@ -441,26 +441,31 @@ void init_triton_tlx_ir(py::module_ &m) {
              // treats it as a user-pinned (do-not-retag) buffer layout.
              return tlx::wrapUserLayout(inner);
            })
-      .def("make_padded_shared_encoding_attr",
-           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
-              std::vector<unsigned> paddings, std::vector<unsigned> order,
-              std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
-              std::vector<unsigned> CTASplitNum,
-              std::vector<unsigned> CTAOrder) {
-             assert(intervals.size() == paddings.size() &&
-                    "intervals/paddings size mismatch");
-             assert(order.size() == shape.size() &&
-                    "order/shape rank mismatch");
-             auto context = self.getBuilder().getContext();
-             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
-             intervalPads.reserve(intervals.size());
-             for (auto [i, p] : llvm::zip(intervals, paddings))
-               intervalPads.emplace_back(i, p);
-             auto CTALayout =
-                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
-             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
-                 context, intervalPads, order, shape, CTALayout));
-           })
+      .def(
+          "make_padded_shared_encoding_attr",
+          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+             std::vector<unsigned> paddings, std::vector<unsigned> order,
+             std::vector<int64_t> shape, std::vector<unsigned> CTAsPerCGA,
+             std::vector<unsigned> CTASplitNum,
+             std::vector<unsigned> CTAOrder) {
+            assert(intervals.size() == paddings.size() &&
+                   "intervals/paddings size mismatch");
+            assert(order.size() == shape.size() && "order/shape rank mismatch");
+            assert(order.size() == CTAsPerCGA.size() &&
+                   "CTAsPerCGA rank mismatch");
+            assert(order.size() == CTASplitNum.size() &&
+                   "CTASplitNum rank mismatch");
+            assert(order.size() == CTAOrder.size() && "CTAOrder rank mismatch");
+            auto context = self.getBuilder().getContext();
+            llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+            intervalPads.reserve(intervals.size());
+            for (auto [i, p] : llvm::zip(intervals, paddings))
+              intervalPads.emplace_back(i, p);
+            auto CTALayout =
+                makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                context, intervalPads, order, shape, CTALayout));
+          })
       .def("make_padded_shared_encoding_attr_with_bases",
            [](TritonOpBuilder &self, std::vector<unsigned> intervals,
               std::vector<unsigned> paddings,
@@ -521,6 +526,48 @@ void init_triton_tlx_ir(py::module_ &m) {
              tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(ll), alignment));
+           })
+      .def("make_distributed_linear_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<std::vector<int32_t>> regBases,
+              std::vector<std::vector<int32_t>> laneBases,
+              std::vector<std::vector<int32_t>> warpBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              std::vector<int64_t> shape) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(ctx, "register");
+             auto kLane = mlir::StringAttr::get(ctx, "lane");
+             auto kWarp = mlir::StringAttr::get(ctx, "warp");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto outDims = tt::standardOutDimPairs(ctx, shape);
+             auto ll = tt::LinearLayout({{kReg, regBases},
+                                         {kLane, laneBases},
+                                         {kWarp, warpBases},
+                                         {kBlock, blockBases}},
+                                        outDims,
+                                        /*requiresSurjective=*/true);
+             if (ttg::isPermutationMatrixLayout(ll))
+               return mlir::cast<Attribute>(
+                   ttg::LinearEncodingAttr::get(ctx, std::move(ll)));
+             return mlir::cast<Attribute>(
+                 ttg::GenericLinearEncodingAttr::get(ctx, std::move(ll)));
+           })
+      .def("make_padded_shared_encoding_attr_from_offsets",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              std::vector<int64_t> shape) -> Attribute {
+             assert(intervals.size() == paddings.size() &&
+                    "intervals/paddings size mismatch");
+             auto ctx = self.getBuilder().getContext();
+             auto rank = shape.size();
+             auto kOffset = mlir::StringAttr::get(ctx, "offset");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto outDims = tt::standardOutDimNames(ctx, rank);
+             auto ll = tt::LinearLayout({{kOffset, offsetBases}}, outDims) *
+                       tt::LinearLayout({{kBlock, blockBases}}, outDims);
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 ctx, intervals, paddings, std::move(ll)));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
@@ -782,6 +829,13 @@ void init_triton_tlx_ir(py::module_ &m) {
                            ttg::GenericLinearEncodingAttr::get(context,
                                                                std::move(ll)));
              return tlx::wrapNoVerifyLayout(encoding);
+           })
+      .def("make_dot_operand_encoding_attr_from_layout",
+           [](TritonOpBuilder &self, unsigned opIdx, Attribute parentEnc,
+              unsigned kWidth) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             return mlir::cast<Attribute>(ttg::DotOperandEncodingAttr::get(
+                 context, opIdx, parentEnc, kWidth));
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -1124,6 +1178,9 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("desc"), py::arg("addOffsets"), py::arg("setBounds"),
           py::arg("pred").none(), py::arg("clampBounds"))
+      // AMD-only: emit amdgpu.tdm_prefetch — an L2 prefetch hint with no
+      // memdesc. Pred is i1 here (unlike the load's i32 pred); we
+      // truncate from i32 if the caller passed a wider int.
       .def("create_tdm_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
               Value pred, bool speculative) {
@@ -1710,6 +1767,7 @@ void init_triton_tlx_plugin_passes(py::module_ &m) {
 }
 
 void init_triton_tlx(py::module_ &m) {
+
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
