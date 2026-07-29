@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
@@ -1317,12 +1318,16 @@ void init_triton_tlx_ir(py::module &&m) {
               std::optional<Value> mask, std::optional<Value> other,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
               bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
-             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+              std::optional<Value> barrier, bool useBulk,
+              std::optional<Attribute> copyLayout) -> mlir::Value {
+             auto op = self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
                  other.value_or(Value()), bulkSize.value_or(Value()),
                  barrier.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile, useBulk);
+             if (copyLayout)
+               op->setAttr("tlx.wave.copy_layout", *copyLayout);
+             return op;
            })
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
@@ -1339,6 +1344,14 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_warp_id",
+           [](TritonOpBuilder &self) -> mlir::Value {
+             return self.create<ttg::WarpIdOp>();
+           })
+      .def("create_set_priority",
+           [](TritonOpBuilder &self, int priority) {
+             self.create<ROCDL::SetPrioOp>(priority);
            })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
