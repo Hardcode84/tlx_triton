@@ -1018,8 +1018,13 @@ bool canBeRemat(Operation *op) {
     return false;
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
-  if (isa<triton::gpu::LocalLoadOp>(op))
-    return !isExpensiveLocalLoad(op);
+  if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
+    // A single-use synchronous load is replaced, not duplicated, when its
+    // layout is rematerialized. Allow that even when the load is large; this
+    // is especially important for loop-carried dot-scaled scale tensors.
+    return (!localLoad.getToken() && localLoad.getResult().hasOneUse()) ||
+           !isExpensiveLocalLoad(op);
+  }
   if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op) ||
       op->getName().getStringRef() == "tti.dot_i8")
     return false;
