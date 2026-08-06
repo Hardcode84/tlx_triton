@@ -138,3 +138,129 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Expensive local loads are eligible for backward rematerialization. The
+// slice-aware cost model decides whether replacing or duplicating them is
+// cheaper than retaining the layout conversion.
+
+// A load with two SSA uses that are both inside the rematerialized slice is
+// replaced rather than duplicated. Raw use count must not block this case.
+
+// CHECK-LABEL: @rematerialize_multi_use_local_load
+// CHECK: %[[LOAD:.*]] = ttg.local_load {{.*}} -> tensor<256xi32, #[[$REMAT:[a-zA-Z0-9_]+]]>
+// CHECK-NEXT: %[[SUM:.*]] = arith.addi %[[LOAD]], %[[LOAD]] : tensor<256xi32, #[[$REMAT]]>
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return %[[SUM]]
+
+// A surviving old-layout use makes rematerialization duplicate the load. This
+// remains profitable for one load, and the cloned load must preserve its async
+// dependency and attributes.
+
+// CHECK-LABEL: @rematerialize_token_local_load
+// CHECK-COUNT-2: ttg.local_load {{.*}} token %{{.*}} {ttg.amdg.syncedViaAsyncWait = true}
+// CHECK-NOT: ttg.local_load
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return
+
+// Five surviving local loads cost more to duplicate than one layout
+// conversion. The profitability model must retain the conversion.
+
+// CHECK-LABEL: @retain_unprofitable_local_load_remat
+// CHECK-COUNT-5: ttg.local_load
+// CHECK-NOT: ttg.local_load
+// CHECK: ttg.convert_layout
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#remat = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @rematerialize_multi_use_local_load(
+      %buf: !ttg.memdesc<256xi32, #shared, #smem, mutable>) -> tensor<256xi32, #remat> {
+    %load = ttg.local_load %buf : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %sum = arith.addi %load, %load : tensor<256xi32, #blocked>
+    %converted = ttg.convert_layout %sum : tensor<256xi32, #blocked> -> tensor<256xi32, #remat>
+    tt.return %converted : tensor<256xi32, #remat>
+  }
+
+  tt.func @rematerialize_token_local_load(
+      %buf: !ttg.memdesc<256xi32, #shared, #smem, mutable>, %token: !ttg.async.token)
+      -> (tensor<256xi64, #remat>, tensor<256xi32, #blocked>) {
+    %load = ttg.local_load %buf token %token {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %extended = arith.extsi %load : tensor<256xi32, #blocked> to tensor<256xi64, #blocked>
+    %converted = ttg.convert_layout %extended : tensor<256xi64, #blocked> -> tensor<256xi64, #remat>
+    tt.return %converted, %load : tensor<256xi64, #remat>, tensor<256xi32, #blocked>
+  }
+
+  tt.func @retain_unprofitable_local_load_remat(
+      %buf0: !ttg.memdesc<256xi32, #shared, #smem, mutable>,
+      %buf1: !ttg.memdesc<256xi32, #shared, #smem, mutable>,
+      %buf2: !ttg.memdesc<256xi32, #shared, #smem, mutable>,
+      %buf3: !ttg.memdesc<256xi32, #shared, #smem, mutable>,
+      %buf4: !ttg.memdesc<256xi32, #shared, #smem, mutable>)
+      -> (tensor<256xi32, #remat>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>,
+          tensor<256xi32, #blocked>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>) {
+    %load0 = ttg.local_load %buf0 : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %load1 = ttg.local_load %buf1 : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %load2 = ttg.local_load %buf2 : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %load3 = ttg.local_load %buf3 : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %load4 = ttg.local_load %buf4 : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> tensor<256xi32, #blocked>
+    %sum01 = arith.addi %load0, %load1 : tensor<256xi32, #blocked>
+    %sum012 = arith.addi %sum01, %load2 : tensor<256xi32, #blocked>
+    %sum0123 = arith.addi %sum012, %load3 : tensor<256xi32, #blocked>
+    %sum = arith.addi %sum0123, %load4 : tensor<256xi32, #blocked>
+    %converted = ttg.convert_layout %sum : tensor<256xi32, #blocked> -> tensor<256xi32, #remat>
+    tt.return %converted, %load0, %load1, %load2, %load3, %load4 : tensor<256xi32, #remat>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>, tensor<256xi32, #blocked>
+  }
+}
+
+// -----
+
+// Loop-carried loads are traced through the region mappings. Both the loop
+// initializer and backedge load are replaced, so neither contributes a
+// duplicated LDS-load cost.
+
+// CHECK-LABEL: @rematerialize_slice_local_loop_scale
+// CHECK: %[[INIT:.*]] = ttg.local_load {{.*}} -> tensor<128x4xi8, #[[$SCALE:[a-zA-Z0-9_]+]]>
+// CHECK: scf.for {{.*}} iter_args({{.*}}%[[CARRIED:.*]] = %[[INIT]]) -> {{.*}}tensor<128x4xi8, #[[$SCALE]]>
+// CHECK-NOT: ttg.convert_layout
+// CHECK: ttg.local_load {{.*}} -> tensor<128x4xi8, #[[$SCALE]]>
+// CHECK-NOT: ttg.convert_layout
+
+#blocked_scale = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear_scale = #ttg.linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [32, 0]], block = []}>
+#linear_b_scale = #ttg.linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [0, 0]], block = []}>
+#mma_a = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 128]}>
+#mma_b = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 64]}>
+#dot_a = #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 16}>
+#dot_b = #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 16}>
+#shared_scale = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_scale = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @rematerialize_slice_local_loop_scale(
+      %a: tensor<128x128xf8E4M3FN, #dot_a>,
+      %b: tensor<64x128xi8, #dot_b>,
+      %b_scale: tensor<128x4xi8, #linear_b_scale>,
+      %acc: tensor<128x128xf32, #mma_a>,
+      %init_buf: !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale>,
+      %next_buf: !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale>)
+      -> tensor<128x128xf32, #mma_a> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %init_scale = ttg.local_load %init_buf : !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale> -> tensor<128x4xi8, #blocked_scale>
+    %result:2 = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%iter_acc = %acc, %iter_scale = %init_scale)
+        -> (tensor<128x128xf32, #mma_a>, tensor<128x4xi8, #blocked_scale>) : i32 {
+      %scale = ttg.convert_layout %iter_scale : tensor<128x4xi8, #blocked_scale> -> tensor<128x4xi8, #linear_scale>
+      %dot = tt.dot_scaled %a scale %scale, %b scale %b_scale, %iter_acc lhs = e4m3 rhs = e2m1 {fastMath = false} : tensor<128x128xf8E4M3FN, #dot_a>, tensor<128x4xi8, #linear_scale> * tensor<64x128xi8, #dot_b>, tensor<128x4xi8, #linear_b_scale> -> tensor<128x128xf32, #mma_a>
+      %next_scale = ttg.local_load %next_buf : !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale> -> tensor<128x4xi8, #blocked_scale>
+      scf.yield %dot, %next_scale : tensor<128x128xf32, #mma_a>, tensor<128x4xi8, #blocked_scale>
+    }
+    tt.return %result#0 : tensor<128x128xf32, #mma_a>
+  }
+}

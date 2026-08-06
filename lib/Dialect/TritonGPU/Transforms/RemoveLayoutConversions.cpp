@@ -340,7 +340,9 @@ bool isLayoutAnchor(Operation *op) {
     return true;
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
-  // local_load is expensive as it reads from shared memory with specific layout
+  // Keep large local loads as forward-propagation anchors so the LDS-efficient
+  // layout selected by coalescing remains preferred. Backward rematerialization
+  // is governed separately by the slice-aware profitability model.
   if (isa<triton::gpu::LocalLoadOp>(op))
     return isExpensiveLocalLoad(op);
   if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
@@ -1018,8 +1020,6 @@ bool canBeRemat(Operation *op) {
     return false;
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
-  if (isa<triton::gpu::LocalLoadOp>(op))
-    return !isExpensiveLocalLoad(op);
   if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op) ||
       op->getName().getStringRef() == "tti.dot_i8")
     return false;
@@ -1764,9 +1764,34 @@ bool LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
 
     // If we can rematerialize the rest of the ext slice we can ignore this ext
     // as it won't need a convert.
-    if (succeeded(getRematerializableSlice(op->getOpOperand(0), srcEncoding,
-                                           slice, layout, existingRemats)))
-      continue;
+    if (smemBudget == 0) {
+      if (succeeded(getRematerializableSlice(op->getOpOperand(0), srcEncoding,
+                                             slice, layout, existingRemats)))
+        continue;
+    } else {
+      // Probe on copies so rejecting the budget-specific path below does not
+      // leak values into the slice rewritten below.
+      auto rematSlice = slice;
+      auto rematLayout = layout;
+      auto rematExistingRemats = existingRemats;
+      bool canRematerializeRest = succeeded(
+          getRematerializableSlice(op->getOpOperand(0), srcEncoding, rematSlice,
+                                   rematLayout, rematExistingRemats));
+      // The budget override must eliminate the conversion even when doing so
+      // duplicates an expensive local load. Keep the widening op as the hoist
+      // boundary; its input conversion then folds into a cloned local load.
+      if (canRematerializeRest)
+        canRematerializeRest = llvm::none_of(rematSlice, [](Value value) {
+          Operation *def = value.getDefiningOp();
+          return def && isExpensiveLocalLoad(def);
+        });
+      if (canRematerializeRest) {
+        slice = std::move(rematSlice);
+        layout = std::move(rematLayout);
+        existingRemats = std::move(rematExistingRemats);
+        continue;
+      }
+    }
 
     // Only apply it if there is a single ext op otherwise we would have to
     // duplicate the convert.

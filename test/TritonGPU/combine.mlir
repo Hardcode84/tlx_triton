@@ -2780,7 +2780,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [4, 0, 1, 2, 3]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: lift_convert_to_local_load
-  // CHECK: ttg.convert_layout
+  // CHECK-NOT: ttg.convert_layout
   // CHECK: tt.return
   tt.func public @lift_convert_to_local_load(%arg0 : !ttg.memdesc<2x1x32x4x4xi8, #shared, #ttg.shared_memory, mutable>) -> tensor<2x4x32x1x4xi8, #blocked2> {
     %1 = ttg.local_load %arg0 : !ttg.memdesc<2x1x32x4x4xi8, #shared, #ttg.shared_memory, mutable> -> tensor<2x1x32x4x4xi8, #blocked>
@@ -2878,7 +2878,7 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: lift_convert_to_local_load
-  // CHECK: ttg.convert_layout
+  // CHECK-NOT: ttg.convert_layout
   // CHECK: tt.return
   tt.func public @lift_convert_to_local_load(%arg0 : !ttg.memdesc<2x1x32x4x4xi8, #shared, #smem, mutable>) -> tensor<2x4x32x1x4xi8, #blocked2> {
     %1 = ttg.local_load %arg0 : !ttg.memdesc<2x1x32x4x4xi8, #shared, #smem, mutable> -> tensor<2x1x32x4x4xi8, #blocked>
@@ -4030,9 +4030,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.th
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
 // CHECK: tt.func @mma_v3_reg_local_load
-//    CHECK: %[[A_BLOCKED:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<128x64xbf16, #shared, #smem> -> tensor<128x64xbf16, #blocked>
-//    CHECK: %[[A_CASTED_BLOCKED:.*]] = tt.fp_to_fp %[[A_BLOCKED]] : tensor<128x64xbf16, #blocked> -> tensor<128x64xf16, #blocked>
-//    CHECK: %[[A_CASTED:.*]] = ttg.convert_layout %[[A_CASTED_BLOCKED]] : tensor<128x64xf16, #blocked> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK: %[[A_DOT:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<128x64xbf16, #shared, #smem> -> tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK: %[[A_CASTED:.*]] = tt.fp_to_fp %[[A_DOT]] : tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK-NOT: ttg.convert_layout
 //    CHECK: %[[R:.*]] = ttng.warp_group_dot %[[A_CASTED]], %{{.*}}, %{{.*}} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<128x64xf32, #mma>
   tt.func @mma_v3_reg_local_load(%dota: !ttg.memdesc<128x64xbf16, #shared, #smem>, %dotb: !ttg.memdesc<64x64xf16, #shared, #smem>, %dotc: tensor<128x64xf32, #mma>) -> tensor<128x64xf32, #mma>{
     %a_bf16 = ttg.local_load %dota : !ttg.memdesc<128x64xbf16, #shared, #smem> -> tensor<128x64xbf16, #blocked>
@@ -4043,9 +4043,9 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   }
 
 // CHECK: tt.func @mma_v3_reg_local_load_loop
-//    CHECK: %[[A_BLOCKED:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<128x64xbf16, #shared, #smem> -> tensor<128x64xbf16, #blocked>
-//    CHECK: %[[A_CASTED_BLOCKED:.*]] = tt.fp_to_fp %[[A_BLOCKED]] : tensor<128x64xbf16, #blocked> -> tensor<128x64xf16, #blocked>
-//    CHECK: %[[A_CASTED:.*]] = ttg.convert_layout %[[A_CASTED_BLOCKED]] : tensor<128x64xf16, #blocked> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK: %[[A_DOT:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<128x64xbf16, #shared, #smem> -> tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK: %[[A_CASTED:.*]] = tt.fp_to_fp %[[A_DOT]] : tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+//    CHECK-NOT: ttg.convert_layout
 //    CHECK: %[[R:.*]] = ttng.warp_group_dot %[[A_CASTED]], %{{.*}}, %{{.*}} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * !ttg.memdesc<64x64xf16, #shared, #smem> -> tensor<128x64xf32, #mma>
   tt.func @mma_v3_reg_local_load_loop(%dota: !ttg.memdesc<128x64xbf16, #shared, #smem>, %dotb: !ttg.memdesc<64x64xf16, #shared, #smem>, %dotc: tensor<128x64xf32, #mma>) -> tensor<128x64xf32, #mma>{
     %c0 = arith.constant 0 : index
