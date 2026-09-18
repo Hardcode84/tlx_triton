@@ -156,10 +156,19 @@ python3 \
   --group_m 4 \
   --tdm_pipeline_depth 2 \
   --l2_prefetch_distance 0 \
-  --benchmark_mode eager --benchmark_num_iters 32
+  --benchmark_mode eager --benchmark_rep_ms 1000
 ```
 
 Use `--benchmark_mode graph` to remove launch overhead from the timing.
+`--benchmark_rep_ms` sets a timing budget in milliseconds, defaulting to
+1000. The timing helper estimates the number of launches needed for that
+budget; it is not an iteration count. In graph mode, the budget determines
+the approximate duration of each graph replay, and the helper measures
+multiple replays. Warmup and setup add to the total benchmark duration.
+The old `--benchmark_num_iters` spelling remains a compatibility alias with
+the same millisecond semantics. The Python wrapper accepts
+`benchmark_rep_ms=1000`; its legacy `benchmark_num_iters` keyword also remains
+supported and overrides the budget when supplied.
 
 ## Full-Path Diagnostic
 
@@ -198,6 +207,8 @@ The sweep defaults to `256x256x128`, depth 2, and the within-group hybrid with
 cross-tile prefetch and TDM output stores enabled for every shape. It uses
 `--cluster-size 4 --cluster-sync refill` with multicast enabled and operand
 reuse disabled. XCD remapping defaults to `chunked`.
+The timing budget defaults to `--benchmark-rep-ms 1000`. The old
+`--benchmark-num-iters` spelling remains a compatibility alias.
 
 Use `--cluster-size 1` to disable clustering. Combine it with
 `--no-cross-tile-prefetch` to compare the alias-C schedule, `--xcd-remap none`

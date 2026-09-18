@@ -118,8 +118,8 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         str(args.l2_prefetch_distance),
         "--benchmark_mode",
         args.benchmark_mode,
-        "--benchmark_num_iters",
-        str(args.benchmark_num_iters),
+        "--benchmark_rep_ms",
+        str(args.benchmark_rep_ms),
         "--xcd_remap",
         args.xcd_remap,
         "--num_xcds",
@@ -253,13 +253,18 @@ def main() -> int:
     parser.add_argument("--lds-buffer-order", choices=("default", "interleaved"), default="default",
                         help="experimental input-slot placement for the square depth-2 hybrid")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
-    parser.add_argument("--benchmark-num-iters", type=int, default=32)
+    parser.add_argument(
+        "--benchmark-rep-ms", "--benchmark-num-iters", dest="benchmark_rep_ms", type=int, default=1000, metavar="MS",
+        help="timing budget in milliseconds (per replay in graph mode; default: 1000); "
+        "--benchmark-num-iters is a compatibility alias")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, default=None, help="optional summary CSV path")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
+    if args.benchmark_rep_ms <= 0:
+        parser.error("--benchmark-rep-ms must be positive")
 
     cases = args.cases or [BenchCase(*case) for case in DEFAULT_CASES]
     results = []

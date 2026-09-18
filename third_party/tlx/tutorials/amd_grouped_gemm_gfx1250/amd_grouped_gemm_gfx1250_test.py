@@ -954,7 +954,8 @@ def grouped_gemm_tdm(
     l2_prefetch_distance: int = 0,
     num_programs: Optional[int] = None,
     benchmark: Optional[str] = None,
-    benchmark_num_iters: int = 32,
+    benchmark_rep_ms: int = 1000,
+    benchmark_num_iters: Optional[int] = None,
     c_staging_mode: int = 0,
     cross_tile_prefetch: bool = False,
     auto_config: bool = False,
@@ -993,7 +994,14 @@ def grouped_gemm_tdm(
     ``b_padding=8|16`` pins B's shared padding per K row; None uses inference.
     ``lds_buffer_order="interleaved"`` interleaves A/B input slots in the
     square depth-2 hybrid, preserving the allocation size and output slots.
+    ``benchmark_rep_ms`` is the timing budget in milliseconds, not an iteration
+    count. In graph mode it targets each replay's duration. The legacy
+    ``benchmark_num_iters`` keyword overrides this budget when supplied.
     """
+    if benchmark_num_iters is not None:
+        benchmark_rep_ms = benchmark_num_iters
+    if benchmark_rep_ms <= 0:
+        raise ValueError("benchmark_rep_ms must be positive")
     assert a_packed.dtype == torch.float16 and b_t.dtype == torch.float16
     assert a_packed.device == b_t.device == group_offsets.device
     assert a_packed.dim() == 2 and b_t.dim() == 3
@@ -1123,10 +1131,10 @@ def grouped_gemm_tdm(
     with experimental_codegen(cluster_size, cluster_multicast, cluster_sync, operand_reuse,
                               jit_kernel=grouped_gemm_tdm_kernel, lds_buffer_order=lds_buffer_order):
         if benchmark == "graph":
-            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_rep_ms)
             print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
         elif benchmark == "eager":
-            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_rep_ms)
             print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
         else:
             run_kernel()
@@ -1593,10 +1601,15 @@ if __name__ == "__main__":
     parser.add_argument("--lds_buffer_order", choices=("default", "interleaved"), default="default",
                         help="experimental input-slot placement for the square depth-2 hybrid")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
-    parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument(
+        "--benchmark_rep_ms", "--benchmark_num_iters", dest="benchmark_rep_ms", type=int, default=1000, metavar="MS",
+        help="timing budget in milliseconds (per replay in graph mode; default: 1000); "
+        "--benchmark_num_iters is a compatibility alias")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.benchmark_rep_ms <= 0:
+        parser.error("--benchmark_rep_ms must be positive")
 
     m_list = [int(x) for x in args.m_list.split(",") if x]
     if not m_list:
@@ -1645,7 +1658,7 @@ if __name__ == "__main__":
         b_padding=None if args.b_padding == "auto" else int(args.b_padding),
         lds_buffer_order=args.lds_buffer_order,
         benchmark=benchmark,
-        benchmark_num_iters=args.benchmark_num_iters,
+        benchmark_rep_ms=args.benchmark_rep_ms,
     )
 
     if args.check:
