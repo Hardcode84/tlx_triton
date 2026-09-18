@@ -9,6 +9,7 @@
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -631,7 +632,15 @@ void init_triton_llvm(py::module_ &m) {
       });
 
   // optimization levels
+#if LLVM_VERSION_MAJOR >= 24
+  py::enum_<llvm::OptimizationLevel>(m, "optimization_level")
+      .value("O0", llvm::OptimizationLevel::O0)
+      .value("O1", llvm::OptimizationLevel::O1)
+      .value("O2", llvm::OptimizationLevel::O2)
+      .value("O3", llvm::OptimizationLevel::O3);
+#else
   py::class_<llvm::OptimizationLevel>(m, "optimization_level");
+#endif
   m.attr("OPTIMIZE_O0") = llvm::OptimizationLevel::O0;
   m.attr("OPTIMIZE_O1") = llvm::OptimizationLevel::O1;
   m.attr("OPTIMIZE_O2") = llvm::OptimizationLevel::O2;
@@ -710,7 +719,7 @@ void init_triton_llvm(py::module_ &m) {
           // registry name "vector-combine".
           const StringRef kVectorCombinePassName = "VectorCombinePass";
           passInstrCb.registerShouldRunOptionalPassCallback(
-              [kVectorCombinePassName](StringRef passName, Any) {
+              [kVectorCombinePassName](StringRef passName, auto) {
                 return passName != kVectorCombinePassName;
               });
           enablePassInstrumentation = true;

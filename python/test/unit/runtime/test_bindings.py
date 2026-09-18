@@ -123,6 +123,36 @@ def test_python_func_in_visit_call(device):
     test_py_call_const_kernel[(4, )](x, out, 4, 4)
 
 
+@pytest.mark.parametrize("level", [0, 1, 2, 3])
+@pytest.mark.parametrize("disable_vector_combine", [False, True])
+def test_llvm_optimization_level_pipeline(tmp_path, level, disable_vector_combine):
+    from triton._C.libtriton import ir, llvm
+
+    source = tmp_path / "identity.mlir"
+    source.write_text("""
+module {
+  llvm.func @identity(%x: i32) -> i32 {
+    %seven = llvm.mlir.constant(7 : i32) : i32
+    %sum = llvm.add %x, %seven : i32
+    %result = llvm.sub %sum, %seven : i32
+    llvm.return %result : i32
+  }
+}
+""")
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    llvm_context = llvm.context()
+    llvm_module = llvm.to_module(module, llvm_context)
+    llvm.optimize_module(llvm_module, getattr(llvm, f"OPTIMIZE_O{level}"),
+                         disable_vector_combine=disable_vector_combine)
+    optimized = str(llvm_module)
+    assert "define i32 @identity(i32" in optimized
+    if level > 0:
+        assert "add i32" not in optimized
+        assert "ret i32 %0" in optimized
+
+
 @pytest.mark.parametrize("scalarize", [False, True])
 def test_scalarize_packed_fops_llvm_pipeline(tmp_path, scalarize):
     from triton._C.libtriton import ir, llvm

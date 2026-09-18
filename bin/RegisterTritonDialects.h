@@ -55,6 +55,7 @@
 
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/Config/llvm-config.h"
 
 namespace mlir {
 namespace test {
@@ -110,7 +111,9 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerCudaWarningsPass();
   mlir::registerLLVMDIScope();
   mlir::LLVM::registerInlinerInterface(registry);
+#if LLVM_VERSION_MAJOR < 24
   mlir::NVVM::registerInlinerInterface(registry);
+#endif
   mlir::registerLLVMDILocalVariable();
 
   // TritonAMDGPUToLLVM passes
