@@ -143,9 +143,34 @@ def _cluster_llir(src, size, multicast, synchronization):
     return src
 
 
+def _interleave_lds_buffers(llir, shared):
+    """Swap the middle two input slots without moving the first/last or C.
+
+    The hybrid has two separately allocated, statically indexed input rings.
+    Recognize their complete padded footprints before relocating any pointer.
+    Equal padding can reverse the allocation order of A and B; either order
+    becomes alternating input slots after the swap.
+    """
+    layouts = {
+        # B padding 16 (inferred or explicit), A padding 8.
+        320448: (73728, 147424, 217056, 286672, 303568),
+        # Both inputs use padding 8.
+        312272: (69632, 139248, 208880, 278496, 295392),
+    }
+    offsets = layouts.get(shared)
+    base = r"(@global_smem, i32 )(\d+)(\))"
+    actual = {int(match[2]) for match in re.finditer(base, llir)}
+    if offsets is None or actual != set(offsets):
+        raise RuntimeError("interleaved LDS buffers did not recognize the square hybrid's input/output allocation")
+    slot1, slot2, slot3, _, _ = offsets
+    # Keep each slot's padding, including the shorter final slot of a ring.
+    mapping = {slot2: slot1, slot1: slot1 + (slot3 - slot2)}
+    return re.sub(base, lambda match: match[1] + str(mapping.get(int(match[2]), int(match[2]))) + match[3], llir)
+
+
 @contextmanager
 def experimental_codegen(cluster_size=1, cluster_multicast=True, cluster_sync="all", operand_reuse=False,
-                         jit_kernel=None):
+                         jit_kernel=None, lds_buffer_order="default"):
     """Temporarily install a cache-keyed hook; restore the caller's hook on exit.
 
     The launch grid counts clusters when cluster_size > 1. The caller must
@@ -155,11 +180,14 @@ def experimental_codegen(cluster_size=1, cluster_multicast=True, cluster_sync="a
     """
     if cluster_size not in (1, 2, 4) or cluster_sync not in ("all", "refill"):
         raise ValueError("cluster_size must be 1, 2, or 4; cluster_sync must be all or refill")
-    if cluster_size == 1 and not operand_reuse:
+    if lds_buffer_order not in ("default", "interleaved"):
+        raise ValueError("lds_buffer_order must be default or interleaved")
+    if cluster_size == 1 and not operand_reuse and lds_buffer_order == "default":
         yield
         return
     previous = knobs.runtime.add_stages_inspection_hook
-    key = repr((cluster_size, cluster_multicast, cluster_sync, operand_reuse)) + Path(__file__).read_text()
+    key = repr(
+        (cluster_size, cluster_multicast, cluster_sync, operand_reuse, lds_buffer_order)) + Path(__file__).read_text()
     if previous is not None:
         key += previous()[0]
     digest = hashlib.sha256(key.encode()).hexdigest()
@@ -175,11 +203,14 @@ def experimental_codegen(cluster_size=1, cluster_multicast=True, cluster_sync="a
 
         def make_llir(src, metadata):
             llir = original_llir(src, metadata)
-            if "define amdgpu_kernel void @grouped_gemm_tdm_kernel(" in llir and cluster_size > 1:
-                llir = _cluster_llir(llir, cluster_size, cluster_multicast, cluster_sync)
-                # Preserve per-workgroup tensor layouts, but keep the LLVM
-                # cluster attribute and the HIP launch metadata consistent.
-                metadata["num_ctas"] = cluster_size
+            if "define amdgpu_kernel void @grouped_gemm_tdm_kernel(" in llir:
+                if lds_buffer_order == "interleaved":
+                    llir = _interleave_lds_buffers(llir, metadata["shared"])
+                if cluster_size > 1:
+                    llir = _cluster_llir(llir, cluster_size, cluster_multicast, cluster_sync)
+                    # Preserve per-workgroup tensor layouts, but keep the LLVM
+                    # cluster attribute and the HIP launch metadata consistent.
+                    metadata["num_ctas"] = cluster_size
             return llir
 
         def make_amdgcn(src, metadata):

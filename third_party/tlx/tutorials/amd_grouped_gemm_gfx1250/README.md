@@ -9,8 +9,8 @@ its correctness and compile tests, and a regular-shape benchmark sweep.
   kernel, tests, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with process isolation and CSV
   output.
-- `grouped_gemm_experiments.py`: opt-in cluster multicast and WMMA operand
-  reuse transformations for hardware experiments.
+- `grouped_gemm_experiments.py`: cluster multicast, WMMA operand reuse, and
+  LDS buffer-order transformations for hardware experiments.
 
 ## Data Layout
 
@@ -276,3 +276,52 @@ These experiments use a scoped, cache-keyed compilation hook for this kernel.
 The cluster prototype edits LLVM IR and rejects unrecognized code generation;
 operand reuse is applied after register allocation. Tensor layouts, tensor
 APIs, and the ordinary compiler schedule remain unchanged.
+
+## LDS Layout Options
+
+`--b-padding auto|8|16` selects B's shared-memory padding, in FP16 elements
+after each K row. The default `auto` keeps compiler inference. Explicit
+padding uses the existing shared-layout API and adjusts the input descriptor
+and LDS allocation together. Padding 8 is a candidate for avoiding bank
+conflicts in B's ordinary vector LDS reads; padding 16 provides an explicit
+comparison control.
+
+`--lds-buffer-order default|interleaved` selects input-slot placement. The
+default keeps compiler allocation. `interleaved` alternates slots from the A
+and B rings instead of keeping each ring together. The first operand depends
+on compiler allocation and padding. This preserves the overall LDS allocation
+size, output slots, and synchronization. It changes which partitions input
+accesses reach; it does not guarantee conflict-free partition access.
+
+Buffer reordering requires the `256x256x128` depth-2 hybrid with cross-tile
+prefetch enabled, dedicated C staging and L2 prefetch disabled, and automatic
+configuration selection disabled. Its scoped LLVM rewrite checks the input
+and output allocation and rejects unrecognized code generation. It works
+with either B padding and with clustering enabled or disabled.
+
+Use separate runs to compare the options, keeping the shape and other flags
+the same:
+
+```bash
+# Current allocation and inferred padding.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --benchmark-mode graph --check --csv lds_default.csv
+
+# B padding only.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --b-padding 8 --benchmark-mode graph --check --csv lds_padding8.csv
+
+# Input-slot placement only.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --lds-buffer-order interleaved --benchmark-mode graph --check --csv lds_interleaved.csv
+
+# Combine both changes.
+python3 third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py \
+  --b-padding 8 --lds-buffer-order interleaved \
+  --benchmark-mode graph --check --csv lds_combined.csv
+```
+
+Add `--case G,M,N,K` to restrict the sweep. The standalone script uses
+`--b_padding` and `--lds_buffer_order`; the Python wrapper accepts
+`b_padding=None|8|16` and `lds_buffer_order="default"|"interleaved"`.
+Both options participate in specialization or compilation-hook cache keys.

@@ -494,6 +494,7 @@ def grouped_gemm_tdm_kernel(
     XCD_REMAP_MODE: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
+    B_PADDING: tl.constexpr = None,
 ):
     """Packed ragged-M grouped GEMM using gfx1250 TDM descriptor loads/stores.
 
@@ -540,7 +541,13 @@ def grouped_gemm_tdm_kernel(
     num_n_tiles = tl.cdiv(N, BLOCK_N)
 
     a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_packed), NUM_BUFFERS)
-    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_t), NUM_BUFFERS)
+    tl.static_assert(B_PADDING is None or B_PADDING == 8 or B_PADDING == 16, "B_PADDING must be None, 8, or 16")
+    if B_PADDING:
+        b_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(BLOCK_K, B_PADDING)],
+                                                                                     [BLOCK_N, BLOCK_K], [1, 0])
+        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_t), NUM_BUFFERS, layout=b_layout)
+    else:
+        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_t), NUM_BUFFERS)
     # TLXRewriteLocalAlias only accepts size-mismatched shared aliases when
     # the backing allocation is an integer multiple of the alias.  Reuse A only
     # when that ratio is legal.  Otherwise store C in BLOCK_K-wide chunks that
@@ -958,6 +965,8 @@ def grouped_gemm_tdm(
     cluster_multicast: bool = True,
     cluster_sync: str = "all",
     operand_reuse: bool = False,
+    b_padding: Optional[int] = None,
+    lds_buffer_order: str = "default",
 ) -> torch.Tensor:
     """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
 
@@ -981,6 +990,9 @@ def grouped_gemm_tdm(
     selects all handoffs or only input-refill handoffs. ``operand_reuse``
     enables conservative WMMA operand-cache hints. Both experiments are off
     by default and use a scoped, cache-keyed code-generation hook.
+    ``b_padding=8|16`` pins B's shared padding per K row; None uses inference.
+    ``lds_buffer_order="interleaved"`` interleaves A/B input slots in the
+    square depth-2 hybrid, preserving the allocation size and output slots.
     """
     assert a_packed.dtype == torch.float16 and b_t.dtype == torch.float16
     assert a_packed.device == b_t.device == group_offsets.device
@@ -991,6 +1003,15 @@ def grouped_gemm_tdm(
     assert num_xcds >= 1 and xcd_chunk >= 1
     if cluster_size not in (1, 2, 4) or cluster_sync not in ("all", "refill"):
         raise ValueError("cluster_size must be 1, 2, or 4; cluster_sync must be all or refill")
+    if b_padding not in (None, 8, 16):
+        raise ValueError("b_padding must be None (inferred), 8, or 16")
+    if lds_buffer_order not in ("default", "interleaved"):
+        raise ValueError("lds_buffer_order must be default or interleaved")
+    if lds_buffer_order == "interleaved" and (
+        (block_m, block_n, block_k, tdm_pipeline_depth, c_staging_mode) != (256, 256, 128, 2, 0)
+            or not cross_tile_prefetch or l2_prefetch_distance or auto_config):
+        raise ValueError("interleaved LDS buffers require the 256x256x128 depth-2 hybrid, "
+                         "cross_tile_prefetch=True, no L2 prefetch, and auto_config=False")
 
     group_size, n, k = b_t.shape
     total_m, a_k = a_packed.shape
@@ -1094,12 +1115,13 @@ def grouped_gemm_tdm(
             XCD_REMAP_MODE=_XCD_REMAP_MODES[xcd_remap_mode],
             NUM_XCDS=num_xcds,
             XCD_CHUNK=xcd_chunk,
+            B_PADDING=b_padding,
             num_warps=4,
             waves_per_eu=1,
         )
 
     with experimental_codegen(cluster_size, cluster_multicast, cluster_sync, operand_reuse,
-                              jit_kernel=grouped_gemm_tdm_kernel):
+                              jit_kernel=grouped_gemm_tdm_kernel, lds_buffer_order=lds_buffer_order):
         if benchmark == "graph":
             ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
             print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
@@ -1343,6 +1365,48 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
         assert last_dot < late_barrier < late_c_desc < closing_barrier
 
 
+@pytest.mark.parametrize("b_padding", [None, 8, 16])
+@pytest.mark.parametrize("group_size", [1, 8])
+def test_grouped_gemm_lds_options_compile_gfx1250(b_padding, group_size):
+    """Keep LDS experiments cache-isolated and composable with clustering."""
+    from triton import knobs
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+    from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm_experiments import (
+        experimental_codegen, _interleave_lds_buffers)
+
+    src = ASTSource(
+        fn=grouped_gemm_tdm_kernel,
+        signature=_grouped_gemm_tdm_compile_signature(),
+        constexprs=dict(NUM_PROGRAMS=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_M=4, NUM_BUFFERS=2,
+                        L2_PREFETCH_DISTANCE=0, C_STAGING_MODE=0, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=2,
+                        NUM_XCDS=8, XCD_CHUNK=2, K=2048, group_size=group_size, B_PADDING=b_padding),
+        attrs=_grouped_gemm_tdm_compile_attrs(),
+    )
+    previous_hook = knobs.runtime.add_stages_inspection_hook
+    kernels = []
+    for order in ("default", "interleaved", "default"):
+        with experimental_codegen(cluster_size=4, cluster_sync="refill", lds_buffer_order=order):
+            kernels.append(triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4}))
+        assert knobs.runtime.add_stages_inspection_hook is previous_hook
+    ordinary, interleaved, repeated = kernels
+    assert ordinary.hash != interleaved.hash
+    assert ordinary.hash == repeated.hash
+    assert ordinary.asm["amdgcn"] == repeated.asm["amdgcn"]
+    assert ordinary.asm["amdgcn"] != interleaved.asm["amdgcn"]
+    for kernel in kernels:
+        assert kernel.metadata.num_ctas == 4
+        assert kernel.metadata.shared == (312272 if b_padding == 8 else 320448)
+        assert kernel.metadata.global_scratch_size == 0
+        assert kernel.asm["amdgcn"].count("v_wmma_f32_16x16x32_f16") == 1024
+        assert "[128:+8]" in kernel.asm["ttgir"]
+        assert ("[128:+16]" in kernel.asm["ttgir"]) == (b_padding != 8)
+    with pytest.raises(RuntimeError, match="did not recognize"):
+        _interleave_lds_buffers(ordinary.asm["llir"], ordinary.metadata.shared + 16)
+    with pytest.raises(RuntimeError, match="did not recognize"):
+        _interleave_lds_buffers(interleaved.asm["llir"], interleaved.metadata.shared)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_grouped_gemm_phase0_ragged_gfx1250():
     device = triton.runtime.driver.active.get_active_torch_device()
@@ -1524,6 +1588,10 @@ if __name__ == "__main__":
                         help="cluster rendezvous at all handoffs or only before input refills")
     parser.add_argument("--operand_reuse", action=argparse.BooleanOptionalAction, default=False,
                         help="experimental WMMA operand-cache reuse hints")
+    parser.add_argument("--b_padding", choices=("auto", "8", "16"), default="auto",
+                        help="experimental B LDS padding in FP16 elements per K row (default: inferred)")
+    parser.add_argument("--lds_buffer_order", choices=("default", "interleaved"), default="default",
+                        help="experimental input-slot placement for the square depth-2 hybrid")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
@@ -1574,6 +1642,8 @@ if __name__ == "__main__":
         cluster_multicast=args.cluster_multicast,
         cluster_sync=args.cluster_sync,
         operand_reuse=args.operand_reuse,
+        b_padding=None if args.b_padding == "auto" else int(args.b_padding),
+        lds_buffer_order=args.lds_buffer_order,
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )

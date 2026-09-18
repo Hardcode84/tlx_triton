@@ -130,6 +130,10 @@ def _build_command(args: argparse.Namespace, case: BenchCase) -> list[str]:
         str(args.cluster_size),
         "--cluster_sync",
         args.cluster_sync,
+        "--b_padding",
+        args.b_padding,
+        "--lds_buffer_order",
+        args.lds_buffer_order,
         "--seed",
         str(args.seed),
     ]
@@ -244,6 +248,10 @@ def main() -> int:
                         help="cluster rendezvous at all handoffs or only before input refills (default: refill)")
     parser.add_argument("--operand-reuse", action=argparse.BooleanOptionalAction, default=False,
                         help="experimental WMMA operand-cache reuse hints")
+    parser.add_argument("--b-padding", choices=("auto", "8", "16"), default="auto",
+                        help="experimental B LDS padding in FP16 elements per K row (default: inferred)")
+    parser.add_argument("--lds-buffer-order", choices=("default", "interleaved"), default="default",
+                        help="experimental input-slot placement for the square depth-2 hybrid")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
