@@ -4,6 +4,11 @@ MXFP TDM-pipelined GEMM for AMD gfx1250 using TLX.
 This mirrors the structure of the Gluon MXFP GEMM example: descriptor-backed
 loads for A/B and scales, optional A scales, L2 prefetch hints, and baseline or
 sliced K/N/MNK compute schedules.
+
+The optional persistent sliceMNK path carries its data/scale rings across
+output tiles and prefetches the next tile during the final K-ring rotation.
+For example, add ``--persistent -M 4096 --num_programs 32`` to the default
+standalone configuration to process two output tiles per workgroup.
 """
 import torch
 
@@ -1159,6 +1164,257 @@ DTYPE_TO_TRITON = {
 }
 
 
+@triton.jit
+def _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    group = tile // (GROUP_M * num_n)
+    first_m = group * GROUP_M
+    group_m = tl.minimum(num_m - first_m, GROUP_M)
+    local = tile % (GROUP_M * num_n)
+    return (first_m + local % group_m) * BM, (local // group_m) * BN
+
+
+@triton.jit
+def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, k, slot,
+                            BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr, BUFFERS: tl.constexpr,
+                            WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr):
+    # The existing loader uses one index for both K and the ring slot. Offset
+    # the descriptors by their difference to decouple them across tile boundaries.
+    # Descriptor folding combines these offsets with the loader's K offsets.
+    delta = k - slot
+    ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, delta * (BK // DA)])
+    bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, delta * (BK // DB)])
+    asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // 128, delta * (BK // 32 * 128)])
+    bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // 128, delta * (BK // 32 * 128)])
+    _mxgemm_issue_loads(ad, bd, asd, bsd, a_buf, b_buf, as_buf, bs_buf, slot, True, BK // DA, BK // DB, BK // 32 * 128,
+                        BUFFERS, True, True, WITH_A_SCALE, FUSION)
+
+
+@triton.jit
+def _mxgemm_persistent_a(a_buf, as_buf, slot, m: tl.constexpr, k: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
+                         DA: tl.constexpr, BUFFERS: tl.constexpr, WITH_A_SCALE: tl.constexpr):
+    a, scale = _mxgemm_load_a_operand(a_buf, as_buf, slot, m, k, BM, BK, DA, 32, BK // 32, BM // 128, 4, BUFFERS, 2, 2,
+                                      True, WITH_A_SCALE)
+    # Preserve the scale distribution across loop edges. A generic blocked
+    # layout here adds an LDS exchange and barriers before the first dot in
+    # each K iteration.
+    scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BM // 128)), stride=((4, 0, 128), (1, 256))))
+    return a, scale
+
+
+@triton.jit
+def _mxgemm_persistent_b(b_buf, bs_buf, slot, k: tl.constexpr, n: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                         DB: tl.constexpr, BUFFERS: tl.constexpr):
+    b, scale = _mxgemm_load_b_operand(b_buf, bs_buf, slot, k, n, BN, BK, DB, 32, BK // 32, BN // 128, 4, BUFFERS, 2, 2,
+                                      True, True)
+    scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BN // 128)), stride=((4, 128, 0), (1, 256))))
+    return b, scale
+
+
+@triton.jit
+def _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot,
+                               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr,
+                               DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
+                               WITH_A_SCALE: tl.constexpr):
+    c00 = tlx.dot_scaled(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
+    c01 = tlx.dot_scaled(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+    b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
+    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS)
+    c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c10 = tlx.dot_scaled(a11, sa11, DTYPE_A, b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
+    c11 = tlx.dot_scaled(a11, sa11, DTYPE_A, b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    return c00, c01, c10, c11
+
+
+@triton.jit
+def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constexpr, BN: tl.constexpr,
+                             INSTR_M: tl.constexpr):
+    # Pin both values and offsets to the accumulator layout. A generic tl.store
+    # introduces an LDS transpose whose scratch cannot fit beside three rings.
+    acc = tlx.require_amd_wmma_layout(acc, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
+                                      instr_shape=(INSTR_M, 16, 128))
+    offsets = tl.arange(0, BM)[:, None] * stride_cm + tl.arange(0, BN)[None, :]
+    offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
+                                          instr_shape=(INSTR_M, 16, 128))
+    base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
+    tlx.buffer_store(acc, base, offsets)
+
+
+@triton.jit
+def mxgemm_tdm_persistent_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale,
+    b_scale,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_bn,
+    stride_cm,
+    stride_as,
+    stride_bs,
+    DTYPE_A: tl.constexpr,
+    DTYPE_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    WITH_A_SCALE: tl.constexpr,
+    TDM_FUSION: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    CROSS_TILE_PREFETCH: tl.constexpr = True,
+):
+    """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
+    tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and BLOCK_K >= 256)
+    tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
+    DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
+    DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+    if TDM_FUSION == "4way":
+        tl.static_assert(WITH_A_SCALE)
+        LOADS: tl.constexpr = 1
+    elif TDM_FUSION == "partial" or TDM_FUSION == "2way":
+        tl.static_assert(TDM_FUSION != "partial" or WITH_A_SCALE)
+        LOADS: tl.constexpr = 2
+    else:
+        tl.static_assert(TDM_FUSION == "none")
+        LOADS: tl.constexpr = 4 if WITH_A_SCALE else 3
+
+    a_desc = tl.make_tensor_descriptor(a_ptr, [M, K // DA], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K // DA])
+    b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
+    as_desc = tl.make_tensor_descriptor(a_scale, [M // 128, K // 32 * 128], [stride_as, tl.constexpr(1)],
+                                        [BLOCK_M // 128, BLOCK_K // 32 * 128])
+    bs_desc = tl.make_tensor_descriptor(b_scale, [N // 128, K // 32 * 128], [stride_bs, tl.constexpr(1)],
+                                        [BLOCK_N // 128, BLOCK_K // 32 * 128])
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
+                            layout=_operand_shared_layout([BLOCK_M, BLOCK_K // DA]))
+    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
+                            layout=_operand_shared_layout([BLOCK_N, BLOCK_K // DB]))
+    as_buf = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 * 128), tlx.dtype_of(a_scale), NUM_BUFFERS,
+                             layout=_scale_shared_layout([BLOCK_M // 128, BLOCK_K // 32 * 128]))
+    bs_buf = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
+                             layout=_scale_shared_layout([BLOCK_N // 128, BLOCK_K // 32 * 128]))
+    num_m, num_n = M // BLOCK_M, N // BLOCK_N
+    total_tiles = num_m * num_n
+    k_iters = K // BLOCK_K
+    tl.assume(k_iters >= NUM_BUFFERS)
+    tile = tl.program_id(0)
+    phase = 0
+    off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N)
+    for p in tl.static_range(NUM_BUFFERS):
+        _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, p, p,
+                                BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+
+    while tile < total_tiles:
+        off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N)
+        c00 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+        c01 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+        c10 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+        c11 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+        a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, phase, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS, WITH_A_SCALE)
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, phase, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+        steady_end = k_iters - NUM_BUFFERS
+        for i in tl.range(steady_end):
+            slot = (phase + i) % NUM_BUFFERS
+            c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
+                                                            as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
+                                                            DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+            _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
+                                    i + NUM_BUFFERS, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+            tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+            next_slot = (phase + i + 1) % NUM_BUFFERS
+            a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
+                                             WITH_A_SCALE)
+            b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+
+        # Only construct the next tile's offsets after the steady loop. The
+        # final ring rotation can refill slots as soon as their operands are read.
+        tlx.amd_sched_barrier()
+        next_tile = tile + NUM_PROGRAMS
+        has_next = next_tile < total_tiles
+        next_m, next_n = _mxgemm_tile_offsets(tl.minimum(next_tile, total_tiles - 1), num_m, num_n, GROUP_SIZE_M,
+                                              BLOCK_M, BLOCK_N)
+        tlx.amd_sched_barrier()
+        for j in tl.static_range(NUM_BUFFERS):
+            slot = (phase + steady_end + j) % NUM_BUFFERS
+            c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
+                                                            as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
+                                                            DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+            if CROSS_TILE_PREFETCH and has_next:
+                _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
+                                        j, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+            if j < NUM_BUFFERS - 1:
+                if CROSS_TILE_PREFETCH and has_next:
+                    tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+                else:
+                    # No replacement batch was issued. Drain the shrinking
+                    # queue far enough to make the next consumer slot ready.
+                    tlx.async_amd_descriptor_wait((NUM_BUFFERS - j - 2) * LOADS)
+                next_slot = (phase + steady_end + j + 1) % NUM_BUFFERS
+                a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
+                                                 WITH_A_SCALE)
+                b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+
+        # Direct stores leave all four input rings intact. A full FP32 C tile
+        # cannot coexist with them in LDS at the default three-buffer tile size.
+        tlx.amd_sched_barrier()
+        INSTR_M: tl.constexpr = 32 if DA == 2 and DB == 2 else 16
+        _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M)
+        _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
+                                 INSTR_M)
+        _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
+                                 INSTR_M)
+        _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
+                                 BLOCK_N // 2, INSTR_M)
+        tlx.amd_sched_barrier()
+        # K=0 of the next tile occupies the first slot recycled by the tail:
+        # (phase + k_iters - NUM_BUFFERS) % NUM_BUFFERS. Keep that phase even
+        # when K's iteration count is not divisible by the ring depth.
+        phase = (phase + k_iters) % NUM_BUFFERS
+        tile = next_tile
+        if not CROSS_TILE_PREFETCH and has_next:
+            for p in tl.static_range(NUM_BUFFERS):
+                _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
+                                        p, (phase + p) % NUM_BUFFERS, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE,
+                                        TDM_FUSION)
+
+
+def _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BM, BN, BK, num_buffers, group_m, transpose_b,
+                                preshuffle, with_a_scale, schedule, fusion, split, l2_prefetch, num_programs):
+    if schedule != "sliceMNK" or not transpose_b or not preshuffle or split or l2_prefetch != -1:
+        raise ValueError("persistent MXFP requires sliceMNK, transposed B, preshuffled scales, "
+                         "unsplit descriptors, and L2 prefetch disabled")
+    if (BM not in (128, 256) or BN not in (128, 256) or BK != 256 or num_buffers not in (2, 3) or group_m <= 0):
+        raise ValueError("persistent MXFP requires 128/256 M and N tiles, BLOCK_K=256, "
+                         "2/3 buffers, and positive GROUP_SIZE_M")
+    if min(M, N, K) <= 0 or M % BM or N % BN or K % BK or K // BK < num_buffers:
+        raise ValueError("persistent MXFP requires nonempty full tiles and at least NUM_BUFFERS K tiles")
+    if M != a.shape[0] or N != b.shape[0] or tuple(b_scale.shape) != (N // 128, K // 32 * 128):
+        raise ValueError("persistent MXFP dimensions must match the data and preshuffled scales")
+    if with_a_scale and (a_scale is None or tuple(a_scale.shape) != (M // 128, K // 32 * 128)):
+        raise ValueError("persistent MXFP dimensions must match the preshuffled A scales")
+    if fusion not in ("none", "2way", "4way", "partial") or (not with_a_scale and fusion in ("4way", "partial")):
+        raise ValueError("invalid persistent MXFP fusion or missing A scales")
+    if a.stride(1) != 1 or b.stride(1) != 1 or b_scale.stride(1) != 1:
+        raise ValueError("persistent MXFP requires contiguous K dimensions")
+    if with_a_scale and (a_scale is None or a_scale.stride(1) != 1):
+        raise ValueError("persistent MXFP requires preshuffled A scales with contiguous K")
+    if num_programs is not None and (not isinstance(num_programs, int) or num_programs <= 0):
+        raise ValueError("NUM_PROGRAMS must be a positive integer")
+    if num_programs is None:
+        num_programs = torch.cuda.get_device_properties(a.device).multi_processor_count
+    return min(num_programs, (M // BM) * (N // BN))
+
+
 def _mxfp_gemm_tflops(ms: float, M: int, N: int, K: int) -> float:
     return 2 * M * N * K / (ms * 1e-3) / 1e12
 
@@ -1197,7 +1453,20 @@ def mxgemm_tdm_pipelined(
     GROUP_SIZE_M: int = 8,
     BENCHMARK: str | None = None,
     BENCHMARK_NUM_ITERS: int = 32,
+    PERSISTENT: bool = False,
+    NUM_PROGRAMS: int | None = None,
+    CROSS_TILE_PREFETCH: bool = True,
 ) -> torch.Tensor:
+    """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
+
+    ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
+    128/256 M and N tiles, BLOCK_K=256, two or three buffers, and L2 prefetch
+    disabled. M/N/K must
+    contain full tiles, with at least NUM_BUFFERS K tiles. ``NUM_PROGRAMS``
+    defaults to the smaller of the CU count and the output tile count.
+    ``CROSS_TILE_PREFETCH=False`` retains persistence but primes each tile
+    after the previous output store, providing a control for input overlap.
+    """
     if M is None:
         M = a.shape[0]
     if K is None:
@@ -1212,12 +1481,24 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    if PERSISTENT:
+        assert K == a.shape[1] * (2 if DTYPE_A == "e2m1" else 1)
+        NUM_PROGRAMS = _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
+                                                   NUM_BUFFERS, GROUP_SIZE_M, TRANSPOSE_B, SCALE_PRESHUFFLE,
+                                                   WITH_A_SCALE, SCHEDULE, TDM_FUSION, TDM_SPLIT, L2_PREFETCH_DISTANCE,
+                                                   NUM_PROGRAMS)
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
 
     def run_kernel():
+        if PERSISTENT:
+            return mxgemm_tdm_persistent_kernel[(NUM_PROGRAMS, )](
+                a, b, c, a_scale_arg, b_scale, M, N, K, a.stride(0), b.stride(0), c.stride(0), a_scale_arg.stride(0),
+                b_scale.stride(0), DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, WITH_A_SCALE=WITH_A_SCALE, TDM_FUSION=TDM_FUSION,
+                NUM_PROGRAMS=NUM_PROGRAMS, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, num_warps=4, waves_per_eu=1)
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -1284,6 +1565,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
 
     ``a_scale`` / ``b_scale`` must already be pre-shuffled with :func:`pack_scale`.
     When ``config["TRANSPOSE_B"]`` is set, ``b`` is the ``[N, K]`` transposed layout.
+    ``PERSISTENT``, ``NUM_PROGRAMS``, and ``CROSS_TILE_PREFETCH`` select the
+    persistent full-tile sliceMNK path; see :func:`mxgemm_tdm_pipelined`.
     """
     cfg = dict(_DEFAULT_CONFIG)
     if config is not None:
@@ -1302,6 +1585,20 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     BLOCK_M = cfg["BLOCK_M"]
     BLOCK_N = cfg["BLOCK_N"]
     BLOCK_K = cfg["BLOCK_K"]
+
+    if cfg.get("PERSISTENT", False):
+        if cfg["num_warps"] != 4 or cfg["waves_per_eu"] != 1 or cfg["SCALE_BLOCK"] != 32:
+            raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
+        return mxgemm_tdm_pipelined(a, b, a_scale, b_scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                                    TRANSPOSE_B=TRANSPOSE_B, NUM_BUFFERS=cfg["NUM_BUFFERS"], DTYPE_A=cfg["DTYPE_A"],
+                                    DTYPE_B=cfg["DTYPE_B"], SCALE_PRESHUFFLE=cfg.get("SCALE_PRESHUFFLE", True),
+                                    WITH_A_SCALE=cfg.get("WITH_A_SCALE",
+                                                         True), SCHEDULE=cfg.get("SCHEDULE", "baseline"),
+                                    L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE",
+                                                                 -1), TDM_FUSION=cfg.get("TDM_FUSION", "none"),
+                                    TDM_SPLIT=cfg.get("TDM_SPLIT", False), GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
+                                    PERSISTENT=True, NUM_PROGRAMS=cfg.get("NUM_PROGRAMS"),
+                                    CROSS_TILE_PREFETCH=cfg.get("CROSS_TILE_PREFETCH", True))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -1367,6 +1664,10 @@ if __name__ == "__main__":
     parser.add_argument("--partial_tdm", action="store_true",
                         help="Alias for --tdm_fusion partial, matching the Gluon CLI spelling")
     parser.add_argument("--tdm_split", action="store_true")
+    parser.add_argument("--persistent", action="store_true", help="use persistent full-tile sliceMNK scheduling")
+    parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
+    parser.add_argument("--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=True,
+                        help="prefetch the next persistent tile during the current tile's K-loop tail")
     parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
                         help="Prefetch distance in K iterations; -1 disables L2 prefetch")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
@@ -1423,4 +1724,7 @@ if __name__ == "__main__":
         args.group_size_m,
         benchmark,
         args.benchmark_num_iters,
+        PERSISTENT=args.persistent,
+        NUM_PROGRAMS=args.num_programs,
+        CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
     )

@@ -542,6 +542,80 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("K,NUM_BUFFERS", [(512, 2), (768, 2), (768, 3), (1024, 3), (1280, 3)])
+@pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
+def test_mxgemm_persistent_ring_phase(K, NUM_BUFFERS, CROSS_TILE_PREFETCH):
+    # Ten tiles over three programs exercise uneven tile counts, changes in
+    # both M and N, the zero-length steady loop, and every ring phase modulo 3.
+    M, N = 1280, 512
+    torch.manual_seed(123)
+    a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
+    b = _gfx1250_mxfp._init_data("float4", K, N)
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+    out = _gfx1250_mxfp.matmul(
+        a.cuda(),
+        b.to_packed_tensor(dim=0).T.contiguous().cuda(),
+        _gfx1250_mxfp.pack_scale(a_scale).cuda(),
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
+        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3", DTYPE_B="e2m1",
+                    TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=3,
+                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH))
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS", [
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2),
+    ("float4", "float4", True, "2way", 32),
+    ("float8_e4m3", "float4", False, "none", 2),
+    ("float8_e4m3", "float4", False, "2way", None),
+])
+def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS):
+    M, N, K = 384, 512, 768
+    torch.manual_seed(7)
+    a = _gfx1250_mxfp._init_data(DTYPE_A, M, K)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8) if WITH_A_SCALE else None
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+    a_data = a.to_packed_tensor(dim=1) if DTYPE_A == "float4" else a
+    b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
+    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_data.cuda(),
+                                             b_data.T.contiguous().cuda(),
+                                             _gfx1250_mxfp.pack_scale(a_scale).cuda() if WITH_A_SCALE else None,
+                                             _gfx1250_mxfp.pack_scale(b_scale).cuda(), BLOCK_M=128, BLOCK_N=256,
+                                             BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_A],
+                                             DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True,
+                                             WITH_A_SCALE=WITH_A_SCALE, SCHEDULE="sliceMNK", TDM_FUSION=FUSION,
+                                             PERSISTENT=True, NUM_PROGRAMS=NUM_PROGRAMS)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("config,match", [
+    ({"TRANSPOSE_B": False}, "transposed B"),
+    ({"NUM_PROGRAMS": 0}, "positive integer"),
+    ({"NUM_BUFFERS": 3}, "at least NUM_BUFFERS"),
+    ({"BLOCK_M": 256}, "full tiles"),
+    ({"SCALE_PRESHUFFLE": False}, "preshuffled scales"),
+    ({"TDM_SPLIT": True}, "unsplit descriptors"),
+])
+def test_mxgemm_persistent_invalid_config(config, match):
+    # Validation happens before any GPU allocation or launch.
+    a = torch.empty((384, 512), dtype=torch.float8_e4m3fn)
+    b = torch.empty((384, 512), dtype=torch.float8_e4m3fn)
+    scales = torch.empty((3, 2048), dtype=torch.uint8)
+    cfg = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True,
+               SCHEDULE="sliceMNK", PERSISTENT=True, NUM_PROGRAMS=2)
+    cfg.update(config)
+    if not cfg["TRANSPOSE_B"]:
+        b = b.T.contiguous()
+    with pytest.raises(ValueError, match=match):
+        _gfx1250_mxfp.matmul(a, b, scales, scales, config=cfg)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("BATCH,H,SEQLEN", [(1, 8, 1024),  # multi-head
                                             (2, 4, 1024),  # multi-batch + multi-head
                                             (1, 16, 2048),  # many heads, longer seqlen
