@@ -11,7 +11,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250)
 
-from triton.tools.mxfp import MXScaleTensor
+from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
     create_inputs as _ikbo_lce_create_inputs,
@@ -1653,6 +1653,45 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     config["TRANSPOSE_B"] = TRANSPOSE_B
     out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype_b", ["e4m3", "e2m1"])
+@pytest.mark.parametrize(
+    "buffers,k_iters,fusion,with_a_scale,cross_tile_prefetch,output_staging",
+    [(2, 3, "partial", True, True, False), (3, 4, "partial", True, True, False), (4, 5, "partial", True, True, False),
+     (4, 4, "partial", True, True, False), (3, 4, "4way", True, True, False), (4, 5, "none", False, False, False),
+     (3, 4, "partial", True, True, True), (2, 3, "none", False, False, True), (3, 3, "4way", True, True, True),
+     (3, 5, "partial", True, True, True)],
+)
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch,
+                                            output_staging):
+    # Three output tiles per program, including a short final M group. Exercise
+    # both an empty steady loop and a K count that rotates the ring's phase.
+    torch.manual_seed(123)
+    M, N, K = 768, 512, 128 * k_iters
+    a = (torch.randn(M, K) * 0.5).to(torch.float8_e4m3fn)
+    if dtype_b == "e2m1":
+        b_mx = MXFP4Tensor(size=(N, K)).random()
+        b, b_ref = b_mx.to_packed_tensor(dim=1), b_mx.to(torch.float32)
+    else:
+        b = (torch.randn(N, K) * 0.5).to(torch.float8_e4m3fn)
+        b_ref = b.float()
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    a_ref = a.float()
+    if with_a_scale:
+        a_ref *= _mxfp_e8m0_to_float32(a_scale).repeat_interleave(32, dim=1)
+    b_ref *= _mxfp_e8m0_to_float32(b_scale).repeat_interleave(32, dim=1)
+    ref = a_ref @ b_ref.T
+    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b,
+                  TRANSPOSE_B=True, WITH_A_SCALE=with_a_scale, SCHEDULE="sliceMNK", TDM_FUSION=fusion, PERSISTENT=True,
+                  NUM_PROGRAMS=2, GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch,
+                  OUTPUT_STAGING=output_staging)
+    out = _amd_mxfp_gemm_tdm_pipelined(a.to(DEVICE), b.to(DEVICE),
+                                       _amd_mxfp_pack_scale(a_scale).to(DEVICE) if with_a_scale else None,
+                                       _amd_mxfp_pack_scale(b_scale).to(DEVICE), config=config)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
 # =============================================================================

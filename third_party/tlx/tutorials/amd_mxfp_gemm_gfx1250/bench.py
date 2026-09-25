@@ -1,14 +1,17 @@
 """Benchmark persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
 Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
-output. Each shape/variant runs in a fresh process using the current interpreter
-and environment. Tensor allocation and compilation are outside the tutorial
-kernel's timed region.
+output, persistent 256x256x128 tiles, three input buffers, output staging, and
+partial TDM fusion. Each shape/variant runs in a fresh process using the current
+interpreter and environment. Tensor allocation and compilation are outside the
+tutorial kernel's timed region.
 
 Examples::
 
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --num-buffers 4 --no-output-staging
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 
@@ -56,7 +59,7 @@ def _command(args, case, dtype_b):
         "-BN",
         str(args.block_n),
         "-BK",
-        "256",
+        str(args.block_k),
         "--dtype_a",
         args.dtype_a,
         "--dtype_b",
@@ -83,6 +86,8 @@ def _command(args, case, dtype_b):
     ]
     if args.persistent:
         command.append("--persistent")
+    if args.output_staging:
+        command.append("--output_staging")
     if args.num_programs is not None:
         command.extend(["--num_programs", str(args.num_programs)])
     if not args.cross_tile_prefetch:
@@ -98,7 +103,8 @@ def main():
     parser.add_argument("-K", type=int)
     parser.add_argument("-BM", "--block-m", dest="block_m", type=int, choices=(128, 256), default=256)
     parser.add_argument("-BN", "--block-n", dest="block_n", type=int, choices=(128, 256), default=256)
-    parser.add_argument("--num-buffers", type=int, choices=(2, 3), default=2)
+    parser.add_argument("-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=128)
+    parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=3)
     parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--variant", action="append", choices=tuple(VARIANT_DTYPES_B),
                         help="repeatable variant selection; default: sweep both variants")
@@ -107,6 +113,8 @@ def main():
                         help="select a single weight dtype instead of --variant")
     parser.add_argument("--tdm-fusion", choices=("none", "2way", "4way", "partial"), default="partial")
     parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
+                        help="stage persistent FP32 output for TDM stores (default: enabled)")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-programs", type=int, default=None,
                         help="default: one program per CU, capped by tile count")
@@ -136,12 +144,20 @@ def main():
         parser.error("--num-programs must be positive")
     if args.benchmark_num_iters <= 0:
         parser.error("--benchmark-num-iters must be positive")
-    if (args.block_m == args.block_n == 256 and args.num_buffers == 3
-            and any(dtype_b != "float4" for _, dtype_b in variants)):
-        parser.error("MXFP8 x MXFP8 256x256 tiles with three buffers exceed gfx1250 LDS capacity; "
-                     "use two buffers or select --variant mx8xmx4")
+    if args.output_staging and (not args.persistent or args.block_m != 256 or args.block_n != 256 or args.block_k != 128
+                                or args.num_buffers not in (2, 3)):
+        parser.error("--output-staging requires persistent 256x256x128 tiles and 2/3 buffers")
+    for _, dtype_b in variants:
+        # Include the operand/scale padding used by the tutorial. This is an
+        # upper bound for the rings; compiler scratch may need additional LDS.
+        data_bytes = (args.block_m + args.block_n // (2 if dtype_b == "float4" else 1)) * args.block_k
+        scale_bytes = (args.block_m + args.block_n) * args.block_k // 32
+        ring_bytes = args.num_buffers * (data_bytes * 272 // 256 + scale_bytes * 264 // 256)
+        if ring_bytes > 320 * 1024:
+            parser.error("input rings exceed gfx1250 LDS capacity; reduce --block-k, --num-buffers, or M/N tiles")
     for m, n, k in cases:
-        if min(m, n, k) <= 0 or m % args.block_m or n % args.block_n or k % 256 or k // 256 < args.num_buffers:
+        if (min(m, n, k) <= 0 or m % args.block_m or n % args.block_n or k % args.block_k
+                or k // args.block_k < args.num_buffers):
             parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
 
     results = []
