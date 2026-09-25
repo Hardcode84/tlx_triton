@@ -1657,19 +1657,26 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 
 @pytest.mark.parametrize("dtype_b", ["e4m3", "e2m1"])
 @pytest.mark.parametrize(
-    "buffers,k_iters,fusion,with_a_scale,cross_tile_prefetch,output_staging",
-    [(2, 3, "partial", True, True, False), (3, 4, "partial", True, True, False), (4, 5, "partial", True, True, False),
-     (4, 4, "partial", True, True, False), (3, 4, "4way", True, True, False), (4, 5, "none", False, False, False),
-     (3, 4, "partial", True, True, True), (2, 3, "none", False, False, True), (3, 3, "4way", True, True, True),
-     (3, 5, "partial", True, True, True), (2, 2, "partial", True, True, True), (3, 8, "partial", True, False, True)],
+    "buffers,k_iters,fusion,with_a_scale,cross_tile_prefetch,output_staging,block_k",
+    [(2, 3, "partial", True, True, False, 128), (3, 4, "partial", True, True, False, 128),
+     (4, 5, "partial", True, True, False, 128), (4, 4, "partial", True, True, False, 128),
+     (3, 4, "4way", True, True, False, 128), (4, 5, "none", False, False, False, 128),
+     (3, 4, "partial", True, True, True, 128), (2, 3, "none", False, False, True, 128),
+     (3, 3, "4way", True, True, True, 128), (3, 5, "partial", True, True, True, 128),
+     (2, 2, "partial", True, True, True, 128), (3, 8, "partial", True, False, True, 128),
+     (2, 2, "partial", True, False, True, 256), (2, 3, "partial", True, False, True, 256),
+     (2, 5, "none", False, False, True, 256), (3, 3, "4way", True, False, True, 256),
+     (3, 4, "partial", True, False, True, 256)],
 )
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch,
-                                            output_staging):
+                                            output_staging, block_k):
+    if output_staging and dtype_b != "e2m1" and buffers > (3 if block_k == 128 else 2):
+        pytest.skip("FP8 B input rings leave insufficient LDS for this output staging configuration")
     # Three output tiles per program, including a short final M group. Exercise
     # both an empty steady loop and a K count that rotates the ring's phase.
     torch.manual_seed(123)
-    M, N, K = 768, 512, 128 * k_iters
+    M, N, K = 768, 512, block_k * k_iters
     a = (torch.randn(M, K) * 0.5).to(torch.float8_e4m3fn)
     if dtype_b == "e2m1":
         b_mx = MXFP4Tensor(size=(N, K)).random()
@@ -1684,7 +1691,7 @@ def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, w
         a_ref *= _mxfp_e8m0_to_float32(a_scale).repeat_interleave(32, dim=1)
     b_ref *= _mxfp_e8m0_to_float32(b_scale).repeat_interleave(32, dim=1)
     ref = a_ref @ b_ref.T
-    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b,
+    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b,
                   TRANSPOSE_B=True, WITH_A_SCALE=with_a_scale, SCHEDULE="sliceMNK", TDM_FUSION=fusion, PERSISTENT=True,
                   NUM_PROGRAMS=2, GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch,
                   OUTPUT_STAGING=output_staging)
