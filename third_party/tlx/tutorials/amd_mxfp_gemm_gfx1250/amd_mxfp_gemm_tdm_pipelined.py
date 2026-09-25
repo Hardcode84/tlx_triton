@@ -1255,6 +1255,23 @@ def _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, 
 
 
 @triton.jit
+def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BM: tl.constexpr,
+                                   BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr,
+                                   DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
+                                   WITH_A_SCALE: tl.constexpr):
+    tl.static_assert(BK == 128)
+    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
+    c00 = tlx.dot_scaled(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    tlx.amd_sched_barrier()
+    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c01 = tlx.dot_scaled(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    tlx.amd_sched_barrier()
+    # Retain the bottom-half operands in registers so the caller can refill
+    # this LDS slot and read the next stage before finishing C10/C11.
+    return c00, c01, a10, sa10, b01, sb01
+
+
+@triton.jit
 def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constexpr, BN: tl.constexpr,
                              INSTR_M: tl.constexpr, c_buf=None):
     # Pin values so output extraction stays in registers. Direct stores also
@@ -1318,6 +1335,10 @@ def mxgemm_tdm_persistent_kernel(
     DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     if OUTPUT_STAGING:
         tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and NUM_BUFFERS <= 3 and DA == 1)
+    # With staged A8W4 output, computing all quadrants before the refill lets
+    # LLVM schedule every WMMA ahead of the next operand loads. Keep independent
+    # bottom-half work after those loads to cover their latency.
+    DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and DB == 2
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE)
         LOADS: tl.constexpr = 1
@@ -1366,9 +1387,16 @@ def mxgemm_tdm_persistent_kernel(
         steady_end = k_iters - NUM_BUFFERS
         for i in tl.range(steady_end):
             slot = (phase + i) % NUM_BUFFERS
-            c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
-                                                            as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
-                                                            DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+            if DEFER_BOTTOM:
+                c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf,
+                                                                                b_buf, as_buf, bs_buf, slot, BLOCK_M,
+                                                                                BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
+                                                                                DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+                last_b00, last_sb00 = b00, sb00
+            else:
+                c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
+                                                                as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
+                                                                DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                     i + NUM_BUFFERS, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
@@ -1376,6 +1404,11 @@ def mxgemm_tdm_persistent_kernel(
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                              WITH_A_SCALE)
             b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+            if DEFER_BOTTOM:
+                c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
 
         # Only construct the next tile's offsets after the steady loop. The
         # final ring rotation can refill slots as soon as their operands are read.
@@ -1387,9 +1420,16 @@ def mxgemm_tdm_persistent_kernel(
         tlx.amd_sched_barrier()
         for j in tl.static_range(NUM_BUFFERS):
             slot = (phase + steady_end + j) % NUM_BUFFERS
-            c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
-                                                            as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
-                                                            DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+            if DEFER_BOTTOM:
+                c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf,
+                                                                                b_buf, as_buf, bs_buf, slot, BLOCK_M,
+                                                                                BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
+                                                                                DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
+                last_b00, last_sb00 = b00, sb00
+            else:
+                c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
+                                                                as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
+                                                                DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             if CROSS_TILE_PREFETCH and has_next:
                 _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
                                         j, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
@@ -1404,6 +1444,11 @@ def mxgemm_tdm_persistent_kernel(
                 a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                                  WITH_A_SCALE)
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+            if DEFER_BOTTOM:
+                c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
 
         # Keep the input rings intact for cross-tile prefetch. Optional output
         # staging uses two small slots because a full FP32 tile cannot fit.
