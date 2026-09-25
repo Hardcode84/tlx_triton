@@ -1661,7 +1661,7 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     [(2, 3, "partial", True, True, False), (3, 4, "partial", True, True, False), (4, 5, "partial", True, True, False),
      (4, 4, "partial", True, True, False), (3, 4, "4way", True, True, False), (4, 5, "none", False, False, False),
      (3, 4, "partial", True, True, True), (2, 3, "none", False, False, True), (3, 3, "4way", True, True, True),
-     (3, 5, "partial", True, True, True)],
+     (3, 5, "partial", True, True, True), (2, 2, "partial", True, True, True), (3, 8, "partial", True, False, True)],
 )
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch,

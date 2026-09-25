@@ -5059,6 +5059,46 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
     assert "wmma" in amdgcn
 
 
+@pytest.mark.parametrize("num_buffers", [2, 3])
+def test_gfx1250_mxgemm_persistent_a8w4_staging_overlaps_loads(num_buffers):
+    kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8", c_ptr="*fp32", a_scale="*u8", b_scale="*u8", M="i32", N="i32",
+                     K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32", stride_as="i32", stride_bs="i32")
+    # Match the aligned, sub-2GB tensors and runtime dimension specialization
+    # used by bench.py at both K4096 and K8192.
+    attrs = {(kernel.arg_names.index(name), ):
+             [["tt.divisibility", 16]] + ([["tt.pointer_range", 32]] if ty.startswith("*") else [])
+             for name, ty in signature.items()}
+    src = ASTSource(
+        kernel, signature=signature, attrs=attrs,
+        constexprs=dict(DTYPE_A="e4m3", DTYPE_B="e2m1", BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_SIZE_M=8,
+                        NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
+                        CROSS_TILE_PREFETCH=True, OUTPUT_STAGING=True))
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+    # Find the innermost loop containing both compute and a TDM refill. Merely
+    # emitting both kinds of instructions is insufficient: the regression put
+    # every WMMA before the tensor wait, exposing all subsequent operand reads.
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
+    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    assert any("v_wmma" in inst for inst in body[load + 1:]), "no matrix work overlaps the next operand loads"
+
+
 def test_gfx1250_mxgemm_tdm_split_compiles():
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
