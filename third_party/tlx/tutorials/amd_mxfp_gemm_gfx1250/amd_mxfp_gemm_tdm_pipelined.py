@@ -10,7 +10,7 @@ output tiles and prefetches the next tile during the final K-ring rotation.
 For example, add ``--persistent -M 4096 --num_programs 32`` to the default
 standalone configuration to process two output tiles per workgroup.
 
-The A8W8 sweep in ``bench.py`` benchmarks FP8 E4M3 inputs with
+The sweep in ``bench.py`` benchmarks MXFP8 x MXFP8 and MXFP8 x MXFP4 with
 two buffers at 8192x8192x8192 and 8192x8192x4096 by default.
 """
 import torch
