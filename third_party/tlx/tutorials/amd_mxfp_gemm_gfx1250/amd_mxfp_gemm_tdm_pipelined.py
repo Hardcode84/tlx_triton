@@ -9,6 +9,9 @@ The optional persistent sliceMNK path carries its data/scale rings across
 output tiles and prefetches the next tile during the final K-ring rotation.
 For example, add ``--persistent -M 4096 --num_programs 32`` to the default
 standalone configuration to process two output tiles per workgroup.
+
+The A8W8 sweep in ``bench.py`` benchmarks FP8 E4M3 inputs with
+two buffers at 8192x8192x8192 and 8192x8192x4096 by default.
 """
 import torch
 
@@ -1221,8 +1224,17 @@ def _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, 
     a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
     b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
+    # Limit overlap between K halves for full A8W8 tiles to avoid spilling.
+    # Preload the next A operand before the current half's last dot so the
+    # scheduling boundary does not serialize its LDS load.
+    LIMIT_FP8_LIFETIME: tl.constexpr = DA == 1 and DB == 1 and BM == 256 and BN == 256
+    if LIMIT_FP8_LIFETIME:
+        a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
-    a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    if LIMIT_FP8_LIFETIME:
+        tlx.amd_sched_barrier()
+    else:
+        a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
     b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS)
     c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
