@@ -120,7 +120,8 @@ python third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx12
 The [grouped benchmark driver](amd_grouped_gemm_gfx1250/bench.py) runs regular
 shape sweeps in separate processes; use `--dry-run` to inspect the commands.
 The [MXFP benchmark driver](amd_mxfp_gemm_gfx1250/bench.py) defaults to persistent
-A8W8 at M=N=8192 with K=8192 and K=4096, and supports CSV output.
+MXFP8 x MXFP8 and MXFP8 x MXFP4 at M=N=8192 with K=8192 and K=4096, and supports
+CSV output with variant and operand dtype columns.
 The GEMM and MXFP modules also provide benchmark CLIs (`--help`). Compile
 checks live in `python/test/unit/language/test_tlx_codegen.py`; gfx1250 runtime
 checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`. The port
