@@ -117,7 +117,7 @@ if is_hip():
         matmul as _amd_gemm_pingpong, )
     from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
         matmul as _amd_gemm_v9_beyond_hotloop, )
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
         matmul as _amd_mxfp_gemm_tdm_pipelined,
         pack_scale as _amd_mxfp_pack_scale,
     )

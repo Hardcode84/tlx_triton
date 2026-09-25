@@ -5,7 +5,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import (
+    amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp, )
 from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
@@ -566,14 +567,15 @@ def test_mxgemm_persistent_ring_phase(K, NUM_BUFFERS, CROSS_TILE_PREFETCH):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS", [
-    ("float8_e4m3", "float8_e5m2", True, "4way", 2),
-    ("float4", "float4", True, "2way", 32),
-    ("float8_e4m3", "float4", False, "none", 2),
-    ("float8_e4m3", "float4", False, "2way", None),
+@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS,BLOCK_M", [
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 128),
+    ("float4", "float4", True, "2way", 32, 128),
+    ("float8_e4m3", "float4", False, "none", 2, 128),
+    ("float8_e4m3", "float4", False, "2way", None, 128),
+    ("float8_e4m3", "float8_e4m3", True, "partial", 2, 256),
 ])
-def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS):
-    M, N, K = 384, 512, 768
+def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS, BLOCK_M):
+    M, N, K = 3 * BLOCK_M, 512, 768
     torch.manual_seed(7)
     a = _gfx1250_mxfp._init_data(DTYPE_A, M, K)
     b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
@@ -585,7 +587,7 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_data.cuda(),
                                              b_data.T.contiguous().cuda(),
                                              _gfx1250_mxfp.pack_scale(a_scale).cuda() if WITH_A_SCALE else None,
-                                             _gfx1250_mxfp.pack_scale(b_scale).cuda(), BLOCK_M=128, BLOCK_N=256,
+                                             _gfx1250_mxfp.pack_scale(b_scale).cuda(), BLOCK_M=BLOCK_M, BLOCK_N=256,
                                              BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_A],
                                              DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True,
                                              WITH_A_SCALE=WITH_A_SCALE, SCHEDULE="sliceMNK", TDM_FUSION=FUSION,

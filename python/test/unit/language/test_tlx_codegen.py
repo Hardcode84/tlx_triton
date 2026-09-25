@@ -11,7 +11,8 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import (
+    amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp, )
 from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
@@ -31,7 +32,7 @@ from triton.compiler.errors import CompilationError
 from triton.backends.amd import amdgc_hazard_repair
 from triton.backends.amd import compiler as amd_compiler
 from triton.language.extra.tlx.tutorials import amd_fa_cluster as _amd_fa_cluster_module
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
