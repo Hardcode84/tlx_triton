@@ -9,8 +9,10 @@ The optional persistent sliceMNK path carries its data/scale rings across
 output tiles and prefetches the next tile during the final K-ring rotation.
 It also supports 128-element K stages with up to four ring slots, allowing
 earlier refills without increasing the input footprint of two 256-element stages.
-With 256x256x128 tiles and two or three input slots, ``--output_staging``
-stages FP32 output through two 64x128 LDS slots for asynchronous TDM stores.
+With 256x256x128 tiles, ``--output_staging`` uses separate LDS output slots.
+For 256x256x256 tiles, combine it with ``--no-cross_tile_prefetch`` to reuse
+the A ring for four quadrant output stores. This supports two input buffers
+for A8W8 and two or three for A8W4, without a separate output allocation.
 For example, add ``--persistent -M 4096 --num_programs 32`` to the default
 standalone configuration to process two output tiles per workgroup.
 
@@ -1272,8 +1274,38 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
 
 
 @triton.jit
+def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot,
+                                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr,
+                                   DB: tl.constexpr, DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr,
+                                   BUFFERS: tl.constexpr, WITH_A_SCALE: tl.constexpr):
+    tl.static_assert(BK == 256)
+    c00 = tlx.dot_scaled(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
+    c01 = tlx.dot_scaled(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+    b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
+    a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    # Limit overlapping operand lifetimes between the two K halves. Without
+    # this boundary, staged BK256 output pushes the A8W4 path into spills.
+    tlx.amd_sched_barrier()
+    if DB != 2:
+        c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS)
+    if DB != 2:
+        c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    tlx.amd_sched_barrier()
+    # All operands are in registers. Refill this slot and read the next stage
+    # before finishing the second K half (or its bottom quadrants for A8W8).
+    return c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11
+
+
+@triton.jit
 def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constexpr, BN: tl.constexpr,
-                             INSTR_M: tl.constexpr, c_buf=None):
+                             INSTR_M: tl.constexpr, c_buf=None, C_ROWS: tl.constexpr = 64, C_SLOTS: tl.constexpr = 2,
+                             QUADRANT: tl.constexpr = 0):
     # Pin values so output extraction stays in registers. Direct stores also
     # pin their offsets below to avoid an implicit LDS transpose.
     acc = tlx.require_amd_wmma_layout(acc, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
@@ -1281,18 +1313,24 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
     base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
     if c_buf is not None:
         tl.static_assert(BM == 128 and BN == 128 and INSTR_M == 16)
-        desc = tl.make_tensor_descriptor(base, [BM, BN], [stride_cm, tl.constexpr(1)], [64, BN])
-        for part in tl.static_range(2):
-            # Each quadrant writes both slots in order, so wait(1) retires the
-            # previous use of this slot, including across quadrant/tile edges.
-            tlx.async_amd_descriptor_wait(1)
-            # Split a register dimension of the pinned accumulator. Smaller
-            # row chunks cross warp dimensions and require an LDS transpose.
-            lo, hi = tl.split(tl.reshape(acc, (2, 64, BN)).permute(1, 2, 0))
-            chunk = lo if part == 0 else hi
-            view = c_buf[part]
-            tlx.local_store(view, chunk)
-            tlx.async_amd_descriptor_store(desc, view, [part * 64, 0], clamp_bounds=False)
+        desc = tl.make_tensor_descriptor(base, [BM, BN], [stride_cm, tl.constexpr(1)], [C_ROWS, BN])
+        if C_ROWS == 128:
+            tlx.async_amd_descriptor_wait(C_SLOTS - 1)
+            view = c_buf[QUADRANT % C_SLOTS]
+            tlx.local_store(view, acc)
+            tlx.async_amd_descriptor_store(desc, view, [0, 0], clamp_bounds=False)
+        else:
+            tl.static_assert(C_ROWS == 64 and C_SLOTS == 2)
+            for part in tl.static_range(2):
+                # Each quadrant writes both slots in order, so wait(1) retires
+                # the previous use even across quadrant/tile boundaries.
+                tlx.async_amd_descriptor_wait(1)
+                # Split a register dimension of the pinned accumulator.
+                lo, hi = tl.split(tl.reshape(acc, (2, 64, BN)).permute(1, 2, 0))
+                chunk = lo if part == 0 else hi
+                view = c_buf[part]
+                tlx.local_store(view, chunk)
+                tlx.async_amd_descriptor_store(desc, view, [part * 64, 0], clamp_bounds=False)
     else:
         offsets = tl.arange(0, BM)[:, None] * stride_cm + tl.arange(0, BN)[None, :]
         offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
@@ -1333,12 +1371,18 @@ def mxgemm_tdm_persistent_kernel(
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
     DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+    OUTPUT_REUSE: tl.constexpr = OUTPUT_STAGING and BLOCK_K == 256
     if OUTPUT_STAGING:
-        tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and NUM_BUFFERS <= 3 and DA == 1)
+        tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and DA == 1)
+        if OUTPUT_REUSE:
+            tl.static_assert(not CROSS_TILE_PREFETCH)
+            tl.static_assert(NUM_BUFFERS == 2 or (NUM_BUFFERS == 3 and DB == 2))
+        else:
+            tl.static_assert(NUM_BUFFERS <= 3)
     # With staged A8W4 output, computing all quadrants before the refill lets
     # LLVM schedule every WMMA ahead of the next operand loads. Keep independent
     # bottom-half work after those loads to cover their latency.
-    DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and DB == 2
+    DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and DB == 2 and BLOCK_K == 128
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE)
         LOADS: tl.constexpr = 1
@@ -1363,7 +1407,14 @@ def mxgemm_tdm_persistent_kernel(
                              layout=_scale_shared_layout([BLOCK_M // 128, BLOCK_K // 32 * 128]))
     bs_buf = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
                              layout=_scale_shared_layout([BLOCK_N // 128, BLOCK_K // 32 * 128]))
-    c_buf = tlx.local_alloc((64, BLOCK_N // 2), tl.float32, 2) if OUTPUT_STAGING else None
+    C_ROWS: tl.constexpr = 128 if OUTPUT_REUSE else 64
+    C_SLOTS: tl.constexpr = NUM_BUFFERS if OUTPUT_REUSE else 2
+    if OUTPUT_REUSE:
+        # One FP32 quadrant has the same byte size as a BK256 FP8 A slot.
+        # Loads and stores use this storage in disjoint phases of each tile.
+        c_buf = tlx.local_alloc((128, BLOCK_N // 2), tl.float32, NUM_BUFFERS, reuse=a_buf)
+    else:
+        c_buf = tlx.local_alloc((C_ROWS, BLOCK_N // 2), tl.float32, 2) if OUTPUT_STAGING else None
     num_m, num_n = M // BLOCK_M, N // BLOCK_N
     total_tiles = num_m * num_n
     k_iters = K // BLOCK_K
@@ -1393,6 +1444,10 @@ def mxgemm_tdm_persistent_kernel(
                                                                                 BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
                                                                                 DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
                 last_b00, last_sb00 = b00, sb00
+            elif OUTPUT_REUSE:
+                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11 = _mxgemm_persistent_compute_256(
+                    c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
+                    BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             else:
                 c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
                                                                 as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
@@ -1404,6 +1459,16 @@ def mxgemm_tdm_persistent_kernel(
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                              WITH_A_SCALE)
             b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+            if OUTPUT_REUSE:
+                if DB == 2:
+                    c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
+                    c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
+                c10 = tlx.dot_scaled(a11, sa11, DTYPE_A, b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                c11 = tlx.dot_scaled(a11, sa11, DTYPE_A, b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
             if DEFER_BOTTOM:
                 c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
@@ -1426,6 +1491,10 @@ def mxgemm_tdm_persistent_kernel(
                                                                                 BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
                                                                                 DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
                 last_b00, last_sb00 = b00, sb00
+            elif OUTPUT_REUSE:
+                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11 = _mxgemm_persistent_compute_256(
+                    c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
+                    BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             else:
                 c00, c01, c10, c11 = _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf,
                                                                 as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
@@ -1444,23 +1513,36 @@ def mxgemm_tdm_persistent_kernel(
                 a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                                  WITH_A_SCALE)
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+            if OUTPUT_REUSE:
+                if DB == 2:
+                    c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
+                    c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
+                c10 = tlx.dot_scaled(a11, sa11, DTYPE_A, b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                c11 = tlx.dot_scaled(a11, sa11, DTYPE_A, b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
             if DEFER_BOTTOM:
                 c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
                 c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
 
-        # Keep the input rings intact for cross-tile prefetch. Optional output
-        # staging uses two small slots because a full FP32 tile cannot fit.
+        # Dedicated staging preserves prefetched inputs. BK256 instead reuses
+        # A only after the final operand reads, then drains stores before reload.
         tlx.amd_sched_barrier()
         INSTR_M: tl.constexpr = 32 if DA == 2 and DB == 2 else 16
-        _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M, c_buf)
+        _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M, c_buf,
+                                 C_ROWS, C_SLOTS, 0)
         _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                 INSTR_M, c_buf)
+                                 INSTR_M, c_buf, C_ROWS, C_SLOTS, 1)
         _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                 INSTR_M, c_buf)
+                                 INSTR_M, c_buf, C_ROWS, C_SLOTS, 2)
         _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
-                                 BLOCK_N // 2, INSTR_M, c_buf)
+                                 BLOCK_N // 2, INSTR_M, c_buf, C_ROWS, C_SLOTS, 3)
+        if OUTPUT_REUSE:
+            tlx.async_amd_descriptor_wait(0)
         tlx.amd_sched_barrier()
         # K=0 of the next tile occupies the first slot recycled by the tail:
         # (phase + k_iters - NUM_BUFFERS) % NUM_BUFFERS. Keep that phase even
@@ -1557,8 +1639,10 @@ def mxgemm_tdm_pipelined(
     defaults to the smaller of the CU count and the output tile count.
     ``CROSS_TILE_PREFETCH=False`` retains persistence but primes each tile
     after the previous output store, providing a control for input overlap.
-    ``OUTPUT_STAGING`` uses two 64x128 LDS slots for TDM output stores. It
-    requires persistence, 256x256x128 tiles, two or three input slots, and FP8 A.
+    ``OUTPUT_STAGING`` requires persistence, 256x256 M/N tiles, and FP8 A.
+    BK128 uses two dedicated 64x128 output slots and 2/3 input buffers.
+    BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
+    supports two input buffers for A8W8 and two or three for A8W4.
     """
     if M is None:
         M = a.shape[0]
@@ -1574,9 +1658,19 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
-    if OUTPUT_STAGING and (not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or BLOCK_K != 128
-                           or NUM_BUFFERS not in (2, 3) or DTYPE_A == "e2m1"):
-        raise ValueError("output staging requires persistent 256x256x128 tiles, 2/3 buffers, and FP8 A")
+    if OUTPUT_STAGING:
+        if not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or DTYPE_A == "e2m1":
+            raise ValueError("output staging requires persistent 256x256 M/N tiles and FP8 A")
+        if BLOCK_K == 128:
+            if NUM_BUFFERS not in (2, 3):
+                raise ValueError("BK128 output staging requires 2/3 buffers")
+        elif BLOCK_K == 256:
+            if CROSS_TILE_PREFETCH:
+                raise ValueError("BK256 output staging reuses the A ring and requires CROSS_TILE_PREFETCH=False")
+            if NUM_BUFFERS != 2 and not (NUM_BUFFERS == 3 and DTYPE_B == "e2m1"):
+                raise ValueError("BK256 output staging requires 2 buffers, or 3 buffers with FP4 B")
+        else:
+            raise ValueError("output staging requires BK128 or BK256")
     if PERSISTENT:
         assert K == a.shape[1] * (2 if DTYPE_A == "e2m1" else 1)
         NUM_PROGRAMS = _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
