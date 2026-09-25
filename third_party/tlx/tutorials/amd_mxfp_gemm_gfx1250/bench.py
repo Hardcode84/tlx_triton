@@ -12,6 +12,8 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4 -BK 256 --no-cross-tile-prefetch
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 
@@ -88,6 +90,8 @@ def _command(args, case, dtype_b):
         command.append("--persistent")
     if args.output_staging:
         command.append("--output_staging")
+    if args.tdm_split:
+        command.append("--tdm_split")
     if args.num_programs is not None:
         command.extend(["--num_programs", str(args.num_programs)])
     if not args.cross_tile_prefetch:
@@ -112,9 +116,10 @@ def main():
     parser.add_argument("--dtype-b", choices=("float8_e4m3", "float8_e5m2", "float4"),
                         help="select a single weight dtype instead of --variant")
     parser.add_argument("--tdm-fusion", choices=("none", "2way", "4way", "partial"), default="partial")
+    parser.add_argument("--tdm-split", action="store_true", help="split descriptors in the nonpersistent kernel")
     parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
-                        help="stage persistent FP32 output for TDM stores (default: enabled)")
+                        help="stage persistent FP32 output for TDM stores; BK256 requires --no-cross-tile-prefetch")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-programs", type=int, default=None,
                         help="default: one program per CU, capped by tile count")
@@ -144,10 +149,18 @@ def main():
         parser.error("--num-programs must be positive")
     if args.benchmark_num_iters <= 0:
         parser.error("--benchmark-num-iters must be positive")
-    if args.output_staging and (not args.persistent or args.block_m != 256 or args.block_n != 256 or args.block_k != 128
-                                or args.num_buffers not in (2, 3)):
-        parser.error("--output-staging requires persistent 256x256x128 tiles and 2/3 buffers")
+    if args.tdm_split and args.persistent:
+        parser.error("--tdm-split requires --no-persistent")
+    if args.output_staging:
+        if not args.persistent or args.block_m != 256 or args.block_n != 256:
+            parser.error("--output-staging requires persistent 256x256 M/N tiles")
+        if args.block_k == 256 and args.cross_tile_prefetch:
+            parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
     for _, dtype_b in variants:
+        if args.output_staging:
+            max_buffers = 3 if args.block_k == 128 else (3 if dtype_b == "float4" else 2)
+            if args.num_buffers > max_buffers:
+                parser.error(f"BK{args.block_k} output staging with {dtype_b} supports at most {max_buffers} buffers")
         # Include the operand/scale padding used by the tutorial. This is an
         # upper bound for the rings; compiler scratch may need additional LDS.
         data_bytes = (args.block_m + args.block_n // (2 if dtype_b == "float4" else 1)) * args.block_k
