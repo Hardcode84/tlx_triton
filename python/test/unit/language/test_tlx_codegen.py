@@ -5384,7 +5384,8 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
     assert any("v_wmma" in inst for inst in body[load + 1:]), "no matrix work overlaps the next operand loads"
     if block_k == 256 and dtype_b == "e2m1":
-        assert sum("v_wmma" in inst for inst in body[wait + 1:]) >= 32, "too little second-half work covers the refill"
+        assert sum("v_wmma" in inst
+                   for inst in body[wait + 1:]) >= 64, "too little deferred matrix work covers the refill"
 
 
 @pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 3, True, "CROSS_TILE_PREFETCH=False"),

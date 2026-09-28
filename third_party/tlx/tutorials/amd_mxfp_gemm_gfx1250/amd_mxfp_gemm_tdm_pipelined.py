@@ -1286,9 +1286,10 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
     c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
     b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
     a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
-    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
-    # Limit overlapping operand lifetimes between the two K halves. Without
-    # this boundary, staged BK256 output pushes the A8W4 path into spills.
+    if DB != 2:
+        c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    # Bound operand lifetimes before gathering the remaining second half.
+    # A8W4 keeps C11's first-half operands live for work after the refill.
     tlx.amd_sched_barrier()
     if DB != 2:
         c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
@@ -1298,8 +1299,8 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
     a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     tlx.amd_sched_barrier()
     # All operands are in registers. Refill this slot and read the next stage
-    # before finishing the second K half (or its bottom quadrants for A8W8).
-    return c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11
+    # before finishing the deferred first- and second-half quadrants.
+    return c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01
 
 
 @triton.jit
@@ -1445,7 +1446,7 @@ def mxgemm_tdm_persistent_kernel(
                                                                                 DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
                 last_b00, last_sb00 = b00, sb00
             elif OUTPUT_REUSE:
-                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11 = _mxgemm_persistent_compute_256(
+                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
                     c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
                     BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             else:
@@ -1461,6 +1462,8 @@ def mxgemm_tdm_persistent_kernel(
             b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
             if OUTPUT_REUSE:
                 if DB == 2:
+                    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
                     c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
                     c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
@@ -1492,7 +1495,7 @@ def mxgemm_tdm_persistent_kernel(
                                                                                 DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
                 last_b00, last_sb00 = b00, sb00
             elif OUTPUT_REUSE:
-                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11 = _mxgemm_persistent_compute_256(
+                c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
                     c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
                     BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             else:
@@ -1515,6 +1518,8 @@ def mxgemm_tdm_persistent_kernel(
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
             if OUTPUT_REUSE:
                 if DB == 2:
+                    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                    tlx.amd_sched_barrier()
                     c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
                     c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
@@ -1866,7 +1871,8 @@ if __name__ == "__main__":
     parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
                         help="Prefetch distance in K iterations; -1 disables L2 prefetch")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
-    parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument("--benchmark_num_iters", type=int, default=32,
+                        help="timing repetition budget in milliseconds (not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
