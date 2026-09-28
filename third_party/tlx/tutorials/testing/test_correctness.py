@@ -1856,13 +1856,14 @@ def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
     (4, True, 4, "4way"),
 ])
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, fusion):
+@pytest.mark.parametrize("remap_mode", ["none", "chunked"])
+def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, fusion, remap_mode):
     # Distinct data/scales catch wrong recipients. Two tiles/program exercise
     # cross-tile prefetch (BK128) and reusing A's LDS for C (BK256). K=3 has no
     # steady loop; K=5 rotates the three-slot ring at the tile boundary.
     _check_amd_mxfp_persistent(
         dtype_b, 3, k_iters, fusion, True, block_k == 128, True, block_k, M=2048, N=1024,
-        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP="chunked", CLUSTER_SIZE=cluster_size,
+        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=cluster_size,
                           CLUSTER_MULTICAST=multicast, SCHED_MODE_2=True))
 
 

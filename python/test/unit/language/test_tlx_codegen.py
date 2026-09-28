@@ -5350,8 +5350,10 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
     (4, True, 4, "2way"),
     (4, True, 4, "4way"),
 ])
-def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_size, multicast, group_m, fusion):
-    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, XCD_REMAP_MODE=2, GROUP_SIZE_M=group_m,
+@pytest.mark.parametrize("remap_mode", [0, 2])
+def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_size, multicast, group_m, fusion,
+                                                      remap_mode):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, XCD_REMAP_MODE=remap_mode, GROUP_SIZE_M=group_m,
                                                   CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast,
                                                   TDM_FUSION=fusion)
     assert compiled.metadata.num_ctas == 1
@@ -5370,7 +5372,9 @@ def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_
     ({}, True),
     ({"group_m": 8}, True),
     ({"num_programs": 32}, True),
-    ({"xcd_remap": "none"}, False),
+    ({"xcd_remap": "none"}, True),
+    ({"xcd_remap": "none", "group_m": 8}, True),
+    ({"xcd_remap": "none", "num_xcds": 1, "xcd_chunk": 1}, True),
     ({"xcd_remap": "balanced"}, False),
     ({"num_xcds": 4}, False),
     ({"xcd_chunk": 1}, False),
