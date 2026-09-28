@@ -166,7 +166,9 @@ the summary/CSV with a `kernel` column. With `--cluster-size 1`, use
 ## Cluster multicast
 
 Cluster size 2 shares B within a workgroup pair; size 4 shares A/B across a
-two-by-two output region. Cluster barriers protect input-slot reuse.
+two-by-two output region. Cluster barriers align matching requests to improve
+sharing. Late requests receive separate loads; each workgroup's local waits
+protect its own LDS, so cluster synchronization is optional for correctness.
 `--no-cluster-multicast` retains synchronization but loads inputs independently.
 Program counts refer to physical workgroups.
 
