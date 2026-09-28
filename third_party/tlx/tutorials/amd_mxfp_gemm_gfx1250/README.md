@@ -43,6 +43,47 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --sched-mode-2 -
 The standalone tutorial accepts `--persistent --sched_mode_2`; the Python
 API and `matmul` configuration use `SCHED_MODE_2=True`.
 
+Persistent program ordering is selectable with `--xcd-remap none|balanced|chunked`,
+using `--num-xcds` (default 8) and `--xcd-chunk` (default 2). Remapping defaults
+to `none`. Balanced mode assigns each logical XCD a contiguous range; chunked
+mode groups small runs of tiles and leaves an incomplete final chunk unchanged.
+
+Use `--cluster-size 2|4` with `--xcd-remap chunked` to multicast inputs across
+independent workgroups. The default cluster size is 1. Data and their E8M0
+scales use the same recipient masks. A two-workgroup cluster shares B and
+its scales. A four-workgroup cluster with `--group-m 4` shares both A and B
+across a two-by-two output region; with the default `--group-m 8`, it shares
+B and its scales across four M tiles. `--no-cluster-multicast` keeps cluster
+synchronization with independent loads, for comparison.
+
+```bash
+# Remapping alone, with the current per-variant tile defaults.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --xcd-remap balanced
+
+# Four-workgroup sharing of A/B and scales.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256
+
+# Same workgroup mapping and barriers, with multicast disabled.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256 --no-cluster-multicast
+```
+
+Clustering requires chunked remapping with eight XCDs and chunk size two,
+group-M of four or eight, full M groups, an even number of N tiles, both
+scales, and partial/two-way/four-way TDM fusion. The actual program count
+must be divisible by 16 and divide the output tile count, keeping all cluster
+members on the same loop boundaries. Set `--num-programs` explicitly if the
+device CU count does not satisfy these conditions. The count includes all
+workgroups, not clusters. Both BK128's separate output staging and BK256's
+reuse of A for output are supported. Cluster barriers protect input ring
+refills and wait for peers before exit.
+
+The summary and CSV record the remapping and cluster configuration. Standalone
+flags use underscores (`--xcd_remap`, `--num_xcds`, `--xcd_chunk`, `--cluster_size`,
+`--cluster_multicast`); Python API/config keys are `XCD_REMAP`, `NUM_XCDS`,
+`XCD_CHUNK`, `CLUSTER_SIZE`, and `CLUSTER_MULTICAST`.
+
 Use repeatable `--variant` options to select variants. `--dtype-a float8_e5m2`
 changes activations for the selected variants. Alternatively, `--dtype-b`
 selects a single weight dtype (`float8_e4m3`, `float8_e5m2`, or `float4`) and

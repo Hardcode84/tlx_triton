@@ -5341,10 +5341,63 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
     assert "wmma" in amdgcn
 
 
-@pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
-                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128)])
-@pytest.mark.parametrize("sched_mode_2", [False, True])
-def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2):
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("cluster_size,multicast,group_m,fusion", [
+    (2, True, 8, "partial"),
+    (4, True, 4, "partial"),
+    (4, True, 8, "partial"),
+    (4, False, 4, "partial"),
+    (4, True, 4, "2way"),
+    (4, True, 4, "4way"),
+])
+def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_size, multicast, group_m, fusion):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, XCD_REMAP_MODE=2, GROUP_SIZE_M=group_m,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast,
+                                                  TDM_FUSION=fusion)
+    assert compiled.metadata.num_ctas == 1
+    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert "amdg.cluster_barrier_arrive" in compiled.asm["ttgir"]
+    assert "amdg.cluster_barrier_wait" in compiled.asm["ttgir"]
+    assert (" multicast " in compiled.asm["ttgir"]) == multicast
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("changes,valid", [
+    ({}, True),
+    ({"group_m": 8}, True),
+    ({"num_programs": 32}, True),
+    ({"xcd_remap": "none"}, False),
+    ({"xcd_remap": "balanced"}, False),
+    ({"num_xcds": 4}, False),
+    ({"xcd_chunk": 1}, False),
+    ({"num_xcds": 0}, False),
+    ({"cluster_size": 3}, False),
+    ({"group_m": 2}, False),
+    ({"M": 2304}, False),
+    ({"N": 768}, False),
+    ({"num_programs": 24}, False),
+    ({"num_programs": 48}, False),
+    ({"num_programs": 0}, False),
+    ({"fusion": "none"}, False),
+    ({"with_a_scale": False}, False),
+    ({"persistent": False}, False),
+])
+def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
+    config = dict(M=2048, N=1024, num_programs=16, persistent=True, block_m=256, block_n=256, group_m=4,
+                  with_a_scale=True, fusion="partial", xcd_remap="chunked", num_xcds=8, xcd_chunk=2, cluster_size=4)
+    config.update(changes)
+    if valid:
+        _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+    else:
+        with pytest.raises(ValueError):
+            _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+
+
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
                      b_scale="*u8", M="i32", N="i32", K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32",
@@ -5354,12 +5407,21 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     attrs = {(kernel.arg_names.index(name), ):
              [["tt.divisibility", 16]] + ([["tt.pointer_range", 32]] if ty.startswith("*") else [])
              for name, ty in signature.items()}
-    src = ASTSource(
-        kernel, signature=signature, attrs=attrs,
-        constexprs=dict(DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, GROUP_SIZE_M=8,
-                        NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
-                        CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=sched_mode_2))
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
+    config = dict(DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, GROUP_SIZE_M=8,
+                  NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
+                  CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False, XCD_REMAP_MODE=0,
+                  NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True)
+    config.update(constants)
+    src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
+    return triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
+                          options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+
+
+@pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
+                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128)])
+@pytest.mark.parametrize("sched_mode_2", [False, True])
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, SCHED_MODE_2=sched_mode_2)
     asm = compiled.asm["amdgcn"]
     assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
     assert "ds_load_b128" in asm and "ds_store_b128" in asm

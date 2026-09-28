@@ -1831,12 +1831,49 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch,
                                             output_staging, block_k):
+    _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch, output_staging,
+                               block_k)
+
+
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
+    # Seventeen programs exercise both uneven XCD ranges and chunked tails;
+    # nine M tiles with group-M=8 also exercise the final short M group.
+    _check_amd_mxfp_persistent(dtype_b, 3, 5, "partial", True, block_k == 128, True, block_k, M=2304, N=768,
+                               extra_config=dict(NUM_PROGRAMS=17, GROUP_SIZE_M=8, XCD_REMAP=mode))
+
+
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("k_iters", [3, 5])
+@pytest.mark.parametrize("cluster_size,multicast,group_m,fusion", [
+    (2, True, 8, "partial"),
+    (4, True, 4, "partial"),
+    (4, True, 8, "partial"),
+    (4, False, 4, "partial"),
+    (4, True, 4, "2way"),
+    (4, True, 4, "4way"),
+])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, fusion):
+    # Distinct data/scales catch wrong recipients. Two tiles/program exercise
+    # cross-tile prefetch (BK128) and reusing A's LDS for C (BK256). K=3 has no
+    # steady loop; K=5 rotates the three-slot ring at the tile boundary.
+    _check_amd_mxfp_persistent(
+        dtype_b, 3, k_iters, fusion, True, block_k == 128, True, block_k, M=2048, N=1024,
+        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP="chunked", CLUSTER_SIZE=cluster_size,
+                          CLUSTER_MULTICAST=multicast, SCHED_MODE_2=True))
+
+
+def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch, output_staging,
+                               block_k, M=768, N=512, extra_config=None):
     if output_staging and dtype_b != "e2m1" and buffers > (3 if block_k == 128 else 2):
         pytest.skip("FP8 B input rings leave insufficient LDS for this output staging configuration")
     # Three output tiles per program, including a short final M group. Exercise
     # both an empty steady loop and a K count that rotates the ring's phase.
     torch.manual_seed(123)
-    M, N, K = 768, 512, block_k * k_iters
+    K = block_k * k_iters
     a = (torch.randn(M, K) * 0.5).to(torch.float8_e4m3fn)
     if dtype_b == "e2m1":
         b_mx = MXFP4Tensor(size=(N, K)).random()
@@ -1855,6 +1892,7 @@ def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, w
                   TRANSPOSE_B=True, WITH_A_SCALE=with_a_scale, SCHEDULE="sliceMNK", TDM_FUSION=fusion, PERSISTENT=True,
                   NUM_PROGRAMS=2, GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch,
                   OUTPUT_STAGING=output_staging)
+    config.update(extra_config or {})
     out = _amd_mxfp_gemm_tdm_pipelined(a.to(DEVICE), b.to(DEVICE),
                                        _amd_mxfp_pack_scale(a_scale).to(DEVICE) if with_a_scale else None,
                                        _amd_mxfp_pack_scale(b_scale).to(DEVICE), config=config)
