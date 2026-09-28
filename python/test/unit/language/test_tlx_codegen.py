@@ -5342,8 +5342,9 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
-                                                         ("e2m1", 3, 256), ("e4m3", 2, 256)])
-def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k):
+                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128)])
+@pytest.mark.parametrize("sched_mode_2", [False, True])
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
                      b_scale="*u8", M="i32", N="i32", K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32",
@@ -5357,9 +5358,10 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         kernel, signature=signature, attrs=attrs,
         constexprs=dict(DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, GROUP_SIZE_M=8,
                         NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
-                        CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True))
+                        CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=sched_mode_2))
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
     asm = compiled.asm["amdgcn"]
+    assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
     assert "ds_load_b128" in asm and "ds_store_b128" in asm
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)

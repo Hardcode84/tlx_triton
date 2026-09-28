@@ -15,9 +15,11 @@ runs by default:
 | `mx8xmx8` | FP8 E4M3 | FP8 E4M3 |
 | `mx8xmx4` | FP8 E4M3 | FP4 E2M1 |
 
-Both use E8M0 scales, FP32 output, 256x256x256 tiles, two buffers, partial TDM
-fusion, persistent scheduling, and cross-tile prefetch. The summary and CSV
-identify each variant and its operand dtypes.
+Both use E8M0 scales, FP32 output, 256x256 M/N tiles, three buffers, partial TDM
+fusion, persistent scheduling, and output staging. MX8xMX8 uses BK128 with
+cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch disabled so
+output can reuse the A ring. The summary and CSV identify each variant and
+its configuration.
 
 Run from the repository root in an environment configured for gfx1250:
 
@@ -28,10 +30,23 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
 
+Use `--sched-mode-2` to enable the persistent kernel's hardware WMMA queuing
+setting (`SCHED_MODE[2]`). It is disabled by default; `--no-sched-mode-2`
+selects the default behavior. The summary and CSV record `sched_mode_2`.
+For example, compare the same sweep with the setting off and on:
+
+```bash
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --no-sched-mode-2 --csv sched-off.csv
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --sched-mode-2 --csv sched-on.csv
+```
+
+The standalone tutorial accepts `--persistent --sched_mode_2`; the Python
+API and `matmul` configuration use `SCHED_MODE_2=True`.
+
 Use repeatable `--variant` options to select variants. `--dtype-a float8_e5m2`
 changes activations for the selected variants. Alternatively, `--dtype-b`
 selects a single weight dtype (`float8_e4m3`, `float8_e5m2`, or `float4`) and
-cannot be combined with `--variant`. Three buffers with 256x256 tiles are
+cannot be combined with `--variant`. Three buffers with 256x256x256 tiles are
 supported for `mx8xmx4`; `mx8xmx8` exceeds LDS capacity with that configuration.
 
 For one simulator dispatch per shape/variant, use `--benchmark-mode none
