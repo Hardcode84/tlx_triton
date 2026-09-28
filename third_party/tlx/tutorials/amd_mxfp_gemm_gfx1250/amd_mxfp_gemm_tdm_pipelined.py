@@ -174,8 +174,28 @@ def _mxgemm_issue_loads(
     SCALE_PRESHUFFLE: tl.constexpr,
     WITH_A_SCALE: tl.constexpr,
     TDM_FUSION: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
+    GROUP_SIZE_M: tl.constexpr = 8,
 ):
     slot = load_idx % NUM_BUFFERS
+    if CLUSTER_SIZE > 1:
+        # A refill can write a peer's LDS. All local waves and peer CTAs must
+        # finish consuming the slot (or storing aliased C) before it is reused.
+        tlx.cluster_barrier()
+    if CLUSTER_SIZE > 1 and CLUSTER_MULTICAST:
+        tl.static_assert(WITH_A_SCALE and TDM_FUSION != "none")
+        tl.static_assert(GROUP_SIZE_M == 4 or GROUP_SIZE_M == 8)
+        rank = tlx.cluster_cta_rank()
+        if CLUSTER_SIZE == 4 and GROUP_SIZE_M == 4:
+            a_mask, b_mask = 5 << (rank & 1), 3 << (rank & 2)
+        else:
+            a_mask, b_mask = 0, (1 << CLUSTER_SIZE) - 1
+        data_masks = [a_mask, b_mask]
+        all_masks = [a_mask, b_mask, a_mask, b_mask]
+    else:
+        data_masks = None
+        all_masks = None
     if TRANSPOSE_B:
         b_offsets = [0, load_idx * BLOCK_K_PACKED_B]
     else:
@@ -196,21 +216,21 @@ def _mxgemm_issue_loads(
                                           pred=pred), tlx.local_view(a_scale_buf, slot), 4),
             (tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, clamp_bounds=False,
                                           pred=pred), tlx.local_view(b_scale_buf, slot), 8),
-        ])
+        ], multicast_masks=all_masks)
     elif TDM_FUSION == "2way":
         tlx.async_amd_descriptor_load_fused([
             (tlx.update_tensor_descriptor(a_desc, add_offsets=[0, load_idx * BLOCK_K_PACKED_A], clamp_bounds=False,
                                           pred=pred), tlx.local_view(a_buf, slot), 3),
             (tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, clamp_bounds=False,
                                           pred=pred), tlx.local_view(b_buf, slot), 12),
-        ])
+        ], multicast_masks=data_masks)
         if WITH_A_SCALE:
             tlx.async_amd_descriptor_load_fused([
                 (tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets, clamp_bounds=False,
                                               pred=pred), tlx.local_view(a_scale_buf, slot), 3),
                 (tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, clamp_bounds=False,
                                               pred=pred), tlx.local_view(b_scale_buf, slot), 12),
-            ])
+            ], multicast_masks=data_masks)
         else:
             _mxgemm_issue_load_b_scale(b_scale_desc, b_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED,
                                        NUM_BUFFERS, SCALE_PRESHUFFLE)
@@ -221,13 +241,13 @@ def _mxgemm_issue_loads(
                                           pred=pred), tlx.local_view(a_buf, slot), 5),
             (tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, clamp_bounds=False,
                                           pred=pred), tlx.local_view(b_buf, slot), 10),
-        ])
+        ], multicast_masks=data_masks)
         tlx.async_amd_descriptor_load_fused([
             (tlx.update_tensor_descriptor(a_scale_desc, add_offsets=scale_offsets, clamp_bounds=False,
                                           pred=pred), tlx.local_view(a_scale_buf, slot), 5),
             (tlx.update_tensor_descriptor(b_scale_desc, add_offsets=scale_offsets, clamp_bounds=False,
                                           pred=pred), tlx.local_view(b_scale_buf, slot), 10),
-        ])
+        ], multicast_masks=data_masks)
     else:
         tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way, partial")
         _mxgemm_issue_load_a_scale(a_scale_desc, a_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
@@ -1173,6 +1193,30 @@ DTYPE_TO_TRITON = {
     "float4": "e2m1",
 }
 
+_XCD_REMAP_MODES = {"none": 0, "balanced": 1, "chunked": 2}
+
+
+@triton.jit
+def _mxgemm_remap_program_id(pid, NUM_PROGRAMS: tl.constexpr, XCD_REMAP_MODE: tl.constexpr, NUM_XCDS: tl.constexpr,
+                             XCD_CHUNK: tl.constexpr):
+    tl.static_assert(NUM_XCDS > 0 and XCD_CHUNK > 0)
+    if XCD_REMAP_MODE == 0 or NUM_XCDS == 1:
+        return pid
+    elif XCD_REMAP_MODE == 1:
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        per_xcd = NUM_PROGRAMS // NUM_XCDS
+        extra = NUM_PROGRAMS % NUM_XCDS
+        return xcd * per_xcd + tl.minimum(xcd, extra) + local_pid
+    else:
+        tl.static_assert(XCD_REMAP_MODE == 2)
+        aligned = NUM_PROGRAMS // (NUM_XCDS * XCD_CHUNK) * (NUM_XCDS * XCD_CHUNK)
+        if pid >= aligned:
+            return pid
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        return (local_pid // XCD_CHUNK) * NUM_XCDS * XCD_CHUNK + xcd * XCD_CHUNK + local_pid % XCD_CHUNK
+
 
 @triton.jit
 def _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
@@ -1186,7 +1230,8 @@ def _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M: tl.constexpr, BM: tl.const
 @triton.jit
 def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, k, slot,
                             BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr, BUFFERS: tl.constexpr,
-                            WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr):
+                            WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr, CLUSTER_SIZE: tl.constexpr,
+                            CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
     # The existing loader uses one index for both K and the ring slot. Offset
     # the descriptors by their difference to decouple them across tile boundaries.
     # Descriptor folding combines these offsets with the loader's K offsets.
@@ -1196,7 +1241,7 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
     asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // 128, delta * (BK // 32 * 128)])
     bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // 128, delta * (BK // 32 * 128)])
     _mxgemm_issue_loads(ad, bd, asd, bsd, a_buf, b_buf, as_buf, bs_buf, slot, True, BK // DA, BK // DB, BK // 32 * 128,
-                        BUFFERS, True, True, WITH_A_SCALE, FUSION)
+                        BUFFERS, True, True, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M)
 
 
 @triton.jit
@@ -1367,6 +1412,11 @@ def mxgemm_tdm_persistent_kernel(
     CROSS_TILE_PREFETCH: tl.constexpr = True,
     OUTPUT_STAGING: tl.constexpr = False,
     SCHED_MODE_2: tl.constexpr = False,
+    XCD_REMAP_MODE: tl.constexpr = 0,
+    NUM_XCDS: tl.constexpr = 8,
+    XCD_CHUNK: tl.constexpr = 2,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -1374,6 +1424,11 @@ def mxgemm_tdm_persistent_kernel(
         tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
+    tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4)
+    if CLUSTER_SIZE > 1:
+        tl.static_assert(XCD_REMAP_MODE == 2 and NUM_XCDS == 8 and XCD_CHUNK == 2)
+        tl.static_assert(GROUP_SIZE_M == 4 or GROUP_SIZE_M == 8)
+        tl.static_assert(NUM_PROGRAMS % 16 == 0)
     DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     OUTPUT_REUSE: tl.constexpr = OUTPUT_STAGING and BLOCK_K == 256
@@ -1424,12 +1479,13 @@ def mxgemm_tdm_persistent_kernel(
     total_tiles = num_m * num_n
     k_iters = K // BLOCK_K
     tl.assume(k_iters >= NUM_BUFFERS)
-    tile = tl.program_id(0)
+    tile = _mxgemm_remap_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
     phase = 0
     off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N)
     for p in tl.static_range(NUM_BUFFERS):
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, p, p,
-                                BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+                                BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
+                                GROUP_SIZE_M)
 
     while tile < total_tiles:
         off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N)
@@ -1458,7 +1514,8 @@ def mxgemm_tdm_persistent_kernel(
                                                                 as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB,
                                                                 DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
-                                    i + NUM_BUFFERS, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+                                    i + NUM_BUFFERS, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION,
+                                    CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             next_slot = (phase + i + 1) % NUM_BUFFERS
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
@@ -1508,7 +1565,8 @@ def mxgemm_tdm_persistent_kernel(
                                                                 DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE)
             if CROSS_TILE_PREFETCH and has_next:
                 _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
-                                        j, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION)
+                                        j, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, CLUSTER_SIZE,
+                                        CLUSTER_MULTICAST, GROUP_SIZE_M)
             if j < NUM_BUFFERS - 1:
                 if CROSS_TILE_PREFETCH and has_next:
                     tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
@@ -1562,9 +1620,12 @@ def mxgemm_tdm_persistent_kernel(
             for p in tl.static_range(NUM_BUFFERS):
                 _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
                                         p, (phase + p) % NUM_BUFFERS, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE,
-                                        TDM_FUSION)
+                                        TDM_FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M)
     if OUTPUT_STAGING:
         tlx.async_amd_descriptor_wait(0)
+    if CLUSTER_SIZE > 1:
+        tlx.async_amd_descriptor_wait(0)
+        tlx.cluster_barrier()
 
 
 def _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BM, BN, BK, num_buffers, group_m, transpose_b,
@@ -1597,6 +1658,32 @@ def _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BM, BN, BK, num
 
 def _mxfp_gemm_tflops(ms: float, M: int, N: int, K: int) -> float:
     return 2 * M * N * K / (ms * 1e-3) / 1e12
+
+
+def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_n, group_m, with_a_scale, fusion,
+                              xcd_remap, num_xcds, xcd_chunk, cluster_size):
+    if xcd_remap not in _XCD_REMAP_MODES:
+        raise ValueError("XCD_REMAP must be none, balanced, or chunked")
+    if num_xcds <= 0 or xcd_chunk <= 0:
+        raise ValueError("NUM_XCDS and XCD_CHUNK must be positive")
+    if cluster_size not in (1, 2, 4):
+        raise ValueError("CLUSTER_SIZE must be 1, 2, or 4")
+    if not persistent and (xcd_remap != "none" or cluster_size > 1):
+        raise ValueError("XCD remapping and clustering require persistence")
+    if cluster_size == 1:
+        return
+    if (xcd_remap, num_xcds, xcd_chunk) != ("chunked", 8, 2):
+        raise ValueError("clustering requires XCD_REMAP=chunked, NUM_XCDS=8, and XCD_CHUNK=2")
+    if group_m not in (4, 8) or M % (group_m * block_m) or N % (2 * block_n):
+        raise ValueError("clustering requires GROUP_SIZE_M=4 or 8, full M groups, and an even number of N tiles")
+    if not with_a_scale or fusion not in ("partial", "2way", "4way"):
+        raise ValueError("clustering requires A scales and partial, 2way, or 4way TDM fusion")
+    # Every cluster member must execute the same number of persistent tiles,
+    # including taking the same has_next branches around cluster barriers.
+    tiles = (M // block_m) * (N // block_n)
+    if not isinstance(num_programs, int) or num_programs <= 0 or num_programs % 16 or tiles % num_programs:
+        raise ValueError("clustering requires NUM_PROGRAMS divisible by 16 and dividing the output tile count; "
+                         "set NUM_PROGRAMS explicitly if necessary")
 
 
 def _init_data(dtype: str, rows: int, cols: int):
@@ -1638,6 +1725,11 @@ def mxgemm_tdm_pipelined(
     CROSS_TILE_PREFETCH: bool = True,
     OUTPUT_STAGING: bool = False,
     SCHED_MODE_2: bool = False,
+    XCD_REMAP: str = "none",
+    NUM_XCDS: int = 8,
+    XCD_CHUNK: int = 2,
+    CLUSTER_SIZE: int = 1,
+    CLUSTER_MULTICAST: bool = True,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -1655,6 +1747,13 @@ def mxgemm_tdm_pipelined(
     supports two input buffers for A8W8 and two or three for A8W4.
     ``SCHED_MODE_2`` optionally enables hardware WMMA queuing in the persistent
     kernel. It defaults to false, leaving the hardware scheduling mode unchanged.
+    ``XCD_REMAP`` selects none, balanced, or chunked persistent program ordering.
+    ``CLUSTER_SIZE=2|4`` groups independent workgroups for input/scale multicast;
+    ``CLUSTER_MULTICAST=False`` keeps the cluster barriers with independent loads.
+    Clustering requires chunked remapping with eight XCDs and chunk size two,
+    full M groups of four or eight tiles, even N tile counts, and fused loads
+    with both scales. The program count must be divisible by 16 and divide the
+    total tile count so cluster members take identical loop boundaries.
     """
     if M is None:
         M = a.shape[0]
@@ -1691,6 +1790,9 @@ def mxgemm_tdm_pipelined(
                                                    NUM_BUFFERS, GROUP_SIZE_M, TRANSPOSE_B, SCALE_PRESHUFFLE,
                                                    WITH_A_SCALE, SCHEDULE, TDM_FUSION, TDM_SPLIT, L2_PREFETCH_DISTANCE,
                                                    NUM_PROGRAMS)
+    _validate_mxfp_scheduling(M, N, NUM_PROGRAMS, persistent=PERSISTENT, block_m=BLOCK_M, block_n=BLOCK_N,
+                              group_m=GROUP_SIZE_M, with_a_scale=WITH_A_SCALE, fusion=TDM_FUSION, xcd_remap=XCD_REMAP,
+                              num_xcds=NUM_XCDS, xcd_chunk=XCD_CHUNK, cluster_size=CLUSTER_SIZE)
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
@@ -1703,7 +1805,9 @@ def mxgemm_tdm_pipelined(
                 b_scale.stride(0), DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, WITH_A_SCALE=WITH_A_SCALE, TDM_FUSION=TDM_FUSION,
                 NUM_PROGRAMS=NUM_PROGRAMS, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
-                SCHED_MODE_2=SCHED_MODE_2, num_warps=4, waves_per_eu=1)
+                SCHED_MODE_2=SCHED_MODE_2, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
+                XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST, num_warps=4,
+                waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1))
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -1772,6 +1876,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     When ``config["TRANSPOSE_B"]`` is set, ``b`` is the ``[N, K]`` transposed layout.
     ``PERSISTENT``, ``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``OUTPUT_STAGING``, and ``SCHED_MODE_2``
     configure the persistent full-tile sliceMNK path; see :func:`mxgemm_tdm_pipelined`.
+    ``XCD_REMAP``, ``NUM_XCDS``, ``XCD_CHUNK``, ``CLUSTER_SIZE``, and ``CLUSTER_MULTICAST``
+    select persistent program remapping and input/scale sharing across workgroups.
     """
     cfg = dict(_DEFAULT_CONFIG)
     if config is not None:
@@ -1795,21 +1901,28 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         raise ValueError("output staging requires persistence")
     if cfg.get("SCHED_MODE_2", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("SCHED_MODE_2 requires persistence")
+    if not cfg.get("PERSISTENT", False):
+        _validate_mxfp_scheduling(M, N, cfg.get("NUM_PROGRAMS"), persistent=False, block_m=BLOCK_M, block_n=BLOCK_N,
+                                  group_m=cfg["GROUP_SIZE_M"], with_a_scale=cfg.get("WITH_A_SCALE", True),
+                                  fusion=cfg.get("TDM_FUSION", "none"), xcd_remap=cfg.get("XCD_REMAP", "none"),
+                                  num_xcds=cfg.get("NUM_XCDS",
+                                                   8), xcd_chunk=cfg.get("XCD_CHUNK",
+                                                                         2), cluster_size=cfg.get("CLUSTER_SIZE", 1))
     if cfg.get("PERSISTENT", False):
         if cfg["num_warps"] != 4 or cfg["waves_per_eu"] != 1 or cfg["SCALE_BLOCK"] != 32:
             raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
-        return mxgemm_tdm_pipelined(a, b, a_scale, b_scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                                    TRANSPOSE_B=TRANSPOSE_B, NUM_BUFFERS=cfg["NUM_BUFFERS"], DTYPE_A=cfg["DTYPE_A"],
-                                    DTYPE_B=cfg["DTYPE_B"], SCALE_PRESHUFFLE=cfg.get("SCALE_PRESHUFFLE", True),
-                                    WITH_A_SCALE=cfg.get("WITH_A_SCALE",
-                                                         True), SCHEDULE=cfg.get("SCHEDULE", "baseline"),
-                                    L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE",
-                                                                 -1), TDM_FUSION=cfg.get("TDM_FUSION", "none"),
-                                    TDM_SPLIT=cfg.get("TDM_SPLIT", False), GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
-                                    PERSISTENT=True, NUM_PROGRAMS=cfg.get("NUM_PROGRAMS"),
-                                    CROSS_TILE_PREFETCH=cfg.get("CROSS_TILE_PREFETCH",
-                                                                True), OUTPUT_STAGING=cfg.get("OUTPUT_STAGING", False),
-                                    SCHED_MODE_2=cfg.get("SCHED_MODE_2", False))
+        return mxgemm_tdm_pipelined(
+            a, b, a_scale, b_scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, TRANSPOSE_B=TRANSPOSE_B,
+            NUM_BUFFERS=cfg["NUM_BUFFERS"], DTYPE_A=cfg["DTYPE_A"], DTYPE_B=cfg["DTYPE_B"],
+            SCALE_PRESHUFFLE=cfg.get("SCALE_PRESHUFFLE", True), WITH_A_SCALE=cfg.get("WITH_A_SCALE", True),
+            SCHEDULE=cfg.get("SCHEDULE", "baseline"), L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE", -1),
+            TDM_FUSION=cfg.get("TDM_FUSION",
+                               "none"), TDM_SPLIT=cfg.get("TDM_SPLIT",
+                                                          False), GROUP_SIZE_M=cfg["GROUP_SIZE_M"], PERSISTENT=True,
+            NUM_PROGRAMS=cfg.get("NUM_PROGRAMS"), CROSS_TILE_PREFETCH=cfg.get("CROSS_TILE_PREFETCH", True),
+            OUTPUT_STAGING=cfg.get("OUTPUT_STAGING", False), SCHED_MODE_2=cfg.get("SCHED_MODE_2", False),
+            XCD_REMAP=cfg.get("XCD_REMAP", "none"), NUM_XCDS=cfg.get("NUM_XCDS", 8), XCD_CHUNK=cfg.get("XCD_CHUNK", 2),
+            CLUSTER_SIZE=cfg.get("CLUSTER_SIZE", 1), CLUSTER_MULTICAST=cfg.get("CLUSTER_MULTICAST", True))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -1880,6 +1993,12 @@ if __name__ == "__main__":
                         help="set SCHED_MODE[2] for persistent WMMA queuing (default: disabled)")
     parser.add_argument("--output_staging", action="store_true", help="stage persistent FP32 output for TDM stores")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
+    parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
+    parser.add_argument("--num_xcds", type=int, default=8)
+    parser.add_argument("--xcd_chunk", type=int, default=2)
+    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share data and scales within a cluster; disable to keep only cluster synchronization")
     parser.add_argument("--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=True,
                         help="prefetch the next persistent tile during the current tile's K-loop tail")
     parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
@@ -1946,4 +2065,9 @@ if __name__ == "__main__":
         CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
         OUTPUT_STAGING=args.output_staging,
         SCHED_MODE_2=args.sched_mode_2,
+        XCD_REMAP=args.xcd_remap,
+        NUM_XCDS=args.num_xcds,
+        XCD_CHUNK=args.xcd_chunk,
+        CLUSTER_SIZE=args.cluster_size,
+        CLUSTER_MULTICAST=args.cluster_multicast,
     )

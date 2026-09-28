@@ -98,6 +98,14 @@ def _command(args, case, dtype_b):
         str(args.benchmark_num_iters),
         "--seed",
         str(args.seed),
+        "--xcd_remap",
+        args.xcd_remap,
+        "--num_xcds",
+        str(args.num_xcds),
+        "--xcd_chunk",
+        str(args.xcd_chunk),
+        "--cluster_size",
+        str(args.cluster_size),
     ]
     if args.persistent:
         command.append("--persistent")
@@ -105,6 +113,8 @@ def _command(args, case, dtype_b):
         command.append("--output_staging")
     if args.sched_mode_2:
         command.append("--sched_mode_2")
+    if not args.cluster_multicast:
+        command.append("--no-cluster_multicast")
     if args.tdm_split:
         command.append("--tdm_split")
     if args.num_programs is not None:
@@ -142,6 +152,14 @@ def main():
                         help="default: disabled for BK256 output staging, enabled otherwise")
     parser.add_argument("--num-programs", type=int, default=None,
                         help="default: one program per CU, capped by tile count")
+    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none",
+                        help="persistent program remapping (default: none)")
+    parser.add_argument("--num-xcds", type=int, default=8)
+    parser.add_argument("--xcd-chunk", type=int, default=2)
+    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=1,
+                        help="workgroups per input multicast cluster; requires --xcd-remap chunked")
+    parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
@@ -173,6 +191,15 @@ def main():
         parser.error("--tdm-split requires --no-persistent")
     if args.sched_mode_2 and not args.persistent:
         parser.error("--sched-mode-2 requires --persistent")
+    if args.num_xcds <= 0 or args.xcd_chunk <= 0:
+        parser.error("--num-xcds and --xcd-chunk must be positive")
+    if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
+        parser.error("XCD remapping and clustering require --persistent")
+    if args.cluster_size > 1:
+        if (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2):
+            parser.error("clustering requires --xcd-remap chunked --num-xcds 8 --xcd-chunk 2")
+        if args.group_m not in (4, 8) or args.tdm_fusion == "none":
+            parser.error("clustering requires --group-m 4 or 8 and partial, 2way, or 4way TDM fusion")
     if args.output_staging:
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
@@ -193,6 +220,13 @@ def main():
         if ring_bytes > 320 * 1024:
             parser.error("input rings exceed gfx1250 LDS capacity; reduce --block-k, --num-buffers, or M/N tiles")
         for m, n, k in cases:
+            if run_args.cluster_size > 1:
+                if m % (run_args.group_m * run_args.block_m) or n % (2 * run_args.block_n):
+                    parser.error("clustering requires full M groups and an even number of N tiles")
+                tiles = (m // run_args.block_m) * (n // run_args.block_n)
+                programs = min(run_args.num_programs, tiles) if run_args.num_programs is not None else None
+                if programs is not None and (programs <= 0 or programs % 16 or tiles % programs):
+                    parser.error("clustering requires --num-programs divisible by 16 and dividing the tile count")
             if (min(m, n, k) <= 0 or m % run_args.block_m or n % run_args.block_n or k % run_args.block_k
                     or k // run_args.block_k < run_args.num_buffers):
                 parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
@@ -223,14 +257,16 @@ def main():
         status = "ok" if returncode == 0 else f"exit {returncode}"
         if status == "ok" and args.benchmark_mode != "none" and ms is None:
             status = "missing timing"
-        config = dict(kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
-                      block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
-                      group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
-                      output_staging=run_args.output_staging, sched_mode_2=run_args.sched_mode_2,
-                      cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
-                      requested_programs=run_args.num_programs if run_args.persistent else None,
-                      benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
-                      seed=run_args.seed)
+        config = dict(
+            kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
+            block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
+            group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
+            output_staging=run_args.output_staging, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
+            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
+            cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
+            requested_programs=run_args.num_programs if run_args.persistent else None,
+            benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
                  tflops=tflops, status=status, **config, command=shlex.join(command)))
@@ -244,6 +280,9 @@ def main():
             f"buffers={run_args.num_buffers}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
             f"sched_mode_2={run_args.sched_mode_2}, "
+            f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "
+            f"cluster_size={run_args.cluster_size}, "
+            f"cluster_multicast={run_args.cluster_multicast if run_args.cluster_size > 1 else False}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
