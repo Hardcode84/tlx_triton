@@ -1366,8 +1366,12 @@ def mxgemm_tdm_persistent_kernel(
     NUM_PROGRAMS: tl.constexpr,
     CROSS_TILE_PREFETCH: tl.constexpr = True,
     OUTPUT_STAGING: tl.constexpr = False,
+    SCHED_MODE_2: tl.constexpr = False,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
+    if SCHED_MODE_2:
+        # Allow WMMA queuing with one wave per SIMD; preserve mode bits 0-1.
+        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
     DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
@@ -1633,6 +1637,7 @@ def mxgemm_tdm_pipelined(
     NUM_PROGRAMS: int | None = None,
     CROSS_TILE_PREFETCH: bool = True,
     OUTPUT_STAGING: bool = False,
+    SCHED_MODE_2: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -1648,6 +1653,8 @@ def mxgemm_tdm_pipelined(
     BK128 uses two dedicated 64x128 output slots and 2/3 input buffers.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
     supports two input buffers for A8W8 and two or three for A8W4.
+    ``SCHED_MODE_2`` optionally enables hardware WMMA queuing in the persistent
+    kernel. It defaults to false, leaving the hardware scheduling mode unchanged.
     """
     if M is None:
         M = a.shape[0]
@@ -1663,6 +1670,8 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    if SCHED_MODE_2 and not PERSISTENT:
+        raise ValueError("SCHED_MODE_2 requires persistence")
     if OUTPUT_STAGING:
         if not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or DTYPE_A == "e2m1":
             raise ValueError("output staging requires persistent 256x256 M/N tiles and FP8 A")
@@ -1694,7 +1703,7 @@ def mxgemm_tdm_pipelined(
                 b_scale.stride(0), DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, WITH_A_SCALE=WITH_A_SCALE, TDM_FUSION=TDM_FUSION,
                 NUM_PROGRAMS=NUM_PROGRAMS, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
-                num_warps=4, waves_per_eu=1)
+                SCHED_MODE_2=SCHED_MODE_2, num_warps=4, waves_per_eu=1)
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -1761,7 +1770,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
 
     ``a_scale`` / ``b_scale`` must already be pre-shuffled with :func:`pack_scale`.
     When ``config["TRANSPOSE_B"]`` is set, ``b`` is the ``[N, K]`` transposed layout.
-    ``PERSISTENT``, ``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, and ``OUTPUT_STAGING``
+    ``PERSISTENT``, ``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``OUTPUT_STAGING``, and ``SCHED_MODE_2``
     configure the persistent full-tile sliceMNK path; see :func:`mxgemm_tdm_pipelined`.
     """
     cfg = dict(_DEFAULT_CONFIG)
@@ -1784,6 +1793,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
 
     if cfg.get("OUTPUT_STAGING", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("output staging requires persistence")
+    if cfg.get("SCHED_MODE_2", False) and not cfg.get("PERSISTENT", False):
+        raise ValueError("SCHED_MODE_2 requires persistence")
     if cfg.get("PERSISTENT", False):
         if cfg["num_warps"] != 4 or cfg["waves_per_eu"] != 1 or cfg["SCALE_BLOCK"] != 32:
             raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
@@ -1797,7 +1808,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                     TDM_SPLIT=cfg.get("TDM_SPLIT", False), GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
                                     PERSISTENT=True, NUM_PROGRAMS=cfg.get("NUM_PROGRAMS"),
                                     CROSS_TILE_PREFETCH=cfg.get("CROSS_TILE_PREFETCH",
-                                                                True), OUTPUT_STAGING=cfg.get("OUTPUT_STAGING", False))
+                                                                True), OUTPUT_STAGING=cfg.get("OUTPUT_STAGING", False),
+                                    SCHED_MODE_2=cfg.get("SCHED_MODE_2", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -1864,6 +1876,8 @@ if __name__ == "__main__":
                         help="Alias for --tdm_fusion partial, matching the Gluon CLI spelling")
     parser.add_argument("--tdm_split", action="store_true")
     parser.add_argument("--persistent", action="store_true", help="use persistent full-tile sliceMNK scheduling")
+    parser.add_argument("--sched_mode_2", action=argparse.BooleanOptionalAction, default=False,
+                        help="set SCHED_MODE[2] for persistent WMMA queuing (default: disabled)")
     parser.add_argument("--output_staging", action="store_true", help="stage persistent FP32 output for TDM stores")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
     parser.add_argument("--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=True,
@@ -1875,6 +1889,8 @@ if __name__ == "__main__":
                         help="timing repetition budget in milliseconds (not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.sched_mode_2 and not args.persistent:
+        parser.error("--sched_mode_2 requires --persistent")
 
     torch.manual_seed(args.seed)
     a = _init_data(args.dtype_a, args.M, args.K)
@@ -1929,4 +1945,5 @@ if __name__ == "__main__":
         NUM_PROGRAMS=args.num_programs,
         CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
         OUTPUT_STAGING=args.output_staging,
+        SCHED_MODE_2=args.sched_mode_2,
     )

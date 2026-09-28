@@ -103,6 +103,8 @@ def _command(args, case, dtype_b):
         command.append("--persistent")
     if args.output_staging:
         command.append("--output_staging")
+    if args.sched_mode_2:
+        command.append("--sched_mode_2")
     if args.tdm_split:
         command.append("--tdm_split")
     if args.num_programs is not None:
@@ -132,6 +134,8 @@ def main():
     parser.add_argument("--tdm-fusion", choices=("none", "2way", "4way", "partial"), default="partial")
     parser.add_argument("--tdm-split", action="store_true", help="split descriptors in the nonpersistent kernel")
     parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sched-mode-2", action=argparse.BooleanOptionalAction, default=False,
+                        help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: disabled)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
                         help="stage persistent FP32 output for TDM stores; BK256 reuses the A ring")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
@@ -167,6 +171,8 @@ def main():
         parser.error("--benchmark-num-iters must be positive")
     if args.tdm_split and args.persistent:
         parser.error("--tdm-split requires --no-persistent")
+    if args.sched_mode_2 and not args.persistent:
+        parser.error("--sched-mode-2 requires --persistent")
     if args.output_staging:
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
@@ -220,7 +226,7 @@ def main():
         config = dict(kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
                       block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
                       group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
-                      output_staging=run_args.output_staging,
+                      output_staging=run_args.output_staging, sched_mode_2=run_args.sched_mode_2,
                       cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
                       requested_programs=run_args.num_programs if run_args.persistent else None,
                       benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
@@ -237,6 +243,7 @@ def main():
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
+            f"sched_mode_2={run_args.sched_mode_2}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
