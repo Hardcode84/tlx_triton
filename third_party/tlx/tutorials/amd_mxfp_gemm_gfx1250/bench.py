@@ -4,7 +4,9 @@ Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
 output, persistent 256x256x128 tiles, three input buffers, output staging, and
 partial TDM fusion. Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
-tutorial kernel's timed region.
+tutorial kernel's timed region. The default timing budget is 256 ms, matching
+a standalone run using --benchmark_num_iters 256 (that parameter is a duration,
+not an iteration count). Override it with --benchmark-ms.
 
 Examples::
 
@@ -124,7 +126,8 @@ def main():
     parser.add_argument("--num-programs", type=int, default=None,
                         help="default: one program per CU, capped by tile count")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
-    parser.add_argument("--benchmark-num-iters", type=int, default=32, help="timing repetition budget in milliseconds")
+    parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
+                        help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's model artifacts")
@@ -174,6 +177,12 @@ def main():
             parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
 
     results = []
+    config = dict(kernel="persistent" if args.persistent else "nonpersistent", block_m=args.block_m,
+                  block_n=args.block_n, block_k=args.block_k, num_buffers=args.num_buffers, group_m=args.group_m,
+                  tdm_fusion=args.tdm_fusion, tdm_split=args.tdm_split, output_staging=args.output_staging,
+                  cross_tile_prefetch=args.cross_tile_prefetch if args.persistent else False,
+                  requested_programs=args.num_programs if args.persistent else None, benchmark_mode=args.benchmark_mode,
+                  benchmark_ms=args.benchmark_num_iters, seed=args.seed)
     runs = [(case, variant, dtype_b) for case in cases for variant, dtype_b in variants]
     for index, (case, variant, dtype_b) in enumerate(runs, 1):
         label = "x".join(map(str, case))
@@ -201,10 +210,16 @@ def main():
             status = "missing timing"
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
-                 tflops=tflops, status=status))
+                 tflops=tflops, status=status, **config, command=shlex.join(command)))
 
     if args.dry_run:
         return 0
+    print(
+        f"\nConfiguration: {config['kernel']}, tile={args.block_m}x{args.block_n}x{args.block_k}, "
+        f"buffers={args.num_buffers}, group_m={args.group_m}, fusion={args.tdm_fusion}, split={args.tdm_split}, "
+        f"output_staging={args.output_staging}, cross_tile_prefetch={config['cross_tile_prefetch']}, "
+        f"programs={(args.num_programs or 'auto') if args.persistent else 'tile count'}, "
+        f"timing={args.benchmark_mode}/{args.benchmark_num_iters} ms", flush=True)
     print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'M':>7} {'N':>7} {'K':>7} "
           f"{'ms':>12} {'TFLOPS':>12}  status")
     for row in results:
@@ -215,8 +230,7 @@ def main():
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         with args.csv.open("w", newline="") as output:
-            writer = csv.DictWriter(
-                output, fieldnames=("variant", "dtype_a", "dtype_b", "M", "N", "K", "ms", "tflops", "status"))
+            writer = csv.DictWriter(output, fieldnames=tuple(results[0]))
             writer.writeheader()
             writer.writerows(results)
     return int(any(row["status"] != "ok" for row in results))
