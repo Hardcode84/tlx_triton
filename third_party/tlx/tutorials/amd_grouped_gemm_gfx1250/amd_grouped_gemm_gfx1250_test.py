@@ -296,8 +296,8 @@ def _tdm_load_subtile(
 @triton.jit
 def _tdm_load_fused(a_desc, b_desc, a_view, b_view, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr):
     if CLUSTER_SIZE > 1:
-        # Every wave must finish reading a slot before any workgroup can
-        # refill that slot through multicast into a neighbor's LDS.
+        # Align matching requests to improve multicast sharing. A late CTA
+        # receives a separate load; its own local waits protect its LDS.
         tlx.cluster_barrier()
     if CLUSTER_SIZE > 1 and CLUSTER_MULTICAST:
         rank = tlx.cluster_cta_rank()

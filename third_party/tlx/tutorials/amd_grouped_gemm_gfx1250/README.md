@@ -233,7 +233,10 @@ workgroup's inputs independently, providing a comparison control.
 The kernel expresses recipient masks on `tlx.async_amd_descriptor_load_fused`
 and uses `tlx.cluster_barrier()` before refilling an input slot. The barrier
 first synchronizes local waves, then arrives and waits at the AMD cluster
-barrier so a remote refill cannot overwrite data another workgroup still reads.
+barrier to align matching requests and improve sharing. AMD multicast returns
+data only to workgroups which requested it; late requests receive separate
+loads. Cluster synchronization is optional for correctness, while each
+workgroup's local waits protect its own LDS.
 The masks and barriers lower through the compiler's AMD TDM and synchronization
 operations. Compilation uses the ordinary JIT cache and launch path.
 Each input mask selects two recipients, within gfx1250's limit of five.

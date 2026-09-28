@@ -106,6 +106,8 @@ def _command(args, case, dtype_b):
         str(args.xcd_chunk),
         "--cluster_size",
         str(args.cluster_size),
+        "--cluster_barrier_interval",
+        str(args.cluster_barrier_interval),
     ]
     if args.persistent:
         command.append("--persistent")
@@ -160,6 +162,8 @@ def main():
                         help="workgroups per input multicast cluster; supports --xcd-remap none or chunked")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
+    parser.add_argument("--cluster-barrier-interval", type=int, default=1,
+                        help="align cluster requests every N input K blocks; 0 disables all cluster barriers")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
@@ -193,6 +197,8 @@ def main():
         parser.error("--sched-mode-2 requires --persistent")
     if args.num_xcds <= 0 or args.xcd_chunk <= 0:
         parser.error("--num-xcds and --xcd-chunk must be positive")
+    if args.cluster_barrier_interval < 0:
+        parser.error("--cluster-barrier-interval must be nonnegative")
     if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
         parser.error("XCD remapping and clustering require --persistent")
     if args.cluster_size > 1:
@@ -264,6 +270,7 @@ def main():
             output_staging=run_args.output_staging, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
             num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
+            cluster_barrier_interval=run_args.cluster_barrier_interval,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
             requested_programs=run_args.num_programs if run_args.persistent else None,
             benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
@@ -283,6 +290,7 @@ def main():
             f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "
             f"cluster_size={run_args.cluster_size}, "
             f"cluster_multicast={run_args.cluster_multicast if run_args.cluster_size > 1 else False}, "
+            f"cluster_barrier_interval={run_args.cluster_barrier_interval}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)

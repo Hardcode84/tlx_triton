@@ -58,6 +58,30 @@ across a two-by-two output region, while `--group-m 8` shares B and its scales
 across four M tiles. `--no-cluster-multicast` keeps cluster synchronization
 with independent loads, for comparison.
 
+Cluster barriers are optional for AMD multicast. Only workgroups that have
+issued matching requests receive a combined load; late requests receive a
+separate load after timeout. `--cluster-barrier-interval N` aligns requests
+every N input K blocks, restarting at K=0 of each output tile. The default
+is 1. Set it to 0 to remove **all** cluster barriers, including the exit
+barrier. Local workgroup synchronization and TDM completion waits still
+protect each workgroup's LDS. Positive intervals retain an exit barrier.
+
+```bash
+# Multicast with no cluster synchronization.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
+  --cluster-barrier-interval 0
+
+# Align requests once every four input K blocks.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
+  --cluster-barrier-interval 4
+```
+
+Use interval 1 for the original per-load synchronization. Add
+`--no-cluster-multicast` at any interval to compare independent loads with
+the same synchronization cadence.
+
 ```bash
 # Remapping alone, with the current per-variant tile defaults.
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --xcd-remap balanced
@@ -87,13 +111,15 @@ must be divisible by 16 and divide the output tile count, keeping all cluster
 members on the same loop boundaries. Set `--num-programs` explicitly if the
 device CU count does not satisfy these conditions. The count includes all
 workgroups, not clusters. Both BK128's separate output staging and BK256's
-reuse of A for output are supported. Cluster barriers protect input ring
-refills and wait for peers before exit.
+reuse of A for output are supported. Cluster barriers align requests to
+improve sharing; they are not required for multicast correctness.
 
 The summary and CSV record the remapping and cluster configuration. Standalone
 flags use underscores (`--xcd_remap`, `--num_xcds`, `--xcd_chunk`, `--cluster_size`,
 `--cluster_multicast`); Python API/config keys are `XCD_REMAP`, `NUM_XCDS`,
 `XCD_CHUNK`, `CLUSTER_SIZE`, and `CLUSTER_MULTICAST`.
+The barrier interval uses standalone flag `--cluster_barrier_interval` and
+Python API/config key `CLUSTER_BARRIER_INTERVAL`; the summary and CSV record it.
 
 Use repeatable `--variant` options to select variants. `--dtype-a float8_e5m2`
 changes activations for the selected variants. Alternatively, `--dtype-b`
