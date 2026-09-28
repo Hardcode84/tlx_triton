@@ -5389,6 +5389,10 @@ def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_
     ({"fusion": "none"}, False),
     ({"with_a_scale": False}, False),
     ({"persistent": False}, False),
+    ({"cluster_barrier_interval": 0}, True),
+    ({"cluster_barrier_interval": 4}, True),
+    ({"cluster_barrier_interval": -1}, False),
+    ({"cluster_barrier_interval": 1.5}, False),
 ])
 def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
     config = dict(M=2048, N=1024, num_programs=16, persistent=True, block_m=256, block_n=256, group_m=4,
@@ -5399,6 +5403,22 @@ def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
     else:
         with pytest.raises(ValueError):
             _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+
+
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("remap_mode", [0, 2])
+@pytest.mark.parametrize("interval", [0, 4])
+def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, remap_mode, interval):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, CLUSTER_SIZE=4, GROUP_SIZE_M=4,
+                                                  XCD_REMAP_MODE=remap_mode, CLUSTER_BARRIER_INTERVAL=interval)
+    ttgir = compiled.asm["ttgir"]
+    assert ("amdg.cluster_barrier_arrive" in ttgir) == (interval > 0)
+    assert ("amdg.cluster_barrier_wait" in ttgir) == (interval > 0)
+    assert " multicast " in ttgir
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
 
 
 def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
@@ -5414,7 +5434,7 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constant
     config = dict(DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, GROUP_SIZE_M=8,
                   NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
                   CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False, XCD_REMAP_MODE=0,
-                  NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True)
+                  NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True, CLUSTER_BARRIER_INTERVAL=1)
     config.update(constants)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     return triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),

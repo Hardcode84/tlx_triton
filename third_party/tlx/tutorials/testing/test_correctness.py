@@ -1867,6 +1867,24 @@ def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, 
                           CLUSTER_MULTICAST=multicast, SCHED_MODE_2=True))
 
 
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("k_iters", [3, 10])
+@pytest.mark.parametrize("interval,remap_mode,group_m,fusion,multicast", [
+    (0, "none", 8, "partial", True),
+    (0, "chunked", 4, "partial", True),
+    (0, "none", 8, "partial", False),
+    (4, "none", 4, "partial", True),
+    (3, "chunked", 4, "4way", True),
+])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_mxfp_persistent_cluster_barrier_interval(dtype_b, block_k, k_iters, interval, remap_mode, group_m, fusion,
+                                                      multicast):
+    _check_amd_mxfp_persistent(
+        dtype_b, 3, k_iters, fusion, True, block_k == 128, True, block_k, M=2048, N=1024,
+        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=4,
+                          CLUSTER_MULTICAST=multicast, CLUSTER_BARRIER_INTERVAL=interval))
+
+
 def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch, output_staging,
                                block_k, M=768, N=512, extra_config=None):
     if output_staging and dtype_b != "e2m1" and buffers > (3 if block_k == 128 else 2):
