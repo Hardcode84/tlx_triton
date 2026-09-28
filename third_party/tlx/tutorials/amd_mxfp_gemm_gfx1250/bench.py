@@ -1,8 +1,10 @@
 """Benchmark persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
 Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
-output, persistent 256x256x128 tiles, three input buffers, output staging, and
-partial TDM fusion. Each shape/variant runs in a fresh process using the current
+output, persistent 256x256 M/N tiles, three input buffers, output staging, and
+partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
+BK256 with cross-tile prefetch disabled so output can reuse the A ring.
+Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
 tutorial kernel's timed region. The default timing budget is 256 ms, matching
 a standalone run using --benchmark_num_iters 256 (that parameter is a duration,
@@ -12,10 +14,10 @@ Examples::
 
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
-    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --num-buffers 4 --no-output-staging
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
-    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4 -BK 256 --no-cross-tile-prefetch
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4 -BK 128
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 
@@ -45,6 +47,15 @@ def _parse_case(value):
     if len(dims) != 3 or min(dims) <= 0:
         raise argparse.ArgumentTypeError("case must contain three positive dimensions")
     return dims
+
+
+def _variant_args(args, dtype_b):
+    resolved = argparse.Namespace(**vars(args))
+    if resolved.block_k is None:
+        resolved.block_k = 256 if dtype_b == "float4" else 128
+    if resolved.cross_tile_prefetch is None:
+        resolved.cross_tile_prefetch = not (resolved.output_staging and resolved.block_k == 256)
+    return resolved
 
 
 def _command(args, case, dtype_b):
@@ -109,7 +120,8 @@ def main():
     parser.add_argument("-K", type=int)
     parser.add_argument("-BM", "--block-m", dest="block_m", type=int, choices=(128, 256), default=256)
     parser.add_argument("-BN", "--block-n", dest="block_n", type=int, choices=(128, 256), default=256)
-    parser.add_argument("-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=128)
+    parser.add_argument("-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=None,
+                        help="default: 128 for MX8xMX8, 256 for MX8xMX4; an override applies to all selected variants")
     parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=3)
     parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--variant", action="append", choices=tuple(VARIANT_DTYPES_B),
@@ -121,8 +133,9 @@ def main():
     parser.add_argument("--tdm-split", action="store_true", help="split descriptors in the nonpersistent kernel")
     parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
-                        help="stage persistent FP32 output for TDM stores; BK256 requires --no-cross-tile-prefetch")
-    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=True)
+                        help="stage persistent FP32 output for TDM stores; BK256 reuses the A ring")
+    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
+                        help="default: disabled for BK256 output staging, enabled otherwise")
     parser.add_argument("--num-programs", type=int, default=None,
                         help="default: one program per CU, capped by tile count")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
@@ -157,36 +170,32 @@ def main():
     if args.output_staging:
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
-        if args.block_k == 256 and args.cross_tile_prefetch:
-            parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
-    for _, dtype_b in variants:
-        if args.output_staging:
-            max_buffers = 3 if args.block_k == 128 else (3 if dtype_b == "float4" else 2)
-            if args.num_buffers > max_buffers:
-                parser.error(f"BK{args.block_k} output staging with {dtype_b} supports at most {max_buffers} buffers")
+    variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
+    for _, dtype_b, run_args in variants:
+        if run_args.output_staging:
+            if run_args.block_k == 256 and run_args.cross_tile_prefetch:
+                parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
+            max_buffers = 3 if run_args.block_k == 128 else (3 if dtype_b == "float4" else 2)
+            if run_args.num_buffers > max_buffers:
+                parser.error(
+                    f"BK{run_args.block_k} output staging with {dtype_b} supports at most {max_buffers} buffers")
         # Include the operand/scale padding used by the tutorial. This is an
         # upper bound for the rings; compiler scratch may need additional LDS.
-        data_bytes = (args.block_m + args.block_n // (2 if dtype_b == "float4" else 1)) * args.block_k
-        scale_bytes = (args.block_m + args.block_n) * args.block_k // 32
-        ring_bytes = args.num_buffers * (data_bytes * 272 // 256 + scale_bytes * 264 // 256)
+        data_bytes = (run_args.block_m + run_args.block_n // (2 if dtype_b == "float4" else 1)) * run_args.block_k
+        scale_bytes = (run_args.block_m + run_args.block_n) * run_args.block_k // 32
+        ring_bytes = run_args.num_buffers * (data_bytes * 272 // 256 + scale_bytes * 264 // 256)
         if ring_bytes > 320 * 1024:
             parser.error("input rings exceed gfx1250 LDS capacity; reduce --block-k, --num-buffers, or M/N tiles")
-    for m, n, k in cases:
-        if (min(m, n, k) <= 0 or m % args.block_m or n % args.block_n or k % args.block_k
-                or k // args.block_k < args.num_buffers):
-            parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
+        for m, n, k in cases:
+            if (min(m, n, k) <= 0 or m % run_args.block_m or n % run_args.block_n or k % run_args.block_k
+                    or k // run_args.block_k < run_args.num_buffers):
+                parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
 
     results = []
-    config = dict(kernel="persistent" if args.persistent else "nonpersistent", block_m=args.block_m,
-                  block_n=args.block_n, block_k=args.block_k, num_buffers=args.num_buffers, group_m=args.group_m,
-                  tdm_fusion=args.tdm_fusion, tdm_split=args.tdm_split, output_staging=args.output_staging,
-                  cross_tile_prefetch=args.cross_tile_prefetch if args.persistent else False,
-                  requested_programs=args.num_programs if args.persistent else None, benchmark_mode=args.benchmark_mode,
-                  benchmark_ms=args.benchmark_num_iters, seed=args.seed)
-    runs = [(case, variant, dtype_b) for case in cases for variant, dtype_b in variants]
-    for index, (case, variant, dtype_b) in enumerate(runs, 1):
+    runs = [(case, variant, dtype_b, run_args) for case in cases for variant, dtype_b, run_args in variants]
+    for index, (case, variant, dtype_b, run_args) in enumerate(runs, 1):
         label = "x".join(map(str, case))
-        command = _command(args, case, dtype_b)
+        command = _command(run_args, case, dtype_b)
         print(f"\n[{index}/{len(runs)}] {variant} {label} ({args.dtype_a} x {dtype_b})", flush=True)
         print(f"$ {shlex.join(command)}", flush=True)
         if args.dry_run:
@@ -208,25 +217,36 @@ def main():
         status = "ok" if returncode == 0 else f"exit {returncode}"
         if status == "ok" and args.benchmark_mode != "none" and ms is None:
             status = "missing timing"
+        config = dict(kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
+                      block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
+                      group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
+                      output_staging=run_args.output_staging,
+                      cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
+                      requested_programs=run_args.num_programs if run_args.persistent else None,
+                      benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
+                      seed=run_args.seed)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
                  tflops=tflops, status=status, **config, command=shlex.join(command)))
 
     if args.dry_run:
         return 0
-    print(
-        f"\nConfiguration: {config['kernel']}, tile={args.block_m}x{args.block_n}x{args.block_k}, "
-        f"buffers={args.num_buffers}, group_m={args.group_m}, fusion={args.tdm_fusion}, split={args.tdm_split}, "
-        f"output_staging={args.output_staging}, cross_tile_prefetch={config['cross_tile_prefetch']}, "
-        f"programs={(args.num_programs or 'auto') if args.persistent else 'tile count'}, "
-        f"timing={args.benchmark_mode}/{args.benchmark_num_iters} ms", flush=True)
+    for variant, _, run_args in variants:
+        print(
+            f"\nConfiguration ({variant}): {'persistent' if run_args.persistent else 'nonpersistent'}, "
+            f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
+            f"buffers={run_args.num_buffers}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
+            f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
+            f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
+            f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
+            f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
     print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'M':>7} {'N':>7} {'K':>7} "
-          f"{'ms':>12} {'TFLOPS':>12}  status")
+          f"{'BK':>4} {'ms':>12} {'TFLOPS':>12}  status")
     for row in results:
         ms = "-" if row["ms"] is None else f"{row['ms']:.4f}"
         tflops = "-" if row["tflops"] is None else f"{row['tflops']:.2f}"
         print(f"{row['variant']:>9} {row['dtype_a']:>12} {row['dtype_b']:>12} "
-              f"{row['M']:7d} {row['N']:7d} {row['K']:7d} {ms:>12} {tflops:>12}  {row['status']}")
+              f"{row['M']:7d} {row['N']:7d} {row['K']:7d} {row['block_k']:4d} {ms:>12} {tflops:>12}  {row['status']}")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         with args.csv.open("w", newline="") as output:
