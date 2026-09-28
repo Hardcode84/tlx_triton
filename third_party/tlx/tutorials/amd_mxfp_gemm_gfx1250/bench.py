@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
     parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=1,
-                        help="workgroups per input multicast cluster; requires --xcd-remap chunked")
+                        help="workgroups per input multicast cluster; supports --xcd-remap none or chunked")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
@@ -196,8 +196,8 @@ def main():
     if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
         parser.error("XCD remapping and clustering require --persistent")
     if args.cluster_size > 1:
-        if (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2):
-            parser.error("clustering requires --xcd-remap chunked --num-xcds 8 --xcd-chunk 2")
+        if args.xcd_remap != "none" and (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2):
+            parser.error("clustering requires --xcd-remap none or chunked with --num-xcds 8 --xcd-chunk 2")
         if args.group_m not in (4, 8) or args.tdm_fusion == "none":
             parser.error("clustering requires --group-m 4 or 8 and partial, 2way, or 4way TDM fusion")
     if args.output_staging:
