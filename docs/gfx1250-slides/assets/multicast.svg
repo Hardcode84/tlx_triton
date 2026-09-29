@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="535" height="335" viewBox="0 0 535 335">
+  <title>Logical multicast sharing across four workgroups</title>
+  <g font-family="DejaVu Sans, sans-serif" text-anchor="middle">
+    <g fill="#275dbe" font-size="22"><text x="185" y="29">B0 · N tile 0</text><text x="410" y="29">B1 · N tile 1</text></g>
+    <g fill="#e0eaf9"><rect x="80" y="43" width="210" height="124" rx="12"/><rect x="305" y="43" width="210" height="124" rx="12"/></g>
+    <g fill="#dcefea"><rect x="80" y="182" width="210" height="124" rx="12"/><rect x="305" y="182" width="210" height="124" rx="12"/></g>
+    <g fill="#172c40" font-size="25"><text x="185" y="91">Rank 0</text><text x="410" y="91">Rank 2</text><text x="185" y="229">Rank 1</text><text x="410" y="229">Rank 3</text></g>
+    <g fill="#536a7b" font-size="20"><text x="185" y="128">tile (0,0)</text><text x="410" y="128">tile (0,1)</text><text x="185" y="268">tile (2,0)</text><text x="410" y="268">tile (2,1)</text></g>
+    <g fill="#007e80" font-size="20"><text x="31" y="101">A0</text><text x="31" y="239">A2</text></g>
+    <g stroke="#007e80" stroke-width="3"><path d="M57 58V153"/><path d="M57 197V292"/></g>
+    <text x="291" y="333" font-size="15" fill="#536a7b">Logical tile coordinates; physical placement is not shown.</text>
+  </g>
+</svg>

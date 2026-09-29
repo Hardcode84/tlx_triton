@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="180" viewBox="0 0 1120 180">
+  <title>Recycle the last two K-block slots for the next tile</title>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0L6 3L0 6" fill="none" stroke="#536a7b" stroke-width="1.5"/></marker></defs>
+  <g font-family="DejaVu Sans, sans-serif" font-size="21">
+    <text x="0" y="61" fill="#536a7b">Slot 0</text><text x="0" y="137" fill="#536a7b">Slot 1</text>
+    <g fill="#e0eaf9"><rect x="112" y="25" width="299" height="58" rx="9"/><rect x="112" y="102" width="299" height="58" rx="9"/></g>
+    <g fill="#275dbe" text-anchor="middle"><text x="261" y="62">Consume tile t: K-last−1</text><text x="261" y="139">Consume tile t: K-last</text></g>
+    <g fill="#dcefea"><rect x="535" y="25" width="286" height="58" rx="9"/><rect x="535" y="102" width="286" height="58" rx="9"/></g>
+    <g fill="#007e80" text-anchor="middle"><text x="678" y="62">Load tile t+1: K0</text><text x="678" y="139">Load tile t+1: K1</text></g>
+    <g stroke="#536a7b" stroke-width="2" marker-end="url(#arrow)"><path d="M426 54H517"/><path d="M426 131H517"/><path d="M837 54H892"/><path d="M837 131H892"/></g>
+    <g font-size="15" fill="#536a7b" text-anchor="middle"><text x="473" y="40">released</text><text x="473" y="117">released</text></g>
+    <rect x="910" y="25" width="208" height="135" rx="10" fill="#fff" stroke="#d6e0e7"/>
+    <text x="1014" y="77" fill="#172c40" text-anchor="middle">Next tile</text><text x="1014" y="109" fill="#172c40" text-anchor="middle">starts primed</text>
+  </g>
+</svg>

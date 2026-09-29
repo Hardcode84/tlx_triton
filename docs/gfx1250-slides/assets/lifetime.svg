@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="166" viewBox="0 0 1120 166">
+  <title>Buffer ownership and synchronization</title>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0L6 3L0 6" fill="none" stroke="#536a7b" stroke-width="1.5"/></marker></defs>
+  <g font-family="DejaVu Sans, sans-serif" font-size="22" text-anchor="middle">
+    <rect x="1" y="22" width="180" height="72" rx="10" fill="#e0eaf9"/>
+    <rect x="235" y="22" width="180" height="72" rx="10" fill="#dcefea"/>
+    <rect x="469" y="22" width="180" height="72" rx="10" fill="#e0eaf9"/>
+    <rect x="703" y="22" width="180" height="72" rx="10" fill="#dcefea"/>
+    <rect x="937" y="22" width="180" height="72" rx="10" fill="#e0eaf9"/>
+    <g fill="#172c40"><text x="91" y="66">Transfer</text><text x="325" y="66">Completion</text><text x="559" y="66">Consume</text><text x="793" y="66">Release</text><text x="1027" y="66">Refill</text></g>
+    <g stroke="#536a7b" stroke-width="2" marker-end="url(#arrow)"><path d="M190 58H221"/><path d="M424 58H455"/><path d="M658 58H689"/><path d="M892 58H923"/></g>
+    <g fill="#007e80" font-size="18"><text x="325" y="131">Readers may proceed</text><text x="793" y="131">Next writer may proceed</text></g>
+    <g stroke="#90c6be"><path d="M325 96V110"/><path d="M793 96V110"/></g>
+  </g>
+</svg>

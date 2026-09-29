@@ -1,5 +1,6 @@
 - **gfx1250 / CDNA5 programming — 30 minutes; 12 slides.**
 - Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
+- Draft deck: [Markdown slides](gfx1250-slides/slides.md) and [local PDF build instructions](gfx1250-slides/README.md).
 - Code reference: `gfx1250-kernels-2` at `b266fe4c1d`; selected optimization commits below.
 - ISA reference: AMD CDNA5 ISA Reference Guide, 27 July 2026; section numbers below refer to that edition.
 - Main bullets: slide content. Subbullets: speaker details and figures to prepare.
