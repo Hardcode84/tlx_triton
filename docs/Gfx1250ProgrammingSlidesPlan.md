@@ -96,6 +96,12 @@
   - Use physical addresses, including allocation base. Fix bank selection with padding/swizzling; fix partition placement with pair-aware layouts and allocation. Scheduling can separate conflicting accesses.
   - Analyze `ds_load_tr` source addresses before its register redistribution. Visual: bank map beside SIMD-pair/partition map.
   - Sources: [CDNA5 ISA, §11.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD LDS optimization article](https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimization/README.html).
+- **Backup — `S_CLAUSE`.**
+  - Group instructions of one class from one wave; the first instruction after `S_CLAUSE` selects the class. Other waves cannot interleave that class during an uninterrupted clause.
+  - Example: `s_clause 3` groups four following compatible memory instructions; the length field encodes instruction count minus one.
+  - Keep independent requests together; a stalled clause can leave execution resources idle. Compare issue order and stalls in the trace.
+  - A clause does not wait for memory completion or synchronize workgroups. Put waits needed by the first instruction before `S_CLAUSE`; do not mix instruction classes or nest clauses.
+  - Visual: two-wave issue timeline with and without a clause. Source: [CDNA5 ISA, §§5.3, 15.5](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
 - **Backup — TDM gather/scatter.**
   - Descriptor row indices: up to 16 indices of 16 bits or eight indices of 32 bits per instruction; issue more instructions for more rows.
   - Gather permits arbitrary and repeated row indices; correct out-of-bounds handling requires nondecreasing indices. Gather/scatter mode is restricted to 2D tiles.
