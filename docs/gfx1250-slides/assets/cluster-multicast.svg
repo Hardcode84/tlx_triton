@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="180" viewBox="0 0 1120 180">
+  <title>TDM multicast into separate LDS allocations in a workgroup cluster</title>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0L6 3L0 6" fill="none" stroke="#007e80" stroke-width="1.5"/></marker></defs>
+  <rect x="1" y="57" width="1118" height="122" rx="12" fill="#eef3f7" stroke="#d6e0e7"/>
+  <g font-family="DejaVu Sans, sans-serif" text-anchor="middle">
+    <rect x="405" y="1" width="310" height="48" rx="10" fill="#dcefea"/>
+    <text x="560" y="32" font-size="22" fill="#007e80">Global input tile</text>
+    <rect x="26" y="74" width="320" height="88" rx="10" fill="#fff" stroke="#d6e0e7"/>
+    <rect x="774" y="74" width="320" height="88" rx="10" fill="#fff" stroke="#d6e0e7"/>
+    <g font-size="21" fill="#172c40"><text x="186" y="107">Rank 0 · WGP A</text><text x="934" y="107">Rank 1 · WGP B</text></g>
+    <g font-size="20" fill="#275dbe"><text x="186" y="139">Own LDS · copy of input tile</text><text x="934" y="139">Own LDS · copy of input tile</text></g>
+    <g fill="none" stroke="#007e80" stroke-width="3" marker-end="url(#arrow)"><path d="M405 25H186V70"/><path d="M715 25H934V70"/></g>
+    <text x="560" y="88" font-size="22" fill="#007e80">One cluster · mask 0011</text>
+    <text x="560" y="123" font-size="19" fill="#536a7b">Both members issue</text>
+    <text x="560" y="149" font-size="19" fill="#536a7b">matching TDM requests</text>
+  </g>
+</svg>

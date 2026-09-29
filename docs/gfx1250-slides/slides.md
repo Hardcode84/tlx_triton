@@ -5,7 +5,7 @@ size: 16:9
 paginate: true
 footer: 'CDNA5 / gfx1250 programming · Draft'
 title: 'Programming CDNA5 / gfx1250 — architecture and TLX grouped GEMM'
-description: 'Draft talk with assembly and XDL efficiency placeholders.'
+description: 'CDNA5 programming draft with checked assembly and XDL efficiency placeholders.'
 ---
 
 <!-- _class: compact -->
@@ -37,6 +37,8 @@ https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-
 
 ---
 
+<!-- _class: asm-detail registers-asm -->
+
 <div class="eyebrow">02 / Registers and matrix programming</div>
 
 # More addressable VGPRs for one wave
@@ -52,69 +54,128 @@ https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-
 <div>MSB 3<br>v768–v1023</div>
 </div>
 
-<div class="flow">LDS → VGPR operands → WMMA → VGPR accumulator</div>
+<p class="small muted">Generated K-loop excerpt · FP16 A/B → FP32 accumulator</p>
 
-<div class="placeholder"><div class="label">ASM placeholder · register selection + FP16 WMMA</div><p>Insert a short generated excerpt showing MSB changes and the 16 × 16 × 32 matrix instruction.</p></div>
+```asm
+s_set_vgpr_msb 0x5a  ; dst=1, src0=2, src1=2, src2=1
+s_wait_dscnt 0xe
+v_wmma_f32_16x16x32_f16 v[202:209], v[42:49], v[130:137], v[202:209]
+```
+
+<p class="small">Physical registers: <strong>D/C = v458–465</strong> · A = v554–561 · B = v642–649.</p>
 
 <div class="source">CDNA5 ISA §§3.3.2, 7.12, 15.5 · More addressability does not imply four times the physical register capacity.</div>
 
 <!--
 3 min. The source/destination classes have independent MSB fields; this is not four independent register files.
-Kernel instruction to show later: v_wmma_f32_16x16x32_f16, with FP16 A/B and FP32 accumulation.
+Generated v_wmma_f32_16x16x32_f16, with FP16 A/B and FP32 accumulation.
 All 32 lanes cooperate on one matrix operation. Mention ds_load_tr redistribution as an LDS-to-register option.
-TODO ASM-REGISTERS: replace the box with generated assembly from the selected presentation build.
+Contiguous instructions from the current grouped kernel's inner K loop; debug directives and physical-register comments removed.
+0x5a assigns destination/SRC2 MSB 1 and SRC0/SRC1 MSB 2. Each encoded operand is the low register index.
+The partial DS wait relies on the preceding load queue in this generated loop; it is not a standalone prologue.
+See assembly.md for the build configuration, exact excerpt boundaries, and validation.
 Source: CDNA5 ISA, 27 July 2026, §§3.3.2, 7.12, 15.5.
 -->
 
 ---
 
+<!-- _class: tdm-movement -->
+
 <div class="eyebrow">03 / Data movement</div>
 
-# Move payloads directly between memory and LDS
+# TDM moves tiles for the grouped GEMM
 
-<img class="diagram" src="assets/transfers.svg" alt="CDNA3/4 use implicit lane placement for direct LDS loads. CDNA5 adds explicit per-lane LDS addresses and descriptor-based bidirectional TDM transfers." />
+<p class="subtitle">SGPR descriptors specify each transfer; the payload bypasses VGPRs.</p>
 
 <div class="cols">
-<div class="panel"><h3>Per-lane asynchronous transfers</h3><p>Programmable LDS addresses.</p><p>Global → LDS and LDS → global.</p><p class="small muted">Addresses still use registers.</p></div>
-<div class="panel"><h3>Tensor Data Mover · TDM</h3><p>SGPR descriptors define 1–5D tiles.</p><p>Load / store; 2D gather / scatter.</p><p class="small muted">Loads support padding and multicast.</p></div>
+<div class="panel">
+
+### A/B global tiles → LDS rings
+
+<p class="small">Load the next operand tile into an input slot.</p>
+
+```asm
+tensor_load_to_lds s[68:71], s[12:19]
+```
+
+<p class="small"><strong>Group 0 · s[68:71]</strong><br>Global tile address + LDS base.</p>
+<p class="small"><strong>Group 1 · s[12:19]</strong><br>Shape, strides, format, padding, recipient mask.</p>
+
+</div>
+<div class="panel">
+
+### LDS output chunks → C
+
+<p class="small">Store a converted 32-row chunk from LDS.</p>
+
+```asm
+tensor_store_from_lds s[28:31], s[20:27]
+```
+
+<p class="small"><strong>Group 0 · s[28:31]</strong><br>Global tile address + LDS base.</p>
+<p class="small"><strong>Group 1 · s[20:27]</strong><br>C shape, strides, and format.</p>
+
+</div>
 </div>
 
-> The payload bypasses VGPRs; addresses and descriptors still cost resources.
+<div class="panel tdm-note"><h3>One request describes a whole tile</h3><p class="small">EXEC is ignored · 1–5D tiles · 2D gather/scatter · loads support padding and multicast.</p><p class="small">Use <code>S_WAIT_TENSORCNT</code> for completion; sharing LDS also needs a handoff.</p></div>
 
-<div class="source">CDNA5 ISA §§10.8, 10.11 · Direct-to-LDS loading already exists on CDNA3/4.</div>
+<div class="source">CDNA5 ISA §10.11 · Generated input/output excerpts; descriptor setup and synchronization omitted. See slides 4 and 9.</div>
 
 <!--
-2 min. Explain the progression from implicit lane placement to explicit addresses to a tensor descriptor.
-TDM operations are not per-lane operations and ignore EXEC; the source-level wave masks choose issuing waves.
-TDM descriptors support both directions. Stores do not remove LDS padding.
-Gather/scatter details are in backup E.
+2 min. Introduce TDM as the data path used by the kernel: operand tiles into LDS, then converted output chunks back to global memory.
+These are individual instructions from separate input and output regions of the generated reference kernel, not one consecutive program.
+The load is reference.amdgcn line 1682; the store is line 1023. Descriptor construction and synchronization are outside the excerpts.
+This 2D form consumes two descriptor groups: group 0 has four SGPRs, group 1 has eight. Group 0 also includes control bits.
+Group 0 supplies the global address of the tile start (not the tensor origin) and its LDS byte address.
+Group 1 supplies dimensions, strides, element size, padding controls, and the multicast workgroup mask.
+The fused A/B source wave masks select issuing waves; the descriptor's recipient mask independently selects multicast workgroups.
+TDM instructions ignore EXEC, including EXEC==0. They do not take per-lane global/LDS pointers, and their operands are unaffected by VGPR MSB settings.
+The load's descriptor selection depends on the issuing wave; the output instruction stores C2 from the two-slot staging path.
+TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast; slide 9 shows output-slot reuse.
+Stores do not remove LDS padding. Gather/scatter details are in backup E; CDNA4/CDNA5 per-lane direct-LDS examples are in backup I.
+Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provenance in assembly.md.
 -->
 
 ---
 
-<div class="eyebrow">04 / Synchronization</div>
+<!-- _class: cluster-intro -->
 
-# A buffer has two handoffs
+<div class="eyebrow">04 / Workgroup clusters and multicast</div>
 
-<img class="diagram" src="assets/lifetime.svg" alt="Transfer, completion, consumption, release, then refill. Completion protects readers; release protects the next writer." />
+# Clusters share input tiles across WGPs
+
+<p class="subtitle">Grid → cluster → workgroup → wave</p>
+
+<img class="diagram" src="assets/cluster-multicast.svg" alt="Two workgroups in one cluster run on separate WGPs. Both issue a matching TDM load with recipient mask 0011; the global input tile is multicast into each workgroup's own LDS." />
 
 <div class="cols">
-<div class="panel"><h3>Completion is per wave</h3><p>TDM loads and stores complete in issue order within one wave.</p><p class="small">With two stores pending, wait-to-one retires the older store.</p></div>
-<div class="panel"><h3>Sharing needs synchronization</h3><p>Other waves need a handoff; multicast extends it across workgroups.</p><p class="small">Mixed ASYNC loads/stores can complete out of order.</p></div>
+<div class="panel"><h3>Launch and placement</h3><p>Same shader engine; one WGP per member.</p><p class="small">Each workgroup keeps its own LDS allocation.</p><p class="small">1D / 2D / 3D clusters; up to 16 workgroups.</p></div>
+<div class="panel"><h3>Matching TDM requests</h3><p>Every recipient issues the same tile load.</p><p class="small"><code>D#.workgroup_mask</code> selects cluster ranks.</p><p class="small">Shared A/B inputs feed distinct output tiles.</p></div>
 </div>
 
-> Transfer complete before read. All readers complete before refill.
+<div class="flow">Before refill: finish local LDS reads → cluster arrival / wait → next TDM load.</div>
 
-<div class="source">CDNA5 ISA §§5.6–5.7, 10.8, 10.11.1, 11.2.2 · Compiler scheduling barriers do not synchronize workgroups.</div>
+<div class="source">CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3 · Two-workgroup illustration; the kernel's four-rank mapping is on slide 10.</div>
 
 <!--
-2 min. CDNA5 separates LOAD, STORE, DS, KM, ASYNC and TENSOR waits; counter details are backup A.
-For the example, one wave issues C0 then C1. TDM completion ordering makes wait-to-one sufficient for C0.
-This does not imply ordering across waves or against other memory types.
-Split/named barriers separate arrival and wait. LDS asynchronous barriers can receive completion signals.
+2 min. Introduce clusters as an architectural cooperation unit before presenting the grouped kernel's concrete sharing pattern.
+Cluster dimensions are part of the launch configuration. Members have equal workgroup size and run on separate WGPs in one shader engine.
+The two-workgroup diagram illustrates the mechanism; the grouped kernel uses two- or four-workgroup clusters, detailed on slide 10.
+Each workgroup has its own LDS allocation. Multicast delivers a copy of the shared input into each selected member's LDS.
+Mask 0011 selects cluster ranks 0 and 1. For TDM this mask is in descriptor group 1; it is independent of source wave masks and EXEC.
+Each selected workgroup issues a matching request. Hardware can combine matching loads; it is not a leader-only remote write into passive recipients.
+Late requests can be served separately after timeout, so do not claim an unconditional traffic reduction equal to cluster size.
+For this kernel, matching requests describe the same global tile and recipient mask at corresponding local LDS slot offsets.
+The refill barrier prevents one member from overwriting input data that a neighbor still reads: finish local LDS reads, synchronize local waves, then cluster arrival/wait.
+The cluster barrier uses ID -3. One wave per workgroup signals after local synchronization; all waves wait. ID -1 is the ordinary workgroup barrier.
+After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A; output-slot waits are on slide 9.
+Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two selected recipients, not a physical GPU floorplan.
 -->
 
 ---
+
+<!-- _class: asm-detail scheduling-asm -->
 
 <div class="eyebrow">05 / Scheduling</div>
 
@@ -125,7 +186,20 @@ Split/named barriers separate arrival and wait. LDS asynchronous barriers can re
 <div class="panel"><h3>WMMA queuing · bit [2] = 1</h3><p>Queue WMMAs, then issue independent work.</p><p class="small">Useful here: one wave per SIMD.<br>WMMA hazard spacing still applies.</p></div>
 </div>
 
-<div class="placeholder"><div class="label">ASM placeholder · dependency waits and queued WMMA</div><p>Address producer → dependency wait → memory operation</p><p>Queued matrix work → independent scalar / memory instructions</p></div>
+<p class="small muted">Generated excerpts · separate regions of the same kernel</p>
+
+```asm
+s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2
+s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1
+; ... metadata-load region: protect registers, then wait for data ...
+s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
+global_load_b64 v[10:11], v7, s[12:13]
+s_wait_loadcnt 0x0
+; ... queued-WMMA region: operands and MSB settings already prepared ...
+v_wmma_f32_16x16x32_f16 v[202:209], v[18:25], v[130:137], v[202:209]
+s_add_nc_u64 s[66:67], s[24:25], 0x100
+s_add_nc_u64 s[26:27], s[26:27], 0x100
+```
 
 <div class="source">CDNA5 ISA §§5.7.2, 7.12.1 · LLVM SIInsertWaitcnts · third_party/amd/backend/compiler.py</div>
 
@@ -133,7 +207,12 @@ Split/named barriers separate arrival and wait. LDS asynchronous barriers can re
 2 min. TRITON_HIP_USE_EXPERT_SCHEDULING controls the backend default.
 Normal VALU-to-VALU dependencies still receive hardware handling; WMMA co-execution adds specific RAW/WAR/WAW spacing rules.
 The TLX call amd_set_wave_sched_mode(1, offset=2, width=1) sets only bit 2; it does not enable LLVM wait insertion.
-TODO ASM-SCHEDULING: generated excerpt showing both independent controls and the waits that protect reuse.
+Three excerpts, with intervening work omitted: mode setup; group-offset metadata load; WMMA with independent scalar descriptor updates.
+The two mode writes are separated in the full prologue by unrelated instructions. Their bit fields do not overlap.
+The metadata-load excerpt enters with VGPR MSBs zero. VA_VDST protects prior VALU results; VM_VSRC protects prior memory-source reads.
+S_WAIT_LOADCNT then establishes load completion; the ALU dependency wait is not a data-transfer completion wait.
+The WMMA excerpt enters with MSBs dst=1, src0=2, src1=2, src2=1; the scalar adds do not touch its VGPR operands.
+Operand initialization, co-execution mode setup, and synchronization appear outside these excerpts. See assembly.md.
 Sources: https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html
 CDNA5 ISA §§5.7.2, 7.12.1. Backup B has the WMMA hazard example.
 -->
@@ -175,27 +254,43 @@ Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1
 
 ---
 
+<!-- _class: asm-detail pipeline-asm -->
+
 <div class="eyebrow">07 / Supply the matrix units</div>
 
 # Pipeline operands, bound their lifetimes
 
 <img class="diagram" src="assets/operand-pipeline.svg" alt="Two A/B ring slots alternate. Each K128 block has four K32 dots; the next operand subtile is loaded before the current dot." />
 
-- **Two A slots + two B slots**; producer selects iteration modulo 2.
-- Load the next K32 operand subtile before the current dot.
-- Fused-load wave masks: **A = 0011**, **B = 1100**.
-- Bound dot regions with `amd_sched_barrier()`; retain load/dot overlap.
+- **Two A + two B ring slots**; issuing waves: A = **0011**, B = **1100**.
+- Bound dot lifetimes with `amd_sched_barrier()`; overlap LDS loads and WMMAs.
 
-<div class="placeholder small"><div class="label">ASM placeholder · steady K loop</div><p>Show interleaved LDS loads and WMMAs, plus operand lifetime boundaries.</p></div>
+```asm
+s_set_vgpr_msb 0x825a
+s_wait_dscnt 0x18
+v_wmma_f32_16x16x32_f16 v[178:185], v[18:25], v[130:137], v[178:185]
+s_set_vgpr_msb 0x5a82
+ds_load_b128 v[138:141], v251 offset:60992
+ds_load_b128 v[142:145], v251 offset:61024
+s_set_vgpr_msb 0x825a
+s_wait_dscnt 0x18
+v_wmma_f32_16x16x32_f16 v[162:169], v[82:89], v[130:137], v[162:169]
+```
 
-<div class="source">cafe4379f3 · f66d3fc00c · Wave masks select issuing waves; they are separate from multicast recipient masks.</div>
+<div class="source">Generated steady K-loop excerpt · cafe4379f3 / f66d3fc00c · Issuing-wave masks differ from multicast recipient masks.</div>
 
 <!--
 2 min. Each K128 block becomes four K32 tl.dot steps, each expanded to multiple WMMA instructions.
 The diagram is a dependency schematic, not a cycle-accurate schedule.
 Keep output descriptor updates in the epilogue to avoid extra VGPR-MSB transitions in the steady loop.
+Before LDS consumption, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all local LDS readers finish; multicast adds the cluster handoff on slide 4.
 The source-level scheduling barrier constrains scheduling; it is not a workgroup synchronization barrier.
-TODO ASM-PIPELINE: show generated instructions after validating the chosen configuration.
+Contiguous instructions from the inner K loop, with debug directives and physical-register comments removed; see assembly.md.
+Only the low byte of each S_SET_VGPR_MSB immediate controls selection; the compiler also prints the prior setting in the high byte.
+0x5a selects dst/src2=1, src0/src1=2; 0x82 selects dst=2, src0=2, src1/src2=0.
+The LDS loads fill physical v650–657 using address v763. Neither adjacent WMMA reads those registers.
+The waits to 0x18 (24 outstanding DS operations) depend on the complete load queue outside this window; do not reuse the count in isolation.
+Compiler scheduling barriers bound whole dot regions outside this excerpt; they emit no hardware barrier instruction.
 -->
 
 ---
@@ -224,27 +319,44 @@ The source option dedicated_c_buffer selects the square cross-group path, but it
 
 ---
 
+<!-- _class: asm-detail output-asm -->
+
 <div class="eyebrow">09 / Overlap output stores</div>
 
 # Stage C in two small slots
 
 <img class="diagram" src="assets/output-staging.svg" alt="The 256 KiB input rings plus a full 128 KiB output tile exceed 320 KiB. Two 16 KiB output slots reduce logical payload to 288 KiB." />
 
-- Split C into **eight 32-row chunks**; convert and store one at a time.
-- Before reusing a slot, retire its older TDM store.
-- The newest store may stay in flight; final stores overlap next-tile entry.
+<p class="small">Eight 32-row chunks. Here, <strong>C1 finishes before slot 1 receives C3</strong>; C2 may stay in flight.</p>
 
-> TDM ordering protects the store queue; synchronization protects shared reuse.
+```asm
+s_wait_tensorcnt 0x1
+s_barrier_signal -1
+s_add_nc_u64 s[30:31], s[72:73], s[50:51]
+s_set_vgpr_msb 0x605
+s_barrier_wait -1
+ds_store_b128 v90, v[34:37]
+; ... seven more LDS stores and their ALU dependency wait ...
+s_wait_dscnt 0x0
+s_barrier_signal -1
+s_barrier_wait -1
+tensor_store_from_lds s[40:43], s[20:27]
+```
 
-<div class="source">7a58d5e627 · Sizes are logical payload, before layout overhead · ASM/resource allocation excerpt: placeholder.</div>
+<div class="source">Generated C3 staging excerpt, abridged · 7a58d5e627 · Sizes are logical payload, before layout overhead.</div>
 
 <!--
 2 min. A and B rings use 2 × (256×128 + 256×128) × 2 bytes = 256 KiB.
 Full C uses 256×256×2 = 128 KiB; two 32×256 FP16 slots use 32 KiB.
 Alias-C reuses A storage but blocks A refill until the C store drains.
 Here, TDM's per-wave completion order makes a partial wait useful. Other waves still require synchronization.
-TODO ASM-OUTPUT: insert a compact excerpt or annotated detail showing slot reuse and partial waits.
-TODO RESOURCE: verify actual LDS allocation and VGPR counts for the presentation build. Payload is not allocation.
+Generated C3 staging excerpt; seven LDS stores and one ALU dependency wait are omitted at the marked line. See assembly.md.
+The window starts after the C2 TDM store, with C1 and C2 pending. TDM's ordered completion retires C1 before slot 1 is overwritten.
+The first workgroup barrier propagates this release; DS completion plus the second workgroup barrier makes every wave's C3 writes visible.
+MSB low byte 0x05 makes v90 the physical address register v346 and v[34:37] the physical data registers v290–293.
+The scalar add updates the other slot's descriptor state. s[40:43] and s[20:27] already describe this output transfer.
+Final two stores can remain in flight into next-tile entry. This excerpt is a window into the generated kernel, not a standalone copy routine.
+The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.md. Payload is not allocation.
 -->
 
 ---
@@ -327,7 +439,7 @@ Other possible cases: G=8/32 large groups, or ordinary GEMM cubes 4096/8192/1638
 <div class="flow">Data movement → buffer lifetime → instruction overlap → reuse</div>
 
 <!--
-3 min. Questions. The following eight slides are backup, outside the 30-minute main sequence.
+3 min. Questions. The following nine slides are backup, outside the 30-minute main sequence.
 Code reference b266fe4c1d. Chained-dot compiler changes reverted by 02a632587a are excluded from the story.
 -->
 
@@ -363,15 +475,24 @@ XCNT does not establish completed payload transfers.
 
 ---
 
+<!-- _class: asm-detail hazard-asm -->
+
 <div class="eyebrow">Backup B / WMMA co-execution hazards</div>
 
 # Dependency waits are only part of the contract
 
-- Multicycle instructions can co-execute within a wave.
-- Hardware does not detect every overlapping-operand hazard.
+- Hardware does not detect every overlapping-operand hazard during co-execution.
 - Code generation must satisfy the ISA's **RAW / WAR / WAW** spacing rules.
 
-<div class="placeholder"><div class="label">ASM placeholder · FP16 WMMA → dependent VALU</div><p>Show a VALU reading the preceding WMMA's Matrix D, with the required independent instructions or V_NOPs between them.</p></div>
+```asm
+; Illustrative: co-execution enabled, MSB fields zero, operands ready.
+v_wmma_f32_16x16x32_f16 v[0:7], v[8:15], v[16:23], v[0:7]
+v_nop
+v_nop
+v_nop
+v_nop
+v_add_f32 v24, v0, 1.0  ; reads Matrix D after four co-execution slots
+```
 
 <p class="small">For this case: four independent VALU instructions or V_NOPs with co-execution enabled; none required with co-execution disabled.</p>
 
@@ -380,7 +501,10 @@ XCNT does not establish completed payload transfers.
 <div class="source">CDNA5 ISA §§5.7.2, 7.12.1 · SCHED_MODE[2] permits queuing; it does not waive hazard rules.</div>
 
 <!--
-TODO ASM-HAZARDS. RAW=read after write; WAR=write after read; WAW=write after write.
+Handwritten, assembler-checked example of the dense FP16 WMMA-to-VALU row in ISA §7.12.1.
+Assume a full Wave32, allocated VGPRs, initialized A/B/C operands, zero MSB fields, and co-execution enabled by the surrounding kernel.
+The four V_NOP instructions may instead be independent VALU instructions. S_NOP and scalar housekeeping do not count as these VALU slots.
+RAW=read after write; WAR=write after read; WAW=write after write.
 A WMMA result reused as a following WMMA input has a different requirement. Use the full ISA table.
 The instruction count here is an architectural hazard requirement, not a measured performance result.
 -->
@@ -413,6 +537,8 @@ Source: https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimiz
 
 ---
 
+<!-- _class: asm-detail clause-asm -->
+
 <div class="eyebrow">Backup D / Instruction clauses</div>
 
 # S_CLAUSE groups a supported memory class
@@ -421,7 +547,15 @@ Source: https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimiz
 - Supported: non-flat memory, flat memory, indexed LDS, or SMEM.
 - The first instruction selects the class; stalled clauses can leave units idle.
 
-<div class="placeholder"><div class="label">ASM placeholder · one memory clause</div><p>Show a clause covering four compatible memory instructions; annotate the count-minus-one length field.</p></div>
+```asm
+s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
+s_clause 3  ; four following global loads: encoded length = 4 - 1
+global_load_b32 v8,  v[0:1], off
+global_load_b32 v9,  v[0:1], off offset:4
+global_load_b32 v10, v[0:1], off offset:8
+global_load_b32 v11, v[0:1], off offset:12
+s_wait_loadcnt 0  ; completion is separate from clause formation
+```
 
 > TDM instructions are illegal inside a clause.
 
@@ -430,7 +564,10 @@ Source: https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimiz
 <div class="source">CDNA5 ISA §§5.3, 10.11.1, 15.5 · Do not mix clause classes or nest clauses.</div>
 
 <!--
-TODO ASM-CLAUSE: use a supported non-TDM sequence. Non-flat includes buffer/global/scratch/ASYNC.
+Handwritten, assembler-checked gfx1250 example: four independent global B32 loads in the non-flat memory class.
+Assume zero MSB fields, valid per-lane global base addresses in v[0:1], and v8–v11 available as destinations.
+In expert mode the initial ALU wait covers prior address producers and memory-source uses; the ending LOAD wait protects consumers.
+This is an ISA illustration, not a claim that the grouped kernel emits this clause. Non-flat includes buffer/global/scratch/ASYNC.
 S_CLAUSE length encodes count minus one. Put waits required by the first instruction before the clause.
 Some scalar housekeeping instructions are legal after the first instruction; refer to the ISA table.
 -->
@@ -538,4 +675,66 @@ Source: python/test/unit/language/test_tlx_amd_gfx1250.py
 The square tile has 256×256 FP32 values distributed across 128 threads: 512 values per thread.
 Operands and addresses add register pressure. Payload arithmetic does not include physical layout overhead.
 TODO RESOURCE: replace the placeholder after compiling the exact configurations.
+-->
+
+---
+
+<!-- _class: data-movement -->
+
+<div class="eyebrow">Backup I / Per-lane direct-to-LDS copies</div>
+
+# Global → LDS: who chooses the destination?
+
+<p class="subtitle">Both examples copy 4 bytes per lane; v[0:1] holds each lane's global address.</p>
+
+<div class="cols asm-compare">
+<div class="panel">
+
+### CDNA4 · implicit lane placement
+
+<p class="small"><code>s4</code> holds one LDS base offset for the wave.</p>
+
+```asm
+s_mov_b32 m0, s4
+s_nop 0
+global_load_lds_dword v[0:1], off
+s_waitcnt vmcnt(0)
+```
+
+<p class="small">LDS destination: <strong>M0 + 4 × lane</strong>.</p>
+
+</div>
+<div class="panel">
+
+### CDNA5 · per-lane LDS address
+
+<p class="small"><code>v4[lane]</code> holds that lane's LDS byte offset.</p>
+
+```asm
+global_load_async_to_lds_b32 v4, v[0:1], off
+s_wait_asynccnt 0
+```
+
+<p class="small">LDS destination: <strong>v4[lane]</strong>.</p>
+
+</div>
+</div>
+
+<div class="panel tdm-note"><h3>Per-lane copies are a separate path from TDM</h3><p class="small">TDM uses SGPR tile descriptors; these copies use each lane's global address.</p><p class="small muted">Both paths bypass payload VGPRs. The grouped GEMM uses TDM.</p></div>
+
+<div class="source">CDNA5 ISA §10.8 · LLVM gfx950 LDS codegen tests · Illustrative assembly; other-wave consumers also need synchronization.</div>
+
+<!--
+Explain implicit lane placement versus explicit per-lane LDS addresses; the descriptor-based TDM path is on slide 3.
+These are handwritten, assembler-checked examples, not generated excerpts from the grouped GEMM.
+Both examples assume the global addresses are ready, the LDS allocation is valid, and immediate offsets are zero.
+CDNA4: s4 supplies an aligned base offset; the B32 form places lane i at M0 + 4*i within the workgroup's LDS allocation.
+The s_nop 0 covers the M0-write-to-LDS-DMA hazard, as in LLVM's gfx950 codegen tests.
+CDNA5: v4 holds each lane's LDS byte offset. Assume VGPR-MSB fields are zero and prior address-producer hazards are resolved.
+The payload bypasses VGPRs in both examples; only the addresses occupy registers. CDNA5 also supports the reverse per-lane LDS-to-global copy.
+The shown completion waits belong to the issuing wave. Other waves require synchronization before consuming the data.
+Unlike TDM, these are per-lane operations. TDM uses SGPR descriptors and ignores EXEC.
+Syntax checked with llvm-mc for gfx950 and gfx1250.
+References: llvm/test/CodeGen/AMDGPU/llvm.amdgcn.global.load.lds.gfx950.ll;
+llvm/test/MC/AMDGPU/gfx1250_asm_vflat.s; CDNA5 ISA §§10.8, 10.11.
 -->

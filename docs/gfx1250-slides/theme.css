@@ -69,3 +69,34 @@ section.efficiency td:nth-child(n+2) { color: #927024; font-weight: 700; }
 section.questions h1 { font-size: 60px; margin-bottom: 36px; }
 section.questions .panel { padding: 22px 28px; margin-bottom: 20px; }
 section.questions .number { color: var(--teal); font-weight: 700; padding-right: 16px; }
+section.data-movement .subtitle { font-size: 22px; margin-bottom: 12px; }
+section.data-movement .asm-compare { align-items: stretch; }
+section.data-movement .panel { padding: 16px 20px; }
+section.data-movement h3 { font-size: 22px; }
+section.data-movement pre { font-size: 18px; padding: 14px 12px; min-height: 86px; }
+section.data-movement pre code { font-size: 1em; }
+section.data-movement .tdm-note { background: #e8f4f2; }
+section.tdm-movement .subtitle { font-size: 22px; margin-bottom: 12px; }
+section.tdm-movement h1 { margin-bottom: 12px; }
+section.tdm-movement .cols { align-items: stretch; }
+section.tdm-movement .panel { padding: 12px 20px; }
+section.tdm-movement h3 { font-size: 22px; }
+section.tdm-movement pre { font-size: 18px; padding: 14px 12px; }
+section.tdm-movement pre code { font-size: 1em; }
+section.tdm-movement .tdm-note { background: #e8f4f2; }
+section.cluster-intro .subtitle { font-size: 22px; margin-bottom: 12px; }
+section.cluster-intro .diagram { height: 180px; object-fit: contain; }
+section.cluster-intro .cols { align-items: stretch; }
+section.cluster-intro .panel { padding: 14px 20px; font-size: 21px; }
+section.cluster-intro h3 { font-size: 22px; }
+section.cluster-intro .small { font-size: 20px; }
+section.cluster-intro .flow { font-size: 22px; margin-top: 6px; }
+section.asm-detail pre { font-size: 18px; padding: 12px 16px; }
+section.asm-detail pre code { font-size: 1em; }
+section.scheduling-asm h1 { margin-bottom: 12px; }
+section.scheduling-asm .panel { padding: 14px 20px; font-size: 21px; }
+section.scheduling-asm .panel .small { font-size: 19px; }
+section.pipeline-asm .diagram { height: 140px; object-fit: contain; }
+section.pipeline-asm ul { font-size: 22px; }
+section.output-asm h1 { margin-bottom: 12px; }
+section.output-asm .diagram { height: 158px; object-fit: contain; }

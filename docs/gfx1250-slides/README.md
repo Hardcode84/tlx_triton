@@ -1,7 +1,7 @@
 # CDNA5 / gfx1250 programming slides
 
 Marp draft of the [reviewed plan](../Gfx1250ProgrammingSlidesPlan.md):
-12 main slides for 30 minutes, followed by eight backup slides.
+12 main slides for 30 minutes, followed by nine backup slides.
 
 ## Build locally
 
@@ -45,9 +45,13 @@ In the Marp VS Code extension, enable HTML and select `theme.css` as a custom
 theme. Alternatively, `npm run preview` opens the CLI preview when a full browser
 is available.
 
-Assembly panels and XDL efficiency cells are explicitly marked as draft
-placeholders. Search for `TODO` in `slides.md` to find their preparation notes.
-Resource allocations also await verification. XDL results use percentages and
+All assembly panels are filled and assembler-checked. Slides 2, 3, 5, 7, and 9 use
+generated grouped-GEMM excerpts; backups B/D/I use handwritten ISA
+examples. [Assembly preparation records](assembly.md) describe their provenance,
+assumptions, and reproduction using `scripts/compile-assembly.py`.
+
+XDL efficiency cells and the resource-comparison panel remain draft placeholders.
+Search for `TODO` in `slides.md` to find their preparation notes. XDL results use percentages and
 percentage-point changes, with full-kernel and steady-loop metrics kept separate.
 The draft contains no absolute performance results or invented chart values.
 
