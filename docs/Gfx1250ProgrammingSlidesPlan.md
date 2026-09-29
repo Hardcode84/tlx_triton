@@ -22,3 +22,4 @@
 - **Evidence:** no tracked speedup table found; distinguish hardware measurements from simulator results and theoretical peaks.
 - **History:** baseline port `f3857b2641`; chained-dot changes reverted by `02a632587a`; exclude them from the final optimization claims.
 - **Backup:** CDNA4 FP4/FP6 and microscaling → CDNA5 scaling extensions ([AMD comparison](https://www.amd.com/en/technologies/cdna.html)); cluster shape/divisibility rules; ragged-group path; small-M tile choice; LDS/register budget; native multicast API and tests.
+- **Backup — LDS bank conflicts versus partition conflicts:** address mapping; conflicting access patterns; effects on throughput; padding, swizzling, and scheduling. Visual: bank/partition map with one example of each conflict.
