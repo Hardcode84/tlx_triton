@@ -1,0 +1,24 @@
+- **gfx1250 / CDNA5 programming — 30 minutes; 12 slides.**
+- Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
+- Scope: `gfx1250-kernels-2` at `b266fe4c1d`; current code and selected optimization commits.
+
+- **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
+  - **1. Architecture comparison — 3 min.** CDNA3 (`gfx942`), CDNA4 (`gfx950`), CDNA5 (`gfx1250`); CU → WGP; Wave64 → Wave32; LDS: 64/160 KB per CU → 320 KB per WGP; register addressability. Visual: three-column comparison. [AMD whitepaper, pp. 6–10](https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-cdna5-whitepaper.pdf).
+  - **2. Matrix programming — 3 min.** MFMA → WMMA; LDS → VGPR → WMMA; FP16 tile and lane layout; register lifetimes; queued WMMA and `SCHED_MODE[2]`. Visual: one instruction and its tile. [CDNA5 ISA](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+  - **3. Tensor Data Movement — 2 min.** Descriptors; asynchronous global-memory ↔ LDS transfers; input and output pipelines. CDNA4 already supports direct-to-LDS loads. Visual: old/new data paths. [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html), [CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
+  - **4. Synchronization and sharing — 2 min.** Split/named barriers versus LDS asynchronous barriers; TDM completion; workgroup clusters; TDM multicast; safe buffer reuse. Visual: producer/consumer timeline. [CDNA5 ISA](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+  - **5. Map hardware to TLX — 2 min.** Explicit LDS buffers, fused descriptor loads, dot operations, asynchronous stores, cluster barriers. Visual: short kernel skeleton. [Current kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+
+- **Part 2 — TLX grouped GEMM in this branch — 15 min.**
+  - **6. Workload and baseline — 2 min.** Persistent FP16 grouped GEMM; packed A, K-contiguous B, group offsets; full tiles; `256×256×128`; four waves. Visual: groups → output tiles.
+  - **7. Keep WMMA supplied — 2 min.** Depth-2 TDM input ring; short operand and descriptor lifetimes; scheduling mode. Visual: load/WMMA overlap. Commits: `cafe4379f3`, `f66d3fc00c`.
+  - **8. Cross tile boundaries — 3 min.** Prefetch next-tile K0/K1 into released slots; reuse group metadata; show the within-group hybrid path. Visual: last K iterations → next tile. Commits: `a050699ba1`, `42925e81b1`.
+  - **9. Overlap output stores — 2 min.** Compare C/A aliasing with eight C chunks through two `32×256` LDS slots; preserve prefetched inputs. Visual: LDS allocation and store timeline. Commit: `7a58d5e627`.
+  - **10. Reuse data across workgroups — 3 min.** Chunked XCD remapping; two-workgroup B sharing; four-workgroup A/B sharing; barrier before refill. Regular-group constraints. Visual: 2×2 tile/multicast map. Commits: `acae400635`, `f676cb6304`.
+  - **11. Measure each step — 3 min.** Alias-C → hybrid → remap → cluster without multicast → multicast; identical shapes and graph timing; correctness, generated ISA, latency/TFLOP/s. Visual: one measured comparison chart. [Benchmark and constraints](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md), [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py).
+
+- **12. Questions — 3 min.**
+- **Preparation:** capture the timelines, ISA excerpts, and comparison chart; include ordinary GEMM and grouped cases; record device, revision, shapes, and timing method.
+- **Evidence:** no tracked speedup table found; distinguish hardware measurements from simulator results and theoretical peaks.
+- **History:** baseline port `f3857b2641`; chained-dot changes reverted by `02a632587a`; exclude them from the final optimization claims.
+- **Backup:** CDNA4 FP4/FP6 and microscaling → CDNA5 scaling extensions ([AMD comparison](https://www.amd.com/en/technologies/cdna.html)); cluster shape/divisibility rules; ragged-group path; small-M tile choice; LDS/register budget; native multicast API and tests.
