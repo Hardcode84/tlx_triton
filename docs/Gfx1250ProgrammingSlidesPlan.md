@@ -1,6 +1,7 @@
 - **gfx1250 / CDNA5 programming — 30 minutes; 12 slides.**
 - Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
 - Code reference: `gfx1250-kernels-2` at `b266fe4c1d`; selected optimization commits below.
+- ISA reference: AMD CDNA5 ISA Reference Guide, 27 July 2026; section numbers below refer to that edition.
 - Main bullets: slide content. Subbullets: speaker details and figures to prepare.
 
 - **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
@@ -25,22 +26,20 @@
     - TDM gather selects indexed rows of a 2D tensor into LDS; the store direction supports row scatter to global memory. Loads also support LDS padding and multicast; address registers and descriptors still consume resources.
     - Visual: implicit lane placement → explicit LDS addresses → descriptor tile transfer. Sources: [AMD direct-LDS example](https://rocm-handbook.amd.com/projects/amd-rocm-optimization-guide/en/docs-1.0.0/patterns/examples/matrix-multiply-optimization.html), [CDNA5 ISA, §§10.8, 10.11, 15.18](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html).
   - **4. Synchronization and sharing — 2 min.**
-    - CDNA3/4 combined `S_WAITCNT` fields → separate `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, and `S_WAIT_KMCNT`; LDS and scalar-memory waits are now independent.
-    - Direct LDS transfers: `S_WAIT_ASYNCCNT`; TDM: `S_WAIT_TENSORCNT`.
-    - Counter limits: LOAD/STORE/DS/ASYNC/TENSOR are 6-bit (0–63); KM is 5-bit (0–31). Hardware stalls issue before counter overflow.
-    - Wait value N permits at most N outstanding operations; zero drains that counter. Scalar loads can finish out of order: use `S_WAIT_KMCNT 0`. Counts are not cycles or lanes.
-    - Combined LOAD+DS and STORE+DS wait instructions remain; `S_WAIT_XCNT` tracks pending address translations, not completed data transfers.
-    - Split/named barriers separate arrival from waiting; LDS asynchronous barriers can receive transfer-completion signals.
-    - Clusters coordinate workgroups; multicast delivers shared inputs to multiple LDS allocations.
-    - Buffer contract: transfer complete before read; all readers complete before refill. Compiler scheduling barriers do not synchronize workgroups.
-    - Visual: producer → completion → consumer → release → refill. Source: [CDNA5 ISA, §§2.3, 5.6–5.7, 10.11, 11.2.2](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+    - CDNA3/4 combined `S_WAITCNT` fields → separate LOAD/STORE/DS/KM waits. Direct LDS transfers use `S_WAIT_ASYNCCNT`; TDM uses `S_WAIT_TENSORCNT`. Counter details are in backup.
+    - TDM loads and stores complete in issue order within one wave. Mixed ASYNC loads and stores can report completion out of order relative to each other.
+    - Example: one wave issues TDM stores C0 then C1; `S_WAIT_TENSORCNT 1` ensures C0 is complete while C1 may remain in flight. This ordering enables output-slot reuse on slide 9.
+    - Counters belong to the issuing wave; consumers in other waves need synchronization. Split/named barriers separate arrival from waiting; LDS asynchronous barriers can receive transfer-completion signals.
+    - Buffer contract: transfer complete before read; all readers complete before refill. Clusters extend coordination across workgroups for multicast. Compiler scheduling barriers do not synchronize workgroups.
+    - Visual: producer → completion → consumer → release → refill, with a two-store partial-wait example. Source: [CDNA5 ISA, §§5.6–5.7, 10.8, 10.11.1, 11.2.2](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
   - **5. Expert scheduling mode — 2 min.**
     - Expert mode 2 transfers selected VMEM/VALU hazard checks to compiler-inserted waits; it does not remove all hardware dependency checks.
     - Example: VALU produces a memory address → wait before VMEM consumes it. VMEM still reads a source register → wait before overwriting it.
     - LLVM uses `S_WAITCNT_DEPCTR` counters `VA_VDST` and `VM_VSRC`; hardware still handles ordinary VALU→VALU register dependencies.
+    - WMMA co-execution has additional read-after-write, write-after-read, and write-after-write spacing rules handled by code generation; expert-mode counter waits alone do not cover them. See the WMMA hazard backup.
     - This backend enables expert mode for gfx1250 by default; `TRITON_HIP_USE_EXPERT_SCHEDULING` controls it.
     - Expert mode uses `SCHED_MODE[1:0]=2`. Separate bit `SCHED_MODE[2]` permits queued WMMAs followed by independent work; useful for the kernel's one-wave-per-SIMD schedule.
-    - Visual: generated ISA with hazard waits and overlapped instructions. Sources: [LLVM wait insertion](https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html), [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py).
+    - Visual: generated ISA with hazard waits and overlapped instructions. Sources: [CDNA5 ISA, §§5.7.2, 7.12.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [LLVM wait insertion](https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html), [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py).
 
 - **Part 2 — TLX grouped GEMM in this branch — 15 min.**
   - **6. Workload and baseline — 2 min.**
@@ -56,7 +55,7 @@
     - Fused A/B TDM loads use wave masks `3` and `12`; these differ from multicast recipient masks.
     - `amd_sched_barrier()` bounds operand lifetimes between dots; retain useful load/dot overlap.
     - Keep output descriptor setup in the epilogue; avoid extra VGPR-MSB transitions in the steady loop.
-    - Expert-mode waits preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
+    - Compiler-inserted waits and WMMA hazard spacing preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
     - Visual: TDM, LDS load, WMMA, scalar work. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
   - **8. Cross tile boundaries — 3 min.**
     - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
@@ -69,7 +68,8 @@
     - Input rings: `2 × (256×128 + 256×128) × 2 B = 256 KiB`.
     - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.
     - Hybrid: eight 32-row chunks; two `32×256` FP16 output slots add 32 KiB; total logical payload 288 KiB, before layout overhead.
-    - Convert and store one chunk at a time; wait for the older store before reusing its slot; leave the newest store in flight.
+      - Historical compile records from 24 September 2026 report 320,448 bytes ≈ 312.94 KiB of LDS, before hardware allocation rounding. The layout leaves much less headroom than the payload arithmetic suggests; regenerate this figure for the presentation revision.
+    - Convert and store one chunk at a time; TDM's per-wave load/store completion order lets the wait retire the older store before its slot is reused while the newest store may remain in flight. Cross-wave access also requires workgroup synchronization.
     - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
     - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
   - **10. Reuse data across workgroups — 3 min.**
@@ -82,16 +82,29 @@
   - **11. Measure each step — 3 min.**
     - Compare alias-C → hybrid → remap → cluster without multicast → multicast; keep shape, program count, and timing method fixed.
     - Use the same cluster size with multicast disabled to isolate sharing from synchronization cost.
-    - Graph timing reduces launch overhead; report latency and `TFLOP/s = 2×ΣM_g×N×K / (ms×10⁹)`.
+    - Select `--benchmark-mode graph` explicitly; the runner defaults to eager timing. Graph timing reduces launch overhead; report latency and `TFLOP/s = 2×ΣM_g×N×K / (ms×10⁹)`.
     - Check against `torch.matmul`; inspect LDS allocation, VGPR count, TDM loads, and eight hybrid TDM output stores.
     - Cases: reference `(G,M,N,K)=(16,4096,4096,4096)`; large groups `G=8/32`; ordinary GEMM cubes `4096/8192/16384`.
     - Record device, revision, flags, and raw CSV; separate measured hardware time, simulator correctness, and theoretical peak.
-    - Visual: comparison chart with one row per change. No measured chart is available from this documentation work. Sources: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+    - Visual: comparison chart with one row per change. Preparation task: collect a controlled hardware comparison and attach its raw CSV; until then, this slide presents the measurement protocol without speedup bars. Sources: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 
 - **12. Questions — 3 min.**
   - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
   - Which comparison separates the proposed gain from extra synchronization or a changed launch configuration?
 
+- **Backup — Wait counters and completion order.**
+  - `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, and `S_WAIT_KMCNT` separate vector loads, vector stores, LDS, and scalar-memory/message tracking. LDS and scalar-memory waits are now independent.
+  - LOAD/STORE/DS/ASYNC/TENSOR counters are 6-bit (0–63); KM is 5-bit (0–31). Hardware stalls issue before counter overflow.
+  - Wait value N waits until that wave's counter is at most N; zero drains the counter. Counts are not cycles or lanes. Scalar memory increments KM by one for a single DWORD and by two for larger loads; scalar loads may complete out of order, so use `S_WAIT_KMCNT 0`.
+  - A partial wait identifies an older operation as complete only when the relevant completion ordering guarantees it. TDM loads and stores share in-order completion within a wave, but have no ordering guarantee across waves or against other memory instruction types.
+  - ASYNC loads report completion in order with other ASYNC loads, and stores with other stores; loads versus stores report completion out of order. Do not transfer the mixed TDM load/store partial-wait argument to ASYNC.
+  - Combined `S_WAIT_LOADCNT_DSCNT` and `S_WAIT_STORECNT_DSCNT` remain. `S_WAIT_XCNT` tracks pending address translations, not completed data transfers.
+  - Source: [CDNA5 ISA, §§5.7, 10.8, 10.11.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+- **Backup — WMMA co-execution hazards.**
+  - Separate expert-mode memory/VALU dependency waits from WMMA co-execution spacing. Hardware does not detect every dependency between co-executing multicycle instructions from the same wave.
+  - Example: dense FP16 WMMA followed by a VALU reading its Matrix D needs four independent VALU instructions or `V_NOP`s between them when co-execution is enabled. With co-execution disabled, this particular case needs no `V_NOP`.
+  - The required spacing depends on the instruction, operand overlap, and co-execution mode. WMMA-result-to-WMMA-input dependencies have their own rules; use the ISA table rather than a universal NOP count. `SCHED_MODE[2]` controls WMMA queuing and does not waive these hazards.
+  - Source: [CDNA5 ISA, §§5.7.2, 7.12.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
 - **Backup — LDS bank conflicts versus partition conflicts.**
   - Bank: `bank=(byte_address >> 2) & 63`; 64 banks of 4 bytes. For a Wave32 B32 load, `address=4×lane` uses distinct banks; `256×lane` selects distinct words in bank 0.
   - Partition: five physical 64 KiB LDS regions. SIMD pairs `{0,2}` and `{1,3}` contend when both access the same partition in the same cycle.
@@ -101,7 +114,8 @@
   - Analyze `ds_load_tr` source addresses before its register redistribution. Visual: bank map beside SIMD-pair/partition map.
   - Sources: [CDNA5 ISA, §11.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD LDS optimization article](https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimization/README.html).
 - **Backup — `S_CLAUSE`.**
-  - Group instructions of one class from one wave; the first instruction after `S_CLAUSE` selects the class. Other waves cannot interleave that class during an uninterrupted clause.
+  - Group instructions from one supported memory class in one wave: non-flat memory (buffer/global/scratch/ASYNC), flat memory, indexed LDS load/store/atomic, or SMEM. The first instruction after `S_CLAUSE` selects the class; other waves cannot interleave that class during an uninterrupted clause.
+  - `TENSOR_*` instructions are illegal inside clauses. TDM loads and stores cannot be grouped with `S_CLAUSE`.
   - Example: `s_clause 3` groups four following compatible memory instructions; the length field encodes instruction count minus one.
   - Keep independent requests together; a stalled clause can leave execution resources idle. Compare issue order and stalls in the trace.
   - A clause does not wait for memory completion or synchronize workgroups. Put waits needed by the first instruction before `S_CLAUSE`; do not mix instruction classes or nest clauses.
@@ -127,5 +141,8 @@
   - Auto selection ranks saturated-rate estimate × CU utilization × useful/padded FLOPs; verify the selected configuration with timing. Source: [kernel configuration](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 - **Preparation and evidence.**
   - Capture ISA excerpts, timelines, LDS map, and the controlled performance chart; retain raw results and correctness checks.
+  - Historical resource evidence: the local, untracked artifact `../am-runs/grouped_gemm_native_multicast_20260924/compiled/results.json` (path relative to the repository root) records all 12 benchmark configurations with 320,448 LDS bytes, 886–890 VGPRs, and zero private-segment bytes. These are saved compiler results, not hardware timings or fresh verification of `b266fe4c1d`.
+  - Before finalizing the resource figure and ISA excerpt, compile the selected configuration with matching Python and native TLX components and record the Triton and LLVM revisions. Replace the historical resource figures only after this verification.
+  - For the performance chart, explicitly fix program count and graph timing across the five variants on slide 11; retain commands, correctness results, and raw CSV. Saved simulator cycle comparisons do not fill this hardware-measurement gap.
   - Baseline port: `f3857b2641`. Chained-dot compiler changes were reverted by `02a632587a`; exclude them from optimization claims.
   - AMD peak specifications and blog measurements describe their stated workloads; do not present them as this branch's grouped-GEMM results. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
