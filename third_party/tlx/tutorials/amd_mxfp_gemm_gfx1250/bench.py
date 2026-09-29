@@ -4,6 +4,8 @@ Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
 output, persistent 256x256 M/N tiles, three input buffers, output staging, and
 partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
 BK256 with cross-tile prefetch disabled so output can reuse the A ring.
+Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
+multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
 Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
 tutorial kernel's timed region. The default timing budget is 256 ms, matching
@@ -152,18 +154,19 @@ def main():
                         help="stage persistent FP32 output for TDM stores; BK256 reuses the A ring")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
                         help="default: disabled for BK256 output staging, enabled otherwise")
-    parser.add_argument("--num-programs", type=int, default=None,
-                        help="default: one program per CU, capped by tile count")
+    parser.add_argument("--num-programs", type=int, default=256,
+                        help="persistent program count, capped by tile count (default: 256)")
     parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none",
                         help="persistent program remapping (default: none)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
-    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=1,
-                        help="workgroups per input multicast cluster; supports --xcd-remap none or chunked")
+    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=4,
+                        help="workgroups per input multicast cluster (default: 4); use 1 to disable clustering")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
-    parser.add_argument("--cluster-barrier-interval", type=int, default=1,
-                        help="align cluster requests every N input K blocks; 0 disables all cluster barriers")
+    parser.add_argument(
+        "--cluster-barrier-interval", type=int, default=4,
+        help="align cluster requests every N input K blocks (default: 4); 0 disables all cluster barriers")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
