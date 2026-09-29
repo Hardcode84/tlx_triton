@@ -21,7 +21,8 @@
   - **3. More powerful direct-to-LDS transfers — 2 min.**
     - CDNA3/4: register-bypassing loads already exist; LDS destinations follow an implicit lane pattern.
     - CDNA5: programmable per-lane LDS addresses; asynchronous loads to LDS and stores from LDS; payload bypasses VGPRs.
-    - TDM: SGPR descriptors, 1–5 dimensions, tile padding, load multicast. Address registers and descriptors still consume resources.
+    - TDM is bidirectional: `tensor_load_to_lds` moves global → LDS; `tensor_store_from_lds` moves LDS → global. SGPR descriptors describe 1–5-dimensional tiles.
+    - TDM gather selects indexed rows of a 2D tensor into LDS; the store direction supports row scatter to global memory. Loads also support LDS padding and multicast; address registers and descriptors still consume resources.
     - Visual: implicit lane placement → explicit LDS addresses → descriptor tile transfer. Sources: [AMD direct-LDS example](https://rocm-handbook.amd.com/projects/amd-rocm-optimization-guide/en/docs-1.0.0/patterns/examples/matrix-multiply-optimization.html), [CDNA5 ISA, §§10.8, 10.11, 15.18](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html).
   - **4. Synchronization and sharing — 2 min.**
     - Direct LDS transfers: `S_WAIT_ASYNCCNT`; TDM: `S_WAIT_TENSORCNT`.
@@ -95,6 +96,10 @@
   - Use physical addresses, including allocation base. Fix bank selection with padding/swizzling; fix partition placement with pair-aware layouts and allocation. Scheduling can separate conflicting accesses.
   - Analyze `ds_load_tr` source addresses before its register redistribution. Visual: bank map beside SIMD-pair/partition map.
   - Sources: [CDNA5 ISA, §11.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD LDS optimization article](https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimization/README.html).
+- **Backup — TDM gather/scatter.**
+  - Descriptor row indices: up to 16 indices of 16 bits or eight indices of 32 bits per instruction; issue more instructions for more rows.
+  - Gather permits arbitrary and repeated row indices; correct out-of-bounds handling requires nondecreasing indices. Gather/scatter mode is restricted to 2D tiles.
+  - Padding and multicast apply to loads; stores do not remove LDS padding. Source: [CDNA5 ISA, §10.11.3](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
 - **Backup — Precision and scaling.**
   - CDNA4 adds FP4/FP6 and OCP microscaling; CDNA5 extends scaling with 16/32-element blocks and fractional FP4 scales.
   - Keep low-precision peak figures separate from this FP16 kernel's results. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
