@@ -21,6 +21,13 @@ cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch disabled so
 output can reuse the A ring. The summary and CSV identify each variant and
 its configuration.
 
+Both variants default to 256 persistent programs (capped by tile count),
+group-M 8, no XCD remapping, and four-workgroup multicast with a cluster
+barrier every four input K blocks. This captures the selected hardware
+configuration across both default shapes. Interval 8 was slightly faster
+at K8192, while interval 4 was faster at K4096, so the benchmark uses 4
+for both. The eager timing budget remains 256 ms.
+
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash
@@ -49,7 +56,8 @@ to `none`. Balanced mode assigns each logical XCD a contiguous range; chunked
 mode groups small runs of tiles and leaves an incomplete final chunk unchanged.
 
 Use `--cluster-size 2|4` with `--xcd-remap none|chunked` to multicast inputs
-across independent workgroups. The default cluster size is 1. Data and their
+across independent workgroups. The benchmark defaults to cluster size 4;
+use `--cluster-size 1` to disable clustering. Data and their
 E8M0 scales use the same recipient masks. Without remapping, a cluster shares
 B and its scales across consecutive M tiles, for either `--group-m 4` or
 `--group-m 8`. With chunked remapping, a two-workgroup cluster shares B and
@@ -61,8 +69,9 @@ with independent loads, for comparison.
 Cluster barriers are optional for AMD multicast. Only workgroups that have
 issued matching requests receive a combined load; late requests receive a
 separate load after timeout. `--cluster-barrier-interval N` aligns requests
-every N input K blocks, restarting at K=0 of each output tile. The default
-is 1. Set it to 0 to remove **all** cluster barriers, including the exit
+every N input K blocks, restarting at K=0 of each output tile. The benchmark
+default is 4; the standalone tutorial and Python API default to 1.
+Set it to 0 to remove **all** cluster barriers, including the exit
 barrier. Local workgroup synchronization and TDM completion waits still
 protect each workgroup's LDS. Positive intervals retain an exit barrier.
 
@@ -72,7 +81,7 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
   --cluster-barrier-interval 0
 
-# Align requests once every four input K blocks.
+# Selected benchmark defaults: align requests every four input K blocks.
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
   --cluster-barrier-interval 4
@@ -84,7 +93,7 @@ the same synchronization cadence.
 
 ```bash
 # Remapping alone, with the current per-variant tile defaults.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --xcd-remap balanced
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --cluster-size 1 --xcd-remap balanced
 
 # Multicast with the original tile ordering.
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
@@ -108,8 +117,8 @@ chunk size two. Both require group-M of four or eight, full M groups,
 an even number of N tiles, both
 scales, and partial/two-way/four-way TDM fusion. The actual program count
 must be divisible by 16 and divide the output tile count, keeping all cluster
-members on the same loop boundaries. Set `--num-programs` explicitly if the
-device CU count does not satisfy these conditions. The count includes all
+members on the same loop boundaries. Override `--num-programs` to select
+a different count satisfying these conditions. The count includes all
 workgroups, not clusters. Both BK128's separate output staging and BK256's
 reuse of A for output are supported. Cluster barriers align requests to
 improve sharing; they are not required for multicast correctness.
