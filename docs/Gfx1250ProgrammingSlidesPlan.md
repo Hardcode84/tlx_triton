@@ -25,11 +25,15 @@
     - TDM gather selects indexed rows of a 2D tensor into LDS; the store direction supports row scatter to global memory. Loads also support LDS padding and multicast; address registers and descriptors still consume resources.
     - Visual: implicit lane placement → explicit LDS addresses → descriptor tile transfer. Sources: [AMD direct-LDS example](https://rocm-handbook.amd.com/projects/amd-rocm-optimization-guide/en/docs-1.0.0/patterns/examples/matrix-multiply-optimization.html), [CDNA5 ISA, §§10.8, 10.11, 15.18](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html).
   - **4. Synchronization and sharing — 2 min.**
+    - CDNA3/4 combined `S_WAITCNT` fields → separate `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, and `S_WAIT_KMCNT`; LDS and scalar-memory waits are now independent.
     - Direct LDS transfers: `S_WAIT_ASYNCCNT`; TDM: `S_WAIT_TENSORCNT`.
+    - Counter limits: LOAD/STORE/DS/ASYNC/TENSOR are 6-bit (0–63); KM is 5-bit (0–31). Hardware stalls issue before counter overflow.
+    - Wait value N permits at most N outstanding operations; zero drains that counter. Scalar loads can finish out of order: use `S_WAIT_KMCNT 0`. Counts are not cycles or lanes.
+    - Combined LOAD+DS and STORE+DS wait instructions remain; `S_WAIT_XCNT` tracks pending address translations, not completed data transfers.
     - Split/named barriers separate arrival from waiting; LDS asynchronous barriers can receive transfer-completion signals.
     - Clusters coordinate workgroups; multicast delivers shared inputs to multiple LDS allocations.
     - Buffer contract: transfer complete before read; all readers complete before refill. Compiler scheduling barriers do not synchronize workgroups.
-    - Visual: producer → completion → consumer → release → refill. Source: [CDNA5 ISA, §§2.3, 5.6, 10.11, 11.2.2](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+    - Visual: producer → completion → consumer → release → refill. Source: [CDNA5 ISA, §§2.3, 5.6–5.7, 10.11, 11.2.2](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
   - **5. Expert scheduling mode — 2 min.**
     - Expert mode 2 transfers selected VMEM/VALU hazard checks to compiler-inserted waits; it does not remove all hardware dependency checks.
     - Example: VALU produces a memory address → wait before VMEM consumes it. VMEM still reads a source register → wait before overwriting it.
