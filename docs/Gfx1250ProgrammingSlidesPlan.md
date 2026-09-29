@@ -3,6 +3,7 @@
 - Code reference: `gfx1250-kernels-2` at `b266fe4c1d`; selected optimization commits below.
 - ISA reference: AMD CDNA5 ISA Reference Guide, 27 July 2026; section numbers below refer to that edition.
 - Main bullets: slide content. Subbullets: speaker details and figures to prepare.
+- Performance results: XDL efficiency (%) and changes in percentage points; omit absolute execution time, throughput, and measured cycle counts. Collection details stay in preparation records, outside the slides and talk narrative.
 
 - **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
   - **1. Architecture comparison — 3 min.**
@@ -79,18 +80,18 @@
     - Example: physical IDs `0,1,2,3` → logical IDs `0,2,4,6` → tile coordinates `(0,0),(2,0),(0,1),(2,1)` with `GROUP_M=4`.
     - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **11. Measure each step — 3 min.**
-    - Compare alias-C → hybrid → remap → cluster without multicast → multicast; keep shape, program count, and timing method fixed.
+  - **11. XDL efficiency at each step — 3 min.**
+    - Show XDL efficiency: the fraction of available matrix-execution capacity used over the full kernel, expressed as a percentage. Report improvements in percentage points.
+    - Compare alias-C → hybrid → remap → cluster without multicast → multicast; keep shape, program count, and metric definition fixed.
     - Use the same cluster size with multicast disabled to isolate sharing from synchronization cost.
-    - Select `--benchmark-mode graph` explicitly; the runner defaults to eager timing. Graph timing reduces launch overhead; report latency and `TFLOP/s = 2×ΣM_g×N×K / (ms×10⁹)`.
+    - Keep the observation interval and execution-unit normalization consistent. Full-kernel efficiency includes startup, output stores, and tile/group transitions; show steady-loop efficiency separately if needed.
     - Check against `torch.matmul`; inspect LDS allocation, VGPR count, TDM loads, and eight hybrid TDM output stores.
     - Cases: reference `(G,M,N,K)=(16,4096,4096,4096)`; large groups `G=8/32`; ordinary GEMM cubes `4096/8192/16384`.
-    - Record device, revision, flags, and raw CSV; separate measured hardware time, simulator correctness, and theoretical peak.
-    - Visual: comparison chart with one row per change. Preparation task: collect a controlled hardware comparison and attach its raw CSV; until then, this slide presents the measurement protocol without speedup bars. Sources: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+    - Visual: XDL efficiency (%) chart with one row per variant and percentage-point changes from the baseline. Label the workload and full-kernel scope; explain changes through the pipeline diagrams. Populate bars from the controlled comparison in the preparation records. Sources for workload configurations: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 
 - **12. Questions — 3 min.**
   - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
-  - Which comparison separates the proposed gain from extra synchronization or a changed launch configuration?
+  - Which comparison separates the XDL efficiency gain from extra synchronization or a changed launch configuration?
 
 - **Backup — Wait counters and completion order.**
   - `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, and `S_WAIT_KMCNT` separate vector loads, vector stores, LDS, and scalar-memory/message tracking. LDS and scalar-memory waits are now independent.
@@ -126,7 +127,7 @@
   - Padding and multicast apply to loads; stores do not remove LDS padding. Source: [CDNA5 ISA, §10.11.3](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
 - **Backup — Precision and scaling.**
   - CDNA4 adds FP4/FP6 and OCP microscaling; CDNA5 extends scaling with 16/32-element blocks and fractional FP4 scales.
-  - Keep low-precision peak figures separate from this FP16 kernel's results. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
+  - Discuss supported formats and scaling behavior; omit peak-throughput figures. The efficiency comparison uses the FP16 kernel throughout. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
 - **Backup — Cluster contract and native API.**
   - Require `256×256×128`, depth 2, `GROUP_M=4`, hybrid prefetch; no L2 prefetch, dedicated C staging, or auto configuration.
   - Equal positive M, divisible by 1024; N divisible by 512; P divisible by 16 and dividing each group's tile count.
@@ -138,11 +139,13 @@
   - `128×256×128`: input rings 192 KiB plus C staging 64 KiB = 256 KiB logical payload; finer M tiles improve available parallelism.
   - Asymmetric prefetch stays within a group; it needs more tiles/group than persistent programs.
   - A `256×256` FP32 accumulator across 128 threads needs 512 accumulator values/thread; operands and addresses add register pressure.
-  - Auto selection ranks saturated-rate estimate × CU utilization × useful/padded FLOPs; verify the selected configuration with timing. Source: [kernel configuration](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
-- **Preparation and evidence.**
-  - Capture ISA excerpts, timelines, LDS map, and the controlled performance chart; retain raw results and correctness checks.
-  - Historical resource evidence: the local, untracked artifact `../am-runs/grouped_gemm_native_multicast_20260924/compiled/results.json` (path relative to the repository root) records all 12 benchmark configurations with 320,448 LDS bytes, 886–890 VGPRs, and zero private-segment bytes. These are saved compiler results, not hardware timings or fresh verification of `b266fe4c1d`.
+  - Auto selection ranks saturated-rate estimate × CU utilization × useful/padded FLOPs; validate the choice for the selected workload and report its XDL efficiency using the same normalization. Source: [kernel configuration](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+- **Preparation and evidence — internal notes, outside the presentation.**
+  - Capture ISA excerpts, timelines, LDS map, and the controlled XDL efficiency chart; retain raw results and correctness checks.
+  - Collect the five variants on slide 11 with the same workload, program count, and collection method; change execution settings only for the intended optimization or cluster control. Simulator XDL efficiency is accepted evidence for this chart; hardware timing is not a prerequisite. Keep collection mechanics and simulator details out of the slides and talk narrative, and label the chart simply as XDL efficiency (%).
+  - Record source and tool/model revisions, flags, metric field, observation interval, execution-unit normalization, and raw reports in preparation records. Use `100 × xdl_util_e2e` for full-kernel percentages after confirming its scope and denominator; report differences in percentage points. Keep steady-state or active-unit-only metrics separate.
+  - Historical diagnostic evidence: `../am-runs/grouped_gemm_native_multicast_20260924/validation-summary.log` records `xdl_util_e2e` for `(G,M,N,K)=(2,2048,1024,2048)`, P=16, cluster size 4. It is one configuration, not the five-variant comparison; retain that workload label if the point is used.
+  - Historical resource evidence: the local, untracked artifact `../am-runs/grouped_gemm_native_multicast_20260924/compiled/results.json` (paths relative to the repository root) records all 12 benchmark configurations with 320,448 LDS bytes, 886–890 VGPRs, and zero private-segment bytes. These are saved compiler results requiring fresh verification for `b266fe4c1d`.
   - Before finalizing the resource figure and ISA excerpt, compile the selected configuration with matching Python and native TLX components and record the Triton and LLVM revisions. Replace the historical resource figures only after this verification.
-  - For the performance chart, explicitly fix program count and graph timing across the five variants on slide 11; retain commands, correctness results, and raw CSV. Saved simulator cycle comparisons do not fill this hardware-measurement gap.
   - Baseline port: `f3857b2641`. Chained-dot compiler changes were reverted by `02a632587a`; exclude them from optimization claims.
-  - AMD peak specifications and blog measurements describe their stated workloads; do not present them as this branch's grouped-GEMM results. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
+  - Use AMD publications for architecture context; the talk's quantitative results are the selected kernel's XDL efficiency percentages. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
