@@ -1,25 +1,116 @@
 - **gfx1250 / CDNA5 programming — 30 minutes; 12 slides.**
 - Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
-- Scope: `gfx1250-kernels-2` at `b266fe4c1d`; current code and selected optimization commits.
+- Code reference: `gfx1250-kernels-2` at `b266fe4c1d`; selected optimization commits below.
+- Main bullets: slide content. Subbullets: speaker details and figures to prepare.
 
 - **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
-  - **1. Architecture comparison — 3 min.** CDNA3 (`gfx942`), CDNA4 (`gfx950`), CDNA5 (`gfx1250`); CU → WGP; Wave64 → Wave32; LDS: 64/160 KB per CU → 320 KB per WGP; CDNA3/4 VGPRs + AGPRs → CDNA5 unified VGPRs. Visual: three-column comparison. [AMD whitepaper, pp. 6–10](https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-cdna5-whitepaper.pdf).
-  - **2. Registers and matrix programming — 3 min.** CDNA3/4 AGPR accumulators → CDNA5 VGPR accumulators; up to 1024 VGPRs per thread; `S_SET_VGPR_MSB` selects upper register-index bits for each operand. MFMA → WMMA; LDS → VGPR → WMMA; register lifetimes; queued WMMA and `SCHED_MODE[2]`. Visual: register ranges and one WMMA tile. [CDNA5 ISA, §§3.3.2, 7.12, 15.5](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
-  - **3. More powerful direct-to-LDS transfers — 2 min.** CDNA3/4 baseline → CDNA5 programmable per-lane LDS addresses; asynchronous global-to-LDS loads and LDS-to-global stores; separate completion counter. TDM adds multidimensional descriptors, tile padding, and multicast. Visual: old/new addressing and data paths. [CDNA5 ISA, §§10.11, 15.18](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html), [CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
-  - **4. Synchronization and sharing — 2 min.** Split/named barriers versus LDS asynchronous barriers; TDM completion; workgroup clusters; TDM multicast; safe buffer reuse. Visual: producer/consumer timeline. [CDNA5 ISA](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
-  - **5. Expert scheduling mode — 2 min.** Compiler responsibility for VMEM/VALU hazard waits; expert scheduling mode 2; enabled by default for gfx1250 in this repo. Separate control: `SCHED_MODE[2]` permits queued WMMAs and independent instruction issue. Visual: TLX → generated ISA with waits and overlap. [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py), [current kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+  - **1. Architecture comparison — 3 min.**
+    - CDNA3 `gfx942` → CDNA4 `gfx950` → CDNA5 `gfx1250`.
+    - Wave64/CU → Wave32/WGP; CDNA5 has four SIMD32 units per WGP.
+    - LDS capacity: 64 KiB/CU → 160 KiB/CU → 320 KiB/WGP; distinguish allocation capacity from bandwidth.
+    - CDNA3/4 expose VGPRs and AGPRs; CDNA5 uses one VGPR namespace for matrix operands and accumulators.
+    - Larger tiles need more register and LDS capacity; fewer resident waves can make instruction overlap more important.
+    - Visual: three-column comparison; add WGP/SIMD/LDS diagram. Sources: [CDNA4 whitepaper, p. 9](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf), [CDNA5 whitepaper, pp. 6–10](https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-cdna5-whitepaper.pdf).
+  - **2. Registers and matrix programming — 3 min.**
+    - MFMA → WMMA; AGPR accumulators → VGPR accumulators; up to 1024 VGPRs per thread.
+    - `S_SET_VGPR_MSB`: select register-index bits 9:8 independently for source/destination operand classes; settings persist until changed.
+    - Example: low register index 7 plus MSB value 2 selects `v519`; 1024-register addressability is not four times the physical register capacity.
+    - Kernel instruction: `v_wmma_f32_16x16x32_f16`; FP16 A/B, FP32 accumulation; all 32 lanes participate.
+    - Data path: LDS → VGPR operands → WMMA → VGPR accumulator. `ds_load_tr` can redistribute values during LDS loads.
+    - Visual: register ranges plus a WMMA tile. Source: [CDNA5 ISA, §§3.3.2, 7.12, 15.5](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+  - **3. More powerful direct-to-LDS transfers — 2 min.**
+    - CDNA3/4: register-bypassing loads already exist; LDS destinations follow an implicit lane pattern.
+    - CDNA5: programmable per-lane LDS addresses; asynchronous loads to LDS and stores from LDS; payload bypasses VGPRs.
+    - TDM: SGPR descriptors, 1–5 dimensions, tile padding, load multicast. Address registers and descriptors still consume resources.
+    - Visual: implicit lane placement → explicit LDS addresses → descriptor tile transfer. Sources: [AMD direct-LDS example](https://rocm-handbook.amd.com/projects/amd-rocm-optimization-guide/en/docs-1.0.0/patterns/examples/matrix-multiply-optimization.html), [CDNA5 ISA, §§10.8, 10.11, 15.18](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD CDNA4 TLX article](https://www.amd.com/en/developer/resources/technical-articles/2026/optimizing-gemm-with-tlx.html).
+  - **4. Synchronization and sharing — 2 min.**
+    - Direct LDS transfers: `S_WAIT_ASYNCCNT`; TDM: `S_WAIT_TENSORCNT`.
+    - Split/named barriers separate arrival from waiting; LDS asynchronous barriers can receive transfer-completion signals.
+    - Clusters coordinate workgroups; multicast delivers shared inputs to multiple LDS allocations.
+    - Buffer contract: transfer complete before read; all readers complete before refill. Compiler scheduling barriers do not synchronize workgroups.
+    - Visual: producer → completion → consumer → release → refill. Source: [CDNA5 ISA, §§2.3, 5.6, 10.11, 11.2.2](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
+  - **5. Expert scheduling mode — 2 min.**
+    - Expert mode 2 transfers selected VMEM/VALU hazard checks to compiler-inserted waits; it does not remove all hardware dependency checks.
+    - Example: VALU produces a memory address → wait before VMEM consumes it. VMEM still reads a source register → wait before overwriting it.
+    - LLVM uses `S_WAITCNT_DEPCTR` counters `VA_VDST` and `VM_VSRC`; hardware still handles ordinary VALU→VALU register dependencies.
+    - This backend enables expert mode for gfx1250 by default; `TRITON_HIP_USE_EXPERT_SCHEDULING` controls it.
+    - Expert mode uses `SCHED_MODE[1:0]=2`. Separate bit `SCHED_MODE[2]` permits queued WMMAs followed by independent work; useful for the kernel's one-wave-per-SIMD schedule.
+    - Visual: generated ISA with hazard waits and overlapped instructions. Sources: [LLVM wait insertion](https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html), [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py).
 
 - **Part 2 — TLX grouped GEMM in this branch — 15 min.**
-  - **6. Workload and baseline — 2 min.** Persistent FP16 grouped GEMM; packed A, K-contiguous B, group offsets; full tiles; `256×256×128`; four waves. Visual: groups → output tiles.
-  - **7. Keep WMMA supplied — 2 min.** Depth-2 TDM input ring; short operand and descriptor lifetimes; expert-mode hazard waits; `SCHED_MODE[2]` with one wave per SIMD. Visual: load/WMMA overlap. Commits: `cafe4379f3`, `f66d3fc00c`.
-  - **8. Cross tile boundaries — 3 min.** Prefetch next-tile K0/K1 into released slots; reuse group metadata; show the within-group hybrid path. Visual: last K iterations → next tile. Commits: `a050699ba1`, `42925e81b1`.
-  - **9. Overlap output stores — 2 min.** Compare C/A aliasing with eight C chunks through two `32×256` LDS slots; preserve prefetched inputs. Visual: LDS allocation and store timeline. Commit: `7a58d5e627`.
-  - **10. Reuse data across workgroups — 3 min.** Chunked XCD remapping; two-workgroup B sharing; four-workgroup A/B sharing; barrier before refill. Regular-group constraints. Visual: 2×2 tile/multicast map. Commits: `acae400635`, `f676cb6304`.
-  - **11. Measure each step — 3 min.** Alias-C → hybrid → remap → cluster without multicast → multicast; identical shapes and graph timing; correctness, generated ISA, latency/TFLOP/s. Visual: one measured comparison chart. [Benchmark and constraints](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md), [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py).
+  - **6. Workload and baseline — 2 min.**
+    - `C_g = A_g × B_gᵀ`; FP16 inputs/output, FP32 accumulation.
+    - Packed `A[ΣM_g,K]`, `B[G,N,K]`, `C[ΣM_g,N]`; `group_offsets[G+1]`; both inputs K-contiguous.
+    - Optimized path: full tiles; group M sizes may differ. Separate pointer-table baseline supports arbitrary group shapes with masks.
+    - Benchmark tile: `256×256×128`; four Wave32 waves; `GROUP_M=4` varies M first to reuse B.
+    - Persistent program handles tile `p`, then `p+P`, where P is the program count; continue across group ranges.
+    - Visual: packed groups → persistent programs → output tiles. Sources: [kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py), [configuration guide](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+  - **7. Keep WMMA supplied — 2 min.**
+    - Two A slots and two B slots; producer selects `iteration % 2`.
+    - Each K128 block becomes four K32 dot steps; load the next operand subtile before the current dot.
+    - Fused A/B TDM loads use wave masks `3` and `12`; these differ from multicast recipient masks.
+    - `amd_sched_barrier()` bounds operand lifetimes between dots; retain useful load/dot overlap.
+    - Keep output descriptor setup in the epilogue; avoid extra VGPR-MSB transitions in the steady loop.
+    - Expert-mode waits preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
+    - Visual: TDM, LDS load, WMMA, scalar work. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+  - **8. Cross tile boundaries — 3 min.**
+    - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
+    - Require depth 2, even `K/128`, and at least two K blocks.
+    - Benchmark hybrid prefetches within each group; the first tile of each group still needs initial loads.
+    - Separate square cross-group path skips empty groups and carries four upcoming boundaries in scalar state; refill metadata in the preceding tile's tail.
+    - Example: `M=2048,N=1024,P=32` gives one tile/program/group; cross-group prefetch is needed. With `M=4096`, each program has two tiles/group.
+    - Visual: last two K blocks → next tile; label within-group and cross-group paths separately. Commits: `a050699ba1`, `42925e81b1`; [schedule description](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+  - **9. Overlap output stores — 2 min.**
+    - Input rings: `2 × (256×128 + 256×128) × 2 B = 256 KiB`.
+    - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.
+    - Hybrid: eight 32-row chunks; two `32×256` FP16 output slots add 32 KiB; total logical payload 288 KiB, before layout overhead.
+    - Convert and store one chunk at a time; wait for the older store before reusing its slot; leave the newest store in flight.
+    - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
+    - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+  - **10. Reuse data across workgroups — 3 min.**
+    - Chunked program remapping groups logical work for locality; cluster configuration uses eight logical XCDs and chunk size two.
+    - Two workgroups share B; four share A and B. Each recipient issues a matching TDM request.
+    - Four-rank A masks: `0101/1010`; B masks: `0011/1100`; each transfer has two recipients.
+    - Example: physical IDs `0,1,2,3` → logical IDs `0,2,4,6` → tile coordinates `(0,0),(2,0),(0,1),(2,1)` with `GROUP_M=4`.
+    - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
+    - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+  - **11. Measure each step — 3 min.**
+    - Compare alias-C → hybrid → remap → cluster without multicast → multicast; keep shape, program count, and timing method fixed.
+    - Use the same cluster size with multicast disabled to isolate sharing from synchronization cost.
+    - Graph timing reduces launch overhead; report latency and `TFLOP/s = 2×ΣM_g×N×K / (ms×10⁹)`.
+    - Check against `torch.matmul`; inspect LDS allocation, VGPR count, TDM loads, and eight hybrid TDM output stores.
+    - Cases: reference `(G,M,N,K)=(16,4096,4096,4096)`; large groups `G=8/32`; ordinary GEMM cubes `4096/8192/16384`.
+    - Record device, revision, flags, and raw CSV; separate measured hardware time, simulator correctness, and theoretical peak.
+    - Visual: comparison chart with one row per change. No measured chart is available from this documentation work. Sources: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 
 - **12. Questions — 3 min.**
-- **Preparation:** capture the timelines, ISA excerpts, and comparison chart; include ordinary GEMM and grouped cases; record device, revision, shapes, and timing method.
-- **Evidence:** no tracked speedup table found; distinguish hardware measurements from simulator results and theoretical peaks.
-- **History:** baseline port `f3857b2641`; chained-dot changes reverted by `02a632587a`; exclude them from the final optimization claims.
-- **Backup:** CDNA4 FP4/FP6 and microscaling → CDNA5 scaling extensions ([AMD comparison](https://www.amd.com/en/technologies/cdna.html)); cluster shape/divisibility rules; ragged-group path; small-M tile choice; LDS/register budget; native multicast API and tests.
-- **Backup — LDS bank conflicts versus partition conflicts:** address mapping; conflicting access patterns; effects on throughput; padding, swizzling, and scheduling. Visual: bank/partition map with one example of each conflict.
+  - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
+  - Which comparison separates the proposed gain from extra synchronization or a changed launch configuration?
+
+- **Backup — LDS bank conflicts versus partition conflicts.**
+  - Bank: `bank=(byte_address >> 2) & 63`; 64 banks of 4 bytes. For a Wave32 B32 load, `address=4×lane` uses distinct banks; `256×lane` selects distinct words in bank 0.
+  - Partition: five physical 64 KiB LDS regions. SIMD pairs `{0,2}` and `{1,3}` contend when both access the same partition in the same cycle.
+  - Two ports provide 256 B/cycle each; distinct partitions permit 512 B/cycle total. Conflict-free banks alone do not ensure both ports can proceed.
+  - Example: opposite-pair waves read `[0,128)` and `[256,384)`; each has distinct banks, but both target partition 0. Move the second to `65536+[0,128)`.
+  - Use physical addresses, including allocation base. Fix bank selection with padding/swizzling; fix partition placement with pair-aware layouts and allocation. Scheduling can separate conflicting accesses.
+  - Analyze `ds_load_tr` source addresses before its register redistribution. Visual: bank map beside SIMD-pair/partition map.
+  - Sources: [CDNA5 ISA, §11.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [AMD LDS optimization article](https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimization/README.html).
+- **Backup — Precision and scaling.**
+  - CDNA4 adds FP4/FP6 and OCP microscaling; CDNA5 extends scaling with 16/32-element blocks and fractional FP4 scales.
+  - Keep low-precision peak figures separate from this FP16 kernel's results. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
+- **Backup — Cluster contract and native API.**
+  - Require `256×256×128`, depth 2, `GROUP_M=4`, hybrid prefetch; no L2 prefetch, dedicated C staging, or auto configuration.
+  - Equal positive M, divisible by 1024; N divisible by 512; P divisible by 16 and dividing each group's tile count.
+  - These rules keep cluster members on matching loop/group boundaries; general ragged groups use ordinary workgroups.
+  - `ctas_per_cga=(cluster_size,1,1)`; grid counts physical workgroups; one output tile per workgroup.
+  - Native fused-load masks and `tlx.cluster_barrier()` replace code-generation hooks; cover masks, launch configuration, and correctness in [API tests](../python/test/unit/language/test_tlx_amd_gfx1250.py).
+  - Benchmark defaults to four-workgroup clusters; general wrapper defaults to one. Source: [cluster constraints](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+- **Backup — Small M and resource budget.**
+  - `128×256×128`: input rings 192 KiB plus C staging 64 KiB = 256 KiB logical payload; finer M tiles improve available parallelism.
+  - Asymmetric prefetch stays within a group; it needs more tiles/group than persistent programs.
+  - A `256×256` FP32 accumulator across 128 threads needs 512 accumulator values/thread; operands and addresses add register pressure.
+  - Auto selection ranks saturated-rate estimate × CU utilization × useful/padded FLOPs; verify the selected configuration with timing. Source: [kernel configuration](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+- **Preparation and evidence.**
+  - Capture ISA excerpts, timelines, LDS map, and the controlled performance chart; retain raw results and correctness checks.
+  - Baseline port: `f3857b2641`. Chained-dot compiler changes were reverted by `02a632587a`; exclude them from optimization claims.
+  - AMD peak specifications and blog measurements describe their stated workloads; do not present them as this branch's grouped-GEMM results. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
