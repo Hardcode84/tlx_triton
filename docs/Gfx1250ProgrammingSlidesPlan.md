@@ -1,4 +1,4 @@
-- **gfx1250 / CDNA5 programming — 30 minutes; 12 main content slides, two dividers, nine backups (23 total).**
+- **gfx1250 / CDNA5 programming — 30 minutes; one title slide, 12 main content slides, two dividers, nine backups (24 total).**
 - Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
 - Draft deck: [Markdown slides](gfx1250-slides/slides.md) and [local PDF build instructions](gfx1250-slides/README.md).
 - Assembly panels are filled; [preparation records](gfx1250-slides/assembly.md) distinguish generated kernel excerpts from illustrative ISA examples and record their validation.
@@ -8,7 +8,9 @@
 - The performance comparison slide is deferred; retain the data in preparation records. If restored, report XDL efficiency (%) and changes in percentage points; omit absolute execution time, throughput, and measured cycle counts. Collection details stay in preparation records, outside the slides and talk narrative.
 
 - **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
-  - **1. Architecture comparison — 3 min.**
+  - **1. Title — Programming CDNA5 / gfx1250 — 10 sec.**
+    - Ivan Butygin, 2026. Brief introduction before the hardware overview.
+  - **2. Hardware overview — 2 min 50 sec.**
     - CDNA3 `gfx942` → CDNA4 `gfx950` → CDNA5 `gfx1250`.
     - Wave size: Wave64 → Wave32. Separately, CDNA5 hardware organization: one WGP = two CUs = four SIMD32s; each CU contains two SIMD32s.
     - All waves of a CDNA5 workgroup run within one WGP and can use any of its four SIMD32s and shared LDS. Use WGP for workgroup placement/resources and CU for the two-SIMD subunit.
@@ -16,46 +18,46 @@
     - CDNA3/4 expose VGPRs and AGPRs; CDNA5 uses one VGPR namespace for matrix operands and accumulators.
     - Larger tiles need more register and LDS capacity; fewer resident waves can make instruction overlap more important.
     - Visual: three-column comparison; WGP diagram with two CUs, each containing two SIMD32s, plus shared LDS/TDM. Sources: [CDNA5 ISA, §§1.1, 2.2, 3.4.9](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [CDNA4 whitepaper, p. 9](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf), [CDNA5 whitepaper, pp. 6–10](https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-cdna5-whitepaper.pdf).
-  - **2. Registers and matrix programming — 3 min.**
+  - **3. Registers and matrix programming — 3 min.**
     - MFMA → WMMA; AGPR accumulators → VGPR accumulators; up to 1024 VGPRs per thread.
     - `S_SET_VGPR_MSB`: select register-index bits 9:8 independently for source/destination operand classes; settings persist until changed.
     - Example: low register index 7 plus MSB value 2 selects `v519`; 1024-register addressability is not four times the physical register capacity.
-    - Kernel instruction: `v_wmma_f32_16x16x32_f16`; FP16 A/B, FP32 accumulation; all 32 lanes participate.
+    - Example instruction: `v_wmma_f32_16x16x32_f16`; FP16 A/B, FP32 accumulation; all 32 lanes participate.
     - Data path: LDS → VGPR operands → WMMA → VGPR accumulator. `ds_load_tr` can redistribute values during LDS loads.
     - Visual: register ranges plus a generated MSB/wait/WMMA excerpt, with encoded and physical register indices. Source: [CDNA5 ISA, §§3.3.2, 7.12, 15.5](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
-  - **3. TDM moves tiles for the grouped GEMM — 2 min.**
-    - Focus on the kernel's descriptor-driven path: `tensor_load_to_lds` moves A/B global tiles into LDS rings; `tensor_store_from_lds` moves converted 32-row C chunks from LDS to global memory.
-    - Show generated load/store instructions from separate input/output regions. Explain the 2D descriptor operands: group 0 uses four SGPRs for global tile/LDS addresses and control bits; group 1 uses eight for shape, strides, format, padding, and multicast controls.
-    - TDM is a whole-tile operation that ignores EXEC. Payload bypasses VGPRs; descriptor setup still consumes registers. Source wave masks choose issuing waves, while descriptor masks select multicast recipients.
+  - **4. TDM moves tiles — 2 min.**
+    - Descriptor-driven tile transfers: `tensor_load_to_lds` moves a global tile into an LDS buffer; `tensor_store_from_lds` moves an LDS tile to global memory.
+    - Show generated load/store instructions from separate regions. Explain the 2D descriptor operands: group 0 uses four SGPRs for global tile/LDS addresses and control bits; group 1 uses eight for shape, strides, format, padding, and multicast controls.
+    - TDM is a whole-tile operation that ignores EXEC. Payload bypasses VGPRs; descriptor setup still consumes registers. Choosing issuing waves is separate from selecting multicast recipients in the descriptor.
     - TDM supports 1–5-dimensional tiles and 2D gather/scatter; loads support LDS padding and multicast. Completion uses `S_WAIT_TENSORCNT`; the next slide introduces clusters and their multicast mechanism.
-    - Visual: side-by-side A/B-load and C-store assembly panels with descriptor fields. CDNA4/CDNA5 per-lane direct-LDS comparison moves to backup I. Source: [CDNA5 ISA, §10.11](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf) and [assembly preparation records](gfx1250-slides/assembly.md).
-  - **4. Workgroup clusters and multicast — 2 min.**
+    - Visual: side-by-side tile-load and tile-store assembly panels with descriptor fields. CDNA4/CDNA5 per-lane direct-LDS comparison moves to backup I. Source: [CDNA5 ISA, §10.11](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf) and [assembly preparation records](gfx1250-slides/assembly.md).
+  - **5. Workgroup clusters and multicast — 2 min.**
     - Grid → cluster → workgroup → wave. A launch-defined cluster has up to 16 equal-size workgroups, in 1D/2D/3D; each member runs on a separate WGP within the same shader engine.
-    - Each workgroup retains its own LDS allocation and computes its own output tile. Multicast supplies copies of a shared input tile to selected members.
+    - Each workgroup retains its own LDS allocation and performs its own computation. Multicast supplies copies of a shared input tile to selected members.
     - TDM descriptor `workgroup_mask` selects cluster ranks. Each recipient issues a matching tile request; source wave masks independently choose the issuing waves.
     - Two-member example: mask `0011` delivers the tile to ranks 0 and 1. Hardware combines matching requests; late requests can be served separately after timeout, so avoid unconditional traffic-reduction claims.
     - Before input refill, finish local LDS reads and synchronize local waves, then perform cluster arrival/wait. Cluster barrier ID `-3`: one wave per workgroup signals, all waves wait. Ordinary workgroup barrier ID is `-1`.
-    - Keep per-wave completion counters in backup A and partial output-store waits in slide 11. Slide 12 applies this architecture to the kernel's four-rank A/B sharing pattern.
+    - Keep per-wave completion-counter details in backup A; focus here on cluster placement, matching requests, and synchronization.
     - Visual: one global tile multicast into two separate LDS allocations, with matching requests and recipient mask labeled. Source: [CDNA5 ISA, §§2.3, 5.6.6, 10.7, 10.11.3](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
-  - **5. Expert scheduling mode — 2 min.**
+  - **6. Expert scheduling mode — 2 min.**
     - Expert mode 2 transfers selected VMEM/VALU hazard checks to compiler-inserted waits; it does not remove all hardware dependency checks.
     - Example: VALU produces a memory address → wait before VMEM consumes it. VMEM still reads a source register → wait before overwriting it.
     - LLVM uses `S_WAITCNT_DEPCTR` counters `VA_VDST` and `VM_VSRC`; hardware still handles ordinary VALU→VALU register dependencies.
     - WMMA co-execution has additional read-after-write, write-after-read, and write-after-write spacing rules handled by code generation; expert-mode counter waits alone do not cover them. See the WMMA hazard backup.
     - This backend enables expert mode for gfx1250 by default; `TRITON_HIP_USE_EXPERT_SCHEDULING` controls it.
-    - Expert mode uses `SCHED_MODE[1:0]=2`. Separate bit `SCHED_MODE[2]` permits queued WMMAs followed by independent work; useful for the kernel's one-wave-per-SIMD schedule.
+    - Expert mode uses `SCHED_MODE[1:0]=2`. Separate bit `SCHED_MODE[2]` permits queued WMMAs followed by independent work; useful at low wave occupancy.
     - Visual: generated ISA with hazard waits and overlapped instructions. Sources: [CDNA5 ISA, §§5.7.2, 7.12.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [LLVM wait insertion](https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html), [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py).
 
 - **Part 2 — TLX grouped GEMM in this branch — 13 min.**
-  - **6. Divider — TLX grouped GEMM — 10 sec.**
+  - **7. Divider — TLX grouped GEMM — 10 sec.**
     - Brief transition from hardware mechanisms to pipelining, tile transitions, and input sharing.
-  - **7. Grouped GEMM: inputs and contract — 1 min.**
+  - **8. Grouped GEMM: inputs and contract — 1 min.**
     - `C_g = A_g × B_gᵀ`; FP16 inputs/output, FP32 accumulation.
     - Packed `A[ΣM_g,K]`, `B[G,N,K]`, `C[ΣM_g,N]`; both inputs K-contiguous, output N-contiguous. Int32 `group_offsets[G+1]` are nondecreasing, starting at zero and ending at ΣM_g.
     - Shared N/K; M_g may vary and empty groups are supported by the ordinary-workgroup path. Full tiles: M_g divisible by BM, N by BN, K by 128. Separate pointer-table baseline supports arbitrary group shapes with masks.
     - The selected depth-2 hybrid requires even K/128 ≥ 2. Multicast additionally requires equal positive M and the regular-shape/launch constraints in backup G.
     - Visual: packed tensor shapes next to interface constraints. Sources: [kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py), [configuration guide](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
-  - **8. Kernel design — 1 min 50 sec.**
+  - **9. Kernel design — 1 min 50 sec.**
     - Tile `256×256×128`; four Wave32 waves (128 threads) per workgroup. All four waves load and compute.
     - Launch P physical workgroups across all groups. Program p handles tiles p, p+P, p+2P, continuing across group ranges and retaining its buffers across tiles.
     - Default P = min(total output tiles, runtime-reported multiprocessor count), with an explicit override. The assembly reference uses P=32; this is not an established optimum for other workloads or devices.
@@ -64,23 +66,23 @@
     - Fused TDM selects A/B descriptor fields by source wave (`0011`/`1100`) and emits one load instruction site. This compiler/API fusion differs from multicast across workgroups. Source: [TDM lowering](../third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.cpp), `emitTDMLoadFused`.
     - `GROUP_M=4` orders M tiles first for B reuse; optional four-workgroup clusters share A/B inputs. P counts workgroups even with clusters; the implementation requires P divisible by 16 and dividing the per-group tile count.
     - Visual: persistent launch and pipeline/reuse bullets. Subsequent slides explain the K loop, tile boundaries, output slots, and cluster mapping.
-  - **9. Keep WMMA supplied — 2 min.**
+  - **10. Keep WMMA supplied — 2 min.**
     - Two A slots and two B slots; producer selects `iteration % 2`.
     - Each K128 block becomes four K32 dot steps; load the next operand subtile before the current dot.
     - Fused A/B TDM loads use wave masks `3` and `12`; these differ from multicast recipient masks.
-    - Before consuming an input slot, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all LDS readers must finish; multicast adds the cluster handoff introduced on slide 4.
+    - Before consuming an input slot, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all LDS readers must finish; multicast adds the cluster handoff introduced on slide 5.
     - `amd_sched_barrier()` bounds operand lifetimes between dots; retain useful load/dot overlap.
     - Keep output descriptor setup in the epilogue; avoid extra VGPR-MSB transitions in the steady loop.
     - Compiler-inserted waits and WMMA hazard spacing preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
     - Visual: TDM, LDS load, WMMA, scalar work. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **10. Cross tile boundaries — 3 min.**
+  - **11. Cross tile boundaries — 3 min.**
     - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
     - Require depth 2, even `K/128`, and at least two K blocks.
     - Benchmark hybrid prefetches within each group; the first tile of each group still needs initial loads.
     - Separate square cross-group path skips empty groups and carries four upcoming boundaries in scalar state; refill metadata in the preceding tile's tail.
     - Example: `M=2048,N=1024,P=32` gives one tile/program/group; cross-group prefetch is needed. With `M=4096`, each program has two tiles/group.
     - Visual: last two K blocks → next tile; label within-group and cross-group paths separately. Commits: `a050699ba1`, `42925e81b1`; [schedule description](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
-  - **11. Overlap output stores — 2 min.**
+  - **12. Overlap output stores — 2 min.**
     - Input rings: `2 × (256×128 + 256×128) × 2 B = 256 KiB`.
     - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.
     - Hybrid: eight 32-row chunks; two `32×256` FP16 output slots add 32 KiB; total logical payload 288 KiB, before layout overhead.
@@ -88,7 +90,7 @@
     - Convert and store one chunk at a time; TDM's per-wave load/store completion order lets the wait retire the older store before its slot is reused while the newest store may remain in flight. Cross-wave access also requires workgroup synchronization.
     - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
     - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **12. Reuse data across workgroups — 3 min.**
+  - **13. Reuse data across workgroups — 3 min.**
     - Chunked program remapping groups logical work for locality; cluster configuration uses eight logical XCDs and chunk size two.
     - Two workgroups share B; four share A and B. Each recipient issues a matching TDM request.
     - Four-rank A masks: `0101/1010`; B masks: `0011/1100`; each transfer has two recipients.
@@ -96,11 +98,11 @@
     - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
 
-- **13. Questions — 5 min.**
+- **14. Questions — 5 min.**
   - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
   - Which controlled comparison would tell us which change addresses that gap?
 
-- **14. Divider — Backup.**
+- **15. Divider — Backup.**
   - Marks the end of the main talk; nine optional technical references follow outside the 30-minute schedule.
 
 - **Backup — Wait counters and completion order.**

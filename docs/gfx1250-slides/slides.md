@@ -3,16 +3,28 @@ marp: true
 theme: gfx1250
 size: 16:9
 paginate: true
-footer: 'CDNA5 / gfx1250 programming · Draft'
+footer: 'CDNA5 / gfx1250 programming'
 title: 'Programming CDNA5 / gfx1250 — architecture and TLX grouped GEMM'
-description: 'CDNA5 programming draft with checked assembly and a grouped GEMM case study.'
+description: 'CDNA5 programming with checked assembly and a grouped GEMM case study.'
+---
+
+<!-- _class: divider title -->
+
+# Programming CDNA5 / gfx1250
+
+<p class="subtitle">Ivan Butygin, 2026</p>
+
+<!--
+10 sec. Introduce yourself and the topic, then move to the hardware overview.
+-->
+
 ---
 
 <!-- _class: compact -->
 
-<div class="eyebrow">01 / Architecture · Programming CDNA5 / gfx1250</div>
+<div class="eyebrow">02 / Architecture · Programming CDNA5 / gfx1250</div>
 
-# A new programming unit
+# Hardware overview
 
 | | CDNA3 · gfx942 | CDNA4 · gfx950 | CDNA5 · gfx1250 |
 | :--- | :--- | :--- | :--- |
@@ -28,7 +40,7 @@ description: 'CDNA5 programming draft with checked assembly and a grouped GEMM c
 <div class="source">CDNA5 ISA §§1.1, 2.2, 3.4.9 · CDNA4 whitepaper, p. 9 · CDNA5 whitepaper, pp. 6–10 · LDS units as labeled.</div>
 
 <!--
-3 min. Introduce the architecture half and the grouped-GEMM case study.
+2 min 50 sec. Introduce wave size, workgroup placement, memory capacity, and matrix instructions.
 CDNA5: one WGP contains two CUs, each with two SIMD32s. CU remains a subunit of the WGP.
 All waves of one workgroup run within one WGP and may use any of its four SIMD32s and shared LDS.
 Use WGP for CDNA5 workgroup placement and the 320 KiB LDS budget; use CU for its two-SIMD subunits.
@@ -44,11 +56,11 @@ https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-
 
 <!-- _class: asm-detail registers-asm -->
 
-<div class="eyebrow">02 / Registers and matrix programming</div>
+<div class="eyebrow">03 / Registers and matrix programming</div>
 
 # More addressable VGPRs for one wave
 
-- Up to **1024 VGPRs per thread**, including matrix accumulators.
+- Up to **1024 VGPRs per thread**.
 - `S_SET_VGPR_MSB` supplies index bits 9:8 for each operand class.
 - Low index 7 + MSB value 2 selects **v519**; settings persist.
 
@@ -59,7 +71,7 @@ https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-
 <div>MSB 3<br>v768–v1023</div>
 </div>
 
-<p class="small muted">Generated K-loop excerpt · FP16 A/B → FP32 accumulator</p>
+<p class="small muted">Generated matrix-instruction excerpt · FP16 A/B → FP32 accumulator</p>
 
 ```asm
 s_set_vgpr_msb 0x5a  ; dst=1, src0=2, src1=2, src2=1
@@ -75,7 +87,7 @@ v_wmma_f32_16x16x32_f16 v[202:209], v[42:49], v[130:137], v[202:209]
 3 min. The source/destination classes have independent MSB fields; this is not four independent register files.
 Generated v_wmma_f32_16x16x32_f16, with FP16 A/B and FP32 accumulation.
 All 32 lanes cooperate on one matrix operation. Mention ds_load_tr redistribution as an LDS-to-register option.
-Contiguous instructions from the current grouped kernel's inner K loop; debug directives and physical-register comments removed.
+Contiguous generated instructions; debug directives and physical-register comments removed.
 0x5a assigns destination/SRC2 MSB 1 and SRC0/SRC1 MSB 2. Each encoded operand is the low register index.
 The partial DS wait relies on the preceding load queue in this generated loop; it is not a standalone prologue.
 See assembly.md for the build configuration, exact excerpt boundaries, and validation.
@@ -86,18 +98,18 @@ Source: CDNA5 ISA, 27 July 2026, §§3.3.2, 7.12, 15.5.
 
 <!-- _class: tdm-movement -->
 
-<div class="eyebrow">03 / Data movement</div>
+<div class="eyebrow">04 / Data movement</div>
 
-# TDM moves tiles for the grouped GEMM
+# TDM moves tiles
 
 <p class="subtitle">SGPR descriptors specify each transfer; the payload bypasses VGPRs.</p>
 
 <div class="cols">
 <div class="panel">
 
-### A/B global tiles → LDS rings
+### Global memory → LDS
 
-<p class="small">Load the next operand tile into an input slot.</p>
+<p class="small">Load a global tile into an LDS buffer.</p>
 
 ```asm
 tensor_load_to_lds s[68:71], s[12:19]
@@ -109,35 +121,34 @@ tensor_load_to_lds s[68:71], s[12:19]
 </div>
 <div class="panel">
 
-### LDS output chunks → C
+### LDS → global memory
 
-<p class="small">Store a converted 32-row chunk from LDS.</p>
+<p class="small">Store an LDS tile to global memory.</p>
 
 ```asm
 tensor_store_from_lds s[28:31], s[20:27]
 ```
 
 <p class="small"><strong>Group 0 · s[28:31]</strong><br>Global tile address + LDS base.</p>
-<p class="small"><strong>Group 1 · s[20:27]</strong><br>C shape, strides, and format.</p>
+<p class="small"><strong>Group 1 · s[20:27]</strong><br>Shape, strides, and format.</p>
 
 </div>
 </div>
 
 <div class="panel tdm-note"><h3>One request describes a whole tile</h3><p class="small">EXEC is ignored · 1–5D tiles · 2D gather/scatter · loads support padding and multicast.</p><p class="small">Use <code>S_WAIT_TENSORCNT</code> for completion; sharing LDS also needs a handoff.</p></div>
 
-<div class="source">CDNA5 ISA §10.11 · Generated input/output excerpts; descriptor setup and synchronization omitted. See slides 4 and 11.</div>
+<div class="source">CDNA5 ISA §10.11 · Generated load/store excerpts; descriptor setup and synchronization omitted.</div>
 
 <!--
-2 min. Introduce TDM as the data path used by the kernel: operand tiles into LDS, then converted output chunks back to global memory.
-These are individual instructions from separate input and output regions of the generated reference kernel, not one consecutive program.
+2 min. Introduce descriptor-driven tile transfers between global memory and LDS.
+These are individual generated load and store instructions from separate regions, not one consecutive program.
 The load is reference.amdgcn line 1682; the store is line 1023. Descriptor construction and synchronization are outside the excerpts.
 This 2D form consumes two descriptor groups: group 0 has four SGPRs, group 1 has eight. Group 0 also includes control bits.
 Group 0 supplies the global address of the tile start (not the tensor origin) and its LDS byte address.
 Group 1 supplies dimensions, strides, element size, padding controls, and the multicast workgroup mask.
-The fused A/B source wave masks select issuing waves; the descriptor's recipient mask independently selects multicast workgroups.
+Choosing which waves issue requests is separate from selecting multicast recipients in the descriptor.
 TDM instructions ignore EXEC, including EXEC==0. They do not take per-lane global/LDS pointers, and their operands are unaffected by VGPR MSB settings.
-The load's descriptor selection depends on the issuing wave; the output instruction stores C2 from the two-slot staging path.
-TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast; slide 11 shows output-slot reuse.
+TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast.
 Stores do not remove LDS padding. Gather/scatter details are in backup E; CDNA4/CDNA5 per-lane direct-LDS examples are in backup I.
 Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provenance in assembly.md.
 -->
@@ -146,7 +157,7 @@ Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provena
 
 <!-- _class: cluster-intro -->
 
-<div class="eyebrow">04 / Workgroup clusters and multicast</div>
+<div class="eyebrow">05 / Workgroup clusters and multicast</div>
 
 # Clusters share input tiles across WGPs
 
@@ -156,25 +167,25 @@ Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provena
 
 <div class="cols">
 <div class="panel"><h3>Launch and placement</h3><p>Same shader engine; one WGP per member.</p><p class="small">Each workgroup keeps its own LDS allocation.</p><p class="small">1D / 2D / 3D clusters; up to 16 workgroups.</p></div>
-<div class="panel"><h3>Matching TDM requests</h3><p>Every recipient issues the same tile load.</p><p class="small"><code>D#.workgroup_mask</code> selects cluster ranks.</p><p class="small">Shared A/B inputs feed distinct output tiles.</p></div>
+<div class="panel"><h3>Matching TDM requests</h3><p>Every recipient issues the same tile load.</p><p class="small"><code>D#.workgroup_mask</code> selects cluster ranks.</p><p class="small">Shared input data supports independent work.</p></div>
 </div>
 
 <div class="flow">Before refill: finish local LDS reads → cluster arrival / wait → next TDM load.</div>
 
-<div class="source">CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3 · Two-workgroup illustration; the kernel's four-rank mapping is on slide 12.</div>
+<div class="source">CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3 · Two-workgroup multicast illustration.</div>
 
 <!--
-2 min. Introduce clusters as an architectural cooperation unit before presenting the grouped kernel's concrete sharing pattern.
+2 min. Introduce clusters as an architectural cooperation unit.
 Cluster dimensions are part of the launch configuration. Members have equal workgroup size and run on separate WGPs in one shader engine.
-The two-workgroup diagram illustrates the mechanism; the grouped kernel uses two- or four-workgroup clusters, detailed on slide 12.
+The two-workgroup diagram illustrates matching requests and recipient selection.
 Each workgroup has its own LDS allocation. Multicast delivers a copy of the shared input into each selected member's LDS.
 Mask 0011 selects cluster ranks 0 and 1. For TDM this mask is in descriptor group 1; it is independent of source wave masks and EXEC.
 Each selected workgroup issues a matching request. Hardware can combine matching loads; it is not a leader-only remote write into passive recipients.
 Late requests can be served separately after timeout, so do not claim an unconditional traffic reduction equal to cluster size.
-For this kernel, matching requests describe the same global tile and recipient mask at corresponding local LDS slot offsets.
+In this example, matching requests describe the same global tile and recipient mask at corresponding local LDS slot offsets.
 The refill barrier prevents one member from overwriting input data that a neighbor still reads: finish local LDS reads, synchronize local waves, then cluster arrival/wait.
 The cluster barrier uses ID -3. One wave per workgroup signals after local synchronization; all waves wait. ID -1 is the ordinary workgroup barrier.
-After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A; output-slot waits are on slide 11.
+After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A.
 Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two selected recipients, not a physical GPU floorplan.
 -->
 
@@ -182,13 +193,13 @@ Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two 
 
 <!-- _class: asm-detail scheduling-asm -->
 
-<div class="eyebrow">05 / Scheduling</div>
+<div class="eyebrow">06 / Scheduling</div>
 
 # Two controls, different jobs
 
 <div class="cols">
 <div class="panel"><h3>Expert mode · bits [1:0] = 2</h3><p>Compiler waits resolve selected VMEM / VALU hazards.</p><p class="small"><code>VA_VDST</code> and <code>VM_VSRC</code><br>Enabled by this backend by default.</p></div>
-<div class="panel"><h3>WMMA queuing · bit [2] = 1</h3><p>Queue WMMAs, then issue independent work.</p><p class="small">Useful here: one wave per SIMD.<br>WMMA hazard spacing still applies.</p></div>
+<div class="panel"><h3>WMMA queuing · bit [2] = 1</h3><p>Queue WMMAs, then issue independent work.</p><p class="small">Useful at low wave occupancy.<br>WMMA hazard spacing still applies.</p></div>
 </div>
 
 <p class="small muted">Generated excerpts · separate regions of the same kernel</p>
@@ -196,7 +207,7 @@ Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two 
 ```asm
 s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2
 s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1
-; ... metadata-load region: protect registers, then wait for data ...
+; ... memory-load region: protect registers, then wait for data ...
 s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 global_load_b64 v[10:11], v7, s[12:13]
 s_wait_loadcnt 0x0
@@ -212,9 +223,9 @@ s_add_nc_u64 s[26:27], s[26:27], 0x100
 2 min. TRITON_HIP_USE_EXPERT_SCHEDULING controls the backend default.
 Normal VALU-to-VALU dependencies still receive hardware handling; WMMA co-execution adds specific RAW/WAR/WAW spacing rules.
 The TLX call amd_set_wave_sched_mode(1, offset=2, width=1) sets only bit 2; it does not enable LLVM wait insertion.
-Three excerpts, with intervening work omitted: mode setup; group-offset metadata load; WMMA with independent scalar descriptor updates.
+Three excerpts, with intervening work omitted: mode setup; global-memory load; WMMA with independent scalar descriptor updates.
 The two mode writes are separated in the full prologue by unrelated instructions. Their bit fields do not overlap.
-The metadata-load excerpt enters with VGPR MSBs zero. VA_VDST protects prior VALU results; VM_VSRC protects prior memory-source reads.
+The memory-load excerpt enters with VGPR MSBs zero. VA_VDST protects prior VALU results; VM_VSRC protects prior memory-source reads.
 S_WAIT_LOADCNT then establishes load completion; the ALU dependency wait is not a data-transfer completion wait.
 The WMMA excerpt enters with MSBs dst=1, src0=2, src1=2, src2=1; the scalar adds do not touch its VGPR operands.
 Operand initialization, co-execution mode setup, and synchronization appear outside these excerpts. See assembly.md.
@@ -226,7 +237,7 @@ CDNA5 ISA §§5.7.2, 7.12.1. Backup B has the WMMA hazard example.
 
 <!-- _class: divider -->
 
-<div class="eyebrow">06 / From architecture to the kernel</div>
+<div class="eyebrow">07 / From architecture to the kernel</div>
 
 # TLX grouped GEMM
 
@@ -241,7 +252,7 @@ We have the hardware pieces. Now follow one persistent kernel from loading input
 
 <!-- _class: gemm-contract -->
 
-<div class="eyebrow">07 / Grouped GEMM · Workload and contract</div>
+<div class="eyebrow">08 / Grouped GEMM · Workload and contract</div>
 
 # Grouped GEMM: inputs and contract
 
@@ -279,7 +290,7 @@ Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1
 
 <!-- _class: kernel-design -->
 
-<div class="eyebrow">08 / Grouped GEMM · Kernel design</div>
+<div class="eyebrow">09 / Grouped GEMM · Kernel design</div>
 
 # Keep work and buffers on the WGP
 
@@ -316,7 +327,7 @@ Sources: grouped_gemm_tdm, _tdm_load_fused; TDMUtility.cpp::emitTDMLoadFused; as
 
 <!-- _class: asm-detail pipeline-asm -->
 
-<div class="eyebrow">09 / Supply the matrix units</div>
+<div class="eyebrow">10 / Supply the matrix units</div>
 
 # Pipeline operands, bound their lifetimes
 
@@ -343,7 +354,7 @@ v_wmma_f32_16x16x32_f16 v[162:169], v[82:89], v[130:137], v[162:169]
 2 min. Each K128 block becomes four K32 tl.dot steps, each expanded to multiple WMMA instructions.
 The diagram is a dependency schematic, not a cycle-accurate schedule.
 Keep output descriptor updates in the epilogue to avoid extra VGPR-MSB transitions in the steady loop.
-Before LDS consumption, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all local LDS readers finish; multicast adds the cluster handoff on slide 4.
+Before LDS consumption, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all local LDS readers finish; multicast adds the cluster handoff on slide 5.
 The source-level scheduling barrier constrains scheduling; it is not a workgroup synchronization barrier.
 Contiguous instructions from the inner K loop, with debug directives and physical-register comments removed; see assembly.md.
 Only the low byte of each S_SET_VGPR_MSB immediate controls selection; the compiler also prints the prior setting in the high byte.
@@ -355,7 +366,7 @@ Compiler scheduling barriers bound whole dot regions outside this excerpt; they 
 
 ---
 
-<div class="eyebrow">10 / Cross tile boundaries</div>
+<div class="eyebrow">11 / Cross tile boundaries</div>
 
 # Use the tail to prime the next tile
 
@@ -381,7 +392,7 @@ The source option dedicated_c_buffer selects the square cross-group path, but it
 
 <!-- _class: asm-detail output-asm -->
 
-<div class="eyebrow">11 / Overlap output stores</div>
+<div class="eyebrow">12 / Overlap output stores</div>
 
 # Stage C in two small slots
 
@@ -421,7 +432,7 @@ The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.
 
 ---
 
-<div class="eyebrow">12 / Reuse data across workgroups</div>
+<div class="eyebrow">13 / Reuse data across workgroups</div>
 
 # A 2 × 2 sharing pattern
 
@@ -449,7 +460,7 @@ The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.
 3 min. The diagram is logical tile space, not physical GPU placement. The M rows are nonadjacent.
 The physical rank is the mask bit position: rank 0 is the least significant bit.
 Two-workgroup clusters share B only; four-workgroup clusters share A and B.
-Masks select recipients independently of the source wave masks on slide 9.
+Masks select recipients independently of the source wave masks on slide 10.
 Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 -->
 
@@ -457,7 +468,7 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 
 <!-- _class: questions -->
 
-<div class="eyebrow">13 / Discussion</div>
+<div class="eyebrow">14 / Discussion</div>
 
 # Where is the next gap?
 
@@ -476,7 +487,7 @@ Code reference b266fe4c1d. Chained-dot compiler changes reverted by 02a632587a a
 
 <!-- _class: divider -->
 
-<div class="eyebrow">14 / End of the main talk</div>
+<div class="eyebrow">15 / End of the main talk</div>
 
 # Backup
 
@@ -771,7 +782,7 @@ s_wait_asynccnt 0
 <div class="source">CDNA5 ISA §10.8 · LLVM gfx950 LDS codegen tests · Illustrative assembly; other-wave consumers also need synchronization.</div>
 
 <!--
-Explain implicit lane placement versus explicit per-lane LDS addresses; the descriptor-based TDM path is on slide 3.
+Explain implicit lane placement versus explicit per-lane LDS addresses; the descriptor-based TDM path is on slide 4.
 These are handwritten, assembler-checked examples, not generated excerpts from the grouped GEMM.
 Both examples assume the global addresses are ready, the LDS allocation is valid, and immediate offsets are zero.
 CDNA4: s4 supplies an aligned base offset; the B32 form places lane i at M0 + 4*i within the workgroup's LDS allocation.
