@@ -119,3 +119,8 @@ section.next-directions .panel { padding: 16px 20px; font-size: 22px; }
 section.next-directions h3 { font-size: 23px; }
 section.next-directions .small { font-size: 20px; }
 section.next-directions .flow { font-size: 24px; margin-top: 10px; }
+section.barrier-backup h1 { margin-bottom: 16px; }
+section.barrier-backup table { font-size: 19px; }
+section.barrier-backup th, section.barrier-backup td { padding: 8px 12px; }
+section.barrier-backup li { font-size: 21px; margin: 7px 0; }
+section.barrier-backup .flow { font-size: 21px; margin-top: 10px; padding: 12px; }

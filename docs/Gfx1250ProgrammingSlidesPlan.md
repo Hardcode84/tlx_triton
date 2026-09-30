@@ -1,4 +1,4 @@
-- **gfx1250 / CDNA5 programming — 30 minutes; one title slide, 12 main content slides, two dividers, nine backups (24 total).**
+- **gfx1250 / CDNA5 programming — 30 minutes; one title slide, 12 main content slides, two dividers, ten backups (25 total).**
 - Audience: GPU kernel developers; assumed Triton and GEMM knowledge.
 - Draft deck: [Markdown slides](gfx1250-slides/slides.md) and [local PDF build instructions](gfx1250-slides/README.md).
 - Assembly panels are filled; [preparation records](gfx1250-slides/assembly.md) distinguish generated kernel excerpts from illustrative ISA examples and record their validation.
@@ -106,7 +106,7 @@
   - Related-branch experiments are candidate directions, not measured improvements for the deck's code reference. Ask which experiment to prioritize.
 
 - **15. Divider — Backup.**
-  - Marks the end of the main talk; nine optional technical references follow outside the 30-minute schedule.
+  - Marks the end of the main talk; ten optional technical references follow outside the 30-minute schedule.
 
 - **Backup — Wait counters and completion order.**
   - `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, and `S_WAIT_KMCNT` separate vector loads, vector stores, LDS, and scalar-memory/message tracking. LDS and scalar-memory waits are now independent.
@@ -169,3 +169,9 @@
   - Fresh assembly preparation on 29 September 2026 compiled the square hybrid reference with matching local components: 320,448 shared bytes, 886 VGPRs, 104 SGPRs, zero private bytes, and eight static TDM stores. [Assembly records](gfx1250-slides/assembly.md) retain the configuration, revisions, hashes, and excerpt boundaries. The smaller-tile resource comparison still needs separate preparation; the 30 September steady-state XDL comparison is recorded in [efficiency.md](gfx1250-slides/efficiency.md).
   - Baseline port: `f3857b2641`. Chained-dot compiler changes were reverted by `02a632587a`; exclude them from optimization claims.
   - Use AMD publications for architecture context; keep the selected kernel's XDL efficiency results in preparation records while the comparison slide is deferred. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
+
+- **Backup J — Split, named, and LDS barriers.**
+  - Compare arrival/wait timing, participant sets, and hardware versus LDS state.
+  - Show producer readiness and consumer release as separate buffer handoffs.
+  - Connect workgroup signal/wait, named-wave participation, and TDM completion arrival; retain required memory waits.
+  - Reference: CDNA5 ISA §§5.6, 10.11.3, 11.2.2; slide 25 and its presenter transcript.

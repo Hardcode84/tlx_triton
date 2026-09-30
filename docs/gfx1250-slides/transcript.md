@@ -761,3 +761,27 @@ ignores EXEC. These direct copies instead operate on per-lane addresses.
 So when I describe programmable LDS addresses on CDNA5, this is the per-lane
 capability I mean. When I describe the grouped kernel’s tile loads, stores, and
 multicast, I’m referring to TDM and its descriptor-based operations.
+
+## Slide 25 / Backup J — Separate arrival, participants, and state
+
+*Optional backup · split, named, and LDS barriers*
+
+Read this comparison along three axes: when a participant arrives, which
+participants must arrive, and where the barrier state lives. “Split” describes
+the timing; it is also possible with named and LDS barriers.
+
+Use the timeline to explain buffer ownership. A producer first establishes that
+the data is ready, then publishes readiness. A consumer waits before reading.
+A separate release handoff tells the producer when that storage can be reused.
+Independent work can go between arrival and waiting if it respects those lifetimes.
+
+Connect this to the earlier examples: the C staging excerpt uses the workgroup
+signal/wait pair. A pipeline with selected producer and consumer waves can use
+named barriers. An asynchronous transfer can signal an LDS barrier through its
+TDM descriptor, so transfer completion participates in the handoff.
+
+The comparison does not replace the data path's completion waits. Check the
+arrival count, initialization, and reuse protocol for each buffer.
+
+*[Return to slide 5 for cluster scope, slide 12 for C staging, or backup A for
+per-wave completion counters. Reference: CDNA5 ISA §§5.6, 10.11.3, 11.2.2.]*

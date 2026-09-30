@@ -1,8 +1,8 @@
 # CDNA5 / gfx1250 programming slides
 
 Marp draft of the [reviewed plan](../Gfx1250ProgrammingSlidesPlan.md):
-one title slide, 12 main content slides, two section dividers, and nine backup
-slides (24 slides total). Slides 2–6 cover hardware. The dividers introduce the
+one title slide, 12 main content slides, two section dividers, and ten backup
+slides (25 slides total). Slides 2–6 cover hardware. The dividers introduce the
 grouped GEMM case study (slide 7) and the backup material (slide 15).
 The main talk runs for 30 minutes, including five minutes for discussion.
 

@@ -809,3 +809,35 @@ Syntax checked with llvm-mc for gfx950 and gfx1250.
 References: llvm/test/CodeGen/AMDGPU/llvm.amdgcn.global.load.lds.gfx950.ll;
 llvm/test/MC/AMDGPU/gfx1250_asm_vflat.s; CDNA5 ISA §§10.8, 10.11.
 -->
+
+---
+
+<!-- _class: compact barrier-backup -->
+
+<div class="eyebrow">Backup J / Split, named, and LDS barriers</div>
+
+# Separate arrival, participants, and state
+
+| Mechanism | State / participants | Programming model |
+| :--- | :--- | :--- |
+| Split workgroup barrier | Hardware; all workgroup waves | `S_BARRIER_SIGNAL -1` → independent work → `S_BARRIER_WAIT -1` |
+| Named barrier | Hardware; selected waves | Initialize count; join; signal / wait. Up to 16 per workgroup. |
+| LDS barrier | 64-bit LDS object; software-defined arrivals | Atomic arrival updates count / phase; wait for phase change. |
+
+- **Split** describes arrival/wait timing; named and LDS barriers can also be split.
+- **Named:** one joined named barrier per wave; allocate IDs at launch.
+- **LDS:** a TDM descriptor can request arrival after transfer completion.
+- Initialize state before use; match arrival counts and phases before reusing a slot.
+
+<div class="flow">Producer completes data → signals ready → consumer waits → reads → releases slot</div>
+
+<div class="source">CDNA5 ISA §§5.6.1–5.6.5, 10.11.3, 11.2.2 · A barrier is not an implicit drain of every memory counter.</div>
+
+<!--
+Optional backup. Compare timing, membership, and state storage; these are overlapping properties.
+Keep completion waits required by the data path before publishing readiness.
+The release handoff protects reuse after all consumers finish; readiness alone does not release the buffer.
+Named-barrier initialization and joining must precede use. LDS initialization must be visible before arrivals.
+TDM completion can update the LDS barrier directly; scalar named barriers do not acquire that connection merely by being named.
+Source: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf
+-->
