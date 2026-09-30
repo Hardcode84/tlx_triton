@@ -466,21 +466,35 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 
 ---
 
-<!-- _class: questions -->
+<!-- _class: next-directions -->
 
-<div class="eyebrow">14 / Discussion</div>
+<div class="eyebrow">14 / Directions to explore</div>
 
-# Where is the next gap?
+# Which directions should we explore next?
 
-<div class="panel"><span class="number">01</span>Matrix issue, LDS delivery, global traffic,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;or tile-boundary overhead?</div>
+<div class="cols">
+<div class="panel"><h3>01 · LDS and operand delivery</h3><p>B padding · A/B slot placement · WMMA operand reuse</p><p class="small">Separate bank conflicts, partition contention, and register reads.</p></div>
+<div class="panel"><h3>02 · Multicast with fewer barriers</h3><p>Request alignment versus synchronization cost</p><p class="small">Compare barrier intervals; retain local buffer-lifetime waits.</p></div>
+</div>
+<div class="cols">
+<div class="panel"><h3>03 · Choose the schedule by shape</h3><p>Alias-C · hybrid · cross-group prefetch</p><p class="small">Vary group sizes and tiles per program; include small and uneven groups.</p></div>
+<div class="panel"><h3>04 · Extend the pipeline to MXFP</h3><p>Data + scale rings · BK128 versus BK256</p><p class="small">Balance operand lifetimes, output staging, and next-tile prefetch.</p></div>
+</div>
 
-<div class="panel"><span class="number">02</span>Which controlled comparison would tell us<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;which change addresses that gap?</div>
+<div class="flow">Which experiment would you prioritize?</div>
 
-<div class="flow">Data movement → buffer lifetime → instruction overlap → reuse</div>
+<div class="source">History: 069a0121aa · 647b1a4e05 · 5920df0408 · 70ea55c702 · d55b4d22f1 · Recorded comparison: efficiency.md</div>
 
 <!--
-5 min. Questions. A divider introduces nine backup slides outside the 30-minute main sequence.
-Code reference b266fe4c1d. Chained-dot compiler changes reverted by 02a632587a are excluded from the story.
+5 min, including discussion. These are directions supported by prior experiments, not demonstrated gains in this deck.
+LDS: my/gfx1250-kernels-3, 069a0121aa, exposes B padding auto/8/16 and default/interleaved input-slot placement.
+Operand reuse: 647b1a4e05 used post-regalloc hints for unchanged physical operands; f676cb6304 removed the hooks. A new experiment needs a native compiler implementation.
+Multicast: my/gfx1250-kernels-mxfp, 5920df0408, compares barrier intervals 0/1/N. Matching requests receive multicast; late requests may receive separate loads after timeout.
+That branch treats cluster barriers as request alignment. Preserve local TDM completion and LDS handoffs; compare multicast off/on with identical cadence before changing this kernel.
+Shape selection: efficiency.md records alias-C ahead of hybrid on its diagnostic workload, while multicast improves the matched clustered case. Those results do not establish a universal schedule ranking.
+MXFP: 70ea55c702 introduces persistent data/scale rings; d55b4d22f1 explores BK256 with A-ring output reuse; 255abe4594 selects defaults per format.
+Related-branch experiments are not options available in the deck's b266fe4c1d code reference. No new benchmark was run for this slide.
+Chained-dot compiler changes reverted by 02a632587a produced identical default binaries; they do not support a performance direction without a new witness.
 -->
 
 ---

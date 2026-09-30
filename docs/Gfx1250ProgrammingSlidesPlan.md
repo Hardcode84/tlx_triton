@@ -98,9 +98,12 @@
     - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
 
-- **14. Questions — 5 min.**
-  - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
-  - Which controlled comparison would tell us which change addresses that gap?
+- **14. Directions to explore — 5 min, including discussion.**
+  - LDS/operand delivery: B padding, interleaved A/B slots, native WMMA reuse hints; separate bank, partition, and register effects (`069a0121aa`, `647b1a4e05`).
+  - Multicast: compare cluster-barrier intervals with matched multicast-off controls; preserve local completion and buffer reuse (`5920df0408`).
+  - Shape-specific scheduling: alias-C versus hybrid versus cross-group prefetch; vary group sizes and tiles/program; use the [recorded comparison](gfx1250-slides/efficiency.md) as a starting point.
+  - MXFP: data/scale rings, BK128/BK256, output reuse, and operand lifetimes; check each format before extending to grouped workloads (`70ea55c702`, `d55b4d22f1`, `255abe4594`).
+  - Related-branch experiments are candidate directions, not measured improvements for the deck's code reference. Ask which experiment to prioritize.
 
 - **15. Divider — Backup.**
   - Marks the end of the main talk; nine optional technical references follow outside the 30-minute schedule.

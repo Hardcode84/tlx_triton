@@ -112,3 +112,10 @@ section.kernel-design .cols { align-items: stretch; }
 section.kernel-design .panel { font-size: 21px; padding: 16px 20px; }
 section.kernel-design li { margin: 12px 0; }
 section.kernel-design .flow { font-size: 21px; padding: 12px; margin-top: 8px; }
+
+section.next-directions h1 { font-size: 40px; margin-bottom: 20px; }
+section.next-directions .cols { align-items: stretch; gap: 22px; }
+section.next-directions .panel { padding: 16px 20px; font-size: 22px; }
+section.next-directions h3 { font-size: 23px; }
+section.next-directions .small { font-size: 20px; }
+section.next-directions .flow { font-size: 24px; margin-top: 10px; }

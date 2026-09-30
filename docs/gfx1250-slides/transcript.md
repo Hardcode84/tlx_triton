@@ -424,31 +424,56 @@ it shares both A and B. The wrapper imposes shape and program-count constraints
 so the members reach compatible tile and group boundaries.
 
 We have now changed both the pipeline and the opportunities for input reuse.
-That leaves a question for discussion: which resource would we investigate next?
+That gives us several concrete directions to explore next.
 
-## Slide 14 — Where is the next gap?
+## Slide 14 — Which directions should we explore next?
 
 *25:00–30:00 · 5 minutes, including discussion*
 
-I’ll leave these two questions up for discussion.
+There are four directions I would like to explore further. Each has a starting
+point in the branch history.
 
-For a particular shape, where is the remaining gap: matrix issue, delivery from
-LDS, global-memory traffic, or transitions between tiles and groups?
+First, operand delivery. An experimental branch already exposed B padding of
+eight or sixteen FP16 elements and interleaved A/B input slots. Those test two
+different things: bank selection and physical partition placement. An earlier
+experiment also tried WMMA operand-reuse hints after register allocation. I would
+compare these separately, and use a native compiler path for the reuse hints;
+the old code-generation hooks are no longer in this branch.
 
-And what controlled comparison would tell us which change addresses that gap?
-The answer determines whether I would work on operand layout, register
-lifetimes, the boundary schedule, or sharing between workgroups.
+Second, how much cluster synchronization is useful? A later MXFP branch exposes
+one barrier per input block, one every few blocks, or none. Matching requests can
+share a transfer; late requests can receive a separate transfer after timeout.
+The question is how much alignment helps sharing, and when barrier cost exceeds
+that benefit. Local completion waits and safe LDS reuse must remain. We can
+compare multicast on and off at each identical barrier interval.
 
-That is the sequence I’ve followed through the kernel: move the data, establish
-when storage can be reused, expose independent instructions, and then share
-inputs where the work mapping supports it.
+Third, schedule selection by shape. We have alias-C, the within-group hybrid,
+and a separate cross-group path. The retained diagnostic comparison does not
+show the hybrid winning universally: alias-C has higher steady XDL efficiency
+on that shape. With only one tile per program per group, within-group prefetch
+has no next tile to target. I would map where each schedule helps as group size,
+K, and tiles per program change, including uneven groups.
 
-I have backup slides on the wait counters, WMMA hazards, LDS conflicts, clauses,
-and the exact cluster constraints. I’m happy to go into whichever part is most
-useful.
+Fourth, low precision. The MXFP branch already pipelines data and scale rings.
+It also explores BK128 versus BK256, reusing A storage for output, and retaining
+operands across refills. The useful question is which combination fits each
+format's register and LDS budget. Then we can test how those choices transfer
+to grouped workloads, with numerical correctness checked for every format.
 
-*[Pause for questions. Use the relevant backup slide as needed; the following
-slides are outside the timed main sequence.]*
+These are experiments to choose between, rather than a claim that each option
+will improve every workload. Which direction would you prioritize?
+
+*[Pause for discussion. Use backup C for LDS conflicts, G for the current
+cluster contract, and F/H for formats and resource budgets.]*
+
+*Evidence: `069a0121aa` on `my/gfx1250-kernels-3`; operand-reuse experiment
+`647b1a4e05`, hooks removed by `f676cb6304`; barrier intervals `5920df0408` on
+`my/gfx1250-kernels-mxfp`; persistent MXFP `70ea55c702`, BK256 output reuse
+`d55b4d22f1`, per-format defaults `255abe4594`; [recorded comparison](efficiency.md).
+Related-branch options are not part of the deck's code reference. No new
+performance measurements were collected for this slide. The reverted
+chained-dot changes (`02a632587a`) produced identical default binaries and need
+a new production witness before further optimization work.*
 
 ## Slide 15 — Backup
 
