@@ -1,7 +1,7 @@
 # Assembly preparation record
 
 The deck's ten assembly blocks were checked with `llvm-mc` for their stated
-targets on 29 September 2026. Slides 2, 3, 5, 7, and 9 use freshly generated grouped
+targets on 29 September 2026. Slides 2, 3, 5, 8, and 10 use freshly generated grouped
 GEMM assembly. Backups B/D/I use handwritten ISA examples.
 Generated excerpts retain instruction order and operands; debug directives and
 compiler comments showing physical registers are removed. Omissions are marked.
@@ -63,8 +63,8 @@ directives. Regeneration with different debug settings can change line numbers.
 | 2: registers | Lines 1841–1845, inner K-loop entry | Three consecutive instructions; `0x5a` selects D/C in v256–511 and A/B in v512–767. Partial DS wait assumes the existing load queue. |
 | 3: TDM | Lines 1682 and 1023 | Individual input-load and C2-store instructions from separate regions. Descriptor setup and synchronization omitted. First operand: group 0, four SGPRs with global/LDS addresses; second: group 1, eight SGPRs with shape/strides and controls. |
 | 5: scheduling | Lines 16/21, 200–202, 474–478 | Three separate regions, explicitly marked. Setup writes separate scheduling fields. Metadata uses zero MSBs; WMMA uses `0x5a`. Scalar descriptor updates are independent of WMMA VGPR operands. |
-| 7: K loop | Lines 1872–1886 | Nine consecutive instructions; two LDS loads interleave with WMMAs. `0x18` depends on earlier loads, not just the two shown. Only the low byte of MSB immediates controls selection. |
-| 9: C staging | Lines 1025–1046 | C3 reuses slot 1 after C1 completes; C2 may remain outstanding. Seven DS stores and one ALU dependency wait are omitted at the comment. Both workgroup handoffs are retained. |
+| 8: K loop | Lines 1872–1886 | Nine consecutive instructions; two LDS loads interleave with WMMAs. `0x18` depends on earlier loads, not just the two shown. Only the low byte of MSB immediates controls selection. |
+| 10: C staging | Lines 1025–1046 | C3 reuses slot 1 after C1 completes; C2 may remain outstanding. Seven DS stores and one ALU dependency wait are omitted at the comment. Both workgroup handoffs are retained. |
 | Backup B: hazard | Handwritten gfx1250 | Dense FP16 WMMA → dependent VALU, co-execution enabled. Four V_NOPs cover the ISA's four slots; independent VALU instructions can replace them. Operands are initialized and MSBs zero. |
 | Backup D: clause | Handwritten gfx1250 | Four independent global loads, one non-flat memory clause. Dependency wait precedes the clause; load completion follows it. MSBs zero, valid global addresses, free destinations. |
 | Backup I: direct LDS | Handwritten gfx950 / gfx1250 | Four-byte per-lane copies; ready addresses, valid LDS, zero immediate offsets and CDNA5 MSBs. gfx950 includes the M0 hazard delay. Completion waits are per wave. |

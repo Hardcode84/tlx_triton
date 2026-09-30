@@ -64,6 +64,11 @@ blockquote p { margin: 0; }
 section.compact { font-size: 22px; }
 section.compact table { font-size: 20px; }
 section.compact th, section.compact td { padding: 10px 14px; }
+section.divider { background: var(--ink); color: #f7f9fb; justify-content: center; align-content: center; }
+section.divider h1 { color: #f7f9fb; font-size: 72px; margin: 16px 0 24px; line-height: 1.1; }
+section.divider .eyebrow { color: #9edbd3; font-size: 18px; }
+section.divider .subtitle { color: #cfdae4; font-size: 28px; margin: 0; }
+section.divider footer, section.divider::after { color: #b7c8d5; }
 section.cluster th, section.cluster td { padding: 7px 14px; }
 section.efficiency td:nth-child(n+2) { color: #927024; font-weight: 700; }
 section.questions h1 { font-size: 60px; margin-bottom: 36px; }

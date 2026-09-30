@@ -1,7 +1,12 @@
 # CDNA5 / gfx1250 programming slides
 
 Marp draft of the [reviewed plan](../Gfx1250ProgrammingSlidesPlan.md):
-12 main slides for 30 minutes, followed by nine backup slides.
+12 main content slides for 30 minutes, two section dividers, and nine backup
+slides (23 slides total). The dividers introduce the grouped GEMM case study
+(slide 6) and the backup material (slide 14).
+
+[Presenter transcript](transcript.md): spoken script for every slide, with timing
+windows, delivery cues, and optional backup explanations.
 
 ## Build locally
 
@@ -37,6 +42,7 @@ Both exports embed the SVG diagrams and can be moved as standalone files.
 ## Edit
 
 - `slides.md`: slide text and speaker notes in HTML comments; `---` separates slides.
+- `transcript.md`: full spoken script for the main talk and all backup slides.
 - `theme.css`: typography, colors, layout, and placeholder styling.
 - `assets/*.svg`: editable diagrams; pipeline diagrams are schematic.
 - `package.json` and `package-lock.json`: pinned local build dependencies.
@@ -45,7 +51,7 @@ In the Marp VS Code extension, enable HTML and select `theme.css` as a custom
 theme. Alternatively, `npm run preview` opens the CLI preview when a full browser
 is available.
 
-All assembly panels are filled and assembler-checked. Slides 2, 3, 5, 7, and 9 use
+All assembly panels are filled and assembler-checked. Slides 2, 3, 5, 8, and 10 use
 generated grouped-GEMM excerpts; backups B/D/I use handwritten ISA
 examples. [Assembly preparation records](assembly.md) describe their provenance,
 assumptions, and reproduction using `scripts/compile-assembly.py`.

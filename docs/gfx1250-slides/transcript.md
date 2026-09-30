@@ -1,0 +1,759 @@
+# Programming CDNA5 / gfx1250 — presenter transcript
+
+Companion to [slides.md](slides.md), including the CU/WGP terminology corrections
+and section dividers following deck revision `23b2bb7d36`.
+The time windows follow the 30-minute main talk and include pauses to inspect
+the diagrams and assembly. Slide 13 reserves most of its time for discussion.
+The grouped GEMM divider is included in that schedule. The backup divider and
+backups A–I are optional, outside it. Section numbers match all 23 deck pages.
+
+The main script is approximately 3,200 spoken words: about 26 minutes at
+125 words per minute, leaving the remaining time for pauses and discussion.
+Treat the time windows as rehearsal targets.
+
+Text beneath each timing line is written to be spoken. Italic text in square
+brackets gives delivery cues. Slide 12 and backup H address the current draft's
+unfilled results directly; update those passages when the tables are populated.
+
+## Slide 01 — A new programming unit
+
+*0:00–3:00 · 3 minutes*
+
+Today I’m going to look at the CDNA5 changes that affect how we write and schedule
+a GPU kernel. Then I’ll put those changes together in a TLX grouped GEMM: how it
+loads operands, keeps matrix work supplied, crosses tile boundaries, and shares
+inputs between workgroups.
+
+First, I want to separate wave size from hardware organization. CDNA3 and CDNA4
+use Wave64; CDNA5 uses Wave32. On CDNA5, one workgroup processor, or WGP,
+contains two compute units, or CUs. Each CU contains two SIMD32 units, so there
+are four SIMD32s in a WGP. CU is still a hardware term on CDNA5.
+
+*[Point to the two CUs inside the WGP diagram.]*
+
+All waves of a workgroup are placed within one WGP. They can execute on any of
+its four SIMD32s and share its LDS. That makes the WGP the relevant boundary
+for our workgroup’s resource budget. Multiple workgroups can reside in a WGP
+when resources allow.
+
+That change affects how values are distributed across lanes and how the workgroup
+uses the machine. A matrix layout built around 64 cooperating lanes needs to be
+reconsidered when the hardware matrix instruction operates across 32 lanes.
+
+The LDS capacity also changes. The table shows 64 kibibytes per CU on CDNA3,
+160 per CU on CDNA4, and 320 per WGP on CDNA5. That last number belongs to
+the whole WGP, containing both CUs. We’re comparing the LDS budget available
+to a workgroup across generations; we cannot call this doubled LDS per CU.
+
+For the kernel we’ll examine, that larger LDS budget makes room for substantial
+input tiles and multiple buffer slots. It also makes the allocation decisions
+more interesting. Input buffering, output staging, and layout padding all have
+to fit in the same budget.
+
+Finally, the matrix instruction family changes from MFMA to WMMA, and the matrix
+accumulators live in the VGPR namespace. That puts accumulator storage and
+ordinary vector state into one register-allocation problem.
+
+Those capabilities give us more room to organize the computation. Whether that
+organization is useful depends on how well the kernel delivers operands and
+overlaps independent work. I’ll follow that path from global memory, through
+LDS and registers, into the matrix instructions, and then back out to the output.
+
+## Slide 02 — More addressable VGPRs for one wave
+
+*3:00–6:00 · 3 minutes*
+
+Let’s start with registers, because the assembly is hard to read correctly
+without understanding this part.
+
+CDNA5 can address up to 1,024 VGPRs per thread. The instruction’s ordinary
+register field supplies the low eight bits of the index. The remaining two
+bits come from persistent state set by `S_SET_VGPR_MSB`.
+
+There are separate settings for the destination and for each of the three
+source operand classes. The four ranges in the diagram are therefore address
+ranges within the VGPR namespace. For example, low index seven with MSB value
+two resolves to register 519: two times 256, plus seven.
+
+*[Point to the MSB instruction, then follow the four WMMA operands.]*
+
+Here is an actual excerpt from the grouped kernel. The value `0x5a` sets the
+destination and source-two MSBs to one, and source-zero and source-one to two.
+
+So the destination written as registers 202 through 209 actually resolves to
+458 through 465. The A operand resolves to 554 through 561, and B to 642 through
+649. The final operand is the existing accumulator, in the same register range
+as the destination.
+
+This WMMA computes a 16-by-16 result with a reduction depth of 32. A and B contain
+FP16 values, while accumulation is FP32. All 32 lanes cooperate in that matrix
+operation; each lane holds part of the operands and result.
+
+The DS wait immediately above it makes the required loaded operands available.
+Its particular count comes from the larger sequence of LDS loads around this
+excerpt. We’ll see more of that sequence in the pipeline slide.
+
+There are two practical consequences here. First, when inspecting assembly,
+carry the MSB state forward as you read. Two identical printed register numbers
+can resolve differently after a state change. Second, greater addressability
+still comes with an allocation cost. A large accumulator, its operands, and
+addressing state all consume registers, so their lifetimes matter.
+
+Now that we can identify the registers correctly, let’s look at how the kernel
+gets its input tiles into LDS.
+
+## Slide 03 — TDM moves tiles for the grouped GEMM
+
+*6:00–8:00 · 2 minutes*
+
+The Tensor Data Mover, or TDM, is the main global-memory-to-LDS path in this
+kernel. It takes a description of a tile and performs the transfer while other
+instructions can make progress.
+
+On the left is a generated input load. Its operands name two groups of scalar
+registers. Group zero contains the tile’s global address and its LDS address,
+along with control bits. Group one carries the dimensions, strides, element
+format, padding, and multicast controls. This two-dimensional form uses four
+SGPRs for the first group and eight for the second.
+
+On the right is the corresponding output operation. The kernel has already
+converted a chunk of C and written it into LDS; TDM copies that chunk to global
+memory. These are excerpts from separate parts of the kernel, with their
+descriptor setup omitted.
+
+*[Indicate the two instruction operands in each panel.]*
+
+The data payload goes directly between global memory and LDS. The descriptors
+still need registers and instructions to construct them, but the transfer avoids
+an intermediate payload in VGPRs.
+
+TDM operates on whole tile requests and ignores EXEC. Choosing which waves issue
+requests therefore happens separately from the per-lane execution mask. The ISA
+supports one- through five-dimensional tiles, plus two-dimensional gather and
+scatter. Loads can also apply LDS padding and multicast.
+
+Completion is tracked by the issuing wave’s tensor counter. We use
+`S_WAIT_TENSORCNT` where completion is required, and synchronize other waves
+before they consume shared data. The multicast option extends this cooperation
+across workgroups, which brings us to clusters.
+
+## Slide 04 — Clusters share input tiles across WGPs
+
+*8:00–10:00 · 2 minutes*
+
+A cluster adds a level to the launch hierarchy between the grid and the
+workgroup. Its members are scheduled within one shader engine, with each member
+on a separate WGP. Clusters can have one-, two-, or three-dimensional shapes,
+and the architecture allows up to 16 workgroups in a cluster.
+
+Each workgroup still has its own LDS allocation. In this diagram, multicast
+places a copy of the same input tile into both allocations, so two workgroups
+can use that input while computing different output tiles.
+
+*[Trace the two arrows from the global tile into the LDS boxes.]*
+
+The example selects ranks zero and one with mask `0011`. For a TDM operation,
+that recipient mask is carried in the descriptor. Every selected recipient
+issues a matching request. The hardware can then combine those requests and
+deliver the data to the participating workgroups. Requests that arrive late
+can be served separately, so the amount of sharing also depends on how well
+the workgroups stay aligned.
+
+That alignment matters for correctness as well. Before a workgroup refills an
+input slot, its neighbors must have finished reading their corresponding copies.
+The kernel finishes local LDS reads, synchronizes its local waves, and then uses
+cluster arrival and wait before issuing the refill.
+
+The cluster barrier coordinates workgroups; transfer completion is still tracked
+at the requesting waves. Both pieces are needed when shared input slots are
+reused.
+
+Later I’ll show the four-workgroup arrangement used by the kernel, including the
+exact A and B recipient masks. First, we need one more piece: how the wave
+schedules memory and matrix instructions together.
+
+## Slide 05 — Two controls, different jobs
+
+*10:00–12:00 · 2 minutes*
+
+There are two scheduling controls in this kernel, and each addresses a different
+part of execution.
+
+The first is expert mode, selected by setting the low two scheduling-mode bits
+to two. In this mode, the compiler inserts waits for selected dependencies
+between vector memory and vector ALU instructions. This backend enables it by
+default for gfx1250.
+
+Look at the metadata-load excerpt. The ALU wait protects the register
+dependencies associated with issuing the memory operation: prior ALU writes
+must be ready, and prior memory operations must have finished using registers
+that would otherwise be overwritten. The later load-counter wait establishes
+that the loaded data has arrived. Those waits protect different events.
+
+*[Move from the first mode write to the second, then to the WMMA excerpt.]*
+
+The second control is bit two, which allows a wave to queue WMMA operations and
+then issue independent work while the matrix operations execute. This is useful
+for the configuration here, which uses one wave per SIMD.
+
+At the bottom, a WMMA is followed by scalar additions that update descriptor
+addresses. Those additions use scalar registers and can proceed independently
+of the matrix operands in VGPRs. That is the kind of overlap the schedule is
+trying to expose.
+
+WMMA co-execution also has specific operand-hazard spacing requirements. The
+compiler must satisfy those alongside the memory dependency waits; the backup
+slide has a small example.
+
+## Slide 06 — TLX grouped GEMM
+
+*12:00–12:10 · 10-second transition*
+
+We now have the hardware pieces. Let’s follow one persistent grouped GEMM
+through its input pipeline, tile transitions, output stores, and input sharing.
+
+*[Pause on the section title, then advance to the workload.]*
+
+## Slide 07 — One persistent launch, many GEMMs
+
+*12:10–14:00 · 1 minute 50 seconds*
+
+The workload is a collection of matrix multiplications. For each group, we
+compute A times B-transpose, using FP16 inputs and output with FP32 accumulation.
+
+A contains the packed rows from all groups. B has a separate N-by-K tensor for
+each group. The group-offset array tells us where each group’s rows begin in A
+and C. Both inputs are contiguous along K, which is the dimension we traverse
+while accumulating a tile.
+
+The working tile is 256 by 256, with a K block of 128. Four Wave32 waves cooperate
+on each output tile. Within the tile ordering, `GROUP_M` is four: we vary M first
+within that grouping to give nearby work an opportunity to reuse B.
+
+*[Follow the persistent-program sequence along the bottom.]*
+
+We launch a fixed number of persistent programs, P. Program p starts with tile
+p, then advances to p plus P, then p plus two P, continuing through the linear
+tile sequence as it crosses group ranges. P controls how many programs are
+active in that traversal; the total tile count can be much larger.
+
+For this optimized path, the shapes provide full tile coverage. Group M sizes
+can differ, while a separate pointer-table baseline handles more general
+shapes using masks. The clustered variant adds constraints that I’ll cover
+in backup if needed.
+
+This gives us a repeating unit of work inside each program. The next question
+is how to keep its matrix instructions supplied throughout K.
+
+## Slide 08 — Pipeline operands, bound their lifetimes
+
+*14:00–16:00 · 2 minutes*
+
+There are two levels of pipelining here. At the outer level, TDM feeds two A
+slots and two B slots in LDS. At the inner level, we load operand subtiles from
+LDS into registers and feed the WMMAs.
+
+Each K block is 128 elements deep. We process it as four K32 dot steps, loading
+the next operand subtile ahead of the current dot. Each source-level dot expands
+into multiple matrix instructions for the larger output tile.
+
+The fused TDM loads use issuing-wave masks `0011` for A and `1100` for B. These
+masks distribute issuing work among the four waves. The multicast recipient
+masks we just discussed are a separate choice across workgroups.
+
+*[Follow the first WMMA, the two LDS loads, and the second WMMA.]*
+
+The assembly shows the inner pipeline directly. Between two WMMAs, we change
+the VGPR MSB settings and load two more pieces from LDS. Those loads write
+registers that neither adjacent WMMA reads, which gives the schedule independent
+memory work to overlap with matrix execution.
+
+The DS waits protect the operands that each WMMA does consume. The value
+`0x18` comes from the full queue of earlier LDS operations. It depends on more
+than the two loads visible in this small window.
+
+We also bound operand lifetimes at dot boundaries with `amd_sched_barrier()`.
+That lets us retain useful overlap without allowing unrelated work to extend
+register lifetimes throughout the loop. It is a compiler scheduling constraint;
+the TDM completion waits and workgroup handoffs are handled separately.
+
+That organizes the steady K loop. But a persistent kernel also has to move from
+one output tile to the next without repeatedly emptying and restarting its
+input pipeline.
+
+## Slide 09 — Use the tail to prime the next tile
+
+*16:00–19:00 · 3 minutes*
+
+At a tile boundary, we have an opportunity to prepare future work while finishing
+the current tile. The final K iterations already tell us which input slots are
+about to become available.
+
+The schedule peels the last two K iterations. Once the current operands have
+been read from a slot into registers, and all readers have released that slot,
+we can refill it with K0 or K1 of the next tile assigned to this persistent
+program. Matrix work on the current tile can continue using the operands already
+in registers.
+
+*[Trace the released slots into K0 and K1 of the next tile.]*
+
+There are two implementations on this slide, with different behavior at group
+boundaries.
+
+The hybrid path on the left prefetches the next tile within the same group.
+Its first tile in each group still needs initial priming. Once the program has
+another tile in that group, the preceding tile’s tail can provide its first
+two K blocks.
+
+The separate cross-group path on the right also prepares work across group
+boundaries. It carries four upcoming boundaries in scalar state, skips empty
+groups, and refills that metadata in the preceding tile’s tail. Its output
+uses vector stores so that the input rings remain available for prefetched data.
+
+The amount of useful prefetch depends on the tile sequence assigned to each
+program. With M equal to 2,048 and N equal to 1,024, there are 32 of these square
+tiles per group. If P is also 32, each program receives one tile from that group.
+There is no second tile within the group for the hybrid tail to prepare.
+
+If we double M to 4,096 while keeping the other settings, each program gets two
+tiles per group. Now within-group prefetch has a next tile to target.
+
+The implementation also requires a depth-two ring, an even number of K128
+iterations, and at least two K blocks. Those conditions make the peeled tail
+match the ring rotation.
+
+This prepares the next inputs. We still need somewhere to put the current
+output without blocking those inputs, which is the LDS-budget problem on the
+next slide.
+
+## Slide 10 — Stage C in two small slots
+
+*19:00–21:00 · 2 minutes*
+
+The A and B input rings already occupy 256 kibibytes of logical payload. A full
+256-by-256 FP16 output tile adds another 128 kibibytes. Together, that exceeds
+the WGP’s 320-kibibyte LDS capacity, even before layout overhead.
+
+The alias-C path reuses A storage for the output. That saves space, but it ties
+the next A refill to completion of the C store.
+
+The hybrid path instead divides C into eight 32-row chunks and alternates
+between two small output slots. Those slots add 32 kibibytes of payload, bringing
+the logical total to 288. The actual allocation also includes layout overhead.
+
+*[Follow the wait and the two barrier pairs in the assembly.]*
+
+This excerpt stages C3. At entry, C1 and C2 may still be in flight. The wait to
+one retires C1 because TDM operations complete in issue order within the issuing
+wave. C2 can remain outstanding.
+
+The first workgroup barrier communicates that slot one is available for reuse.
+The waves then write C3 into that slot. We show one LDS store and omit the
+remaining stores at the marked line.
+
+The DS wait establishes that this wave’s LDS writes have completed. The next
+workgroup barrier brings all the writers together, after which the tensor-store
+instruction can read the completed C3 chunk.
+
+We repeat that process across the eight chunks. The final two stores can stay
+in flight as the program enters its next tile, while the A and B rings retain
+the prefetched inputs. That is how the output path fits alongside the input
+pipeline without requiring a full extra C tile in LDS.
+
+## Slide 11 — A 2 × 2 sharing pattern
+
+*21:00–24:00 · 3 minutes*
+
+Now let’s apply clusters to the actual tile mapping. Each workgroup still
+computes one output tile. The goal is to arrange those tiles so that pairs of
+workgroups can share A and B inputs.
+
+In the diagram, ranks zero and two use A0. Ranks one and three use A2. Across
+the other direction, ranks zero and one use B0, while ranks two and three use B1.
+
+*[Trace one row for A, then one column for B.]*
+
+That gives the A recipient masks `0101` and `1010`. Reading the bits from the
+least significant bit, the first selects ranks zero and two, and the second
+selects ranks one and three.
+
+For B, the masks are `0011` and `1100`: ranks zero and one, or ranks two and
+three. Every individual transfer therefore has two recipients. The four-member
+cluster gives us sharing in both operand directions.
+
+These are cluster-rank masks. The source wave masks on the pipeline slide choose
+which waves issue the A and B requests inside each workgroup. We need both
+choices: who issues locally, and which workgroups receive the data.
+
+Notice also that the two M positions are zero and two. They are nonadjacent
+because the program remapping and `GROUP_M` ordering determine the logical tile
+coordinates. Physical IDs zero through three map to logical IDs zero, two, four,
+and six, producing the four tile coordinates printed below the diagram.
+
+The diagram represents that logical sharing relationship. The hardware places
+the cluster members on separate WGPs according to the cluster launch rules.
+
+Every selected recipient issues the matching load, and the kernel synchronizes
+the cluster before refilling a released input slot. That keeps one member’s
+progress from causing an overwrite while another member is still reading.
+
+With two-workgroup clusters, this implementation shares B only. With four,
+it shares both A and B. The wrapper imposes shape and program-count constraints
+so the members reach compatible tile and group boundaries.
+
+We have now changed both the pipeline and the opportunities for input reuse.
+The results comparison needs to separate those effects.
+
+## Slide 12 — What does each step recover?
+
+*24:00–27:00 · 3 minutes*
+
+The quantity I want to compare is XDL efficiency: the fraction of available
+matrix-execution capacity used over the full kernel. I’ll express that as a
+percentage, with differences between variants in percentage points.
+
+This table is still unfilled in the current draft, so I’ll explain what the
+comparison is designed to tell us. The mechanisms we’ve discussed give us
+hypotheses about where utilization can be recovered. The table will test those
+hypotheses under a common workload and normalization.
+
+*[Walk down the rows, without implying a ranking among them.]*
+
+The first row is alias-C, where output staging reuses input storage. The hybrid
+row changes the tile-boundary and output schedule so input prefetch can coexist
+with small C staging slots. Comparing those rows tests the combined effect of
+that scheduling change.
+
+Next, we add program remapping. That changes which logical tiles are assigned
+to nearby physical programs and can affect the opportunity to reuse inputs.
+
+Then we introduce a cluster with multicast disabled. That row includes the
+cluster launch and synchronization structure while retaining independent input
+loads. Finally, we enable multicast at the same cluster size. Comparing those
+last two rows isolates the effect of enabling input sharing within that cluster
+configuration.
+
+The reference workload has 16 groups, with M, N, and K each equal to 4,096.
+We also need to choose and fix P across the comparison. Changing the persistent
+program count would change the work assigned to each program and the tile
+boundaries we are trying to study.
+
+The observation scope includes startup, output stores, and tile and group
+transitions. A well-supplied inner K loop can coexist with a less efficient full
+kernel if too much time is spent entering and leaving that loop. Any separate
+steady-loop figure therefore needs its own label.
+
+Once the values are available, I’ll use each change in efficiency to revisit
+the corresponding pipeline or sharing decision. Until then, this table defines
+the comparison rather than establishing which variant wins.
+
+## Slide 13 — Where is the next gap?
+
+*27:00–30:00 · 3 minutes, including discussion*
+
+I’ll leave these two questions up for discussion.
+
+For a particular shape, where is the remaining gap: matrix issue, delivery from
+LDS, global-memory traffic, or transitions between tiles and groups?
+
+And what controlled comparison would tell us which change addresses that gap?
+The answer determines whether I would work on operand layout, register
+lifetimes, the boundary schedule, or sharing between workgroups.
+
+That is the sequence I’ve followed through the kernel: move the data, establish
+when storage can be reused, expose independent instructions, and then share
+inputs where the work mapping supports it.
+
+I have backup slides on the wait counters, WMMA hazards, LDS conflicts, clauses,
+and the exact cluster constraints. I’m happy to go into whichever part is most
+useful.
+
+*[Pause for questions. Use the relevant backup slide as needed; the following
+slides are outside the timed main sequence.]*
+
+## Slide 14 — Backup
+
+*Optional transition · outside the 30-minute main talk*
+
+That ends the main talk. These slides have the ISA details and kernel constraints
+we can refer to during discussion.
+
+*[Open the relevant backup for a question; skip the others.]*
+
+## Slide 15 / Backup A — Partial waits need an ordering guarantee
+
+*Optional backup · about 2 minutes*
+
+This slide is the reference for interpreting the waits in the assembly.
+CDNA5 separates vector loads, vector stores, LDS operations, scalar-memory
+operations, direct asynchronous LDS transfers, and tensor transfers into
+different counters. Most of these are six bits wide; KM is five bits.
+
+A wait to N allows the issuing wave to continue when that counter is at most N.
+Zero drains the counter. To conclude that a particular earlier operation has
+finished, we also need to know the completion ordering for that counter.
+
+TDM loads and stores complete in issue order within one wave. That is what
+makes the C-staging example work: with C1 followed by C2, a wait to one ensures
+that C1 has retired, while C2 may still be outstanding.
+
+For direct asynchronous LDS transfers, loads are ordered with loads and stores
+with stores, but the two directions can report completion out of order relative
+to each other. The same partial-wait argument therefore needs more care when
+those operations are mixed.
+
+Scalar loads can also complete out of order, so the useful scalar-memory wait
+is a zero KM wait. A single-DWORD scalar load increments KM by one; larger loads
+increment it by two.
+
+Combined load-plus-DS and store-plus-DS waits remain available. XCNT has another
+purpose: it tracks pending address translations. It does not establish that
+the payload transfer is complete.
+
+All of these counts belong to a wave. When other waves consume the resulting
+data, we still need the corresponding synchronization between them.
+
+## Slide 16 / Backup B — Dependency waits are only part of the contract
+
+*Optional backup · about 1½ minutes*
+
+This example isolates a WMMA result dependency under co-execution. The WMMA
+writes its FP32 result into registers zero through seven. The vector add below
+it reads register zero, so it depends on that matrix result.
+
+*[Count the four vector NOPs between producer and consumer.]*
+
+For this dense FP16 WMMA followed by a dependent VALU instruction, the ISA
+requires four intervening independent VALU instructions or vector NOPs when
+co-execution is enabled. I’ve used NOPs to make the spacing visible. In a useful
+schedule, independent vector work can occupy those slots.
+
+Scalar instructions do not count as those VALU slots. The scalar descriptor
+updates we saw in the main talk are useful independent work, but they do not
+substitute for this particular vector-instruction spacing requirement.
+
+The example assumes the operands are initialized and the VGPR MSB fields are
+zero. It is an illustrative instruction sequence, rather than an excerpt from
+the grouped kernel.
+
+With co-execution disabled, this particular WMMA-to-VALU case needs no inserted
+vector NOPs. Other operand relationships have different requirements. Feeding
+the result into a following WMMA’s A or B input is one example.
+
+So I check the relevant ISA hazard-table entry for the instruction and the
+overlapping operands. Enabling WMMA queuing still leaves that responsibility
+with code generation.
+
+## Slide 17 / Backup C — Bank conflicts and partition conflicts differ
+
+*Optional backup · about 2 minutes*
+
+There are two levels of LDS contention to consider here: banks within a wave’s
+access, and physical partitions used by different SIMD pairs.
+
+For banks, the mapping is the byte address shifted right by two, masked to six
+bits. That gives 64 banks, each four bytes wide. With a Wave32 B32 load,
+address four times the lane number uses 32 distinct banks. Address 256 times
+the lane number sends every lane to a different word in bank zero.
+
+*[Move from the bank examples to the two rows in the table.]*
+
+Now suppose two waves from opposite SIMD pairs each have a bank-conflict-free
+access. One reads the byte range starting at zero, and the other reads the range
+starting at 256. Their bank patterns are individually fine, but both ranges
+are in the same physical 64-kibibyte LDS partition.
+
+The WGP has five such partitions. SIMD pair zero-and-two belongs to CU zero;
+pair one-and-three belongs to CU one. Accesses from these two CUs can contend
+when they target the same partition together.
+Moving the second range to 65,536 plus its original within-range offsets
+changes the partition while preserving its bank pattern in this example.
+
+That gives us two separate layout questions. Padding or swizzling can address
+the bank pattern. Partition placement depends on the physical allocation and
+which SIMD pairs access which regions. Scheduling can also separate competing
+accesses.
+
+These examples use physical LDS addresses, including the allocation base.
+For a transpose load, I would analyze the source LDS addresses first, before
+considering how the instruction redistributes values into registers.
+
+## Slide 18 / Backup D — S_CLAUSE groups a supported memory class
+
+*Optional backup · about 1½ minutes*
+
+`S_CLAUSE` lets a wave group a sequence of compatible memory instructions.
+The first instruction after it selects the memory class. During an uninterrupted
+clause, other waves cannot interleave instructions from that class.
+
+In this example, the encoded length is three, which means four following
+instructions. All four are global loads, using the same per-lane base address
+with successive offsets and separate destination registers.
+
+*[Point to the wait before the clause and the wait after the loads.]*
+
+The dependency wait before the clause makes the registers safe for the memory
+operations. The load-counter wait afterward makes the returned values available
+to consumers. Clause formation itself provides neither of those completion
+guarantees.
+
+Supported classes include non-flat memory, flat memory, indexed LDS operations,
+and scalar memory. TDM tensor instructions are illegal inside a clause. The
+tensor loads in the grouped kernel therefore cannot be wrapped in `S_CLAUSE`
+as a way to group them.
+
+This is a small ISA example to show the mechanism. Whether a clause helps a
+particular kernel depends on the available independent requests and the resulting
+issue schedule. A stalled clause can leave resources idle, so I would inspect
+the affected memory sequence before making it part of an optimization.
+
+## Slide 19 / Backup E — Select rows with descriptor indices
+
+*Optional backup · about 1½ minutes*
+
+TDM can also use a descriptor-provided list of row indices. In the load
+direction, those indices select global rows to gather into LDS. In the store
+direction, they select the global rows that receive data scattered from LDS.
+
+This mode operates on two-dimensional tiles. Per instruction, the descriptor
+can carry up to 16 indices when each index is 16 bits, or eight indices when
+each is 32 bits. A larger row set requires more instructions.
+
+Gather can use arbitrary row indices, including repeated rows. There is an
+additional condition when relying on out-of-bounds handling: the indices need
+to be nondecreasing for that handling to be correct. That condition needs to
+be preserved when constructing the descriptor for an irregular access pattern.
+
+The extra descriptor groups, two and three, carry these indices. The global
+row selection is therefore expressed in descriptor state, while TDM performs
+the tile movement.
+
+Padding and multicast remain load-side capabilities. In particular, the store
+operation does not remove padding previously introduced in LDS; the output
+layout must be suitable for the store being issued.
+
+The main grouped-GEMM path we discussed uses regular tiles. This backup shows
+another way to express data movement when the rows we want are selected by an
+index list.
+
+## Slide 20 / Backup F — Scaling is another programming dimension
+
+*Optional backup · about 1 minute*
+
+The main example uses FP16 throughout, but lower-precision formats introduce
+another set of layout and scheduling choices.
+
+CDNA4 adds FP4 and FP6 support along with OCP microscaling. CDNA5 extends the
+scaling options, including 16- and 32-element blocks and fractional FP4 scales.
+
+For a kernel developer, the data path now includes both the encoded values and
+the scale information needed to interpret them. The scale-block size determines
+which values share metadata, and the tile layout needs to deliver that metadata
+with the corresponding matrix operands.
+
+I would treat that as part of the operand-supply problem: where the scales
+reside, when they become available, and how long their registers stay live.
+The appropriate tile and pipeline can change with the format and its scaling
+rules.
+
+For the comparison in this talk, I’m keeping FP16 inputs and output with FP32
+accumulation fixed. That lets us evaluate the scheduling and sharing changes
+under the same precision choice. A scaled-format version would need its own
+layout, correctness, and efficiency comparison.
+
+## Slide 21 / Backup G — Keep cluster members on matching boundaries
+
+*Optional backup · about 2 minutes*
+
+This is the contract enforced by the clustered version of this kernel. It
+exists so that workgroups sharing inputs reach compatible loop and group
+boundaries.
+
+The tile is 256 by 256 by 128, the input ring has depth two, and `GROUP_M` is
+four. The path uses the within-group hybrid schedule with cross-tile prefetch.
+Remapping is chunked, with eight logical XCDs and a chunk size of two.
+
+The groups have equal, positive M. M is divisible by 1,024, and N by 512. P is
+divisible by 16 and divides the number of output tiles in each group. Together,
+those restrictions make the work assignment regular enough for the selected
+members to share the expected inputs and execute compatible synchronization.
+
+The launch expresses the cluster shape with `ctas_per_cga`. The grid and P
+count physical workgroups, and each workgroup owns an output tile. The native
+fused-load masks choose recipients, and `tlx.cluster_barrier()` protects the
+input refills.
+
+The benchmark defaults to four-workgroup clusters. The general wrapper defaults
+to ordinary workgroups, which also remain the path for general ragged groups.
+The clustered path excludes the other options listed here, including dedicated
+C staging, L2 prefetch, and automatic configuration selection.
+
+These restrictions describe this implementation. The architectural cluster
+mechanism supports a broader set of programs. To extend this kernel to less
+regular shapes, I would first establish how every member follows the correct
+request and barrier sequence at tile and group boundaries.
+
+## Slide 22 / Backup H — Smaller tiles can expose more parallel work
+
+*Optional backup · about 1½ minutes*
+
+The large square tile gives each workgroup substantial reuse, but the workload
+also needs enough output tiles to keep the available execution resources busy.
+For smaller M, reducing the tile height can expose more independent workgroups.
+
+The table compares logical payloads. The square hybrid has 256 kibibytes of
+input rings and 32 kibibytes of chunked output staging. The 128-by-256 variant
+uses 192 kibibytes for inputs and a dedicated 64-kibibyte output tile, totaling
+256 kibibytes before layout overhead.
+
+Register storage matters as well. A 256-by-256 FP32 accumulator distributed
+across 128 threads already represents 512 accumulator values per thread.
+Operands, addresses, and other state add to that allocation.
+
+The resource panel is still a placeholder in this draft, so the table describes
+the payload design rather than a completed comparison of compiler allocations.
+Both configurations need to be compared with their actual layouts and register
+counts.
+
+The selection model also estimates how fully the available program slots are
+used by the tile count. That is what I mean here by tile-slot utilization;
+it is a scheduling estimate, not a measurement of how busy each hardware CU is.
+
+The asymmetric prefetch path stays within a group. It therefore needs more
+tiles per group than persistent programs to have another tile to prepare.
+Shrinking the tile changes both the available parallel work and the work each
+program performs. I would evaluate those effects together on the selected
+shape, using the same XDL-efficiency definition as the main comparison.
+
+## Slide 23 / Backup I — Global → LDS: who chooses the destination?
+
+*Optional backup · about 2 minutes*
+
+These examples show the per-lane direct-to-LDS path. In both cases, each lane’s
+global address is already in registers zero and one, and each active lane
+copies four bytes.
+
+On CDNA4, we put a shared LDS base offset into M0. The instruction supplies the
+lane placement: lane i writes at M0 plus four times i. The scalar NOP after
+writing M0 covers the dependency before the LDS load uses that register.
+The vector-memory wait establishes completion for the issuing wave.
+
+*[Move to the explicit LDS-address operand in the CDNA5 instruction.]*
+
+On CDNA5, register four supplies an LDS byte offset independently for each lane.
+The kernel can therefore choose each lane’s destination placement. The
+asynchronous-counter wait establishes completion of these transfers for the
+issuing wave.
+
+In both examples, the payload bypasses VGPRs on its way to LDS. The address
+operands still occupy registers. These are illustrative sequences with valid
+allocations and ready addresses; consumers in other waves also require a
+synchronization handoff.
+
+The grouped kernel uses the TDM path from slide three. TDM receives scalar
+descriptors describing a whole tile, including global and LDS placement, and
+ignores EXEC. These direct copies instead operate on per-lane addresses.
+
+So when I describe programmable LDS addresses on CDNA5, this is the per-lane
+capability I mean. When I describe the grouped kernel’s tile loads, stores, and
+multicast, I’m referring to TDM and its descriptor-based operations.
