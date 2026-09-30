@@ -70,7 +70,6 @@ section.divider .eyebrow { color: #9edbd3; font-size: 18px; }
 section.divider .subtitle { color: #cfdae4; font-size: 28px; margin: 0; }
 section.divider footer, section.divider::after { color: #b7c8d5; }
 section.cluster th, section.cluster td { padding: 7px 14px; }
-section.efficiency td:nth-child(n+2) { color: #927024; font-weight: 700; }
 section.questions h1 { font-size: 60px; margin-bottom: 36px; }
 section.questions .panel { padding: 22px 28px; margin-bottom: 20px; }
 section.questions .number { color: var(--teal); font-weight: 700; padding-right: 16px; }
@@ -105,3 +104,11 @@ section.pipeline-asm .diagram { height: 140px; object-fit: contain; }
 section.pipeline-asm ul { font-size: 22px; }
 section.output-asm h1 { margin-bottom: 12px; }
 section.output-asm .diagram { height: 158px; object-fit: contain; }
+section.gemm-contract .panel { font-size: 21px; padding: 18px 22px; }
+section.gemm-contract .equation { margin-bottom: 12px; }
+section.kernel-design h1 { margin-bottom: 16px; }
+section.kernel-design .subtitle { font-size: 22px; }
+section.kernel-design .cols { align-items: stretch; }
+section.kernel-design .panel { font-size: 21px; padding: 16px 20px; }
+section.kernel-design li { margin: 12px 0; }
+section.kernel-design .flow { font-size: 21px; padding: 12px; margin-top: 8px; }

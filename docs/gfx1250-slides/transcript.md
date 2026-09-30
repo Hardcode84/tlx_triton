@@ -1,19 +1,18 @@
 # Programming CDNA5 / gfx1250 — presenter transcript
 
-Companion to [slides.md](slides.md), including the CU/WGP terminology corrections
-and section dividers following deck revision `23b2bb7d36`.
+Companion to [slides.md](slides.md).
 The time windows follow the 30-minute main talk and include pauses to inspect
 the diagrams and assembly. Slide 13 reserves most of its time for discussion.
 The grouped GEMM divider is included in that schedule. The backup divider and
 backups A–I are optional, outside it. Section numbers match all 23 deck pages.
 
-The main script is approximately 3,200 spoken words: about 26 minutes at
-125 words per minute, leaving the remaining time for pauses and discussion.
-Treat the time windows as rehearsal targets.
+The schedule reserves 25 minutes for the material and five minutes for discussion.
+Treat the time windows as rehearsal targets, including pauses to inspect the examples.
 
 Text beneath each timing line is written to be spoken. Italic text in square
-brackets gives delivery cues. Slide 12 and backup H address the current draft's
-unfilled results directly; update those passages when the tables are populated.
+brackets gives delivery cues. The XDL efficiency comparison is deferred; its data
+remain in [efficiency.md](efficiency.md). Backup H still describes an unfilled
+resource-comparison panel.
 
 ## Slide 01 — A new programming unit
 
@@ -214,40 +213,58 @@ through its input pipeline, tile transitions, output stores, and input sharing.
 
 *[Pause on the section title, then advance to the workload.]*
 
-## Slide 07 — One persistent launch, many GEMMs
+## Slide 07 — Grouped GEMM: inputs and contract
 
-*12:10–14:00 · 1 minute 50 seconds*
+*12:10–13:10 · 1 minute*
 
-The workload is a collection of matrix multiplications. For each group, we
-compute A times B-transpose, using FP16 inputs and output with FP32 accumulation.
+Each group computes A times B-transpose, using FP16 inputs and output with FP32
+accumulation. N and K are shared; M can vary.
 
-A contains the packed rows from all groups. B has a separate N-by-K tensor for
-each group. The group-offset array tells us where each group’s rows begin in A
-and C. Both inputs are contiguous along K, which is the dimension we traverse
-while accumulating a tile.
+A and C pack the rows from all groups. B holds each group's weight matrix.
+The int32 offsets mark row boundaries; equal adjacent offsets represent an
+empty group. A and B are K-contiguous; C is N-contiguous.
 
-The working tile is 256 by 256, with a K block of 128. Four Wave32 waves cooperate
-on each output tile. Within the tile ordering, `GROUP_M` is four: we vary M first
-within that grouping to give nearby work an opportunity to reuse B.
+*[Point from the packed shapes to the contract.]*
 
-*[Follow the persistent-program sequence along the bottom.]*
+The TDM path requires complete tiles: M divisible by BM, N by BN, and K by 128.
+The depth-two hybrid also needs an even number of K128 blocks, at least two.
+Multicast adds equal positive M and the launch constraints in backup G.
 
-We launch a fixed number of persistent programs, P. Program p starts with tile
-p, then advances to p plus P, then p plus two P, continuing through the linear
-tile sequence as it crosses group ranges. P controls how many programs are
-active in that traversal; the total tile count can be much larger.
+## Slide 08 — Keep work and buffers on the WGP
 
-For this optimized path, the shapes provide full tile coverage. Group M sizes
-can differ, while a separate pointer-table baseline handles more general
-shapes using masks. The clustered variant adds constraints that I’ll cover
-in backup if needed.
+*13:10–15:00 · 1 minute 50 seconds*
 
-This gives us a repeating unit of work inside each program. The next question
-is how to keep its matrix instructions supplied throughout K.
+The output tile is 256 by 256, with K blocks of 128. Four Wave32 waves,
+or 128 threads, cooperate in each workgroup.
 
-## Slide 08 — Pipeline operands, bound their lifetimes
+P counts workgroups across all groups. Program p takes tiles p, p plus P,
+and so on, retaining buffers and preparing the next tile in the current tail.
 
-*14:00–16:00 · 2 minutes*
+The wrapper starts P from the runtime’s multiprocessor count,
+capped by the number of tiles. For this tile, the LDS allocation limits us to
+one resident workgroup per WGP, so available WGPs guide the choice. More programs
+expose parallel work; fewer leave more tiles per program for within-group prefetch.
+The assembly reference uses P equal to 32; the best count depends on the device
+and workload.
+
+*[Move to the pipeline column.]*
+
+Depth two means two A slots and two B slots. Their payload already uses 256
+kibibytes of LDS; depth three would need 384, exceeding the WGP’s budget before
+output staging. Two slots let us overlap input transfers and compute while
+leaving room for the small C buffers.
+
+Fused TDM selects A descriptors for waves zero and one, and B for waves two and
+three, at one load instruction. All four waves also compute. Multicast masks
+separately choose receiving workgroups.
+
+We also stage output in two small slots, vary M first with GROUP_M equal to four,
+and optionally share inputs across four-workgroup clusters. Let’s look inside
+that pipeline.
+
+## Slide 09 — Pipeline operands, bound their lifetimes
+
+*15:00–17:00 · 2 minutes*
 
 There are two levels of pipelining here. At the outer level, TDM feeds two A
 slots and two B slots in LDS. At the inner level, we load operand subtiles from
@@ -281,9 +298,9 @@ That organizes the steady K loop. But a persistent kernel also has to move from
 one output tile to the next without repeatedly emptying and restarting its
 input pipeline.
 
-## Slide 09 — Use the tail to prime the next tile
+## Slide 10 — Use the tail to prime the next tile
 
-*16:00–19:00 · 3 minutes*
+*17:00–20:00 · 3 minutes*
 
 At a tile boundary, we have an opportunity to prepare future work while finishing
 the current tile. The final K iterations already tell us which input slots are
@@ -326,9 +343,9 @@ This prepares the next inputs. We still need somewhere to put the current
 output without blocking those inputs, which is the LDS-budget problem on the
 next slide.
 
-## Slide 10 — Stage C in two small slots
+## Slide 11 — Stage C in two small slots
 
-*19:00–21:00 · 2 minutes*
+*20:00–22:00 · 2 minutes*
 
 The A and B input rings already occupy 256 kibibytes of logical payload. A full
 256-by-256 FP16 output tile adds another 128 kibibytes. Together, that exceeds
@@ -360,9 +377,9 @@ in flight as the program enters its next tile, while the A and B rings retain
 the prefetched inputs. That is how the output path fits alongside the input
 pipeline without requiring a full extra C tile in LDS.
 
-## Slide 11 — A 2 × 2 sharing pattern
+## Slide 12 — A 2 × 2 sharing pattern
 
-*21:00–24:00 · 3 minutes*
+*22:00–25:00 · 3 minutes*
 
 Now let’s apply clusters to the actual tile mapping. Each workgroup still
 computes one output tile. The goal is to arrange those tiles so that pairs of
@@ -402,54 +419,11 @@ it shares both A and B. The wrapper imposes shape and program-count constraints
 so the members reach compatible tile and group boundaries.
 
 We have now changed both the pipeline and the opportunities for input reuse.
-The results comparison needs to separate those effects.
-
-## Slide 12 — What does each step recover?
-
-*24:00–27:00 · 3 minutes*
-
-The quantity I want to compare is XDL efficiency: the fraction of available
-matrix-execution capacity used over the full kernel. I’ll express that as a
-percentage, with differences between variants in percentage points.
-
-This table is still unfilled in the current draft, so I’ll explain what the
-comparison is designed to tell us. The mechanisms we’ve discussed give us
-hypotheses about where utilization can be recovered. The table will test those
-hypotheses under a common workload and normalization.
-
-*[Walk down the rows, without implying a ranking among them.]*
-
-The first row is alias-C, where output staging reuses input storage. The hybrid
-row changes the tile-boundary and output schedule so input prefetch can coexist
-with small C staging slots. Comparing those rows tests the combined effect of
-that scheduling change.
-
-Next, we add program remapping. That changes which logical tiles are assigned
-to nearby physical programs and can affect the opportunity to reuse inputs.
-
-Then we introduce a cluster with multicast disabled. That row includes the
-cluster launch and synchronization structure while retaining independent input
-loads. Finally, we enable multicast at the same cluster size. Comparing those
-last two rows isolates the effect of enabling input sharing within that cluster
-configuration.
-
-The reference workload has 16 groups, with M, N, and K each equal to 4,096.
-We also need to choose and fix P across the comparison. Changing the persistent
-program count would change the work assigned to each program and the tile
-boundaries we are trying to study.
-
-The observation scope includes startup, output stores, and tile and group
-transitions. A well-supplied inner K loop can coexist with a less efficient full
-kernel if too much time is spent entering and leaving that loop. Any separate
-steady-loop figure therefore needs its own label.
-
-Once the values are available, I’ll use each change in efficiency to revisit
-the corresponding pipeline or sharing decision. Until then, this table defines
-the comparison rather than establishing which variant wins.
+That leaves a question for discussion: which resource would we investigate next?
 
 ## Slide 13 — Where is the next gap?
 
-*27:00–30:00 · 3 minutes, including discussion*
+*25:00–30:00 · 5 minutes, including discussion*
 
 I’ll leave these two questions up for discussion.
 
@@ -656,7 +630,7 @@ reside, when they become available, and how long their registers stay live.
 The appropriate tile and pipeline can change with the format and its scaling
 rules.
 
-For the comparison in this talk, I’m keeping FP16 inputs and output with FP32
+For the kernel in this talk, I’m keeping FP16 inputs and output with FP32
 accumulation fixed. That lets us evaluate the scheduling and sharing changes
 under the same precision choice. A scaled-format version would need its own
 layout, correctness, and efficiency comparison.
@@ -723,7 +697,7 @@ The asymmetric prefetch path stays within a group. It therefore needs more
 tiles per group than persistent programs to have another tile to prepare.
 Shrinking the tile changes both the available parallel work and the work each
 program performs. I would evaluate those effects together on the selected
-shape, using the same XDL-efficiency definition as the main comparison.
+shape, using a consistent steady-state XDL-efficiency definition across variants.
 
 ## Slide 23 / Backup I — Global → LDS: who chooses the destination?
 

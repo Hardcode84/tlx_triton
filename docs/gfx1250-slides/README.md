@@ -3,7 +3,8 @@
 Marp draft of the [reviewed plan](../Gfx1250ProgrammingSlidesPlan.md):
 12 main content slides for 30 minutes, two section dividers, and nine backup
 slides (23 slides total). The dividers introduce the grouped GEMM case study
-(slide 6) and the backup material (slide 14).
+(slide 6) and the backup material (slide 14). The final five minutes are reserved
+for discussion.
 
 [Presenter transcript](transcript.md): spoken script for every slide, with timing
 windows, delivery cues, and optional backup explanations.
@@ -51,15 +52,24 @@ In the Marp VS Code extension, enable HTML and select `theme.css` as a custom
 theme. Alternatively, `npm run preview` opens the CLI preview when a full browser
 is available.
 
-All assembly panels are filled and assembler-checked. Slides 2, 3, 5, 8, and 10 use
+All assembly panels are filled and assembler-checked. Slides 2, 3, 5, 9, and 11 use
 generated grouped-GEMM excerpts; backups B/D/I use handwritten ISA
 examples. [Assembly preparation records](assembly.md) describe their provenance,
 assumptions, and reproduction using `scripts/compile-assembly.py`.
 
-XDL efficiency cells and the resource-comparison panel remain draft placeholders.
-Search for `TODO` in `slides.md` to find their preparation notes. XDL results use percentages and
-percentage-point changes, with full-kernel and steady-loop metrics kept separate.
-The draft contains no absolute performance results or invented chart values.
+[XDL efficiency preparation records](efficiency.md) define the controlled
+five-variant comparison, steady-state metric, and collection procedure.
+`scripts/collect-efficiency.py` launches one variant and checks every output
+against a CPU reference in a dedicated scratch directory.
+
+The XDL efficiency comparison slide is deferred. The [preparation record](efficiency.md)
+retains all five validated results at G=2, M=4096, N=1024, K=2048, P=32,
+including precise values, provenance, and links to the raw artifacts.
+
+The resource-comparison panel in backup H remains a draft placeholder.
+Search for `TODO` in `slides.md` to find its preparation notes. Retained XDL results use
+percentages and percentage-point changes; steady-state and whole-kernel scopes
+remain separate. The draft contains no absolute performance results.
 
 The code reference is `b266fe4c1d`; ISA sections refer to the AMD CDNA5 Reference
 Guide dated 27 July 2026. Technical citations are on slides, with further sources

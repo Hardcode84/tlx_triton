@@ -5,7 +5,7 @@ size: 16:9
 paginate: true
 footer: 'CDNA5 / gfx1250 programming · Draft'
 title: 'Programming CDNA5 / gfx1250 — architecture and TLX grouped GEMM'
-description: 'CDNA5 programming draft with checked assembly and XDL efficiency placeholders.'
+description: 'CDNA5 programming draft with checked assembly and a grouped GEMM case study.'
 ---
 
 <!-- _class: compact -->
@@ -125,7 +125,7 @@ tensor_store_from_lds s[28:31], s[20:27]
 
 <div class="panel tdm-note"><h3>One request describes a whole tile</h3><p class="small">EXEC is ignored · 1–5D tiles · 2D gather/scatter · loads support padding and multicast.</p><p class="small">Use <code>S_WAIT_TENSORCNT</code> for completion; sharing LDS also needs a handoff.</p></div>
 
-<div class="source">CDNA5 ISA §10.11 · Generated input/output excerpts; descriptor setup and synchronization omitted. See slides 4 and 10.</div>
+<div class="source">CDNA5 ISA §10.11 · Generated input/output excerpts; descriptor setup and synchronization omitted. See slides 4 and 11.</div>
 
 <!--
 2 min. Introduce TDM as the data path used by the kernel: operand tiles into LDS, then converted output chunks back to global memory.
@@ -137,7 +137,7 @@ Group 1 supplies dimensions, strides, element size, padding controls, and the mu
 The fused A/B source wave masks select issuing waves; the descriptor's recipient mask independently selects multicast workgroups.
 TDM instructions ignore EXEC, including EXEC==0. They do not take per-lane global/LDS pointers, and their operands are unaffected by VGPR MSB settings.
 The load's descriptor selection depends on the issuing wave; the output instruction stores C2 from the two-slot staging path.
-TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast; slide 10 shows output-slot reuse.
+TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast; slide 11 shows output-slot reuse.
 Stores do not remove LDS padding. Gather/scatter details are in backup E; CDNA4/CDNA5 per-lane direct-LDS examples are in backup I.
 Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provenance in assembly.md.
 -->
@@ -161,12 +161,12 @@ Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provena
 
 <div class="flow">Before refill: finish local LDS reads → cluster arrival / wait → next TDM load.</div>
 
-<div class="source">CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3 · Two-workgroup illustration; the kernel's four-rank mapping is on slide 11.</div>
+<div class="source">CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3 · Two-workgroup illustration; the kernel's four-rank mapping is on slide 12.</div>
 
 <!--
 2 min. Introduce clusters as an architectural cooperation unit before presenting the grouped kernel's concrete sharing pattern.
 Cluster dimensions are part of the launch configuration. Members have equal workgroup size and run on separate WGPs in one shader engine.
-The two-workgroup diagram illustrates the mechanism; the grouped kernel uses two- or four-workgroup clusters, detailed on slide 11.
+The two-workgroup diagram illustrates the mechanism; the grouped kernel uses two- or four-workgroup clusters, detailed on slide 12.
 Each workgroup has its own LDS allocation. Multicast delivers a copy of the shared input into each selected member's LDS.
 Mask 0011 selects cluster ranks 0 and 1. For TDM this mask is in descriptor group 1; it is independent of source wave masks and EXEC.
 Each selected workgroup issues a matching request. Hardware can combine matching loads; it is not a leader-only remote write into passive recipients.
@@ -174,7 +174,7 @@ Late requests can be served separately after timeout, so do not claim an uncondi
 For this kernel, matching requests describe the same global tile and recipient mask at corresponding local LDS slot offsets.
 The refill barrier prevents one member from overwriting input data that a neighbor still reads: finish local LDS reads, synchronize local waves, then cluster arrival/wait.
 The cluster barrier uses ID -3. One wave per workgroup signals after local synchronization; all waves wait. ID -1 is the ordinary workgroup barrier.
-After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A; output-slot waits are on slide 10.
+After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A; output-slot waits are on slide 11.
 Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two selected recipients, not a physical GPU floorplan.
 -->
 
@@ -239,9 +239,11 @@ We have the hardware pieces. Now follow one persistent kernel from loading input
 
 ---
 
-<div class="eyebrow">07 / Case study · TLX grouped GEMM</div>
+<!-- _class: gemm-contract -->
 
-# One persistent launch, many GEMMs
+<div class="eyebrow">07 / Grouped GEMM · Workload and contract</div>
+
+# Grouped GEMM: inputs and contract
 
 <div class="equation">C<sub>g</sub> = A<sub>g</sub> × B<sub>g</sub><sup>T</sup></div>
 
@@ -255,28 +257,66 @@ C  [sum(Mg), N]
 group_offsets [G + 1]
 ```
 
-<p class="small">FP16 input/output · FP32 accumulation<br>Both inputs are K-contiguous.</p>
+<p class="small">FP16 input/output · FP32 accumulation<br>A/B: K-contiguous · C: N-contiguous</p>
 </div>
-<div class="panel"><h3>Working configuration</h3><p>Tile: <strong>256 × 256 × 128</strong></p><p>Four Wave32 waves</p><p><code>GROUP_M = 4</code>: vary M first to reuse B.</p><p class="small">Full tiles; group M sizes may differ.</p></div>
+<div class="panel"><h3>Optimized TDM path</h3><ul><li>Shared N and K; <strong>M<sub>g</sub> may vary</strong>, including empty groups.</li><li>Int32 row offsets: nondecreasing, from 0 to ΣM<sub>g</sub>.</li><li><strong>Full tiles:</strong> M<sub>g</sub> divisible by BM,<br>N by BN, K by BK = 128.</li></ul></div>
 </div>
 
-<div class="flow">Program p: tile p → tile p + P → tile p + 2P → …</div>
+<p class="small">The hybrid uses depth 2 and an even K / 128 ≥ 2.<br>Multicast adds equal positive M and launch-alignment constraints; see backup G.</p>
 
 <div class="source">Code reference: b266fe4c1d · amd_grouped_gemm_gfx1250_test.py · Pointer-table baseline also supports masked ragged shapes.</div>
 
 <!--
-1 min 50 sec after the divider. P is the persistent program count, not the number of output tiles.
+1 min. Define the mathematical workload and the packed TDM interface before discussing implementation choices.
 Group offsets locate rows of packed A and C; B has a separate dense weight tensor per group.
 The optimized path requires exact tile coverage. The pointer-table baseline supports different M/N/K with masks.
-Continue the program's linear tile sequence across group ranges.
+Empty groups are valid for the ordinary-workgroup path. The cluster validator requires equal positive M.
+For the selected square configuration BM=BN=256. The depth-2 hybrid needs an even K/128 of at least two.
 Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py
+-->
+
+---
+
+<!-- _class: kernel-design -->
+
+<div class="eyebrow">08 / Grouped GEMM · Kernel design</div>
+
+# Keep work and buffers on the WGP
+
+<p class="subtitle">256 × 256 × 128 tile · 4 Wave32 waves (128 threads) per workgroup</p>
+
+<div class="cols">
+<div class="panel"><h3>Persistent launch</h3><ul><li><strong>P workgroups total</strong> (reference: 32).<br>Program p takes tiles p, p + P, p + 2P…</li><li>Size P for available WGPs; cap by tile count. LDS permits <strong>one resident workgroup per WGP</strong> here.</li><li>Keep buffers across tiles; balance WGP coverage against tiles per program.</li></ul></div>
+<div class="panel"><h3>Pipeline and reuse</h3><ul><li><strong>Depth 2:</strong> two A + two B LDS slots<br>overlap TDM with compute; 256 KiB payload.</li><li><strong>Fused TDM:</strong> A = 0011, B = 1100.<br>Waves select descriptors at one load instruction.</li><li>Prefetch the next tile; two small C slots keep the input rings intact.</li></ul></div>
+</div>
+
+<div class="flow">GROUP_M = 4: reuse B · Optional 4-workgroup clusters: multicast A/B</div>
+
+<div class="source">Default P = min(output tiles, runtime multiprocessor count) · Assembly reference: P = 32 · P counts workgroups, including with clusters.</div>
+
+<!--
+1 min 50 sec. P is the physical workgroup count. The runtime default comes from multi_processor_count;
+do not equate that API name with the ISA's two-SIMD CU count without checking the device/runtime mapping.
+For this large tile, even the 256 KiB logical input rings exceed half the WGP's 320 KiB LDS budget.
+The checked hybrid build allocates 320,448 LDS bytes, so at most one such workgroup can reside per WGP.
+Use available WGP capacity as the launch-sizing guide; actual P is tunable and may be overridden.
+The assembly reference uses P=32; it is not an established device-wide optimum.
+More programs improve coverage until WGP capacity is covered; fewer leave more tiles per program for within-group prefetch.
+The hybrid needs more tiles per group than P to prefetch another tile within the same group.
+With clusters, P still counts workgroups: P/4 four-member clusters. P must be divisible by 16 and divide each group's tile count.
+Depth 3 would require 384 KiB for A/B payload alone. Depth 2 leaves room for the two 32-row C slots and layout overhead.
+Fused TDM selects positioned A or B descriptor fields by source wave and emits one tensor_load_to_lds instruction site.
+The 0011/1100 masks assign the four waves to A/B transfer portions; they are separate from multicast recipient masks.
+All four waves also compute; these are not dedicated producer waves. The fusion is a compiler/API operation, not an A+B ISA opcode.
+GROUP_M=4 orders M tiles first for B locality. Chunked program remapping and cluster sharing are covered later.
+Sources: grouped_gemm_tdm, _tdm_load_fused; TDMUtility.cpp::emitTDMLoadFused; assembly.md.
 -->
 
 ---
 
 <!-- _class: asm-detail pipeline-asm -->
 
-<div class="eyebrow">08 / Supply the matrix units</div>
+<div class="eyebrow">09 / Supply the matrix units</div>
 
 # Pipeline operands, bound their lifetimes
 
@@ -315,7 +355,7 @@ Compiler scheduling barriers bound whole dot regions outside this excerpt; they 
 
 ---
 
-<div class="eyebrow">09 / Cross tile boundaries</div>
+<div class="eyebrow">10 / Cross tile boundaries</div>
 
 # Use the tail to prime the next tile
 
@@ -341,7 +381,7 @@ The source option dedicated_c_buffer selects the square cross-group path, but it
 
 <!-- _class: asm-detail output-asm -->
 
-<div class="eyebrow">10 / Overlap output stores</div>
+<div class="eyebrow">11 / Overlap output stores</div>
 
 # Stage C in two small slots
 
@@ -381,7 +421,7 @@ The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.
 
 ---
 
-<div class="eyebrow">11 / Reuse data across workgroups</div>
+<div class="eyebrow">12 / Reuse data across workgroups</div>
 
 # A 2 × 2 sharing pattern
 
@@ -409,39 +449,8 @@ The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.
 3 min. The diagram is logical tile space, not physical GPU placement. The M rows are nonadjacent.
 The physical rank is the mask bit position: rank 0 is the least significant bit.
 Two-workgroup clusters share B only; four-workgroup clusters share A and B.
-Masks select recipients independently of the source wave masks on slide 8.
+Masks select recipients independently of the source wave masks on slide 9.
 Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
--->
-
----
-
-<!-- _class: efficiency -->
-
-<div class="eyebrow">12 / XDL efficiency</div>
-
-# What does each step recover?
-
-<p class="subtitle">Full-kernel matrix capacity used · same workload and normalization</p>
-
-| Variant | XDL efficiency | Δ vs. alias-C |
-| :--- | :---: | :---: |
-| Alias-C | TBD % | — |
-| Hybrid | TBD % | TBD pp |
-| Hybrid + remap | TBD % | TBD pp |
-| + cluster, multicast off | TBD % | TBD pp |
-| + multicast | TBD % | TBD pp |
-
-<p class="small"><strong>Draft placeholders.</strong> Reference: G=16, M=4096, N=4096, K=4096; P=TBD.<br>Compare multicast on/off at the same cluster size. Keep steady-loop efficiency separate.</p>
-
-<div class="source">Full-kernel scope includes startup, output stores, and tile/group transitions. pp = percentage points.</div>
-
-<!--
-3 min. No bars are drawn until the controlled results are available: lengths must not imply invented values.
-TODO XDL-RESULTS: fill five percentages and percentage-point deltas from a matching workload/program-count comparison.
-Choose and fix P across all variants. Cluster constraints require P divisible by 16 and dividing per-group tiles.
-Define efficiency as the fraction of available matrix-execution capacity used across the full kernel.
-Use the same observation scope and execution-unit normalization. Check correctness against torch.matmul.
-Other possible cases: G=8/32 large groups, or ordinary GEMM cubes 4096/8192/16384.
 -->
 
 ---
@@ -454,12 +463,12 @@ Other possible cases: G=8/32 large groups, or ordinary GEMM cubes 4096/8192/1638
 
 <div class="panel"><span class="number">01</span>Matrix issue, LDS delivery, global traffic,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;or tile-boundary overhead?</div>
 
-<div class="panel"><span class="number">02</span>Which controlled comparison explains<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;the XDL efficiency change?</div>
+<div class="panel"><span class="number">02</span>Which controlled comparison would tell us<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;which change addresses that gap?</div>
 
 <div class="flow">Data movement → buffer lifetime → instruction overlap → reuse</div>
 
 <!--
-3 min. Questions. A divider introduces nine backup slides outside the 30-minute main sequence.
+5 min. Questions. A divider introduces nine backup slides outside the 30-minute main sequence.
 Code reference b266fe4c1d. Chained-dot compiler changes reverted by 02a632587a are excluded from the story.
 -->
 
@@ -645,7 +654,7 @@ Keep the OOB qualification: arbitrary ordering is allowed, but does not guarante
 
 - Tile formats and scale layout affect the data path.
 - This case study uses **FP16 operands and output, FP32 accumulation**.
-- Keep that precision fixed across the XDL efficiency comparison.
+- Keep that precision fixed when comparing XDL efficiency.
 
 <div class="source">AMD architecture comparison · CDNA5 ISA §7.12.6 · No peak-throughput comparison in this deck.</div>
 

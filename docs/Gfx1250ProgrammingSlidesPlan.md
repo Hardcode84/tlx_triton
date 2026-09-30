@@ -5,7 +5,7 @@
 - Code reference: `gfx1250-kernels-2` at `b266fe4c1d`; selected optimization commits below.
 - ISA reference: AMD CDNA5 ISA Reference Guide, 27 July 2026; section numbers below refer to that edition.
 - Main bullets: slide content. Subbullets: speaker details and figures to prepare.
-- Performance results: XDL efficiency (%) and changes in percentage points; omit absolute execution time, throughput, and measured cycle counts. Collection details stay in preparation records, outside the slides and talk narrative.
+- The performance comparison slide is deferred; retain the data in preparation records. If restored, report XDL efficiency (%) and changes in percentage points; omit absolute execution time, throughput, and measured cycle counts. Collection details stay in preparation records, outside the slides and talk narrative.
 
 - **Part 1 — Architecture and changes from CDNA3/4 — 12 min.**
   - **1. Architecture comparison — 3 min.**
@@ -35,7 +35,7 @@
     - TDM descriptor `workgroup_mask` selects cluster ranks. Each recipient issues a matching tile request; source wave masks independently choose the issuing waves.
     - Two-member example: mask `0011` delivers the tile to ranks 0 and 1. Hardware combines matching requests; late requests can be served separately after timeout, so avoid unconditional traffic-reduction claims.
     - Before input refill, finish local LDS reads and synchronize local waves, then perform cluster arrival/wait. Cluster barrier ID `-3`: one wave per workgroup signals, all waves wait. Ordinary workgroup barrier ID is `-1`.
-    - Keep per-wave completion counters in backup A and partial output-store waits in slide 10. Slide 11 applies this architecture to the kernel's four-rank A/B sharing pattern.
+    - Keep per-wave completion counters in backup A and partial output-store waits in slide 11. Slide 12 applies this architecture to the kernel's four-rank A/B sharing pattern.
     - Visual: one global tile multicast into two separate LDS allocations, with matching requests and recipient mask labeled. Source: [CDNA5 ISA, §§2.3, 5.6.6, 10.7, 10.11.3](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
   - **5. Expert scheduling mode — 2 min.**
     - Expert mode 2 transfers selected VMEM/VALU hazard checks to compiler-inserted waits; it does not remove all hardware dependency checks.
@@ -46,17 +46,25 @@
     - Expert mode uses `SCHED_MODE[1:0]=2`. Separate bit `SCHED_MODE[2]` permits queued WMMAs followed by independent work; useful for the kernel's one-wave-per-SIMD schedule.
     - Visual: generated ISA with hazard waits and overlapped instructions. Sources: [CDNA5 ISA, §§5.7.2, 7.12.1](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), [LLVM wait insertion](https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html), [LLVM mode](https://llvm.org/docs/AMDGPUUsage.html#amdgpu-function-attributes), [backend defaults](../third_party/amd/backend/compiler.py).
 
-- **Part 2 — TLX grouped GEMM in this branch — 15 min.**
+- **Part 2 — TLX grouped GEMM in this branch — 13 min.**
   - **6. Divider — TLX grouped GEMM — 10 sec.**
-    - Brief transition from hardware mechanisms to pipelining, tile transitions, and input sharing; included in the first two minutes of this section.
-  - **7. Workload and baseline — 1 min 50 sec.**
+    - Brief transition from hardware mechanisms to pipelining, tile transitions, and input sharing.
+  - **7. Grouped GEMM: inputs and contract — 1 min.**
     - `C_g = A_g × B_gᵀ`; FP16 inputs/output, FP32 accumulation.
-    - Packed `A[ΣM_g,K]`, `B[G,N,K]`, `C[ΣM_g,N]`; `group_offsets[G+1]`; both inputs K-contiguous.
-    - Optimized path: full tiles; group M sizes may differ. Separate pointer-table baseline supports arbitrary group shapes with masks.
-    - Benchmark tile: `256×256×128`; four Wave32 waves; `GROUP_M=4` varies M first to reuse B.
-    - Persistent program handles tile `p`, then `p+P`, where P is the program count; continue across group ranges.
-    - Visual: packed groups → persistent programs → output tiles. Sources: [kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py), [configuration guide](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
-  - **8. Keep WMMA supplied — 2 min.**
+    - Packed `A[ΣM_g,K]`, `B[G,N,K]`, `C[ΣM_g,N]`; both inputs K-contiguous, output N-contiguous. Int32 `group_offsets[G+1]` are nondecreasing, starting at zero and ending at ΣM_g.
+    - Shared N/K; M_g may vary and empty groups are supported by the ordinary-workgroup path. Full tiles: M_g divisible by BM, N by BN, K by 128. Separate pointer-table baseline supports arbitrary group shapes with masks.
+    - The selected depth-2 hybrid requires even K/128 ≥ 2. Multicast additionally requires equal positive M and the regular-shape/launch constraints in backup G.
+    - Visual: packed tensor shapes next to interface constraints. Sources: [kernel](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py), [configuration guide](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+  - **8. Kernel design — 1 min 50 sec.**
+    - Tile `256×256×128`; four Wave32 waves (128 threads) per workgroup. All four waves load and compute.
+    - Launch P physical workgroups across all groups. Program p handles tiles p, p+P, p+2P, continuing across group ranges and retaining its buffers across tiles.
+    - Default P = min(total output tiles, runtime-reported multiprocessor count), with an explicit override. The assembly reference uses P=32; this is not an established optimum for other workloads or devices.
+    - LDS permits at most one such workgroup per WGP: 256 KiB of logical input rings already exceeds half the 320 KiB WGP budget; the checked hybrid allocation is 320,448 bytes. Size P for available WGPs and tile count, balancing parallel coverage against enough tiles/program for within-group prefetch. Do not equate the runtime's multiprocessor count with the ISA's CU count.
+    - Depth 2: two A and two B slots overlap input movement with compute. Depth 3 would need 384 KiB of input payload alone. Two small output slots preserve prefetched inputs.
+    - Fused TDM selects A/B descriptor fields by source wave (`0011`/`1100`) and emits one load instruction site. This compiler/API fusion differs from multicast across workgroups. Source: [TDM lowering](../third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.cpp), `emitTDMLoadFused`.
+    - `GROUP_M=4` orders M tiles first for B reuse; optional four-workgroup clusters share A/B inputs. P counts workgroups even with clusters; the implementation requires P divisible by 16 and dividing the per-group tile count.
+    - Visual: persistent launch and pipeline/reuse bullets. Subsequent slides explain the K loop, tile boundaries, output slots, and cluster mapping.
+  - **9. Keep WMMA supplied — 2 min.**
     - Two A slots and two B slots; producer selects `iteration % 2`.
     - Each K128 block becomes four K32 dot steps; load the next operand subtile before the current dot.
     - Fused A/B TDM loads use wave masks `3` and `12`; these differ from multicast recipient masks.
@@ -65,14 +73,14 @@
     - Keep output descriptor setup in the epilogue; avoid extra VGPR-MSB transitions in the steady loop.
     - Compiler-inserted waits and WMMA hazard spacing preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
     - Visual: TDM, LDS load, WMMA, scalar work. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **9. Cross tile boundaries — 3 min.**
+  - **10. Cross tile boundaries — 3 min.**
     - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
     - Require depth 2, even `K/128`, and at least two K blocks.
     - Benchmark hybrid prefetches within each group; the first tile of each group still needs initial loads.
     - Separate square cross-group path skips empty groups and carries four upcoming boundaries in scalar state; refill metadata in the preceding tile's tail.
     - Example: `M=2048,N=1024,P=32` gives one tile/program/group; cross-group prefetch is needed. With `M=4096`, each program has two tiles/group.
     - Visual: last two K blocks → next tile; label within-group and cross-group paths separately. Commits: `a050699ba1`, `42925e81b1`; [schedule description](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
-  - **10. Overlap output stores — 2 min.**
+  - **11. Overlap output stores — 2 min.**
     - Input rings: `2 × (256×128 + 256×128) × 2 B = 256 KiB`.
     - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.
     - Hybrid: eight 32-row chunks; two `32×256` FP16 output slots add 32 KiB; total logical payload 288 KiB, before layout overhead.
@@ -80,25 +88,17 @@
     - Convert and store one chunk at a time; TDM's per-wave load/store completion order lets the wait retire the older store before its slot is reused while the newest store may remain in flight. Cross-wave access also requires workgroup synchronization.
     - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
     - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **11. Reuse data across workgroups — 3 min.**
+  - **12. Reuse data across workgroups — 3 min.**
     - Chunked program remapping groups logical work for locality; cluster configuration uses eight logical XCDs and chunk size two.
     - Two workgroups share B; four share A and B. Each recipient issues a matching TDM request.
     - Four-rank A masks: `0101/1010`; B masks: `0011/1100`; each transfer has two recipients.
     - Example: physical IDs `0,1,2,3` → logical IDs `0,2,4,6` → tile coordinates `(0,0),(2,0),(0,1),(2,1)` with `GROUP_M=4`.
     - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **12. XDL efficiency at each step — 3 min.**
-    - Show XDL efficiency: the fraction of available matrix-execution capacity used over the full kernel, expressed as a percentage. Report improvements in percentage points.
-    - Compare alias-C → hybrid → remap → cluster without multicast → multicast; keep shape, program count, and metric definition fixed.
-    - Use the same cluster size with multicast disabled to isolate sharing from synchronization cost.
-    - Keep the observation interval and execution-unit normalization consistent. Full-kernel efficiency includes startup, output stores, and tile/group transitions; show steady-loop efficiency separately if needed.
-    - Check against `torch.matmul`; inspect LDS allocation, VGPR count, TDM loads, and eight hybrid TDM output stores.
-    - Cases: reference `(G,M,N,K)=(16,4096,4096,4096)`; large groups `G=8/32`; ordinary GEMM cubes `4096/8192/16384`.
-    - Visual: XDL efficiency (%) chart with one row per variant and percentage-point changes from the baseline. Label the workload and full-kernel scope; explain changes through the pipeline diagrams. Populate bars from the controlled comparison in the preparation records. Sources for workload configurations: [runner](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py), [benchmark controls](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 
-- **13. Questions — 3 min.**
+- **13. Questions — 5 min.**
   - Which resource limits the selected shape: matrix issue, LDS delivery, global traffic, or tile-boundary overhead?
-  - Which comparison separates the XDL efficiency gain from extra synchronization or a changed launch configuration?
+  - Which controlled comparison would tell us which change addresses that gap?
 
 - **14. Divider — Backup.**
   - Marks the end of the main talk; nine optional technical references follow outside the 30-minute schedule.
@@ -137,7 +137,7 @@
   - Padding and multicast apply to loads; stores do not remove LDS padding. Source: [CDNA5 ISA, §10.11.3](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf).
 - **Backup — Precision and scaling.**
   - CDNA4 adds FP4/FP6 and OCP microscaling; CDNA5 extends scaling with 16/32-element blocks and fractional FP4 scales.
-  - Discuss supported formats and scaling behavior; omit peak-throughput figures. The efficiency comparison uses the FP16 kernel throughout. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
+  - Discuss supported formats and scaling behavior; omit peak-throughput figures. The kernel example uses FP16 inputs/output and FP32 accumulation throughout. Source: [AMD architecture comparison](https://www.amd.com/en/technologies/cdna.html).
 - **Backup — Cluster contract and native API.**
   - Require `256×256×128`, depth 2, `GROUP_M=4`, hybrid prefetch; no L2 prefetch, dedicated C staging, or auto configuration.
   - Equal positive M, divisible by 1024; N divisible by 512; P divisible by 16 and dividing each group's tile count.
@@ -155,11 +155,12 @@
   - Retain the CDNA4 M0 hazard delay and per-wave completion waits. Other-wave consumers require synchronization.
   - These per-lane copies are separate from TDM's SGPR tile descriptors. Both bypass payload VGPRs; the grouped GEMM uses TDM. Sources: [CDNA5 ISA, §10.8](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf), LLVM gfx950 LDS codegen tests, and [assembly preparation records](gfx1250-slides/assembly.md).
 - **Preparation and evidence — internal notes, outside the presentation.**
-  - Capture ISA excerpts, timelines, LDS map, and the controlled XDL efficiency chart; retain raw results and correctness checks.
-  - Collect the five variants on slide 12 with the same workload, program count, and collection method; change execution settings only for the intended optimization or cluster control. Simulator XDL efficiency is accepted evidence for this chart; hardware timing is not a prerequisite. Keep collection mechanics and simulator details out of the slides and talk narrative, and label the chart simply as XDL efficiency (%).
-  - Record source and tool/model revisions, flags, metric field, observation interval, execution-unit normalization, and raw reports in preparation records. Use `100 × xdl_util_e2e` for full-kernel percentages after confirming its scope and denominator; report differences in percentage points. Keep steady-state or active-unit-only metrics separate.
+  - [XDL efficiency collection](gfx1250-slides/efficiency.md): retained five-variant steady-state comparison and reproduction details. The comparison slide is deferred; preserve the measured data, raw artifacts, correctness checks, and collection script.
+  - Capture ISA excerpts, timelines, and the LDS map. Keep the controlled XDL efficiency comparison in preparation records until its slide is restored.
+  - The deferred comparison covers alias-C, hybrid, hybrid + remap, cluster without multicast, and multicast on the same workload with the same program count and collection method. Alias-C leads at 74.7%; multicast recovers 2.1 pp versus its matching cluster control. The diagnostic workload is (G,M,N,K)=(2,4096,1024,2048), P=32; the larger (16,4096,4096,4096) benchmark remains a separate workload. Simulator XDL efficiency is accepted evidence if the chart returns; hardware timing is not a prerequisite. Keep collection mechanics and simulator details out of the slides and talk narrative, and label any restored chart simply as XDL efficiency (%).
+  - Record source and tool/model revisions, flags, metric field, observation interval, execution-unit normalization, and raw reports in preparation records. Use `100 × xdl_steady_state_all_cu` from the official report for the requested steady-state comparison. The r8.05 calculation excludes the first and last nonzero WMMA sample rows and averages all execution-unit columns; internal tile/group transitions stay in the window. Keep active-unit-only and whole-kernel metrics separate. Never substitute peak per-sample `XDL_UTIL_E2E` values.
   - Historical diagnostic evidence: `../am-runs/grouped_gemm_native_multicast_20260924/validation-summary.log` records `xdl_util_e2e` for `(G,M,N,K)=(2,2048,1024,2048)`, P=16, cluster size 4. It is one configuration, not the five-variant comparison; retain that workload label if the point is used.
   - Historical resource evidence: the local, untracked artifact `../am-runs/grouped_gemm_native_multicast_20260924/compiled/results.json` (paths relative to the repository root) records all 12 benchmark configurations with 320,448 LDS bytes, 886–890 VGPRs, and zero private-segment bytes. These are saved compiler results requiring fresh verification for `b266fe4c1d`.
-  - Fresh assembly preparation on 29 September 2026 compiled the square hybrid reference with matching local components: 320,448 shared bytes, 886 VGPRs, 104 SGPRs, zero private bytes, and eight static TDM stores. [Assembly records](gfx1250-slides/assembly.md) retain the configuration, revisions, hashes, and excerpt boundaries. The smaller-tile resource comparison and XDL results still need separate preparation.
+  - Fresh assembly preparation on 29 September 2026 compiled the square hybrid reference with matching local components: 320,448 shared bytes, 886 VGPRs, 104 SGPRs, zero private bytes, and eight static TDM stores. [Assembly records](gfx1250-slides/assembly.md) retain the configuration, revisions, hashes, and excerpt boundaries. The smaller-tile resource comparison still needs separate preparation; the 30 September steady-state XDL comparison is recorded in [efficiency.md](gfx1250-slides/efficiency.md).
   - Baseline port: `f3857b2641`. Chained-dot compiler changes were reverted by `02a632587a`; exclude them from optimization claims.
-  - Use AMD publications for architecture context; the talk's quantitative results are the selected kernel's XDL efficiency percentages. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
+  - Use AMD publications for architecture context; keep the selected kernel's XDL efficiency results in preparation records while the comparison slide is deferred. Context: [AMD CDNA5 overview](https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html).
