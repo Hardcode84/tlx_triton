@@ -11,26 +11,16 @@ windows, delivery cues, and optional backup explanations.
 
 ## Build locally
 
-Requires Node.js 20+ and npm. No global npm packages are required.
+Requires Bun 1.3+ and Firefox. Use Bun for dependencies and export.
 
 ```bash
 cd docs/gfx1250-slides
-npm ci
-npm run browser:install
-npm run build
+bun install --frozen-lockfile
+bun run build
 ```
 
-The browser command downloads a pinned Chrome Headless Shell into this directory's
-`.cache/browser/`. Skip it if a supported browser is already installed; set
-`CHROME_PATH` to select an executable explicitly. Browser system libraries must
-be available on the host.
-
-On hosts that disable unprivileged browser sandboxes (including the draft build
-host), export this trusted local deck with:
-
-```bash
-CHROME_NO_SANDBOX=1 npm run build
-```
+The build uses the installed Firefox. It creates a temporary browser profile
+under the home directory and removes it when the build exits.
 
 Outputs:
 
@@ -46,10 +36,10 @@ Both exports embed the SVG diagrams and can be moved as standalone files.
 - `transcript.md`: full spoken script for the main talk and all backup slides.
 - `theme.css`: typography, colors, layout, and placeholder styling.
 - `assets/*.svg`: editable diagrams; pipeline diagrams are schematic.
-- `package.json` and `package-lock.json`: pinned local build dependencies.
+- `package.json` and `bun.lock`: pinned local build dependencies.
 
 In the Marp VS Code extension, enable HTML and select `theme.css` as a custom
-theme. Alternatively, `npm run preview` opens the CLI preview when a full browser
+theme. Alternatively, `bun run preview` opens the CLI preview when a full browser
 is available.
 
 All assembly panels are filled and assembler-checked. Slides 3, 4, 6, 10, and 12 use

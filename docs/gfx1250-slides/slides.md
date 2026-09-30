@@ -297,7 +297,7 @@ Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1
 <p class="subtitle">256 × 256 × 128 tile · 4 Wave32 waves (128 threads) per workgroup</p>
 
 <div class="cols">
-<div class="panel"><h3>Persistent launch</h3><ul><li><strong>P workgroups total</strong> (reference: 32).<br>Program p takes tiles p, p + P, p + 2P…</li><li>Size P for available WGPs; cap by tile count. LDS permits <strong>one resident workgroup per WGP</strong> here.</li><li>Keep buffers across tiles; balance WGP coverage against tiles per program.</li></ul></div>
+<div class="panel"><h3>Persistent launch</h3><ul><li><strong>P workgroups total</strong> (reference: 32).<br>After remapping, logical program p takes tiles p, p + P, p + 2P…</li><li>Size P for available WGPs; cap by tile count. LDS permits <strong>one resident workgroup per WGP</strong> here.</li><li>Keep buffers across tiles; balance WGP coverage against tiles per program.</li></ul></div>
 <div class="panel"><h3>Pipeline and reuse</h3><ul><li><strong>Depth 2:</strong> two A + two B LDS slots<br>overlap TDM with compute; 256 KiB payload.</li><li><strong>Fused TDM:</strong> A = 0011, B = 1100.<br>Waves select descriptors at one load instruction.</li><li>Prefetch the next tile; two small C slots keep the input rings intact.</li></ul></div>
 </div>
 

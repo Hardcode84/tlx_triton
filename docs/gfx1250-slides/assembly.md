@@ -3,6 +3,7 @@
 The deck's ten assembly blocks were checked with `llvm-mc` for their stated
 targets on 29 September 2026. Slides 3, 4, 6, 10, and 12 use freshly generated grouped
 GEMM assembly. Backups B/D/I use handwritten ISA examples.
+All ten blocks were rechecked with `llvm-mc` on 30 September 2026 during PDF regeneration.
 Generated excerpts retain instruction order and operands; debug directives and
 compiler comments showing physical registers are removed. Omissions are marked.
 These windows assume the surrounding kernel's register state, memory allocations,
@@ -87,7 +88,7 @@ writes. Its scalar add prepares the other slot's descriptor state.
 - LLVM `llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp` and
   `llvm/test/CodeGen/AMDGPU/expert_scheduling_gfx1250.mir`: expert-mode waits.
 - [Current grouped kernel](../../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py):
-  `_tdm_dot_k_block`, `_tdm_wait_and_finish_k_block`, and hybrid C staging.
+  `_tdm_accumulate_subtiles`, `_tdm_wait_and_finish_k_block`, and hybrid C staging.
 
 Each fenced `asm` block in `slides.md` was assembled independently with:
 

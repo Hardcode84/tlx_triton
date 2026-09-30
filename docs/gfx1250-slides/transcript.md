@@ -242,7 +242,7 @@ Multicast adds equal positive M and the launch constraints in backup G.
 The output tile is 256 by 256, with K blocks of 128. Four Wave32 waves,
 or 128 threads, cooperate in each workgroup.
 
-P counts workgroups across all groups. Program p takes tiles p, p plus P,
+P counts workgroups across all groups. After remapping, logical program p takes tiles p, p plus P,
 and so on, retaining buffers and preparing the next tile in the current tail.
 
 The wrapper starts P from the runtime’s multiprocessor count,
@@ -729,7 +729,7 @@ operands still occupy registers. These are illustrative sequences with valid
 allocations and ready addresses; consumers in other waves also require a
 synchronization handoff.
 
-The grouped kernel uses the TDM path from slide three. TDM receives scalar
+The grouped kernel uses the TDM path from slide four. TDM receives scalar
 descriptors describing a whole tile, including global and LDS placement, and
 ignores EXEC. These direct copies instead operate on per-lane addresses.
 
