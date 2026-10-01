@@ -318,44 +318,30 @@ Sources: grouped_gemm_tdm, _tdm_load_fused; TDMUtility.cpp::emitTDMLoadFused; as
 -->
 ---
 
-<!-- _class: asm-detail pipeline-asm -->
+<!-- _class: operand-schedule -->
 
 <div class="eyebrow">10 / Supply the matrix units</div>
 
-# Pipeline operands, bound their lifetimes
+# Pipeline operands through the K loop
 
-<img class="diagram" src="assets/operand-pipeline.svg" alt="Two A/B ring slots alternate. Each K128 block has four K32 dots; the next operand subtile is loaded before the current dot." />
+<img class="diagram" src="assets/operand-pipeline.svg" alt="Four scheduling regions per K128 block: load the next K32 subtile, compute the current dot, then apply a compiler scheduling barrier. After region 2, refill the released slot with block i+2. Region 3 waits for block i+1 and loads its first subtile." />
 
-- **Two A + two B ring slots**; issuing waves: A = **0011**, B = **1100**.
-- Bound dot lifetimes with `amd_sched_barrier()`; overlap LDS loads and WMMAs.
+- Inside each region, LDS loads can interleave with the current dot’s WMMAs.
+- Refill after all slot readers finish; wait and synchronize before reading new data.
 
-```asm
-s_set_vgpr_msb 0x825a
-s_wait_dscnt 0x18
-v_wmma_f32_16x16x32_f16 v[178:185], v[18:25], v[130:137], v[178:185]
-s_set_vgpr_msb 0x5a82
-ds_load_b128 v[138:141], v251 offset:60992
-ds_load_b128 v[142:145], v251 offset:61024
-s_set_vgpr_msb 0x825a
-s_wait_dscnt 0x18
-v_wmma_f32_16x16x32_f16 v[162:169], v[82:89], v[130:137], v[162:169]
-```
-
-<div class="source">Generated steady K-loop excerpt · cafe4379f3 / f66d3fc00c · Issuing-wave masks differ from multicast recipient masks.</div>
+<div class="source">Square hybrid steady loop · source-order schematic, not cycle timing · _tdm_accumulate_subtiles / _tdm_wait_and_finish_k_block</div>
 
 <!--
-2 min. Each K128 block becomes four K32 tl.dot steps, each expanded to multiple WMMA instructions.
-The diagram is a dependency schematic, not a cycle-accurate schedule.
-Keep output descriptor updates in the epilogue to avoid extra VGPR-MSB transitions in the steady loop.
-Before LDS consumption, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all local LDS readers finish; multicast adds the cluster handoff on slide 5.
-The source-level scheduling barrier constrains scheduling; it is not a workgroup synchronization barrier.
-Contiguous instructions from the inner K loop, with debug directives and physical-register comments removed; see assembly.md.
-Only the low byte of each S_SET_VGPR_MSB immediate controls selection; the compiler also prints the prior setting in the high byte.
-0x5a selects dst/src2=1, src0/src1=2; 0x82 selects dst=2, src0=2, src1/src2=0.
-The LDS loads fill physical v650–657 using address v763. Neither adjacent WMMA reads those registers.
-The waits to 0x18 (24 outstanding DS operations) depend on the complete load queue outside this window; do not reuse the count in isolation.
-Compiler scheduling barriers bound whole dot regions outside this excerpt; they emit no hardware barrier instruction.
+2 min. Two A/B ring slots; one phase consumes K128 block i, with four K32 dots.
+The square hybrid has two statically unrolled phases per chunk. This diagram shows one phase; the final two K blocks are peeled on slide 11.
+Subtile 0 is already in VGPRs at entry. Regions 0–2 load subtiles 1–3 before dots 0–2, respectively; each dot ends with amd_sched_barrier().
+After region 2 all current-block operands have been read. Complete the reader handoff before TDM overwrites slot i % 2 with block i+2. Multicast also needs the cluster handoff.
+Region 3 waits for block i+1 in the other slot, loads its subtile 0, then computes dot 3 from current-block operands already in VGPRs; another scheduling barrier ends the phase.
+Each dot expands to multiple WMMA instructions. The compiler can interleave independent LDS loads with WMMAs inside a region; the drawing does not prescribe issue cycles.
+amd_sched_barrier() constrains compiler motion and operand lifetimes; it emits no hardware barrier. TDM/DS completion waits and workgroup handoffs remain separate.
+Generated assembly and its partial DS-wait context remain in assembly.md.
 -->
+
 ---
 
 <div class="eyebrow">11 / Cross tile boundaries</div>

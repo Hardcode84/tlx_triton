@@ -68,15 +68,16 @@
     - Fused TDM selects A/B descriptor fields by source wave (`0011`/`1100`) and emits one load instruction site. This compiler/API fusion differs from multicast across workgroups. Source: [TDM lowering](../third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.cpp), `emitTDMLoadFused`.
     - `GROUP_M=4` orders M tiles first for B reuse; optional four-workgroup clusters share A/B inputs. P counts workgroups even with clusters; the implementation requires P divisible by 16 and dividing the per-group tile count.
     - Visual: persistent launch and pipeline/reuse bullets. Subsequent slides explain the K loop, tile boundaries, output slots, and cluster mapping.
-  - **10. Keep WMMA supplied — 2 min.**
+  - **10. Pipeline operands through the K loop — 2 min.**
     - Two A slots and two B slots; producer selects `iteration % 2`.
-    - Each K128 block becomes four K32 dot steps; load the next operand subtile before the current dot.
+    - Square hybrid: two K128 phases per loop chunk. Each phase has four K32 dots; load the next operand subtile before the current dot.
+    - After dot 2 and its scheduling barrier, release slot `i % 2` and issue TDM for block `i+2`. Wait for block `i+1`, load its subtile 0, then finish dot 3 of block `i`.
     - Fused A/B TDM loads use wave masks `3` and `12`; these differ from multicast recipient masks.
     - Before consuming an input slot, issuing waves wait for TDM completion and synchronize local consumers. Before refill, all LDS readers must finish; multicast adds the cluster handoff introduced on slide 5.
     - `amd_sched_barrier()` bounds operand lifetimes between dots; retain useful load/dot overlap.
     - Keep output descriptor setup in the epilogue; avoid extra VGPR-MSB transitions in the steady loop.
     - Compiler-inserted waits and WMMA hazard spacing preserve dependencies; `amd_set_wave_sched_mode(1, offset=2, width=1)` permits WMMA queuing.
-    - Visual: TDM, LDS load, WMMA, scalar work. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
+    - Visual: four scheduling regions with TDM, LDS-read, and WMMA rows; mark a compiler scheduling barrier after every dot. Source-order schematic; omit the assembly excerpt. Commits: `cafe4379f3`, `f66d3fc00c`; [kernel helpers](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
   - **11. Cross tile boundaries — 3 min.**
     - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
     - Require depth 2, even `K/128`, and at least two K blocks.

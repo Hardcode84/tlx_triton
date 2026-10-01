@@ -130,3 +130,7 @@ section.cluster-contract table { margin: 8px 0; }
 section.cluster-contract th, section.cluster-contract td { padding: 5px 14px; }
 section.cluster-contract li { margin: 5px 0; }
 section.cluster-contract p { margin: 6px 0; }
+
+section.operand-schedule h1 { margin-bottom: 12px; }
+section.operand-schedule .diagram { height: 370px; object-fit: contain; }
+section.operand-schedule li { font-size: 22px; margin: 6px 0; }

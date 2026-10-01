@@ -46,11 +46,13 @@
   - Two A + two B slots: 256 KiB payload; third input stage would exceed LDS capacity.
   - Fused TDM: waves 0–1 load A (`0011`), 2–3 load B (`1100`); one instruction site, all waves also compute.
   - More programs expose parallel work; fewer leave more tiles/program for prefetch.
-- **10 · Operand pipeline — 15:00–17:00**
-  - TDM → LDS rings; LDS → VGPR subtiles → WMMA.
-  - K128 becomes four K32 dots; each dot expands into multiple WMMAs.
-  - Trace WMMA → independent LDS loads → WMMA; track MSB changes.
-  - `amd_sched_barrier()` bounds lifetimes; it is a compiler constraint, not workgroup synchronization.
+- **10 · K-loop operand pipeline — 15:00–17:00**
+  - Square hybrid: two K128 phases/chunk; four K32 dots/phase; each dot expands to WMMAs.
+  - Subtile 0 ready at entry; regions 0–2 load subtiles 1–3 and compute dots 0–2.
+  - `amd_sched_barrier()` after each dot; LDS/WMMA can interleave inside each region.
+  - After region 2: release slot i%2; issue TDM for block i+2.
+  - Region 3: wait/handoff for i+1; load its subtile 0; finish dot 3 of i; scheduling barrier.
+  - Compiler boundaries emit no hardware barrier; completion waits and reader handoffs remain separate.
 - **11 · Tile transitions — 17:00–20:00**
   - Peel final two K iterations; released slots receive next-tile K0/K1.
   - Hybrid: within-group prefetch; first tile/group needs priming.

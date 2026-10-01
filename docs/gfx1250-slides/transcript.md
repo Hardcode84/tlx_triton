@@ -276,41 +276,41 @@ We also stage output in two small slots, vary M first with GROUP_M equal to four
 and optionally share inputs across four-workgroup clusters. Let’s look inside
 that pipeline.
 
-## Slide 10 — Pipeline operands, bound their lifetimes
+## Slide 10 — Pipeline operands through the K loop
 
 *15:00–17:00 · 2 minutes*
 
-There are two levels of pipelining here. At the outer level, TDM feeds two A
-slots and two B slots in LDS. At the inner level, we load operand subtiles from
-LDS into registers and feed the WMMAs.
+The square hybrid steady loop groups two K128 phases in each chunk. The diagram
+expands one phase, for block i. The final two blocks use the peeled tail on the
+next slide. Each phase has four K32 dots, each of which expands to multiple WMMAs.
 
-Each K block is 128 elements deep. We process it as four K32 dot steps, loading
-the next operand subtile ahead of the current dot. Each source-level dot expands
-into multiple matrix instructions for the larger output tile.
+At entry, subtile zero is already in VGPRs. Block i occupies LDS slot i modulo
+two, and block i+1 was issued earlier into the other slot.
 
-The fused TDM loads use issuing-wave masks `0011` for A and `1100` for B. These
-masks distribute issuing work among the four waves. The multicast recipient
-masks we just discussed are a separate choice across workgroups.
+*[Follow regions zero through two, from left to right.]*
 
-*[Follow the first WMMA, the two LDS loads, and the second WMMA.]*
+Load subtile one from LDS, then compute dot zero. Load subtile two, then compute
+dot one. Load subtile three, then compute dot two. Each pair forms a scheduling
+region that ends with `amd_sched_barrier()`. Within that region, the compiler
+can interleave the independent LDS loads with WMMAs for the current dot.
 
-The assembly shows the inner pipeline directly. Between two WMMAs, we change
-the VGPR MSB settings and load two more pieces from LDS. Those loads write
-registers that neither adjacent WMMA reads, which gives the schedule independent
-memory work to overlap with matrix execution.
+*[Point to the TDM box before region three's LDS read.]*
 
-The DS waits protect the operands that each WMMA does consume. The value
-`0x18` comes from the full queue of earlier LDS operations. It depends on more
-than the two loads visible in this small window.
+All operands for block i have now been read from LDS. After the readers finish
+and complete the handoff, TDM can overwrite that slot with block i+2. With
+multicast, this also requires the cluster handoff. Dot three still has its
+operands in VGPRs.
 
-We also bound operand lifetimes at dot boundaries with `amd_sched_barrier()`.
-That lets us retain useful overlap without allowing unrelated work to extend
-register lifetimes throughout the loop. It is a compiler scheduling constraint;
-the TDM completion waits and workgroup handoffs are handled separately.
+Wait for block i+1 in the other slot, load its subtile zero, and finish dot three
+of block i. A fourth scheduling barrier ends the phase. The next phase starts
+with its first operands already in registers, and the same pattern repeats.
 
-That organizes the steady K loop. But a persistent kernel also has to move from
-one output tile to the next without repeatedly emptying and restarting its
-input pipeline.
+The dashed lines are compiler scheduling boundaries. They limit instruction
+motion and operand lifetimes; they emit no hardware barrier. Completion waits
+and synchronization between waves are separate. This is a source-order diagram,
+not a claim about exact instruction issue cycles or transfer duration.
+
+The next slide shows how the last two phases prepare another output tile.
 
 ## Slide 11 — Use the tail to prime the next tile
 
