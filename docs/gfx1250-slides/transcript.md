@@ -326,20 +326,16 @@ we can refill it with K0 or K1 of the next tile assigned to this persistent
 program. Matrix work on the current tile can continue using the operands already
 in registers.
 
-*[Trace the released slots into K0 and K1 of the next tile.]*
+*[Trace time from left to right. Point to the TDM transfers below the remaining WMMA work.]*
 
-There are two implementations on this slide, with different behavior at group
-boundaries.
+The blue blocks show work for the current tile. The green blocks show transfers
+for the next tile. Release means that all readers have copied the operands to
+VGPRs and completed the handoff. The diagram shows overlap opportunities, not
+measured durations. At the next tile, wait for each prefetched block before use.
 
-The hybrid path on the left prefetches the next tile within the same group.
-Its first tile in each group still needs initial priming. Once the program has
-another tile in that group, the preceding tile’s tail can provide its first
-two K blocks.
-
-The separate cross-group path on the right also prepares work across group
-boundaries. It carries four upcoming boundaries in scalar state, skips empty
-groups, and refills that metadata in the preceding tile’s tail. Its output
-uses vector stores so that the input rings remain available for prefetched data.
+This hybrid path prefetches within the same group. Its first tile in each group
+still needs initial loads. Later tiles can receive their first two K blocks from
+the preceding tile’s tail. Backup G describes the separate cross-group path.
 
 The amount of useful prefetch depends on the tile sequence assigned to each
 program. With M equal to 2,048 and N equal to 1,024, there are 32 of these square
@@ -762,6 +758,12 @@ These restrictions describe this implementation. The architectural cluster
 mechanism supports a broader set of programs. To extend this kernel to less
 regular shapes, I would first establish how every member follows the correct
 request and barrier sequence at tile and group boundaries.
+
+The separate cross-group path prepares work across group boundaries. It carries
+four upcoming boundaries in scalar state, skips empty groups, and refills that
+metadata in the preceding tile’s tail. Its output uses vector stores so the input
+rings remain available for prefetched data. This is separate from the within-group
+hybrid path required by the cluster configuration above.
 
 ## Slide 25 / Backup H — Smaller tiles can expose more parallel work
 

@@ -124,3 +124,9 @@ section.barrier-backup table { font-size: 19px; }
 section.barrier-backup th, section.barrier-backup td { padding: 8px 12px; }
 section.barrier-backup li { font-size: 21px; margin: 7px 0; }
 section.barrier-backup .flow { font-size: 21px; margin-top: 10px; padding: 12px; }
+
+section.cluster-contract h1 { margin-bottom: 12px; }
+section.cluster-contract table { margin: 8px 0; }
+section.cluster-contract th, section.cluster-contract td { padding: 5px 14px; }
+section.cluster-contract li { margin: 5px 0; }
+section.cluster-contract p { margin: 6px 0; }

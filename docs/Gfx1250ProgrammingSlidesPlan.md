@@ -81,9 +81,9 @@
     - Prime K0/K1; peel the final two K iterations; refill released input slots with the next tile's K0/K1.
     - Require depth 2, even `K/128`, and at least two K blocks.
     - Benchmark hybrid prefetches within each group; the first tile of each group still needs initial loads.
-    - Separate square cross-group path skips empty groups and carries four upcoming boundaries in scalar state; refill metadata in the preceding tile's tail.
+    - Move separate cross-group path details to backup G; keep this slide on within-group prefetch.
     - Example: `M=2048,N=1024,P=32` gives one tile/program/group; cross-group prefetch is needed. With `M=4096`, each program has two tiles/group.
-    - Visual: last two K blocks → next tile; label within-group and cross-group paths separately. Commits: `a050699ba1`, `42925e81b1`; [schedule description](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+    - Visual: compute and two LDS-slot timelines; show release, overlapping next-tile transfers, and completion waits before use. Commits: `a050699ba1`, `42925e81b1`; [schedule description](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
   - **12. Overlap output stores — 2 min.**
     - Input rings: `2 × (256×128 + 256×128) × 2 B = 256 KiB`.
     - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.

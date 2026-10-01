@@ -54,7 +54,7 @@
 - **11 · Tile transitions — 17:00–20:00**
   - Peel final two K iterations; released slots receive next-tile K0/K1.
   - Hybrid: within-group prefetch; first tile/group needs priming.
-  - Cross-group path: four upcoming boundaries, skip empty groups, vector C stores.
+  - Timeline: overlap next-tile TDM with remaining WMMA; wait for prefetched data before use.
   - M=2048, N=1024, P=32: one tile/program/group; M=4096: two.
   - No next tile in the group means no within-group prefetch opportunity.
 - **12 · Output staging — 20:00–22:00**
@@ -120,6 +120,7 @@
   - Equal positive M; M%1024=0; N%512=0; P%16=0; group tile count divisible by P.
   - Physical workgroup count; benchmark cluster=4, general wrapper=1.
   - No dedicated C, L2 prefetch, or auto configuration; these are kernel restrictions.
+  - Separate cross-group path: four upcoming boundaries; skip empty groups; refill metadata in the preceding tail; vector C stores.
 - **25 / H · Small M — optional, ~1½ min**
   - Smaller M tiles expose more work; asymmetric prefetch still needs tiles/group > P.
   - Square hybrid payload 288 KiB; 128×256 alternative: 192 KiB inputs + 64 KiB C.

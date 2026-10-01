@@ -362,20 +362,18 @@ Compiler scheduling barriers bound whole dot regions outside this excerpt; they 
 
 # Use the tail to prime the next tile
 
-<img class="diagram" src="assets/tile-boundary.svg" alt="After consuming the last two K blocks, refill their released slots with K0 and K1 of the next tile." />
+<img class="diagram" src="assets/tile-boundary.svg" alt="Timeline: release each LDS slot after all operand reads, then overlap next-tile TDM loads with remaining current-tile computation. Wait for prefetched data before use." />
 
-<div class="cols">
-<div class="panel"><h3>Hybrid · within one group</h3><p>Peel the final two K iterations.</p><p>Refill released slots with the next tile's K0 / K1.</p><p class="small">First tile in each group still needs priming.</p></div>
-<div class="panel"><h3>Separate cross-group path</h3><p>Carry four upcoming boundaries.</p><p>Skip empty groups; refill metadata in the preceding tile's tail.</p><p class="small">Vector output stores preserve the input rings.</p></div>
-</div>
+<div class="flow">After operands reach VGPRs, reuse their LDS slot while computation continues.</div>
 
-<p class="small">Depth 2 · even K / 128 · at least two K blocks</p>
+<p class="small">Within one group; first tile requires initial loads.<br>Depth 2 · even K / 128 · at least two K blocks · a next tile in the group</p>
 
 <div class="source">a050699ba1 · 42925e81b1 · M=2048, N=1024, P=32: one tile/program/group; M=4096: two.</div>
 
 <!--
 3 min. The tail recycles a slot only after current-tile operands have been read into registers.
-The production hybrid does not prefetch across group boundaries. Do not attribute the cross-group schedule to it.
+The timeline shows overlap opportunities, not measured durations or guaranteed transfer completion at the tile boundary. Wait for each prefetched block before use.
+The production hybrid does not prefetch across group boundaries. The separate cross-group path is described in backup G.
 At one tile/program/group, within-group prefetch has no following tile to target.
 The source option dedicated_c_buffer selects the square cross-group path, but its output uses vector stores.
 -->
@@ -762,7 +760,7 @@ Source: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/inst
 -->
 ---
 
-<!-- _class: compact cluster -->
+<!-- _class: compact cluster cluster-contract -->
 
 <div class="eyebrow">Backup G / Cluster contract</div>
 
@@ -782,6 +780,8 @@ Source: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/inst
 - Grid and P count physical workgroups; one output tile per workgroup.
 - Native fused-load masks + `tlx.cluster_barrier()` protect refills.
 - Benchmark default: four-workgroup clusters. General wrapper: one.
+
+<p class="small"><strong>Separate cross-group path:</strong> carry four upcoming boundaries; skip empty groups; refill metadata in the preceding tile’s tail. Vector C stores preserve input rings.</p>
 
 <div class="source">f676cb6304 · b266fe4c1d · README and API tests for amd_grouped_gemm_gfx1250.</div>
 
