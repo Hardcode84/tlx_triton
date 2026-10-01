@@ -681,7 +681,6 @@ Keep the OOB qualification: arbitrary ordering is allowed, but does not guarante
 
 - Tile formats and scale layout affect the data path.
 - This case study uses **FP16 operands and output, FP32 accumulation**.
-- Keep that precision fixed when comparing XDL efficiency.
 
 <div class="source">AMD architecture comparison · CDNA5 ISA §7.12.6 · No peak-throughput comparison in this deck.</div>
 
