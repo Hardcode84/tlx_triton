@@ -3,10 +3,10 @@
   <g font-family="DejaVu Sans, sans-serif" font-size="20">
     <text x="0" y="66" fill="#172c40">Full C staging</text><text x="0" y="146" fill="#172c40">Hybrid staging</text>
     <rect x="240" y="30" width="512" height="58" rx="6" fill="#dcefea"/><rect x="752" y="30" width="256" height="58" rx="6" fill="#f5dedd"/>
-    <rect x="240" y="110" width="512" height="58" rx="6" fill="#dcefea"/><rect x="752" y="110" width="64" height="58" rx="6" fill="#e0eaf9"/>
-    <g text-anchor="middle"><text x="496" y="66" fill="#007e80">Input rings · 256 KiB</text><text x="880" y="66" fill="#98433d">C · 128 KiB</text><text x="496" y="146" fill="#007e80">Input rings · 256 KiB</text><text x="784" y="146" fill="#275dbe">C</text><text x="784" y="104" fill="#275dbe" font-size="16">32 KiB</text></g>
+    <rect x="240" y="110" width="512" height="58" rx="6" fill="#dcefea"/><rect x="752" y="110" width="32" height="58" rx="4" fill="#e0eaf9"/><rect x="784" y="110" width="32" height="58" rx="4" fill="#d0def5"/><path d="M784 110V168" stroke="#275dbe" stroke-width="2"/>
+    <g text-anchor="middle"><text x="496" y="66" fill="#007e80">Input rings · 256 KiB</text><text x="880" y="66" fill="#98433d">C · 128 KiB</text><text x="496" y="146" fill="#007e80">Input rings · 256 KiB</text><text x="768" y="146" fill="#275dbe">0</text><text x="800" y="146" fill="#275dbe">1</text><text x="784" y="104" fill="#275dbe" font-size="16">C · 32 KiB total</text></g>
     <path d="M880 14V182" stroke="#b1852f" stroke-width="2" stroke-dasharray="6 5"/>
     <text x="899" y="135" fill="#76551c" font-size="18">320 KiB limit</text><text x="899" y="161" fill="#536a7b" font-size="16">before layout overhead</text>
-    <text x="240" y="205" fill="#536a7b" font-size="17">Slot 0: C0 → C2 → C4 → C6</text><text x="659" y="205" fill="#536a7b" font-size="17">Slot 1: C1 → C3 → C5 → C7</text>
+    <text x="240" y="205" fill="#536a7b" font-size="17">Slot 0 · 16 KiB: C0 → C2 → C4 → C6</text><text x="659" y="205" fill="#536a7b" font-size="17">Slot 1 · 16 KiB: C1 → C3 → C5 → C7</text>
   </g>
 </svg>
