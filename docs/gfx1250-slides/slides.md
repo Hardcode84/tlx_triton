@@ -17,7 +17,6 @@ description: 'CDNA5 programming with checked assembly and a grouped GEMM case st
 <!--
 10 sec. Introduce yourself and the topic, then move to the hardware overview.
 -->
-
 ---
 
 <!-- _class: compact -->
@@ -51,7 +50,6 @@ Source: CDNA5 ISA, 27 July 2026, §§1.1, 2.2, 3.4.9.
 Sources: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf
 https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-cdna5-whitepaper.pdf
 -->
-
 ---
 
 <!-- _class: asm-detail registers-asm -->
@@ -93,7 +91,6 @@ The partial DS wait relies on the preceding load queue in this generated loop; i
 See assembly.md for the build configuration, exact excerpt boundaries, and validation.
 Source: CDNA5 ISA, 27 July 2026, §§3.3.2, 7.12, 15.5.
 -->
-
 ---
 
 <!-- _class: tdm-movement -->
@@ -154,7 +151,6 @@ TDM completion is per wave and ordered across its loads/stores. The next slide i
 Stores do not remove LDS padding. Gather/scatter details are in backup E; CDNA4/CDNA5 per-lane direct-LDS examples are in backup I.
 Syntax checked with llvm-mc for gfx1250. Source: CDNA5 ISA §10.11; full provenance in assembly.md.
 -->
-
 ---
 
 <!-- _class: cluster-intro -->
@@ -190,7 +186,6 @@ The cluster barrier uses ID -3. One wave per workgroup signals after local synch
 After a load, requesting waves still need TDM completion and local handoffs before consumers read LDS. Counter details are in backup A.
 Source: CDNA5 ISA §§2.3, 5.6.6, 10.7, 10.11.3. The diagram shows only the two selected recipients, not a physical GPU floorplan.
 -->
-
 ---
 
 <!-- _class: asm-detail scheduling-asm -->
@@ -234,7 +229,6 @@ Operand initialization, co-execution mode setup, and synchronization appear outs
 Sources: https://llvm.org/docs/doxygen/SIInsertWaitcnts_8cpp_source.html
 CDNA5 ISA §§5.7.2, 7.12.1. Backup B has the WMMA hazard example.
 -->
-
 ---
 
 <!-- _class: divider -->
@@ -249,7 +243,6 @@ CDNA5 ISA §§5.7.2, 7.12.1. Backup B has the WMMA hazard example.
 Brief transition within the case-study time budget.
 We have the hardware pieces. Now follow one persistent kernel from loading inputs to storing results.
 -->
-
 ---
 
 <!-- _class: gemm-contract -->
@@ -287,7 +280,6 @@ Empty groups are valid for the ordinary-workgroup path. The cluster validator re
 For the selected square configuration BM=BN=256. The depth-2 hybrid needs an even K/128 of at least two.
 Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py
 -->
-
 ---
 
 <!-- _class: kernel-design -->
@@ -324,7 +316,6 @@ All four waves also compute; these are not dedicated producer waves. The fusion 
 GROUP_M=4 orders M tiles first for B locality. Chunked program remapping and cluster sharing are covered later.
 Sources: grouped_gemm_tdm, _tdm_load_fused; TDMUtility.cpp::emitTDMLoadFused; assembly.md.
 -->
-
 ---
 
 <!-- _class: asm-detail pipeline-asm -->
@@ -365,7 +356,6 @@ The LDS loads fill physical v650–657 using address v763. Neither adjacent WMMA
 The waits to 0x18 (24 outstanding DS operations) depend on the complete load queue outside this window; do not reuse the count in isolation.
 Compiler scheduling barriers bound whole dot regions outside this excerpt; they emit no hardware barrier instruction.
 -->
-
 ---
 
 <div class="eyebrow">11 / Cross tile boundaries</div>
@@ -389,7 +379,6 @@ The production hybrid does not prefetch across group boundaries. Do not attribut
 At one tile/program/group, within-group prefetch has no following tile to target.
 The source option dedicated_c_buffer selects the square cross-group path, but its output uses vector stores.
 -->
-
 ---
 
 <!-- _class: asm-detail output-asm -->
@@ -431,7 +420,6 @@ The scalar add updates the other slot's descriptor state. s[40:43] and s[20:27] 
 Final two stores can remain in flight into next-tile entry. This excerpt is a window into the generated kernel, not a standalone copy routine.
 The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.md. Payload is not allocation.
 -->
-
 ---
 
 <div class="eyebrow">13 / Reuse data across workgroups</div>
@@ -465,7 +453,6 @@ Two-workgroup clusters share B only; four-workgroup clusters share A and B.
 Masks select recipients independently of the source wave masks on slide 10.
 Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 -->
-
 ---
 
 <!-- _class: next-directions -->
@@ -498,7 +485,6 @@ MXFP: 70ea55c702 introduces persistent data/scale rings; d55b4d22f1 explores BK2
 Related-branch experiments are not options available in the deck's b266fe4c1d code reference. No new benchmark was run for this slide.
 Chained-dot compiler changes reverted by 02a632587a produced identical default binaries; they do not support a performance direction without a new witness.
 -->
-
 ---
 
 <!-- _class: divider -->
@@ -513,7 +499,6 @@ Chained-dot compiler changes reverted by 02a632587a produced identical default b
 Optional reference material outside the 30-minute main talk.
 Open the relevant backup for discussion; there is no need to present them in sequence.
 -->
-
 ---
 
 <!-- _class: compact -->
@@ -543,7 +528,6 @@ Scalar memory increments KM by 1 for one DWORD, by 2 for larger loads.
 ASYNC loads complete in order with loads, and stores with stores; mixed directions are not ordered.
 XCNT does not establish completed payload transfers.
 -->
-
 ---
 
 <!-- _class: asm-detail hazard-asm -->
@@ -579,7 +563,6 @@ RAW=read after write; WAR=write after read; WAW=write after write.
 A WMMA result reused as a following WMMA input has a different requirement. Use the full ISA table.
 The instruction count here is an architectural hazard requirement, not a measured performance result.
 -->
-
 ---
 
 <div class="eyebrow">Backup C / LDS conflicts</div>
@@ -605,7 +588,6 @@ Fix bank mapping through padding/swizzling; partition mapping through pair-aware
 Analyze ds_load_tr source addresses before redistribution.
 Source: https://rocm.blogs.amd.com/software-tools-optimization/mi450-lds-optimization/README.html
 -->
-
 ---
 
 <!-- _class: asm-detail clause-asm -->
@@ -642,7 +624,6 @@ This is an ISA illustration, not a claim that the grouped kernel emits this clau
 S_CLAUSE length encodes count minus one. Put waits required by the first instruction before the clause.
 Some scalar housekeeping instructions are legal after the first instruction; refer to the ISA table.
 -->
-
 ---
 
 <div class="eyebrow">Backup E / TDM gather and scatter</div>
@@ -667,7 +648,6 @@ Some scalar housekeeping instructions are legal after the first instruction; ref
 Gather indices generate global row addresses. The store direction uses the indices to scatter from LDS.
 Keep the OOB qualification: arbitrary ordering is allowed, but does not guarantee correct OOB handling.
 -->
-
 ---
 
 <div class="eyebrow">Backup F / Precision</div>
@@ -688,67 +668,6 @@ Keep the OOB qualification: arbitrary ordering is allowed, but does not guarante
 This is format context, not a low-precision optimization claim for the FP16 grouped-GEMM kernel.
 Source: https://www.amd.com/en/technologies/cdna.html
 -->
-
----
-
-<!-- _class: compact cluster -->
-
-<div class="eyebrow">Backup G / Cluster contract</div>
-
-# Keep cluster members on matching boundaries
-
-| Setting | Required by this kernel |
-| :--- | :--- |
-| Tile / ring / ordering | 256 × 256 × 128 / depth 2 / GROUP_M=4 |
-| Path | Within-group hybrid; cross-tile prefetch enabled |
-| Remapping | Chunked; eight logical XCDs; chunk size two |
-| Group shapes | Equal positive M; M divisible by 1024; N divisible by 512 |
-| Program count P | Divisible by 16; divides each group's output tile count |
-| Other options | L2 prefetch off; dedicated C off; auto configuration off |
-
-<p><code>ctas_per_cga=(cluster_size, 1, 1)</code></p>
-
-- Grid and P count physical workgroups; one output tile per workgroup.
-- Native fused-load masks + `tlx.cluster_barrier()` protect refills.
-- Benchmark default: four-workgroup clusters. General wrapper: one.
-
-<div class="source">f676cb6304 · b266fe4c1d · README and API tests for amd_grouped_gemm_gfx1250.</div>
-
-<!--
-These are implementation constraints, not general ISA restrictions on clusters.
-General ragged groups use ordinary workgroups. Explicit multicast masks are independent of tensor distribution.
-Each selected recipient issues the same request at the same LDS offset.
-Source: python/test/unit/language/test_tlx_amd_gfx1250.py
--->
-
----
-
-<div class="eyebrow">Backup H / Small M and resource budget</div>
-
-# Smaller tiles can expose more parallel work
-
-| Logical payload | 256 × 256 × 128 hybrid | 128 × 256 × 128 |
-| :--- | :--- | :--- |
-| A/B rings, depth 2 | 256 KiB | 192 KiB |
-| C staging | 32 KiB, chunked | 64 KiB, dedicated |
-| Total before layout overhead | **288 KiB** | **256 KiB** |
-
-- Finer M tiles increase available work for small groups.
-- Asymmetric prefetch stays within a group; it needs tiles/group &gt; P.
-- The square FP32 accumulator alone holds **512 values per thread**.
-
-<div class="placeholder small"><div class="label">Resource placeholder · selected build</div><p>Insert verified LDS allocation and VGPR counts for both configurations.</p></div>
-
-<div class="source">Kernel configuration guide · Auto selection ranks relative saturated rate × tile-slot utilization × useful/padded FLOPs.</div>
-
-<!--
-The square tile has 256×256 FP32 values distributed across 128 threads: 512 values per thread.
-Operands and addresses add register pressure. Payload arithmetic does not include physical layout overhead.
-Tile-slot utilization is total_tiles / (ceil(total_tiles / P) × P), where P is the cost model's program budget.
-The kernel guide calls this CU utilization; it is a scheduling estimate, not measured hardware CU activity.
-TODO RESOURCE: replace the placeholder after compiling the exact configurations.
--->
-
 ---
 
 <!-- _class: data-movement -->
@@ -810,7 +729,6 @@ Syntax checked with llvm-mc for gfx950 and gfx1250.
 References: llvm/test/CodeGen/AMDGPU/llvm.amdgcn.global.load.lds.gfx950.ll;
 llvm/test/MC/AMDGPU/gfx1250_asm_vflat.s; CDNA5 ISA §§10.8, 10.11.
 -->
-
 ---
 
 <!-- _class: compact barrier-backup -->
@@ -841,4 +759,62 @@ The release handoff protects reuse after all consumers finish; readiness alone d
 Named-barrier initialization and joining must precede use. LDS initialization must be visible before arrivals.
 TDM completion can update the LDS barrier directly; scalar named barriers do not acquire that connection merely by being named.
 Source: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf
+-->
+---
+
+<!-- _class: compact cluster -->
+
+<div class="eyebrow">Backup G / Cluster contract</div>
+
+# Keep cluster members on matching boundaries
+
+| Setting | Required by this kernel |
+| :--- | :--- |
+| Tile / ring / ordering | 256 × 256 × 128 / depth 2 / GROUP_M=4 |
+| Path | Within-group hybrid; cross-tile prefetch enabled |
+| Remapping | Chunked; eight logical XCDs; chunk size two |
+| Group shapes | Equal positive M; M divisible by 1024; N divisible by 512 |
+| Program count P | Divisible by 16; divides each group's output tile count |
+| Other options | L2 prefetch off; dedicated C off; auto configuration off |
+
+<p><code>ctas_per_cga=(cluster_size, 1, 1)</code></p>
+
+- Grid and P count physical workgroups; one output tile per workgroup.
+- Native fused-load masks + `tlx.cluster_barrier()` protect refills.
+- Benchmark default: four-workgroup clusters. General wrapper: one.
+
+<div class="source">f676cb6304 · b266fe4c1d · README and API tests for amd_grouped_gemm_gfx1250.</div>
+
+<!--
+These are implementation constraints, not general ISA restrictions on clusters.
+General ragged groups use ordinary workgroups. Explicit multicast masks are independent of tensor distribution.
+Each selected recipient issues the same request at the same LDS offset.
+Source: python/test/unit/language/test_tlx_amd_gfx1250.py
+-->
+---
+
+<div class="eyebrow">Backup H / Small M and resource budget</div>
+
+# Smaller tiles can expose more parallel work
+
+| Logical payload | 256 × 256 × 128 hybrid | 128 × 256 × 128 |
+| :--- | :--- | :--- |
+| A/B rings, depth 2 | 256 KiB | 192 KiB |
+| C staging | 32 KiB, chunked | 64 KiB, dedicated |
+| Total before layout overhead | **288 KiB** | **256 KiB** |
+
+- Finer M tiles increase available work for small groups.
+- Asymmetric prefetch stays within a group; it needs tiles/group &gt; P.
+- The square FP32 accumulator alone holds **512 values per thread**.
+
+<div class="placeholder small"><div class="label">Resource placeholder · selected build</div><p>Insert verified LDS allocation and VGPR counts for both configurations.</p></div>
+
+<div class="source">Kernel configuration guide · Auto selection ranks relative saturated rate × tile-slot utilization × useful/padded FLOPs.</div>
+
+<!--
+The square tile has 256×256 FP32 values distributed across 128 threads: 512 values per thread.
+Operands and addresses add register pressure. Payload arithmetic does not include physical layout overhead.
+Tile-slot utilization is total_tiles / (ceil(total_tiles / P) × P), where P is the cost model's program budget.
+The kernel guide calls this CU utilization; it is a scheduling estimate, not measured hardware CU activity.
+TODO RESOURCE: replace the placeholder after compiling the exact configurations.
 -->

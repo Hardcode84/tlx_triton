@@ -674,71 +674,7 @@ accumulation fixed. That lets us evaluate the scheduling and sharing changes
 under the same precision choice. A scaled-format version would need its own
 layout, correctness, and efficiency comparison.
 
-## Slide 22 / Backup G — Keep cluster members on matching boundaries
-
-*Optional backup · about 2 minutes*
-
-This is the contract enforced by the clustered version of this kernel. It
-exists so that workgroups sharing inputs reach compatible loop and group
-boundaries.
-
-The tile is 256 by 256 by 128, the input ring has depth two, and `GROUP_M` is
-four. The path uses the within-group hybrid schedule with cross-tile prefetch.
-Remapping is chunked, with eight logical XCDs and a chunk size of two.
-
-The groups have equal, positive M. M is divisible by 1,024, and N by 512. P is
-divisible by 16 and divides the number of output tiles in each group. Together,
-those restrictions make the work assignment regular enough for the selected
-members to share the expected inputs and execute compatible synchronization.
-
-The launch expresses the cluster shape with `ctas_per_cga`. The grid and P
-count physical workgroups, and each workgroup owns an output tile. The native
-fused-load masks choose recipients, and `tlx.cluster_barrier()` protects the
-input refills.
-
-The benchmark defaults to four-workgroup clusters. The general wrapper defaults
-to ordinary workgroups, which also remain the path for general ragged groups.
-The clustered path excludes the other options listed here, including dedicated
-C staging, L2 prefetch, and automatic configuration selection.
-
-These restrictions describe this implementation. The architectural cluster
-mechanism supports a broader set of programs. To extend this kernel to less
-regular shapes, I would first establish how every member follows the correct
-request and barrier sequence at tile and group boundaries.
-
-## Slide 23 / Backup H — Smaller tiles can expose more parallel work
-
-*Optional backup · about 1½ minutes*
-
-The large square tile gives each workgroup substantial reuse, but the workload
-also needs enough output tiles to keep the available execution resources busy.
-For smaller M, reducing the tile height can expose more independent workgroups.
-
-The table compares logical payloads. The square hybrid has 256 kibibytes of
-input rings and 32 kibibytes of chunked output staging. The 128-by-256 variant
-uses 192 kibibytes for inputs and a dedicated 64-kibibyte output tile, totaling
-256 kibibytes before layout overhead.
-
-Register storage matters as well. A 256-by-256 FP32 accumulator distributed
-across 128 threads already represents 512 accumulator values per thread.
-Operands, addresses, and other state add to that allocation.
-
-The resource panel is still a placeholder, so the table describes
-the payload design rather than a completed comparison of compiler allocations.
-Both configurations need to be compared with their actual layouts and register
-counts.
-
-The selection model also estimates how fully the available program slots are
-used by the tile count. That is what I mean here by tile-slot utilization;
-it is a scheduling estimate, not a measurement of how busy each hardware CU is.
-
-The asymmetric prefetch path stays within a group. It therefore needs more
-tiles per group than persistent programs to have another tile to prepare.
-Shrinking the tile changes both the available parallel work and the work each
-program performs. I would evaluate those effects together on the selected
-shape, using a consistent steady-state XDL-efficiency definition across variants.
-
-## Slide 24 / Backup I — Global → LDS: who chooses the destination?
+## Slide 22 / Backup I — Global → LDS: who chooses the destination?
 
 *Optional backup · about 2 minutes*
 
@@ -771,7 +707,7 @@ So when I describe programmable LDS addresses on CDNA5, this is the per-lane
 capability I mean. When I describe the grouped kernel’s tile loads, stores, and
 multicast, I’m referring to TDM and its descriptor-based operations.
 
-## Slide 25 / Backup J — Separate arrival, participants, and state
+## Slide 23 / Backup J — Separate arrival, participants, and state
 
 *Optional backup · split, named, and LDS barriers*
 
@@ -794,3 +730,67 @@ arrival count, initialization, and reuse protocol for each buffer.
 
 *[Return to slide 5 for cluster scope, slide 12 for C staging, or backup A for
 per-wave completion counters. Reference: CDNA5 ISA §§5.6, 10.11.3, 11.2.2.]*
+
+## Slide 24 / Backup G — Keep cluster members on matching boundaries
+
+*Optional backup · about 2 minutes*
+
+This is the contract enforced by the clustered version of this kernel. It
+exists so that workgroups sharing inputs reach compatible loop and group
+boundaries.
+
+The tile is 256 by 256 by 128, the input ring has depth two, and `GROUP_M` is
+four. The path uses the within-group hybrid schedule with cross-tile prefetch.
+Remapping is chunked, with eight logical XCDs and a chunk size of two.
+
+The groups have equal, positive M. M is divisible by 1,024, and N by 512. P is
+divisible by 16 and divides the number of output tiles in each group. Together,
+those restrictions make the work assignment regular enough for the selected
+members to share the expected inputs and execute compatible synchronization.
+
+The launch expresses the cluster shape with `ctas_per_cga`. The grid and P
+count physical workgroups, and each workgroup owns an output tile. The native
+fused-load masks choose recipients, and `tlx.cluster_barrier()` protects the
+input refills.
+
+The benchmark defaults to four-workgroup clusters. The general wrapper defaults
+to ordinary workgroups, which also remain the path for general ragged groups.
+The clustered path excludes the other options listed here, including dedicated
+C staging, L2 prefetch, and automatic configuration selection.
+
+These restrictions describe this implementation. The architectural cluster
+mechanism supports a broader set of programs. To extend this kernel to less
+regular shapes, I would first establish how every member follows the correct
+request and barrier sequence at tile and group boundaries.
+
+## Slide 25 / Backup H — Smaller tiles can expose more parallel work
+
+*Optional backup · about 1½ minutes*
+
+The large square tile gives each workgroup substantial reuse, but the workload
+also needs enough output tiles to keep the available execution resources busy.
+For smaller M, reducing the tile height can expose more independent workgroups.
+
+The table compares logical payloads. The square hybrid has 256 kibibytes of
+input rings and 32 kibibytes of chunked output staging. The 128-by-256 variant
+uses 192 kibibytes for inputs and a dedicated 64-kibibyte output tile, totaling
+256 kibibytes before layout overhead.
+
+Register storage matters as well. A 256-by-256 FP32 accumulator distributed
+across 128 threads already represents 512 accumulator values per thread.
+Operands, addresses, and other state add to that allocation.
+
+The resource panel is still a placeholder, so the table describes
+the payload design rather than a completed comparison of compiler allocations.
+Both configurations need to be compared with their actual layouts and register
+counts.
+
+The selection model also estimates how fully the available program slots are
+used by the tile count. That is what I mean here by tile-slot utilization;
+it is a scheduling estimate, not a measurement of how busy each hardware CU is.
+
+The asymmetric prefetch path stays within a group. It therefore needs more
+tiles per group than persistent programs to have another tile to prepare.
+Shrinking the tile changes both the available parallel work and the work each
+program performs. I would evaluate those effects together on the selected
+shape, using a consistent steady-state XDL-efficiency definition across variants.

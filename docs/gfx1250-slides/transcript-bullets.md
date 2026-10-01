@@ -105,23 +105,23 @@
   - CDNA4: FP4/FP6 and OCP microscaling; CDNA5: 16/32-element blocks, fractional FP4 scales.
   - Deliver scale metadata with operands; account for layout and lifetime costs.
   - Main case remains FP16/FP32; scaled formats need separate correctness/efficiency checks.
-- **22 / G · Cluster contract — optional, ~2 min**
-  - 256×256×128, depth 2, GROUP_M=4; hybrid; chunked remap, eight logical XCDs, chunk two.
-  - Equal positive M; M%1024=0; N%512=0; P%16=0; group tile count divisible by P.
-  - Physical workgroup count; benchmark cluster=4, general wrapper=1.
-  - No dedicated C, L2 prefetch, or auto configuration; these are kernel restrictions.
-- **23 / H · Small M — optional, ~1½ min**
-  - Smaller M tiles expose more work; asymmetric prefetch still needs tiles/group > P.
-  - Square hybrid payload 288 KiB; 128×256 alternative: 192 KiB inputs + 64 KiB C.
-  - Square accumulator: 512 FP32 values/thread, before operands and addresses.
-  - Allocation comparison remains unfilled; payload and tile-slot utilization are estimates, not measured hardware activity.
-- **24 / I · Direct LDS — optional, ~2 min**
+- **22 / I · Direct LDS — optional, ~2 min**
   - CDNA4: M0 + 4×lane; M0 hazard NOP; VM wait.
   - CDNA5: per-lane LDS offset in v4; ASYNC wait.
   - Both bypass payload VGPRs; addresses still use registers; other-wave consumers need a handoff.
   - Separate from descriptor-driven TDM on slide 4.
-- **25 / J · Barriers — optional**
+- **23 / J · Barriers — optional**
   - Split = arrival/wait timing; named = selected wave participation; LDS = memory-resident state.
   - Producer completes data → publishes readiness → consumer waits/reads → releases storage.
   - TDM can signal an LDS barrier on completion; preserve required data-path waits.
   - Check initialization, arrival count, phase, and reuse; refer to slides 5/12 and backup A.
+- **24 / G · Cluster contract — optional, ~2 min**
+  - 256×256×128, depth 2, GROUP_M=4; hybrid; chunked remap, eight logical XCDs, chunk two.
+  - Equal positive M; M%1024=0; N%512=0; P%16=0; group tile count divisible by P.
+  - Physical workgroup count; benchmark cluster=4, general wrapper=1.
+  - No dedicated C, L2 prefetch, or auto configuration; these are kernel restrictions.
+- **25 / H · Small M — optional, ~1½ min**
+  - Smaller M tiles expose more work; asymmetric prefetch still needs tiles/group > P.
+  - Square hybrid payload 288 KiB; 128×256 alternative: 192 KiB inputs + 64 KiB C.
+  - Square accumulator: 512 FP32 values/thread, before operands and addresses.
+  - Allocation comparison remains unfilled; payload and tile-slot utilization are estimates, not measured hardware activity.
