@@ -58,7 +58,7 @@ https://www.amd.com/content/dam/amd/en/documents/products/technologies/cdna/amd-
 
 # More addressable VGPRs for one wave
 
-- Up to **1024 VGPRs per thread**.
+- Up to **1024 VGPRs per wave**.
 - `S_SET_VGPR_MSB` supplies index bits 9:8 for each operand class.
 - Low index 7 + MSB value 2 selects **v519**; settings persist.
 
