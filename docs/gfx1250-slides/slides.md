@@ -344,6 +344,8 @@ Generated assembly and its partial DS-wait context remain in assembly.md.
 
 ---
 
+<!-- _class: tile-boundary -->
+
 <div class="eyebrow">11 / Cross tile boundaries</div>
 
 # Use the tail to prime the next tile

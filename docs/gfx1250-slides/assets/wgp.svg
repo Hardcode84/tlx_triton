@@ -1,20 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="118" viewBox="0 0 1120 118">
   <title>One CDNA5 WGP contains two CUs, each with two SIMD32 units</title>
-  <g font-family="DejaVu Sans, sans-serif" font-size="21" text-anchor="middle">
-    <rect x="1" y="1" width="1118" height="116" rx="12" fill="#e9eff4" stroke="#d6e0e7"/>
-    <text x="80" y="50" fill="#172c40" font-weight="bold">WGP</text>
-    <text x="80" y="79" fill="#536a7b" font-size="18">2 CUs</text>
-    <g fill="#e0eaf9" stroke="#b4c9e6">
-      <rect x="155" y="12" width="323" height="94" rx="9"/>
-      <rect x="491" y="12" width="323" height="94" rx="9"/>
+  <g font-family="Liberation Sans, Arial, DejaVu Sans, sans-serif" font-size="21" text-anchor="middle">
+    <rect x="1" y="1" width="1118" height="116" rx="0" fill="#262626" stroke="#595959"/>
+    <text x="80" y="50" fill="#ffffff" font-weight="bold">WGP</text>
+    <text x="80" y="79" fill="#bfbfbf" font-size="18">2 CUs</text>
+    <g fill="#393323" stroke="#766941">
+      <rect x="155" y="12" width="323" height="94" rx="0"/>
+      <rect x="491" y="12" width="323" height="94" rx="0"/>
     </g>
-    <g fill="#172c40" font-size="18" font-weight="bold"><text x="316" y="36">CU 0</text><text x="652" y="36">CU 1</text></g>
-    <g fill="#f7f9fb" stroke="#b4c9e6">
-      <rect x="165" y="46" width="146" height="50" rx="6"/><rect x="322" y="46" width="146" height="50" rx="6"/>
-      <rect x="501" y="46" width="146" height="50" rx="6"/><rect x="658" y="46" width="146" height="50" rx="6"/>
+    <g fill="#ffffff" font-size="18" font-weight="bold"><text x="316" y="36">CU 0</text><text x="652" y="36">CU 1</text></g>
+    <g fill="#000000" stroke="#766941">
+      <rect x="165" y="46" width="146" height="50" rx="0"/><rect x="322" y="46" width="146" height="50" rx="0"/>
+      <rect x="501" y="46" width="146" height="50" rx="0"/><rect x="658" y="46" width="146" height="50" rx="0"/>
     </g>
-    <g fill="#275dbe" font-size="19"><text x="238" y="78">SIMD32 · 0</text><text x="395" y="78">SIMD32 · 2</text><text x="574" y="78">SIMD32 · 1</text><text x="731" y="78">SIMD32 · 3</text></g>
-    <rect x="841" y="20" width="255" height="76" rx="9" fill="#dcefea" stroke="#90c6be"/>
-    <text x="968" y="52" fill="#007e80" font-size="19">320 KiB shared LDS</text><text x="968" y="80" fill="#007e80" font-size="18">+ Tensor Data Mover</text>
+    <g fill="#c1a968" font-size="19"><text x="238" y="78">SIMD32 · 0</text><text x="395" y="78">SIMD32 · 2</text><text x="574" y="78">SIMD32 · 1</text><text x="731" y="78">SIMD32 · 3</text></g>
+    <rect x="841" y="20" width="255" height="76" rx="0" fill="#10353b" stroke="#397079"/>
+    <text x="968" y="52" fill="#00c2de" font-size="19">320 KiB shared LDS</text><text x="968" y="80" fill="#00c2de" font-size="18">+ Tensor Data Mover</text>
   </g>
 </svg>

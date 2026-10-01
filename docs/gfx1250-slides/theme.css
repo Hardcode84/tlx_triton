@@ -1,85 +1,119 @@
 /* @theme gfx1250 */
 @import 'default';
 
+/* Arial metrics, bundled for consistent exports on hosts without Arial. */
+@font-face {
+  font-family: 'Liberation Sans';
+  src: url('assets/fonts/liberation-sans-regular.woff') format('woff');
+  font-style: normal;
+  font-weight: 400;
+}
+@font-face {
+  font-family: 'Liberation Sans';
+  src: url('assets/fonts/liberation-sans-bold.woff') format('woff');
+  font-style: normal;
+  font-weight: 700;
+}
+
+/* AMD corporate template: black/white, gray panels, gold accents. */
 section {
-  --ink: #172c40;
-  --muted: #536a7b;
-  --teal: #007e80;
-  --blue: #275dbe;
-  --line: #d6e0e7;
-  background: #f7f9fb;
+  --ink: #ffffff;
+  --muted: #bfbfbf;
+  --accent: #c1a968;
+  --cyan: #00c2de;
+  --line: #595959;
+  --panel: #262626;
+  --bgColor-default: #000000;
+  --bgColor-muted: #262626;
+  --fgColor-default: #ffffff;
+  --fgColor-muted: #bfbfbf;
+  --borderColor-default: #595959;
+  --borderColor-muted: #595959;
+  background: #000000;
   color: var(--ink);
-  font-family: 'DejaVu Sans', sans-serif;
+  font-family: 'Liberation Sans', Arial, 'DejaVu Sans', sans-serif;
   font-size: 24px;
-  line-height: 1.38;
-  padding: 50px 64px 76px;
+  line-height: 1.3;
+  padding: 48px 64px 88px;
   justify-content: flex-start;
   align-content: start;
 }
 section::before {
   content: '';
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 8px;
-  background: linear-gradient(90deg, #007e80 0%, #007e80 38%, #275dbe 100%);
+  right: 26px;
+  bottom: 22px;
+  width: 126px;
+  height: 36px;
+  background: url('assets/amd-lockup.png') center / contain no-repeat;
 }
-section::after { font-size: 16px; color: var(--muted); right: 64px; bottom: 22px; }
-footer { left: 64px; bottom: 22px; color: var(--muted); font-size: 14px; }
-h1 { font-size: 41px; letter-spacing: -1.1px; color: var(--ink); margin: 10px 0 24px; line-height: 1.16; }
-h2 { font-size: 28px; color: var(--teal); margin: 0 0 12px; }
-h3 { font-size: 23px; margin: 0 0 12px; color: var(--teal); }
+section::after { font-size: 12px; color: var(--muted); left: 24px; right: auto; bottom: 24px; }
+footer { left: 64px; right: 180px; bottom: 24px; color: var(--muted); font-size: 12px; border-left: 1px solid var(--line); padding-left: 14px; }
+h1 { font-size: 40px; letter-spacing: -0.4px; color: var(--ink); margin: 10px 0 24px; line-height: 1.12; font-weight: 700; }
+h2 { font-size: 28px; color: var(--ink); margin: 0 0 12px; }
+h3 { font-size: 23px; margin: 0 0 12px; color: var(--ink); }
 p { margin: 10px 0; }
 ul { padding-left: 28px; margin: 10px 0; }
 li { margin: 9px 0; }
-strong { color: var(--teal); }
-code { font-family: 'DejaVu Sans Mono', monospace; font-size: 0.85em; background: #e9eff4; color: #254b70; }
-pre { border: 1px solid var(--line); border-radius: 10px; background: #eef3f7; padding: 18px 22px; margin: 12px 0; font-size: 21px; }
+li::marker { color: var(--accent); }
+strong { color: var(--accent); }
+a { color: var(--cyan); }
+code { font-family: 'DejaVu Sans Mono', monospace; font-size: 0.85em; background: #262626; color: #eeeeee; }
+pre { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 0; background: #1a1a1a; color: #eeeeee; padding: 18px 22px; margin: 12px 0; font-size: 21px; }
 pre code { background: transparent; }
+pre .hljs-comment, pre .hljs-quote { color: #bfbfbf; }
+pre .hljs-keyword, pre .hljs-built_in, pre .hljs-literal { color: #00c2de; }
+pre .hljs-number, pre .hljs-string, pre .hljs-title { color: #c1a968; }
+pre .hljs-variable, pre .hljs-name, pre .hljs-attr, pre .hljs-params { color: #eeeeee; }
 table { display: table; width: 100%; font-size: 22px; margin: 14px 0; border-collapse: collapse; }
-th { background: #e5edf3; color: var(--ink); font-weight: 600; }
-th, td { border: 1px solid var(--line); padding: 12px 17px; }
-tr { background: white; }
-tr:nth-child(even) { background: #f0f5f8; }
-blockquote { border-left: 5px solid var(--teal); background: #e8f4f2; color: var(--ink); padding: 12px 22px; margin: 12px 0 0; font-size: 25px; }
+section table th { background: #404040; color: var(--ink); font-weight: 700; }
+section table th, section table td { border: 1px solid var(--line); padding: 12px 17px; }
+section table thead th { border-top: 3px solid var(--accent); }
+section table tr { background: #262626; }
+section table tr:nth-child(even) { background: #1a1a1a; }
+blockquote { border-left: 4px solid var(--accent); background: #262626; color: var(--ink); padding: 12px 22px; margin: 12px 0 0; font-size: 25px; }
 blockquote p { margin: 0; }
-.eyebrow { text-transform: uppercase; letter-spacing: 2.2px; color: var(--teal); font-size: 16px; font-weight: 700; }
+.eyebrow { text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); font-size: 14px; font-weight: 400; }
 .subtitle { color: var(--muted); font-size: 25px; margin-top: -10px; }
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin: 6px 0 10px; align-items: start; }
-.panel { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 20px 26px; }
+.panel { background: var(--panel); border: 0; border-top: 3px solid var(--accent); border-radius: 0; padding: 20px 26px; }
 .panel p { margin: 8px 0; }
 .small { font-size: 21px; }
 .muted { color: var(--muted); }
-.source { position: absolute; bottom: 51px; left: 64px; right: 64px; color: var(--muted); font-size: 13px; }
-.placeholder { background: #fff7e5; border: 2px dashed #b1852f; border-radius: 12px; padding: 20px 26px; margin: 12px 0; color: #76551c; }
+.source { position: absolute; bottom: 66px; left: 64px; right: 64px; color: var(--muted); font-size: 13px; }
+.placeholder { background: #262626; border: 2px dashed var(--accent); border-radius: 0; padding: 20px 26px; margin: 12px 0; color: var(--accent); }
 .placeholder .label { font-size: 16px; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin-bottom: 10px; }
 .placeholder p { margin: 7px 0; }
 .registers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin: 18px 0; font-size: 21px; text-align: center; }
-.registers div { background: #e5eefb; border-top: 5px solid var(--blue); border-radius: 6px; padding: 14px 8px; }
-.registers .selected { background: #dcefea; border-color: var(--teal); }
-.flow { color: var(--teal); font-size: 26px; text-align: center; background: #e8f4f2; padding: 14px; border-radius: 10px; margin: 16px 0; }
-.equation { color: var(--blue); font-size: 39px; margin: 5px 0 20px; }
+.registers div { background: #262626; border-top: 3px solid #595959; border-radius: 0; padding: 14px 8px; }
+.registers .selected { background: #393323; border-color: var(--accent); color: var(--accent); }
+.flow { color: var(--ink); font-size: 26px; text-align: center; background: #262626; border-top: 2px solid var(--accent); padding: 14px; border-radius: 0; margin: 16px 0; }
+.equation { color: var(--accent); font-size: 39px; margin: 5px 0 20px; }
 .diagram { width: 100%; display: block; margin: 6px 0 10px; }
 section.compact { font-size: 22px; }
 section.compact table { font-size: 20px; }
 section.compact th, section.compact td { padding: 10px 14px; }
-section.divider { background: var(--ink); color: #f7f9fb; justify-content: center; align-content: center; }
-section.divider h1 { color: #f7f9fb; font-size: 72px; margin: 16px 0 24px; line-height: 1.1; }
-section.divider .eyebrow { color: #9edbd3; font-size: 18px; }
-section.divider .subtitle { color: #cfdae4; font-size: 28px; margin: 0; }
-section.divider footer, section.divider::after { color: #b7c8d5; }
+section.divider { padding-top: 310px; }
+section.divider::before { background-image: url('assets/amd-logo.png'); left: 64px; top: 82px; bottom: auto; right: auto; width: 242px; height: 58px; }
+section.divider h1 { font-size: 64px; margin: 16px 0 24px; line-height: 1.08; }
+section.divider .eyebrow { color: var(--accent); font-size: 16px; }
+section.divider .subtitle { color: var(--ink); font-size: 30px; margin: 0; }
+section.title { background: #000000 url('assets/amd-title.jpg') center / cover no-repeat; padding: 170px 64px 120px 562px; }
+section.title h1 { font-size: 54px; letter-spacing: -0.7px; margin: 0 0 32px; }
+section.title .subtitle { font-size: 26px; font-weight: 700; }
+section.title::before { background-image: url('assets/amd-lockup.png'); left: auto; top: auto; right: 48px; bottom: 42px; width: 248px; height: 71px; }
+section.title footer, section.title::after { display: none; }
 section.cluster th, section.cluster td { padding: 7px 14px; }
 section.questions h1 { font-size: 60px; margin-bottom: 36px; }
 section.questions .panel { padding: 22px 28px; margin-bottom: 20px; }
-section.questions .number { color: var(--teal); font-weight: 700; padding-right: 16px; }
+section.questions .number { color: var(--accent); font-weight: 700; padding-right: 16px; }
 section.data-movement .subtitle { font-size: 22px; margin-bottom: 12px; }
 section.data-movement .asm-compare { align-items: stretch; }
 section.data-movement .panel { padding: 16px 20px; }
 section.data-movement h3 { font-size: 22px; }
 section.data-movement pre { font-size: 18px; padding: 14px 12px; min-height: 86px; }
 section.data-movement pre code { font-size: 1em; }
-section.data-movement .tdm-note { background: #e8f4f2; }
+section.data-movement .tdm-note { background: var(--panel); }
 section.tdm-movement .subtitle { font-size: 22px; margin-bottom: 12px; }
 section.tdm-movement h1 { margin-bottom: 12px; }
 section.tdm-movement .cols { align-items: stretch; }
@@ -87,7 +121,7 @@ section.tdm-movement .panel { padding: 12px 20px; }
 section.tdm-movement h3 { font-size: 22px; }
 section.tdm-movement pre { font-size: 18px; padding: 14px 12px; }
 section.tdm-movement pre code { font-size: 1em; }
-section.tdm-movement .tdm-note { background: #e8f4f2; }
+section.tdm-movement .tdm-note { background: var(--panel); }
 section.cluster-intro .subtitle { font-size: 22px; margin-bottom: 12px; }
 section.cluster-intro .diagram { height: 180px; object-fit: contain; }
 section.cluster-intro .cols { align-items: stretch; }
@@ -134,3 +168,4 @@ section.cluster-contract p { margin: 6px 0; }
 section.operand-schedule h1 { margin-bottom: 12px; }
 section.operand-schedule .diagram { height: 370px; object-fit: contain; }
 section.operand-schedule li { font-size: 22px; margin: 6px 0; }
+section.tile-boundary .diagram { height: 300px; object-fit: contain; }

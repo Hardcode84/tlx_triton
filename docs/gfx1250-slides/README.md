@@ -30,20 +30,29 @@ Outputs:
 - `dist/gfx1250-draft.pdf`: complete deck, including backup slides.
 - `dist/gfx1250-draft.html`: browser presentation with speaker notes.
 
-Both exports embed the SVG diagrams and can be moved as standalone files.
+Both exports embed the SVG diagrams, AMD artwork, and bundled fonts and can be
+moved as standalone files. No global font installation is required.
 `node_modules/`, `.cache/`, and generated `dist/` files are ignored by Git.
 
 ## Edit
 
 - `slides.md`: slide text and speaker notes in HTML comments; `---` separates slides.
 - `transcript.md`: full spoken script for the main talk and all backup slides.
-- `theme.css`: typography, colors, layout, and placeholder styling.
+- `theme.css`: AMD template typography, colors, layout, and placeholder styling.
 - `assets/*.svg`: editable diagrams; pipeline diagrams are schematic.
+- `assets/amd-*` and `assets/fonts/`: template artwork and Arial-compatible fonts;
+  see [asset provenance](assets/README.md).
 - `package.json` and `bun.lock`: pinned local build dependencies.
 
 In the Marp VS Code extension, enable HTML and select `theme.css` as a custom
 theme. Alternatively, `bun run preview` opens the CLI preview when a full browser
 is available.
+
+The visual style follows the supplied `amd_template.pptx`: black backgrounds,
+white headings and body text, gray panels with gold rules, AMD logos, and the
+template's title artwork. Teal distinguishes data movement in diagrams.
+Liberation Sans provides Arial-compatible metrics on hosts without Arial.
+The source Markdown, diagrams, and fonts stay local to this directory.
 
 All assembly panels are filled and assembler-checked. Slides 3, 4, 6, 10, and 12 use
 generated grouped-GEMM excerpts; backups B/D/I use handwritten ISA
