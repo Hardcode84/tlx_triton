@@ -4,7 +4,7 @@ Companion to [slides.md](slides.md).
 The time windows follow the 30-minute main talk and include pauses to inspect
 the diagrams and assembly. Slide 14 reserves most of its time for discussion.
 The title and grouped GEMM divider are included in that schedule. The backup divider and
-backups A–I are optional, outside it. Section numbers match all 24 deck pages.
+backups A–J are optional, outside it. Section numbers match all 25 deck pages.
 
 The schedule reserves 25 minutes for the material and five minutes for discussion.
 Treat the time windows as rehearsal targets, including pauses to inspect the examples.

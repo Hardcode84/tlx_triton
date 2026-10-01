@@ -9,6 +9,9 @@ The main talk runs for 30 minutes, including five minutes for discussion.
 [Presenter transcript](transcript.md): spoken script for every slide, with timing
 windows, delivery cues, and optional backup explanations.
 
+[Bullet-only presenter outline](transcript-bullets.md): short cues for all 25 slides,
+with main-talk timing and optional backup reminders.
+
 ## Build locally
 
 Requires Bun 1.3+ and Firefox. Use Bun for dependencies and export.

@@ -1,0 +1,125 @@
+- **CDNA5 / gfx1250 — presenter outline**
+  - [Full transcript](transcript.md) · [Slides](slides.md).
+  - Main talk: 25 minutes + 5 minutes discussion; backups A–J optional.
+
+- **01 · Title — 0:00–0:10**
+  - Ivan Butygin; CDNA5 programming and TLX grouped GEMM.
+- **02 · Hardware overview — 0:10–3:00**
+  - CDNA3/4 Wave64 → CDNA5 Wave32; MFMA → WMMA.
+  - WGP = two CUs × two SIMD32s; all workgroup waves stay within one WGP.
+  - LDS: 64 KiB/CU → 160 KiB/CU → 320 KiB/WGP; keep units explicit.
+  - AGPR/VGPR → one VGPR namespace; balance tile capacity against occupancy.
+  - Point: global memory → LDS → registers → matrix instructions → output.
+- **03 · VGPR addressing — 3:00–6:00**
+  - Up to 1024 VGPRs/thread; `S_SET_VGPR_MSB` supplies index bits 9:8.
+  - Persistent settings for destination and three source classes; low 7 + MSB 2 = v519.
+  - Excerpt `0x5a`: D/C v458–465; A v554–561; B v642–649.
+  - WMMA: 16×16×32, FP16 operands, FP32 accumulation, 32 cooperating lanes.
+  - Carry MSB state while reading assembly; partial DS wait depends on the surrounding load queue.
+- **04 · TDM — 6:00–8:00**
+  - Global ↔ LDS tile transfers; payload bypasses VGPRs.
+  - 2D descriptor: group 0 = four SGPRs, addresses/control; group 1 = eight SGPRs, shape/strides/format.
+  - EXEC ignored; 1–5D tiles; 2D gather/scatter; load padding and multicast.
+  - Per-wave `S_WAIT_TENSORCNT`; synchronize other-wave consumers separately.
+- **05 · Clusters — 8:00–10:00**
+  - Grid → cluster → workgroup → wave; up to 16 workgroups, separate WGPs, same shader engine.
+  - Each member owns LDS; every selected recipient issues a matching request.
+  - Mask `0011`: ranks 0/1; late requests may receive separate transfers.
+  - Presented kernel: local reader completion → local synchronization → cluster handoff → refill.
+  - Keep request alignment, transfer completion, and buffer reuse distinct.
+- **06 · Scheduling controls — 10:00–12:00**
+  - Expert mode: `SCHED_MODE[1:0]=2`; compiler resolves selected VMEM/VALU hazards.
+  - ALU dependency wait protects registers; load-counter wait establishes data arrival.
+  - Bit 2 enables WMMA queuing; overlap independent scalar descriptor updates.
+  - WMMA RAW/WAR/WAW spacing rules still apply; see backup B.
+- **07 · GEMM divider — 12:00–12:10**
+  - Follow inputs, tile transitions, output stores, and sharing.
+- **08 · Workload — 12:10–13:10**
+  - `C_g=A_g×B_gᵀ`; FP16 input/output, FP32 accumulation; shared N/K, variable M.
+  - Packed A/C; B per group; int32 row offsets; equal offsets represent empty groups.
+  - Full tiles; hybrid depth 2, even K/128 ≥ 2; multicast requires regular positive groups.
+- **09 · Persistent design — 13:10–15:00**
+  - Tile 256×256×128; four waves, 128 threads; reference P=32 workgroups.
+  - After remapping: logical p handles p, p+P, p+2P; retain buffers across tiles.
+  - Two A + two B slots: 256 KiB payload; third input stage would exceed LDS capacity.
+  - Fused issuing-wave masks: A `0011`, B `1100`; all waves also compute.
+  - More programs expose parallel work; fewer leave more tiles/program for prefetch.
+- **10 · Operand pipeline — 15:00–17:00**
+  - TDM → LDS rings; LDS → VGPR subtiles → WMMA.
+  - K128 becomes four K32 dots; each dot expands into multiple WMMAs.
+  - Trace WMMA → independent LDS loads → WMMA; track MSB changes.
+  - `amd_sched_barrier()` bounds lifetimes; it is a compiler constraint, not workgroup synchronization.
+- **11 · Tile transitions — 17:00–20:00**
+  - Peel final two K iterations; released slots receive next-tile K0/K1.
+  - Hybrid: within-group prefetch; first tile/group needs priming.
+  - Cross-group path: four upcoming boundaries, skip empty groups, vector C stores.
+  - M=2048, N=1024, P=32: one tile/program/group; M=4096: two.
+  - No next tile in the group means no within-group prefetch opportunity.
+- **12 · Output staging — 20:00–22:00**
+  - Inputs 256 KiB + full C 128 KiB exceed capacity; alias-C delays A refill.
+  - Hybrid: eight 32-row chunks, two 16 KiB slots; 288 KiB logical payload before padding.
+  - C1/C2 pending: wait-to-one retires C1; C2 may continue.
+  - Handoff → write C3 → DS completion → handoff → TDM store.
+  - Final two stores overlap next-tile entry; preserve prefetched A/B.
+- **13 · Multicast mapping — 22:00–25:00**
+  - A masks `0101/1010`; B masks `0011/1100`; two recipients per transfer.
+  - Physical IDs 0/1/2/3 → logical 0/2/4/6 → tiles (0,0)/(2,0)/(0,1)/(2,1).
+  - M rows are nonadjacent; diagram shows logical tiles, not physical placement.
+  - Two-workgroup cluster shares B; four shares A/B; current kernel synchronizes before refill.
+- **14 · Directions to explore — 25:00–30:00**
+  - LDS: B padding 8/16, interleaved slots, native WMMA operand-reuse hints.
+  - Multicast: compare barrier intervals with matched sharing-off controls; preserve local lifetimes.
+  - Shapes: alias-C versus hybrid versus cross-group; sweep group sizes, K, tiles/program.
+  - MXFP: data/scale rings, BK128/BK256, output reuse, operand lifetimes.
+  - Prior experiments motivate these directions; diagnostic alias-C result disproves a universal hybrid advantage.
+  - Ask: which experiment should we prioritize? Use backups C/G/F/H.
+- **15 · Backup divider — optional**
+  - Open the relevant reference; no sequential presentation required.
+
+- **16 / A · Wait counters — optional, ~2 min**
+  - LOAD/STORE/DS/ASYNC/TENSOR: 6 bits; KM: 5 bits; hardware prevents overflow.
+  - Wait-to-N: outstanding count ≤ N; zero drains; partial waits require ordering.
+  - TDM ordered within a wave; mixed ASYNC directions are not; scalar loads require zero KM wait.
+  - Combined LOAD+DS/STORE+DS remain; XCNT tracks translation, not payload completion.
+- **17 / B · WMMA hazards — optional, ~1½ min**
+  - Dense FP16 WMMA → dependent VALU: four independent VALU instructions or V_NOPs with co-execution.
+  - Scalar housekeeping does not fill these slots; other operand overlaps have different rules.
+  - Example assumes ready operands and zero MSBs; check the relevant ISA table.
+- **18 / C · LDS conflicts — optional, ~2 min**
+  - Bank = `(address >> 2) & 63`; 4×lane spreads banks; 256×lane targets bank 0.
+  - Five 64 KiB partitions; CU/SIMD pairs {0,2} and {1,3} can contend on one partition.
+  - Bank-safe ranges [0,128) and [256,384) still share a partition; moving one by 64 KiB separates them.
+  - Include allocation base; tune bank mapping, partition placement, and scheduling separately.
+- **19 / D · S_CLAUSE — optional, ~1½ min**
+  - First instruction selects memory class; `s_clause 3` groups four compatible instructions.
+  - Dependency wait before; completion wait after; clause itself supplies neither guarantee.
+  - TDM prohibited; a stalled clause can leave resources idle.
+- **20 / E · Gather/scatter — optional, ~1½ min**
+  - 2D indexed rows: global→LDS gather, LDS→global scatter.
+  - Per instruction: 16×16-bit or 8×32-bit indices in descriptor groups 2/3.
+  - Repeated/arbitrary gather indices allowed; correct OOB handling needs nondecreasing indices.
+  - Padding/multicast are load-side; stores do not remove LDS padding.
+- **21 / F · Scaling — optional, ~1 min**
+  - CDNA4: FP4/FP6 and OCP microscaling; CDNA5: 16/32-element blocks, fractional FP4 scales.
+  - Deliver scale metadata with operands; account for layout and lifetime costs.
+  - Main case remains FP16/FP32; scaled formats need separate correctness/efficiency checks.
+- **22 / G · Cluster contract — optional, ~2 min**
+  - 256×256×128, depth 2, GROUP_M=4; hybrid; chunked remap, eight logical XCDs, chunk two.
+  - Equal positive M; M%1024=0; N%512=0; P%16=0; group tile count divisible by P.
+  - Physical workgroup count; benchmark cluster=4, general wrapper=1.
+  - No dedicated C, L2 prefetch, or auto configuration; these are kernel restrictions.
+- **23 / H · Small M — optional, ~1½ min**
+  - Smaller M tiles expose more work; asymmetric prefetch still needs tiles/group > P.
+  - Square hybrid payload 288 KiB; 128×256 alternative: 192 KiB inputs + 64 KiB C.
+  - Square accumulator: 512 FP32 values/thread, before operands and addresses.
+  - Allocation comparison remains unfilled; payload and tile-slot utilization are estimates, not measured hardware activity.
+- **24 / I · Direct LDS — optional, ~2 min**
+  - CDNA4: M0 + 4×lane; M0 hazard NOP; VM wait.
+  - CDNA5: per-lane LDS offset in v4; ASYNC wait.
+  - Both bypass payload VGPRs; addresses still use registers; other-wave consumers need a handoff.
+  - Separate from descriptor-driven TDM on slide 4.
+- **25 / J · Barriers — optional**
+  - Split = arrival/wait timing; named = selected wave participation; LDS = memory-resident state.
+  - Producer completes data → publishes readiness → consumer waits/reads → releases storage.
+  - TDM can signal an LDS barrier on completion; preserve required data-path waits.
+  - Check initialization, arrival count, phase, and reuse; refer to slides 5/12 and backup A.
