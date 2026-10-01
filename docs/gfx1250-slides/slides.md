@@ -375,35 +375,35 @@ The source option dedicated_c_buffer selects the square cross-group path, but it
 
 <p class="small">Eight 32-row chunks. Here, <strong>C1 finishes before slot 1 receives C3</strong>; C2 may stay in flight.</p>
 
-```asm
-s_wait_tensorcnt 0x1
-s_barrier_signal -1
-s_add_nc_u64 s[30:31], s[72:73], s[50:51]
-s_set_vgpr_msb 0x605
-s_barrier_wait -1
-ds_store_b128 v90, v[34:37]
-; ... seven more LDS stores and their ALU dependency wait ...
-s_wait_dscnt 0x0
-s_barrier_signal -1
-s_barrier_wait -1
-tensor_store_from_lds s[40:43], s[20:27]
+```python
+sched_barrier()                         # compiler boundary
+for part in range(8):                   # each chunk: 32 × 256
+    slot = part % 2
+    if part >= 2:
+        wait_tensor(1)                  # retire part−2; part−1 may run
+        workgroup_barrier()             # slot is free for all writers
+    rows = slice(part * 32, (part + 1) * 32)
+    local_store(C_lds[slot], fp16(acc[rows, :]))
+    wait_lds_writes(); workgroup_barrier()
+    tdm_store_async(C_global[rows, :], C_lds[slot])
+# Last two stores overlap next-tile entry; wait before slot reuse.
 ```
 
-<div class="source">Generated C3 staging excerpt, abridged · 7a58d5e627 · Sizes are logical payload, before layout overhead.</div>
+<div class="source">Hybrid C epilogue · pseudocode with completion waits and handoffs explicit · Sizes are logical payload, before layout overhead.</div>
 
 <!--
 2 min. A and B rings use 2 × (256×128 + 256×128) × 2 bytes = 256 KiB.
 Full C uses 256×256×2 = 128 KiB; two 32×256 FP16 slots use 32 KiB.
 Alias-C reuses A storage but blocks A refill until the C store drains.
-Here, TDM's per-wave completion order makes a partial wait useful. Other waves still require synchronization.
-Generated C3 staging excerpt; seven LDS stores and one ALU dependency wait are omitted at the marked line. See assembly.md.
-The window starts after the C2 TDM store, with C1 and C2 pending. TDM's ordered completion retires C1 before slot 1 is overwritten.
-The first workgroup barrier propagates this release; DS completion plus the second workgroup barrier makes every wave's C3 writes visible.
-MSB low byte 0x05 makes v90 the physical address register v346 and v[34:37] the physical data registers v290–293.
-The scalar add updates the other slot's descriptor state. s[40:43] and s[20:27] already describe this output transfer.
-Final two stores can remain in flight into next-tile entry. This excerpt is a window into the generated kernel, not a standalone copy routine.
+Pseudocode follows grouped_gemm_tdm's HYBRID_TILE_PREFETCH epilogue. C_global denotes this output tile; descriptor construction is abstracted by the indexed destination.
+Source uses amd_sched_barrier, static_range, async_amd_descriptor_wait(1), local_store, and async_amd_descriptor_store. Completion waits and workgroup handoffs inserted by lowering are explicit here; see assembly.md for generated C3 code.
+For part >= 2, ordered per-wave TDM completion makes wait_tensor(1) retire the older output before its slot is overwritten. The newer output may remain in flight.
+The workgroup handoff propagates slot release. LDS-write completion and the next workgroup handoff make all writers' data available before the TDM store reads it.
+The first two chunks need no same-tile output-reuse wait. Previous-tile C stores have already retired through the input waits before this epilogue reuses the slots.
+Final two stores can remain in flight into next-tile entry; its input waits retire them before C staging is reused. Kernel completion must preserve final output completion.
 The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.md. Payload is not allocation.
 -->
+
 ---
 
 <div class="eyebrow">13 / Reuse data across workgroups</div>

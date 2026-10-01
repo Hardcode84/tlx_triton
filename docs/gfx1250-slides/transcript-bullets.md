@@ -63,7 +63,8 @@
   - Inputs 256 KiB + full C 128 KiB exceed capacity; alias-C delays A refill.
   - Hybrid: eight 32-row chunks, two 16 KiB slots; 288 KiB logical payload before padding.
   - C1/C2 pending: wait-to-one retires C1; C2 may continue.
-  - Handoff → write C3 → DS completion → handoff → TDM store.
+  - Loop over eight chunks: slot = part%2; from part 2, wait-to-one and handoff before reuse.
+  - Convert 32 rows to FP16 → LDS store → DS completion → handoff → asynchronous TDM store.
   - Final two stores overlap next-tile entry; preserve prefetched A/B.
 - **13 · Multicast mapping — 22:00–25:00**
   - A masks `0101/1010`; B masks `0011/1100`; two recipients per transfer.

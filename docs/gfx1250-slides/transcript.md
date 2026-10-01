@@ -368,19 +368,22 @@ The hybrid path instead divides C into eight 32-row chunks and alternates
 between two small output slots. Those slots add 32 kibibytes of payload, bringing
 the logical total to 288. The actual allocation also includes layout overhead.
 
-*[Follow the wait and the two barrier pairs in the assembly.]*
+*[Follow the chunk loop, slot selection, and reuse wait.]*
 
-This excerpt stages C3. At entry, C1 and C2 may still be in flight. The wait to
-one retires C1 because TDM operations complete in issue order within the issuing
-wave. C2 can remain outstanding.
+The pseudocode follows the hybrid C epilogue. It makes the completion waits and
+workgroup handoffs explicit; the compiler inserts those around the source-level
+TLX operations. The global C slice stands for the output descriptor update.
 
-The first workgroup barrier communicates that slot one is available for reuse.
-The waves then write C3 into that slot. We show one LDS store and omit the
-remaining stores at the marked line.
+For each chunk, select slot part modulo two. The first two chunks use the two
+available slots. From chunk two onward, wait until at most one tensor operation
+remains. Ordered completion retires the older output, so chunk three can replace
+chunk one while chunk two may remain in flight. Synchronize the waves before
+any writer reuses that slot.
 
-The DS wait establishes that this wave’s LDS writes have completed. The next
-workgroup barrier brings all the writers together, after which the tensor-store
-instruction can read the completed C3 chunk.
+Convert the 32 accumulator rows to FP16 and write them into LDS. Complete the
+LDS writes and synchronize all writers before issuing the asynchronous TDM store.
+The compiler scheduling barrier at entry bounds instruction motion; it does not
+replace either completion wait or workgroup synchronization.
 
 We repeat that process across the eight chunks. The final two stores can stay
 in flight as the program enters its next tile, while the A and B rings retain

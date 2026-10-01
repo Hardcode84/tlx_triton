@@ -90,6 +90,7 @@
     - Full C staging adds 128 KiB: 384 KiB exceeds LDS capacity. Alias-C reuses A storage but delays A refill until C drains.
     - Hybrid: eight 32-row chunks; two `32×256` FP16 output slots add 32 KiB; total logical payload 288 KiB, before layout overhead.
       - The fresh square reference compile matches the 24 September records: 320,448 bytes ≈ 312.94 KiB of LDS, before hardware allocation rounding. The layout leaves much less headroom than the payload arithmetic suggests; configuration and hashes are in the assembly preparation records.
+    - Show pseudocode: eight chunks, slot `part % 2`, wait-to-one before reuse from part 2, convert/store to LDS, complete writes and synchronize, then issue TDM store.
     - Convert and store one chunk at a time; TDM's per-wave load/store completion order lets the wait retire the older store before its slot is reused while the newest store may remain in flight. Cross-wave access also requires workgroup synchronization.
     - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
     - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
