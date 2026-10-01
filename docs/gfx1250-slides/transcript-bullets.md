@@ -17,7 +17,9 @@
   - WMMA: 16×16×32, FP16 operands, FP32 accumulation, 32 cooperating lanes.
   - Carry MSB state while reading assembly; partial DS wait depends on the surrounding load queue.
 - **04 · TDM — 6:00–8:00**
-  - Global ↔ LDS tile transfers; payload bypasses VGPRs.
+  - Non-gather load/store: descriptor-sized tile per instruction; payload bypasses VGPRs.
+  - Transfer size independent of lane count; 16-bit tile dimensions, allocated LDS capacity.
+  - Grouped GEMM uses transfer specialization: waves 0–1 load A, 2–3 load B; one instruction site.
   - 2D descriptor: group 0 = four SGPRs, addresses/control; group 1 = eight SGPRs, shape/strides/format.
   - EXEC ignored; 1–5D tiles; 2D gather/scatter; load padding and multicast.
   - Per-wave `S_WAIT_TENSORCNT`; synchronize other-wave consumers separately.
@@ -42,7 +44,7 @@
   - Tile 256×256×128; four waves, 128 threads; reference P=32 workgroups.
   - After remapping: logical p handles p, p+P, p+2P; retain buffers across tiles.
   - Two A + two B slots: 256 KiB payload; third input stage would exceed LDS capacity.
-  - Fused issuing-wave masks: A `0011`, B `1100`; all waves also compute.
+  - Fused TDM: waves 0–1 load A (`0011`), 2–3 load B (`1100`); one instruction site, all waves also compute.
   - More programs expose parallel work; fewer leave more tiles/program for prefetch.
 - **10 · Operand pipeline — 15:00–17:00**
   - TDM → LDS rings; LDS → VGPR subtiles → WMMA.

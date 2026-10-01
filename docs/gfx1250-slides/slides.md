@@ -102,7 +102,7 @@ Source: CDNA5 ISA, 27 July 2026, §§3.3.2, 7.12, 15.5.
 
 # TDM moves tiles
 
-<p class="subtitle">SGPR descriptors specify each transfer; the payload bypasses VGPRs.</p>
+<p class="subtitle">Non-gather load/store: one instruction transfers a descriptor-sized tile.</p>
 
 <div class="cols">
 <div class="panel">
@@ -135,7 +135,7 @@ tensor_store_from_lds s[28:31], s[20:27]
 </div>
 </div>
 
-<div class="panel tdm-note"><h3>One request describes a whole tile</h3><p class="small">EXEC is ignored · 1–5D tiles · 2D gather/scatter · loads support padding and multicast.</p><p class="small">Use <code>S_WAIT_TENSORCNT</code> for completion; sharing LDS also needs a handoff.</p></div>
+<div class="panel tdm-note"><h3>Specialize transfers by wave</h3><p class="small">Grouped GEMM: waves 0–1 load A; waves 2–3 load B, at one instruction site.</p><p class="small">Tile size follows the descriptor, within descriptor and LDS limits; payload bypasses VGPRs.</p></div>
 
 <div class="source">CDNA5 ISA §10.11 · Generated load/store excerpts; descriptor setup and synchronization omitted.</div>
 
@@ -146,6 +146,8 @@ The load is reference.amdgcn line 1682; the store is line 1023. Descriptor const
 This 2D form consumes two descriptor groups: group 0 has four SGPRs, group 1 has eight. Group 0 also includes control bits.
 Group 0 supplies the global address of the tile start (not the tensor origin) and its LDS byte address.
 Group 1 supplies dimensions, strides, element size, padding controls, and the multicast workgroup mask.
+Non-gather loads and stores transfer a whole descriptor-sized tile per instruction; the byte count is not fixed by the opcode or lane count. Tile dimensions use 16-bit fields; the LDS footprint must fit the allocated buffer. Gather/scatter instead has an 8- or 16-row index-list limit per instruction.
+This permits transfer specialization by wave. Our grouped GEMM already selects A for waves 0–1 and B for waves 2–3 at one instruction site; all four waves also compute.
 Choosing which waves issue requests is separate from selecting multicast recipients in the descriptor.
 TDM instructions ignore EXEC, including EXEC==0. They do not take per-lane global/LDS pointers, and their operands are unaffected by VGPR MSB settings.
 TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast.
@@ -298,7 +300,7 @@ Source: third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1
 
 <div class="cols">
 <div class="panel"><h3>Persistent launch</h3><ul><li><strong>P workgroups total</strong> (reference: 32).<br>After remapping, logical program p takes tiles p, p + P, p + 2P…</li><li>Size P for available WGPs; cap by tile count. LDS permits <strong>one resident workgroup per WGP</strong> here.</li><li>Keep buffers across tiles; balance WGP coverage against tiles per program.</li></ul></div>
-<div class="panel"><h3>Pipeline and reuse</h3><ul><li><strong>Depth 2:</strong> two A + two B LDS slots<br>overlap TDM with compute; 256 KiB payload.</li><li><strong>Fused TDM:</strong> A = 0011, B = 1100.<br>Waves select descriptors at one load instruction.</li><li>Prefetch the next tile; two small C slots keep the input rings intact.</li></ul></div>
+<div class="panel"><h3>Pipeline and reuse</h3><ul><li><strong>Depth 2:</strong> two A + two B LDS slots<br>overlap TDM with compute; 256 KiB payload.</li><li><strong>Fused TDM:</strong> waves 0–1 load A;<br>waves 2–3 load B at one instruction site.</li><li>Prefetch the next tile; two small C slots keep the input rings intact.</li></ul></div>
 </div>
 
 <div class="flow">GROUP_M = 4: reuse B · Optional 4-workgroup clusters: multicast A/B</div>

@@ -28,6 +28,8 @@
   - **4. TDM moves tiles — 2 min.**
     - Descriptor-driven tile transfers: `tensor_load_to_lds` moves a global tile into an LDS buffer; `tensor_store_from_lds` moves an LDS tile to global memory.
     - Show generated load/store instructions from separate regions. Explain the 2D descriptor operands: group 0 uses four SGPRs for global tile/LDS addresses and control bits; group 1 uses eight for shape, strides, format, padding, and multicast controls.
+    - Non-gather load/store: one instruction transfers a descriptor-sized tile, independent of lane count; 16-bit tile dimensions and allocated LDS capacity bound the transfer.
+    - Transfer specialization is used by grouped GEMM: waves 0–1 load A, waves 2–3 load B, at one instruction site; all waves also compute.
     - TDM is a whole-tile operation that ignores EXEC. Payload bypasses VGPRs; descriptor setup still consumes registers. Choosing issuing waves is separate from selecting multicast recipients in the descriptor.
     - TDM supports 1–5-dimensional tiles and 2D gather/scatter; loads support LDS padding and multicast. Completion uses `S_WAIT_TENSORCNT`; the next slide introduces clusters and their multicast mechanism.
     - Visual: side-by-side tile-load and tile-store assembly panels with descriptor fields. CDNA4/CDNA5 per-lane direct-LDS comparison moves to backup I. Source: [CDNA5 ISA, §10.11](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna5-instruction-set-architecture.pdf) and [assembly preparation records](gfx1250-slides/assembly.md).

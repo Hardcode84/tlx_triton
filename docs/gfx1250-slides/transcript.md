@@ -132,6 +132,16 @@ The data payload goes directly between global memory and LDS. The descriptors
 still need registers and instructions to construct them, but the transfer avoids
 an intermediate payload in VGPRs.
 
+For non-gather loads and stores, one instruction transfers a tile whose size
+comes from the descriptor. The byte count is not fixed by the opcode or lane
+count. Tile dimensions use 16-bit fields, and the LDS footprint must fit the
+allocated buffer. Gather and scatter have a separate row-index-list limit.
+
+This lets us specialize transfers by wave and combine instruction sites. Our
+grouped GEMM already does this: waves zero and one load A; waves two and three
+load B. Each wave selects its descriptor at the same load instruction site.
+All four waves also compute. We will return to this on slide nine.
+
 TDM operates on whole tile requests and ignores EXEC. Choosing which waves issue
 requests therefore happens separately from the per-lane execution mask. The ISA
 supports one- through five-dimensional tiles, plus two-dimensional gather and
