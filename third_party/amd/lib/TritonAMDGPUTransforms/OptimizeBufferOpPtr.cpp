@@ -112,6 +112,7 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
     Value baseIncrement;
     Value offsetInitializer;
     Operation *incrementOp;
+    bool advanceBasePointer;
   };
 
   static std::optional<ConstantIntRanges>
@@ -402,20 +403,61 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
     auto elemBitwidth = ptrType.getPointeeType().getIntOrFloatBitWidth();
     auto dtypeByteWidth = elemBitwidth / 8;
     assert(dtypeByteWidth > 0);
-    if (!isTransformationEquivalent(dtypeByteWidth, offsetLoopArgument,
-                                    advanceStep, solver)) {
-      LDBG("Rejected: it is arithmetically unsafe to split offset computation");
-      return {};
-    }
-
-    LDBG("Buffer op is suitable for offset pointer optimization");
-
     int offsetInitNo =
         offsetLoopArgument.getArgNumber() - targetFor.getNumInductionVars();
     auto offsetInitializer = targetFor.getInitArgs()[offsetInitNo];
-    BufferOpInfo info{op, advanceStep, nullptr, offsetInitializer, addOp};
+    bool advanceBasePointer = isTransformationEquivalent(
+        dtypeByteWidth, offsetLoopArgument, advanceStep, solver);
+    if (!advanceBasePointer) {
+      auto offsetType = dyn_cast<RankedTensorType>(offsetInitializer.getType());
+      if (!offsetType || !offsetType.getElementType().isInteger(32) ||
+          !targetFor.getInductionVar().getType().isInteger(32) ||
+          !isInvariantForLoop(advanceStep, targetFor)) {
+        LDBG("Rejected: unsafe base promotion and unsupported offset "
+             "recurrence");
+        return {};
+      }
+      LDBG("Buffer op is suitable for closed offset reconstruction");
+    } else {
+      LDBG("Buffer op is suitable for offset pointer optimization");
+    }
+
+    BufferOpInfo info{op,    advanceStep,       nullptr, offsetInitializer,
+                      addOp, advanceBasePointer};
 
     return info;
+  }
+
+  // Keep i32 wraparound when byte-scaled base-pointer arithmetic can differ.
+  static void reconstructOffsets(PatternRewriter &rewriter, scf::ForOp forOp,
+                                 ArrayRef<BufferOpInfo> infoList) {
+    for (BufferOpInfo info : infoList) {
+      if (info.advanceBasePointer)
+        continue;
+
+      rewriter.setInsertionPoint(info.op);
+      Location loc = info.op.getLoc();
+      Value iterationOffset = arith::SubIOp::create(
+          rewriter, loc, forOp.getInductionVar(), forOp.getLowerBound());
+      Value iteration = arith::DivUIOp::create(rewriter, loc, iterationOffset,
+                                               forOp.getStep());
+      if (isAddFirst(info.op)) {
+        Value one = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+        iteration = arith::AddIOp::create(rewriter, loc, iteration, one);
+      }
+
+      auto offsetType =
+          cast<RankedTensorType>(info.offsetInitializer.getType());
+      Value iterationSplat =
+          triton::SplatOp::create(rewriter, loc, offsetType, iteration);
+      Value totalIncrement = arith::MulIOp::create(
+          rewriter, loc, iterationSplat, info.offsetIncrement);
+      Value offset = arith::AddIOp::create(
+          rewriter, loc, info.offsetInitializer, totalIncrement);
+      rewriter.modifyOpInPlace(info.op.getOperation(), [&] {
+        info.op.getOffsetsMutable().assign(offset);
+      });
+    }
   }
 
   // Create scalar values which will increment buffer op base ptr
@@ -519,11 +561,22 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
       return rewriter.notifyMatchFailure(forOp,
                                          "no suitable buffer operations");
 
-    // Perform IR transformation
-    createScalarIncrements(rewriter, infoList);
-    auto newForOp = cloneLoopWithBasePtrIncrements(rewriter, forOp, infoList);
+    reconstructOffsets(rewriter, forOp, infoList);
+
+    SmallVector<BufferOpInfo> basePointerInfo;
+    for (const BufferOpInfo &info : infoList)
+      if (info.advanceBasePointer)
+        basePointerInfo.push_back(info);
+
+    if (basePointerInfo.empty())
+      return success();
+
+    createScalarIncrements(rewriter, basePointerInfo);
+    auto newForOp =
+        cloneLoopWithBasePtrIncrements(rewriter, forOp, basePointerInfo);
     rewriter.replaceAllUsesWith(
-        forOp.getResults(), newForOp.getResults().drop_back(infoList.size()));
+        forOp.getResults(),
+        newForOp.getResults().drop_back(basePointerInfo.size()));
     rewriter.eraseOp(forOp);
     return success();
   }

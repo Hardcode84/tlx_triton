@@ -275,25 +275,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 // -----
 
 // CHECK-LABEL: offsets_possible_overflow_negative
+// CHECK-DAG: [[LB:%.*]] = arith.constant 0 : i32
+// CHECK-DAG: [[LOOP_STEP:%.*]] = arith.constant 1 : i32
+// CHECK-DAG: [[INIT:%.*]] = arith.constant dense<123>
+// CHECK-DAG: [[SAFE_INIT:%.*]] = arith.constant dense<456>
+// CHECK-DAG: [[DELTA:%.*]] = tt.splat %{{.*}} : i32 -> tensor<16x64xi32, #blocked>
+// CHECK: scf.for [[IV:%.*]] = [[LB]] to {{.*}} step [[LOOP_STEP]] iter_args({{.*}}[[SAFE_BASE:%.*]] = %{{.*}})
+// CHECK:   [[ITER_OFFSET:%.*]] = arith.subi [[IV]], [[LB]] : i32
+// CHECK:   [[ITER:%.*]] = arith.divui [[ITER_OFFSET]], [[LOOP_STEP]] : i32
+// CHECK:   [[ITER_SPLAT:%.*]] = tt.splat [[ITER]] : i32 -> tensor<16x64xi32, #blocked>
+// CHECK:   [[TOTAL_INCREMENT:%.*]] = arith.muli [[ITER_SPLAT]], [[DELTA]]
+// CHECK:   [[CLOSED_OFFSET:%.*]] = arith.addi [[INIT]], [[TOTAL_INCREMENT]]
+// CHECK:   amdg.buffer_load %{{.*}}{{\[}}[[CLOSED_OFFSET]]{{\]}}
+// CHECK:   amdg.buffer_load [[SAFE_BASE]]{{\[}}[[SAFE_INIT]]{{\]}}
+// CHECK:   [[NEXT_OFFSET:%.*]] = arith.addi {{.*}}, [[DELTA]]
+// CHECK:   [[NEXT_ITER_OFFSET:%.*]] = arith.subi [[IV]], [[LB]] : i32
+// CHECK:   [[NEXT_ITER:%.*]] = arith.divui [[NEXT_ITER_OFFSET]], [[LOOP_STEP]] : i32
+// CHECK:   [[ONE:%.*]] = arith.constant 1 : i32
+// CHECK:   [[AFTER_NEXT_ITER:%.*]] = arith.addi [[NEXT_ITER]], [[ONE]] : i32
+// CHECK:   [[NEXT_ITER_SPLAT:%.*]] = tt.splat [[AFTER_NEXT_ITER]] : i32 -> tensor<16x64xi32, #blocked>
+// CHECK:   [[NEXT_TOTAL_INCREMENT:%.*]] = arith.muli [[NEXT_ITER_SPLAT]], [[DELTA]]
+// CHECK:   [[NEXT_CLOSED_OFFSET:%.*]] = arith.addi [[INIT]], [[NEXT_TOTAL_INCREMENT]]
+// CHECK:   amdg.buffer_load %{{.*}}{{\[}}[[NEXT_CLOSED_OFFSET]]{{\]}}
+// CHECK:   [[NEXT_SAFE_BASE:%.*]] = tt.addptr [[SAFE_BASE]], %{{.*}}
 // CHECK-NOT: tt.addptr
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func public @offsets_possible_overflow_negative(%X: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %step_scalar : i32) attributes {noinline = false} {
+  tt.func public @offsets_possible_overflow_negative(%X: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %Z: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %step_scalar : i32) attributes {noinline = false} {
     %c0 = arith.constant 0 : i32
     %c128 = arith.constant 128 : i32
     %c1 = arith.constant 1 : i32
 
     %Xoffset_init = arith.constant dense<123> : tensor<16x64xi32, #blocked>
+    %Zoffset_init = arith.constant dense<456> : tensor<16x64xi32, #blocked>
     %x_dummy_buffer = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x64>
     %step = tt.splat %step_scalar: i32 -> tensor<16x64xi32, #blocked>
-    %for = scf.for %idx = %c0 to %c128 step %c1 iter_args(%Xoffset = %Xoffset_init) -> (tensor<16x64xi32, #blocked>) : i32 {
+    %safe_step = arith.constant dense<64> : tensor<16x64xi32, #blocked>
+    %for:2 = scf.for %idx = %c0 to %c128 step %c1 iter_args(%Xoffset = %Xoffset_init, %Zoffset = %Zoffset_init) -> (tensor<16x64xi32, #blocked>, tensor<16x64xi32, #blocked>) : i32 {
       %x = amdg.buffer_load %X[%Xoffset] : tensor<16x64xf16, #blocked>
+      %z = amdg.buffer_load %Z[%Zoffset] : tensor<16x64xf16, #blocked>
       ttg.local_store %x, %x_dummy_buffer : tensor<16x64xf16, #blocked> -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x64>
+      ttg.local_store %z, %x_dummy_buffer : tensor<16x64xf16, #blocked> -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x64>
       %Xoffset_next = arith.addi %Xoffset, %step : tensor<16x64xi32, #blocked>
-      scf.yield %Xoffset_next : tensor<16x64xi32, #blocked>
+      %x_next = amdg.buffer_load %X[%Xoffset_next] : tensor<16x64xf16, #blocked>
+      ttg.local_store %x_next, %x_dummy_buffer : tensor<16x64xf16, #blocked> -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x64>
+      %Zoffset_next = arith.addi %Zoffset, %safe_step : tensor<16x64xi32, #blocked>
+      scf.yield %Xoffset_next, %Zoffset_next : tensor<16x64xi32, #blocked>, tensor<16x64xi32, #blocked>
     }
     tt.return
   }
