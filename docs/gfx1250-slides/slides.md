@@ -135,7 +135,7 @@ tensor_store_from_lds s[28:31], s[20:27]
 </div>
 </div>
 
-<div class="panel tdm-note"><h3>Specialize transfers by wave</h3><p class="small">Grouped GEMM: waves 0–1 load A; waves 2–3 load B, at one instruction site.</p><p class="small">Tile size follows the descriptor, within descriptor and LDS limits; payload bypasses VGPRs.</p></div>
+<div class="panel tdm-note"><h3>Specialize transfers by wave</h3><p class="small">Different waves can transfer different tiles at one instruction site.</p><p class="small">Tile size follows the descriptor, within descriptor and LDS limits; payload bypasses VGPRs.</p></div>
 
 <div class="source">CDNA5 ISA §10.11 · Generated load/store excerpts; descriptor setup and synchronization omitted.</div>
 
@@ -147,7 +147,7 @@ This 2D form consumes two descriptor groups: group 0 has four SGPRs, group 1 has
 Group 0 supplies the global address of the tile start (not the tensor origin) and its LDS byte address.
 Group 1 supplies dimensions, strides, element size, padding controls, and the multicast workgroup mask.
 Non-gather loads and stores transfer a whole descriptor-sized tile per instruction; the byte count is not fixed by the opcode or lane count. Tile dimensions use 16-bit fields; the LDS footprint must fit the allocated buffer. Gather/scatter instead has an 8- or 16-row index-list limit per instruction.
-This permits transfer specialization by wave. Our grouped GEMM already selects A for waves 0–1 and B for waves 2–3 at one instruction site; all four waves also compute.
+This permits transfer specialization by wave. For example, half the waves can load matrix A and the other half can load matrix B. Each wave selects its own descriptor at one shared instruction site.
 Choosing which waves issue requests is separate from selecting multicast recipients in the descriptor.
 TDM instructions ignore EXEC, including EXEC==0. They do not take per-lane global/LDS pointers, and their operands are unaffected by VGPR MSB settings.
 TDM completion is per wave and ordered across its loads/stores. The next slide introduces workgroup clusters and multicast.

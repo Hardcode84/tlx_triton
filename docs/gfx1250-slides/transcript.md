@@ -137,10 +137,9 @@ comes from the descriptor. The byte count is not fixed by the opcode or lane
 count. Tile dimensions use 16-bit fields, and the LDS footprint must fit the
 allocated buffer. Gather and scatter have a separate row-index-list limit.
 
-This lets us specialize transfers by wave and combine instruction sites. Our
-grouped GEMM already does this: waves zero and one load A; waves two and three
-load B. Each wave selects its descriptor at the same load instruction site.
-All four waves also compute. We will return to this on slide nine.
+This lets us specialize transfers by wave and combine instruction sites. For
+example, half the waves can load matrix A and the other half can load matrix B.
+Each wave selects its own descriptor at the same load instruction site.
 
 TDM operates on whole tile requests and ignores EXEC. Choosing which waves issue
 requests therefore happens separately from the per-lane execution mask. The ISA

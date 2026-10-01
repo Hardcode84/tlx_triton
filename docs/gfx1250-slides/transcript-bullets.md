@@ -19,7 +19,7 @@
 - **04 · TDM — 6:00–8:00**
   - Non-gather load/store: descriptor-sized tile per instruction; payload bypasses VGPRs.
   - Transfer size independent of lane count; 16-bit tile dimensions, allocated LDS capacity.
-  - Grouped GEMM uses transfer specialization: waves 0–1 load A, 2–3 load B; one instruction site.
+  - Transfer specialization: different waves select different tile descriptors at one instruction site.
   - 2D descriptor: group 0 = four SGPRs, addresses/control; group 1 = eight SGPRs, shape/strides/format.
   - EXEC ignored; 1–5D tiles; 2D gather/scatter; load padding and multicast.
   - Per-wave `S_WAIT_TENSORCNT`; synchronize other-wave consumers separately.
