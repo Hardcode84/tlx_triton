@@ -807,7 +807,6 @@ Source: python/test/unit/language/test_tlx_amd_gfx1250.py
 - Asymmetric prefetch stays within a group; it needs tiles/group &gt; P.
 - The square FP32 accumulator alone holds **512 values per thread**.
 
-<div class="placeholder small"><p>Insert verified LDS allocation and VGPR counts for both configurations.</p></div>
 
 <div class="source">Kernel configuration guide · Auto selection ranks relative saturated rate × tile-slot utilization × useful/padded FLOPs.</div>
 
