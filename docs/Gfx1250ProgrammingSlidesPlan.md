@@ -103,7 +103,7 @@
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
 
 - **14. Grouped GEMM performance — 1 min.**
-  - Device: MI455 B0. Show all twelve [supplied results](gfx1250-slides/grouped-gemm-performance.csv); G=1–32, all reported status values ok.
+  - Device: MI455 B0. Show all twelve [supplied results](gfx1250-slides/grouped-gemm-performance.csv); G=1–32; show dimensions, time, and throughput.
   - Throughput: 2707.87–2918.71 TFLOPS; no per-optimization speedup claim.
 
 - **15. Directions to explore — 5 min, including discussion.**

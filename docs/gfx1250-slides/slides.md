@@ -447,29 +447,29 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 
 # Grouped GEMM: 2.71–2.92 PFLOP/s
 
-<p class="subtitle">MI455 B0 · 12 cases · G = 1–32 · all status values: ok</p>
+<p class="subtitle">MI455 B0 · 12 cases · G = 1–32</p>
 
-| G | M / group | N | K | GiB | ms | TFLOPS | Status |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| 32 | 32768 | 8192 | 4096 | 26.0 | 24.9431 | 2821.17 | ok |
-| 32 | 32768 | 4096 | 4096 | 17.0 | 12.2866 | 2863.65 | ok |
-| 32 | 65536 | 8192 | 4096 | 50.0 | 51.9736 | 2707.87 | ok |
-| 32 | 65536 | 4096 | 4096 | 33.0 | 25.1588 | 2796.98 | ok |
-| 8 | 32768 | 8192 | 4096 | 6.5 | 6.0274 | 2918.71 | ok |
-| 8 | 32768 | 4096 | 4096 | 4.2 | 3.0389 | 2894.47 | ok |
-| 8 | 65536 | 8192 | 4096 | 12.5 | 12.2128 | 2880.95 | ok |
-| 8 | 65536 | 4096 | 4096 | 8.2 | 6.0409 | 2912.20 | ok |
-| 1 | 4096 | 4096 | 4096 | 0.1 | 0.0502 | 2740.28 | ok |
-| 1 | 8192 | 8192 | 8192 | 0.4 | 0.3942 | 2789.53 | ok |
-| 1 | 16384 | 16384 | 16384 | 1.5 | 3.1839 | 2762.69 | ok |
-| 16 | 4096 | 4096 | 4096 | 1.5 | 0.7839 | 2805.07 | ok |
+| G | M / group | N | K | ms | TFLOPS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 32768 | 8192 | 4096 | 24.9431 | 2821.17 |
+| 32 | 32768 | 4096 | 4096 | 12.2866 | 2863.65 |
+| 32 | 65536 | 8192 | 4096 | 51.9736 | 2707.87 |
+| 32 | 65536 | 4096 | 4096 | 25.1588 | 2796.98 |
+| 8 | 32768 | 8192 | 4096 | 6.0274 | 2918.71 |
+| 8 | 32768 | 4096 | 4096 | 3.0389 | 2894.47 |
+| 8 | 65536 | 8192 | 4096 | 12.2128 | 2880.95 |
+| 8 | 65536 | 4096 | 4096 | 6.0409 | 2912.20 |
+| 1 | 4096 | 4096 | 4096 | 0.0502 | 2740.28 |
+| 1 | 8192 | 8192 | 8192 | 0.3942 | 2789.53 |
+| 1 | 16384 | 16384 | 16384 | 3.1839 | 2762.69 |
+| 16 | 4096 | 4096 | 4096 | 0.7839 | 2805.07 |
 
 <div class="source">Source: supplied benchmark summary · 2 October 2026 · Values retained as reported; G = groups, M = rows per group.</div>
 
 <!--
 1 min. Supplied results, preserved in grouped-gemm-performance.csv; no benchmark rerun for this slide.
 Range: 2707.87–2918.71 TFLOPS. Do not infer speedup or percentage of hardware peak from this table.
-Device: MI455 B0, confirmed by the presenter. GPU count, exact kernel variant, timing method, and meaning of the reported GiB column were not supplied with the summary. Status is the benchmark's reported value, not an independent validation in this editing session.
+Device: MI455 B0, confirmed by the presenter. GPU count, exact kernel variant, timing method, and meaning of the reported GiB column were not supplied with the summary. The GiB and status fields remain in the source CSV but are omitted from the slide.
 The TFLOPS formula for equal-sized groups is 2*G*M*N*K / seconds / 1e12. Displayed times are rounded; retain the reported TFLOPS.
 -->
 ---

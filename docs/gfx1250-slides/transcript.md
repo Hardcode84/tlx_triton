@@ -440,10 +440,10 @@ That gives us several concrete directions to explore next.
 
 These are the supplied grouped GEMM benchmark results on MI455 B0. G is the number of
 GEMMs, and M is the row count per group. The table retains all twelve cases,
-including their reported time, memory size, throughput, and status.
+including their dimensions, reported time, and throughput.
 
 Throughput ranges from 2,707.87 to 2,918.71 TFLOPS, or about 2.71 to 2.92
-PFLOP/s. All twelve status values are ok. The cases include one large GEMM and
+PFLOP/s. The cases include one large GEMM and
 batches of eight, sixteen, and thirty-two GEMMs.
 
 These are absolute throughput results. The table does not measure the gain

@@ -72,7 +72,7 @@
   - M rows are nonadjacent; diagram shows logical tiles, not physical placement.
   - Two-workgroup cluster shares B; four shares A/B; current kernel synchronizes before refill.
 - **14 · Grouped GEMM performance — 24:00–25:00**
-  - MI455 B0; all 12 supplied cases; G=1–32; reported status ok throughout.
+  - MI455 B0; all 12 supplied cases; G=1–32.
   - 2707.87–2918.71 TFLOPS = 2.71–2.92 PFLOP/s.
   - Absolute throughput; no per-optimization speedup or hardware-peak claim.
 - **15 · Directions to explore — 25:00–30:00**
