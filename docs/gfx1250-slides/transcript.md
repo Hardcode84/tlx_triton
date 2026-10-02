@@ -438,7 +438,7 @@ That gives us several concrete directions to explore next.
 
 *24:00–25:00 · 1 minute*
 
-These are the supplied grouped GEMM benchmark results. G is the number of
+These are the supplied grouped GEMM benchmark results on MI455 B0. G is the number of
 GEMMs, and M is the row count per group. The table retains all twelve cases,
 including their reported time, memory size, throughput, and status.
 

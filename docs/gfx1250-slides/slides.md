@@ -447,7 +447,7 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 
 # Grouped GEMM: 2.71–2.92 PFLOP/s
 
-<p class="subtitle">12 reported cases · G = 1–32 · all status values: ok</p>
+<p class="subtitle">MI455 B0 · 12 cases · G = 1–32 · all status values: ok</p>
 
 | G | M / group | N | K | GiB | ms | TFLOPS | Status |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
@@ -469,7 +469,7 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 <!--
 1 min. Supplied results, preserved in grouped-gemm-performance.csv; no benchmark rerun for this slide.
 Range: 2707.87–2918.71 TFLOPS. Do not infer speedup or percentage of hardware peak from this table.
-The GPU model/count, exact kernel variant, timing method, and meaning of the reported GiB column were not supplied with the summary. Status is the benchmark's reported value, not an independent validation in this editing session.
+Device: MI455 B0, confirmed by the presenter. GPU count, exact kernel variant, timing method, and meaning of the reported GiB column were not supplied with the summary. Status is the benchmark's reported value, not an independent validation in this editing session.
 The TFLOPS formula for equal-sized groups is 2*G*M*N*K / seconds / 1e12. Displayed times are rounded; retain the reported TFLOPS.
 -->
 ---

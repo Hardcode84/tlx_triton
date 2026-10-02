@@ -79,4 +79,5 @@ and preparation details in the plan. Collection details are outside the deck.
 
 [Grouped GEMM performance data](grouped-gemm-performance.csv) retains the twelve
 benchmark rows supplied on 2 October 2026 for slide 14. No benchmark was rerun
-for that slide. Device and run configuration were not included in the summary.
+for that slide. The presenter confirmed the device as MI455 B0. The remaining run configuration
+was not supplied.
