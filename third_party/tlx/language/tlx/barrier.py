@@ -294,6 +294,30 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
 
 
 @tl.builtin
+def amd_sched_group_barrier(mask: tl.constexpr, size: tl.constexpr, sync_id: tl.constexpr = 0, _semantic=None):
+    """Constrain the relative order of AMD instruction groups.
+
+    Markers with the same ``sync_id`` describe a sequence of groups. Each
+    group contains up to ``size`` instructions matching the LLVM AMDGPU
+    scheduling-class ``mask``; for example, 0x8 selects MFMA/WMMA and 0x100
+    selects LDS reads. Data dependencies still take precedence.
+
+    This emits ``llvm.amdgcn.sched.group.barrier`` and adds no runtime fence
+    or synchronization between waves. Do not combine it with ``amd_iglp_opt``
+    in the same scheduling region.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_group_barrier is only supported on AMD (HIP) backends")
+    mask, size, sync_id = (tl._unwrap_if_constexpr(value) for value in (mask, size, sync_id))
+    for name, value in (("mask", mask), ("size", size), ("sync_id", sync_id)):
+        assert isinstance(value, int) and not isinstance(value, bool), f"{name} must be a constexpr integer"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    assert 0 <= size < 1 << 31, "size must be a non-negative signed 32-bit integer"
+    assert 0 <= sync_id < 1 << 31, "sync_id must be a non-negative signed 32-bit integer"
+    _semantic.builder.create_amd_sched_group_barrier(mask, size, sync_id)
+
+
+@tl.builtin
 def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
     """Emit LLVM's ``llvm.amdgcn.iglp.opt`` scheduling hint for AMD GPUs.
 

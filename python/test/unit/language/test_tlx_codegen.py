@@ -2024,6 +2024,14 @@ def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _amd_sched_group_barrier_kernel(x_ptr, y_ptr, MASK: tl.constexpr, SIZE: tl.constexpr, SYNC_ID: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_sched_group_barrier(MASK, SIZE, SYNC_ID)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
 def _amd_iglp_opt_kernel(x_ptr, y_ptr, VARIANT: tl.constexpr):
     offsets = tl.arange(0, 64)
     values = tl.load(x_ptr + offsets)
@@ -4129,6 +4137,33 @@ def test_amd_sched_barrier_compiles_gfx950():
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
 
 
+def test_amd_sched_group_barrier_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_sched_group_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+        constexprs={"MASK": 0x20, "SIZE": 1, "SYNC_ID": 7},
+    )
+    assert "call void @llvm.amdgcn.sched.group.barrier(i32 32, i32 1, i32 7)" in compiled.asm["llir"]
+    assert "sched_group_barrier" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.parametrize("constants,error", [
+    ({"MASK": 0x1000}, "mask must use only"),
+    ({"MASK": False}, "mask must be a constexpr integer"),
+    ({"SIZE": -1}, "size must be a non-negative"),
+    ({"SIZE": 1.0}, "size must be a constexpr integer"),
+    ({"SYNC_ID": 1 << 31}, "sync_id must be a non-negative"),
+])
+def test_amd_sched_group_barrier_rejects_invalid_constants(constants, error):
+    config = dict(MASK=0x20, SIZE=1, SYNC_ID=0)
+    config.update(constants)
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        with pytest.raises(CompilationError, match=error):
+            compile_for_gfx950(_amd_sched_group_barrier_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+                               constexprs=config)
+
+
 def test_amd_iglp_opt_compiles_gfx950():
     compiled = compile_for_gfx950(
         _amd_iglp_opt_kernel,
@@ -5424,17 +5459,18 @@ def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, rema
 def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
-                     b_scale="*u8", M="i32", N="i32", K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32",
-                     stride_as="i32", stride_bs="i32")
-    # Match the aligned, sub-2GB tensors and runtime dimension specialization
-    # used by bench.py at both K4096 and K8192.
-    attrs = {(kernel.arg_names.index(name), ):
-             [["tt.divisibility", 16]] + ([["tt.pointer_range", 32]] if ty.startswith("*") else [])
-             for name, ty in signature.items()}
-    config = dict(DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, GROUP_SIZE_M=8,
-                  NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial", NUM_PROGRAMS=256,
-                  CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False, XCD_REMAP_MODE=0,
-                  NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True, CLUSTER_BARRIER_INTERVAL=1)
+                     b_scale="*u8")
+    # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
+    # and strides so the persistent kernel can fold descriptor/tile setup.
+    attrs = {(kernel.arg_names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+             for name in signature}
+    m, n, k = (constants.get(dim, 8192) for dim in ("M", "N", "K"))
+    config = dict(M=m, N=n, K=k, stride_am=k, stride_bn=k // 2 if dtype_b == "e2m1" else k, stride_cm=n,
+                  stride_as=k * 4, stride_bs=k * 4, DTYPE_A="e4m3", DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256,
+                  BLOCK_K=block_k, GROUP_SIZE_M=8, NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial",
+                  NUM_PROGRAMS=256, CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False,
+                  XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
+                  CLUSTER_BARRIER_INTERVAL=1)
     config.update(constants)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     return triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
@@ -5442,12 +5478,14 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constant
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
-                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128)])
+                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128),
+                                                         ("e4m3", 4, 128), ("e2m1", 4, 128)])
+@pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("sched_mode_2", [False, True])
 @pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
 def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2, cluster_size,
-                                                          barrier_interval):
-    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, SCHED_MODE_2=sched_mode_2,
+                                                          barrier_interval, k):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, K=k, SCHED_MODE_2=sched_mode_2,
                                                   CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=barrier_interval)
     asm = compiled.asm["amdgcn"]
     assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
@@ -5455,7 +5493,9 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
     assert compiled.metadata.shared <= 320 * 1024
-    assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else 8)
+    assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else (16 if num_buffers == 4 else 8))
+    grouped_prefetch = block_k == 128 and num_buffers == 4 and dtype_b == "e4m3"
+    assert ("sched_group_barrier" in asm) == grouped_prefetch
 
     # Find the innermost loop containing both compute and a TDM refill. Merely
     # emitting both kinds of instructions is insufficient: the regression put
@@ -5471,6 +5511,10 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
                 loops.append(body)
     assert loops, "missing steady compute/refill loop"
     body = min(loops, key=len)
+    if dtype_b == "e4m3" and block_k == 128:
+        # Each wave selects its data/scale base once, outside the K loop.
+        # The two fused refills then need only their common K advances.
+        assert sum("s_add_nc_u64" in inst for inst in body) <= 2
     wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
     load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
     # A periodic cluster barrier can put the refill block before the compute
@@ -5479,6 +5523,10 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     block_end = next((i for i in range(load + 1, len(body)) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", body[i])),
                      len(body))
     assert any("v_wmma" in inst for inst in body[load + 1:block_end]), "no matrix work overlaps the next operand loads"
+    if grouped_prefetch:
+        # Four independent prefetch regions retain their own scheduling IDs.
+        for sync_id in (101, 102, 103, 104):
+            assert f"SyncID({sync_id})" in "\n".join(body)
     if block_k == 256 and dtype_b == "e2m1":
         assert sum("v_wmma" in inst
                    for inst in body[wait + 1:block_end]) >= 64, "too little deferred matrix work covers the refill"

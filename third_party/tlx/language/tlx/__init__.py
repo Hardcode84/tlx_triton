@@ -13,6 +13,7 @@ from .barrier import (
     named_barrier_wait,
     amd_iglp_opt,
     amd_sched_barrier,
+    amd_sched_group_barrier,
     workgroup_barrier,
 )
 from .dynamic_launch import (
@@ -253,6 +254,7 @@ __all__ = [
     "named_barrier_arrive",
     "amd_iglp_opt",
     "amd_sched_barrier",
+    "amd_sched_group_barrier",
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",

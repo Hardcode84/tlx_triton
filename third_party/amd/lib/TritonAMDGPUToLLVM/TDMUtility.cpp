@@ -938,15 +938,17 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   }
   Value &group0 = groups[0];
   Value &group1 = groups[1];
+  // Advance the global address before inserting the changing LDS address.
+  // Otherwise the i32/i64 vector bitcast used by advanceGlobalAddr makes
+  // LLVM's loop-invariant code motion see a dependency on the LDS slot.
+  Value byteOffset =
+      b.mul(baseOffset, b.i64_val(elementType.getIntOrFloatBitWidth() / 8));
+  advanceGlobalAddr(rewriter, b, group0, byteOffset);
   // Skip re-writing pred when it is exactly the descriptor's existing
   // group0[0].
   if (!predIsInherited)
     group0 = vecSet(b, group0, 0, pred);
   group0 = vecSet(b, group0, 1, ldsAddr);
-  // Advance global_addr by the per-warp byte offset.
-  Value byteOffset =
-      b.mul(baseOffset, b.i64_val(elementType.getIntOrFloatBitWidth() / 8));
-  advanceGlobalAddr(rewriter, b, group0, byteOffset);
 
   // Update group1 with tensor shapes
   Value g1_0 = vecGet(b, group1, 0);
@@ -1716,11 +1718,31 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   size_t numGroups = members.front().desc.size();
 
+  // The innermost stride is one. When every member advances by the same
+  // byte offset, apply that offset after selecting the descriptor. Otherwise
+  // a fused GEMM load adds K to both A and B addresses on every iteration,
+  // then selects between them. Keeping the common advance outside the
+  // selection lets LLVM hoist the wave's base address out of the K loop.
+  Value commonInnerOffset;
+  unsigned elementBits = members.front().elementType.getIntOrFloatBitWidth();
+  if (!members.front().descriptorOffsets.empty()) {
+    Value offset = members.front().descriptorOffsets.back();
+    if (llvm::all_of(members, [&](const TDMFusedLoadMemberInfo &member) {
+          return !member.descriptorOffsets.empty() &&
+                 member.descriptorOffsets.back() == offset &&
+                 member.elementType.getIntOrFloatBitWidth() == elementBits;
+        }))
+      commonInnerOffset = offset;
+  }
+
   SmallVector<SmallVector<Value, 4>, 4> filledPerMember(numMembers);
-  for (size_t i = 0; i < numMembers; ++i)
-    filledPerMember[i] =
-        fillFusedTDMDescriptorMember(rewriter, loc, typeConverter, members[i],
-                                     numWarps, ctaId, memberHints[i]);
+  for (size_t i = 0; i < numMembers; ++i) {
+    TDMFusedLoadMemberInfo member = members[i];
+    if (commonInnerOffset)
+      member.descriptorOffsets.back() = b.i32_val(0);
+    filledPerMember[i] = fillFusedTDMDescriptorMember(
+        rewriter, loc, typeConverter, member, numWarps, ctaId, memberHints[i]);
+  }
 
   SmallVector<Value, 4> memberActive(numMembers - 1);
   for (size_t i = 0; i + 1 < numMembers; ++i)
@@ -1729,6 +1751,38 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
 
   SmallVector<Value, 6> selectedGroups(numGroups);
   for (size_t group = 0; group < numGroups; ++group) {
+    if (group == 0 && commonInnerOffset) {
+      // Select the global address separately from the changing LDS address.
+      // A vector select containing both prevents LLVM's loop-invariant code
+      // motion from hoisting even the invariant global-address component.
+      auto getGlobalAddr = [&](Value descriptor) {
+        // Extract dwords before joining them, so the LDS dword's insert can
+        // fold away without looking through a vector bitcast of mixed widths.
+        return b.or_(
+            b.zext(i64_ty, vecGet(b, descriptor, 2)),
+            b.shl(b.zext(i64_ty, vecGet(b, descriptor, 3)), b.i64_val(32)));
+      };
+      Value last = filledPerMember[numMembers - 1][0];
+      Value control = vecGet(b, last, 0);
+      Value ldsAddr = vecGet(b, last, 1);
+      Value globalAddr = getGlobalAddr(last);
+      for (size_t i = numMembers - 1; i-- > 0;) {
+        Value member = filledPerMember[i][0];
+        control = b.select(memberActive[i], vecGet(b, member, 0), control);
+        ldsAddr = b.select(memberActive[i], vecGet(b, member, 1), ldsAddr);
+        globalAddr =
+            b.select(memberActive[i], getGlobalAddr(member), globalAddr);
+      }
+      Value byteOffset =
+          b.mul(b.sext(i64_ty, commonInnerOffset), b.i64_val(elementBits / 8));
+      globalAddr = b.add(globalAddr, byteOffset);
+      Value selected = vecSet(b, b.undef(vec_ty(i32_ty, 4)), 0, control);
+      selected = vecSet(b, selected, 1, ldsAddr);
+      selected = vecSet(b, selected, 2, b.trunc(i32_ty, globalAddr));
+      selectedGroups[0] = vecSet(
+          b, selected, 3, b.trunc(i32_ty, b.lshr(globalAddr, b.i64_val(32))));
+      continue;
+    }
     Value selected = filledPerMember[numMembers - 1][group];
     for (size_t i = numMembers - 1; i-- > 0;)
       selected = b.select(memberActive[i], filledPerMember[i][group], selected);

@@ -6,6 +6,8 @@ partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
 BK256 with cross-tile prefetch disabled so output can reuse the A ring.
 Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
 multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
+MX8xMX8 also supports four input buffers: --num-buffers 4 uses smaller output
+staging chunks and an explicit LDS/WMMA prefetch schedule.
 Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
 tutorial kernel's timed region. The default timing budget is 256 ms, matching
@@ -16,6 +18,7 @@ Examples::
 
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-buffers 4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
@@ -217,7 +220,7 @@ def main():
         if run_args.output_staging:
             if run_args.block_k == 256 and run_args.cross_tile_prefetch:
                 parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
-            max_buffers = 3 if run_args.block_k == 128 else (3 if dtype_b == "float4" else 2)
+            max_buffers = 4 if run_args.block_k == 128 else (3 if dtype_b == "float4" else 2)
             if run_args.num_buffers > max_buffers:
                 parser.error(
                     f"BK{run_args.block_k} output staging with {dtype_b} supports at most {max_buffers} buffers")
