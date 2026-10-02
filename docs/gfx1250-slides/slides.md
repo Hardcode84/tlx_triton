@@ -433,7 +433,7 @@ The captured square build uses 320,448 shared bytes and 886 VGPRs; see assembly.
 <div class="source">acae400635 · f676cb6304 · GROUP_M=4; chunked remapping uses eight logical XCDs and chunk size two.</div>
 
 <!--
-3 min. The diagram is logical tile space, not physical GPU placement. The M rows are nonadjacent.
+2 min. The diagram is logical tile space, not physical GPU placement. The M rows are nonadjacent.
 The physical rank is the mask bit position: rank 0 is the least significant bit.
 Two-workgroup clusters share B only; four-workgroup clusters share A and B.
 Masks select recipients independently of the source wave masks on slide 10.
@@ -441,9 +441,42 @@ Use the cluster constraints in backup G; ragged groups use ordinary workgroups.
 -->
 ---
 
+<!-- _class: gemm-performance -->
+
+<div class="eyebrow">14 / Grouped GEMM · Performance</div>
+
+# Grouped GEMM: 2.71–2.92 PFLOP/s
+
+<p class="subtitle">12 reported cases · G = 1–32 · all status values: ok</p>
+
+| G | M / group | N | K | GiB | ms | TFLOPS | Status |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 32 | 32768 | 8192 | 4096 | 26.0 | 24.9431 | 2821.17 | ok |
+| 32 | 32768 | 4096 | 4096 | 17.0 | 12.2866 | 2863.65 | ok |
+| 32 | 65536 | 8192 | 4096 | 50.0 | 51.9736 | 2707.87 | ok |
+| 32 | 65536 | 4096 | 4096 | 33.0 | 25.1588 | 2796.98 | ok |
+| 8 | 32768 | 8192 | 4096 | 6.5 | 6.0274 | 2918.71 | ok |
+| 8 | 32768 | 4096 | 4096 | 4.2 | 3.0389 | 2894.47 | ok |
+| 8 | 65536 | 8192 | 4096 | 12.5 | 12.2128 | 2880.95 | ok |
+| 8 | 65536 | 4096 | 4096 | 8.2 | 6.0409 | 2912.20 | ok |
+| 1 | 4096 | 4096 | 4096 | 0.1 | 0.0502 | 2740.28 | ok |
+| 1 | 8192 | 8192 | 8192 | 0.4 | 0.3942 | 2789.53 | ok |
+| 1 | 16384 | 16384 | 16384 | 1.5 | 3.1839 | 2762.69 | ok |
+| 16 | 4096 | 4096 | 4096 | 1.5 | 0.7839 | 2805.07 | ok |
+
+<div class="source">Source: supplied benchmark summary · 2 October 2026 · Values retained as reported; G = groups, M = rows per group.</div>
+
+<!--
+1 min. Supplied results, preserved in grouped-gemm-performance.csv; no benchmark rerun for this slide.
+Range: 2707.87–2918.71 TFLOPS. Do not infer speedup or percentage of hardware peak from this table.
+The GPU model/count, exact kernel variant, timing method, and meaning of the reported GiB column were not supplied with the summary. Status is the benchmark's reported value, not an independent validation in this editing session.
+The TFLOPS formula for equal-sized groups is 2*G*M*N*K / seconds / 1e12. Displayed times are rounded; retain the reported TFLOPS.
+-->
+---
+
 <!-- _class: next-directions -->
 
-<div class="eyebrow">14 / Directions to explore</div>
+<div class="eyebrow">15 / Directions to explore</div>
 
 # Which directions should we explore next?
 
@@ -475,7 +508,7 @@ Chained-dot compiler changes reverted by 02a632587a produced identical default b
 
 <!-- _class: divider -->
 
-<div class="eyebrow">15 / End of the main talk</div>
+<div class="eyebrow">16 / End of the main talk</div>
 
 # Backup
 

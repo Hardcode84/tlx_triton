@@ -1,15 +1,15 @@
 # CDNA5 / gfx1250 programming slides
 
 Marp draft of the [reviewed plan](../Gfx1250ProgrammingSlidesPlan.md):
-one title slide, 12 main content slides, two section dividers, and ten backup
-slides (25 slides total). Slides 2–6 cover hardware. The dividers introduce the
-grouped GEMM case study (slide 7) and the backup material (slide 15).
+one title slide, 13 main content slides, two section dividers, and ten backup
+slides (26 slides total). Slides 2–6 cover hardware. The dividers introduce the
+grouped GEMM case study (slide 7) and the backup material (slide 16).
 The main talk runs for 30 minutes, including five minutes for discussion.
 
 [Presenter transcript](transcript.md): spoken script for every slide, with timing
 windows, delivery cues, and optional backup explanations.
 
-[Bullet-only presenter outline](transcript-bullets.md): short cues for all 25 slides,
+[Bullet-only presenter outline](transcript-bullets.md): short cues for all 26 slides,
 with main-talk timing and optional backup reminders.
 
 ## Build locally
@@ -54,7 +54,7 @@ template's title artwork. Teal distinguishes data movement in diagrams.
 Liberation Sans provides Arial-compatible metrics on hosts without Arial.
 The source Markdown, diagrams, and fonts stay local to this directory.
 
-All assembly panels are filled and assembler-checked. Slides 3, 4, 6, 10, and 12 use
+All assembly panels are filled and assembler-checked. Slides 3, 4, and 6 use
 generated grouped-GEMM excerpts; backups B/D/I use handwritten ISA
 examples. [Assembly preparation records](assembly.md) describe their provenance,
 assumptions, and reproduction using `scripts/compile-assembly.py`.
@@ -76,3 +76,7 @@ remain separate. The draft contains no absolute performance results.
 The code reference is `b266fe4c1d`; ISA sections refer to the AMD CDNA5 Reference
 Guide dated 27 July 2026. Technical citations are on slides, with further sources
 and preparation details in the plan. Collection details are outside the deck.
+
+[Grouped GEMM performance data](grouped-gemm-performance.csv) retains the twelve
+benchmark rows supplied on 2 October 2026 for slide 14. No benchmark was rerun
+for that slide. Device and run configuration were not included in the summary.

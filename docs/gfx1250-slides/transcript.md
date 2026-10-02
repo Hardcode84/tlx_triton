@@ -2,9 +2,9 @@
 
 Companion to [slides.md](slides.md).
 The time windows follow the 30-minute main talk and include pauses to inspect
-the diagrams and assembly. Slide 14 reserves most of its time for discussion.
+the diagrams and assembly. Slide 15 reserves most of its time for discussion.
 The title and grouped GEMM divider are included in that schedule. The backup divider and
-backups A–J are optional, outside it. Section numbers match all 25 deck pages.
+backups A–J are optional, outside it. Section numbers match all 26 deck pages.
 
 The schedule reserves 25 minutes for the material and five minutes for discussion.
 Treat the time windows as rehearsal targets, including pauses to inspect the examples.
@@ -392,7 +392,7 @@ pipeline without requiring a full extra C tile in LDS.
 
 ## Slide 13 — A 2 × 2 sharing pattern
 
-*22:00–25:00 · 3 minutes*
+*22:00–24:00 · 2 minutes*
 
 Now let’s apply clusters to the actual tile mapping. Each workgroup still
 computes one output tile. The goal is to arrange those tiles so that pairs of
@@ -434,7 +434,23 @@ so the members reach compatible tile and group boundaries.
 We have now changed both the pipeline and the opportunities for input reuse.
 That gives us several concrete directions to explore next.
 
-## Slide 14 — Which directions should we explore next?
+## Slide 14 — Grouped GEMM: 2.71–2.92 PFLOP/s
+
+*24:00–25:00 · 1 minute*
+
+These are the supplied grouped GEMM benchmark results. G is the number of
+GEMMs, and M is the row count per group. The table retains all twelve cases,
+including their reported time, memory size, throughput, and status.
+
+Throughput ranges from 2,707.87 to 2,918.71 TFLOPS, or about 2.71 to 2.92
+PFLOP/s. All twelve status values are ok. The cases include one large GEMM and
+batches of eight, sixteen, and thirty-two GEMMs.
+
+These are absolute throughput results. The table does not measure the gain
+from any one optimization. The original summary is retained in
+[grouped-gemm-performance.csv](grouped-gemm-performance.csv).
+
+## Slide 15 — Which directions should we explore next?
 
 *25:00–30:00 · 5 minutes, including discussion*
 
@@ -483,7 +499,7 @@ performance measurements were collected for this slide. The reverted
 chained-dot changes (`02a632587a`) produced identical default binaries and need
 a new production witness before further optimization work.*
 
-## Slide 15 — Backup
+## Slide 16 — Backup
 
 *Optional transition · outside the 30-minute main talk*
 
@@ -492,7 +508,7 @@ we can refer to during discussion.
 
 *[Open the relevant backup for a question; skip the others.]*
 
-## Slide 16 / Backup A — Partial waits need an ordering guarantee
+## Slide 17 / Backup A — Partial waits need an ordering guarantee
 
 *Optional backup · about 2 minutes*
 
@@ -525,7 +541,7 @@ the payload transfer is complete.
 All of these counts belong to a wave. When other waves consume the resulting
 data, we still need the corresponding synchronization between them.
 
-## Slide 17 / Backup B — Dependency waits are only part of the contract
+## Slide 18 / Backup B — Dependency waits are only part of the contract
 
 *Optional backup · about 1½ minutes*
 
@@ -556,7 +572,7 @@ So I check the relevant ISA hazard-table entry for the instruction and the
 overlapping operands. Enabling WMMA queuing still leaves that responsibility
 with code generation.
 
-## Slide 18 / Backup C — Bank conflicts and partition conflicts differ
+## Slide 19 / Backup C — Bank conflicts and partition conflicts differ
 
 *Optional backup · about 2 minutes*
 
@@ -590,7 +606,7 @@ These examples use physical LDS addresses, including the allocation base.
 For a transpose load, I would analyze the source LDS addresses first, before
 considering how the instruction redistributes values into registers.
 
-## Slide 19 / Backup D — S_CLAUSE groups a supported memory class
+## Slide 20 / Backup D — S_CLAUSE groups a supported memory class
 
 *Optional backup · about 1½ minutes*
 
@@ -619,7 +635,7 @@ particular kernel depends on the available independent requests and the resultin
 issue schedule. A stalled clause can leave resources idle, so I would inspect
 the affected memory sequence before making it part of an optimization.
 
-## Slide 20 / Backup E — Select rows with descriptor indices
+## Slide 21 / Backup E — Select rows with descriptor indices
 
 *Optional backup · about 1½ minutes*
 
@@ -648,7 +664,7 @@ The main grouped-GEMM path we discussed uses regular tiles. This backup shows
 another way to express data movement when the rows we want are selected by an
 index list.
 
-## Slide 21 / Backup F — Scaling is another programming dimension
+## Slide 22 / Backup F — Scaling is another programming dimension
 
 *Optional backup · about 1 minute*
 
@@ -673,7 +689,7 @@ accumulation fixed. That lets us evaluate the scheduling and sharing changes
 under the same precision choice. A scaled-format version would need its own
 layout, correctness, and efficiency comparison.
 
-## Slide 22 / Backup I — Global → LDS: who chooses the destination?
+## Slide 23 / Backup I — Global → LDS: who chooses the destination?
 
 *Optional backup · about 2 minutes*
 
@@ -706,7 +722,7 @@ So when I describe programmable LDS addresses on CDNA5, this is the per-lane
 capability I mean. When I describe the grouped kernel’s tile loads, stores, and
 multicast, I’m referring to TDM and its descriptor-based operations.
 
-## Slide 23 / Backup J — Separate arrival, participants, and state
+## Slide 24 / Backup J — Separate arrival, participants, and state
 
 *Optional backup · split, named, and LDS barriers*
 
@@ -730,7 +746,7 @@ arrival count, initialization, and reuse protocol for each buffer.
 *[Return to slide 5 for cluster scope, slide 12 for C staging, or backup A for
 per-wave completion counters. Reference: CDNA5 ISA §§5.6, 10.11.3, 11.2.2.]*
 
-## Slide 24 / Backup G — Keep cluster members on matching boundaries
+## Slide 25 / Backup G — Keep cluster members on matching boundaries
 
 *Optional backup · about 2 minutes*
 
@@ -768,7 +784,7 @@ metadata in the preceding tile’s tail. Its output uses vector stores so the in
 rings remain available for prefetched data. This is separate from the within-group
 hybrid path required by the cluster configuration above.
 
-## Slide 25 / Backup H — Smaller tiles can expose more parallel work
+## Slide 26 / Backup H — Smaller tiles can expose more parallel work
 
 *Optional backup · about 1½ minutes*
 

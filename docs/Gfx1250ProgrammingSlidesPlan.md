@@ -94,7 +94,7 @@
     - Convert and store one chunk at a time; TDM's per-wave load/store completion order lets the wait retire the older store before its slot is reused while the newest store may remain in flight. Cross-wave access also requires workgroup synchronization.
     - Final two stores overlap next-tile entry. Separate square cross-group path uses vector stores to preserve the input rings.
     - Visual: LDS allocation and two-slot store timeline. Commit: `7a58d5e627`; [output path](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
-  - **13. Reuse data across workgroups — 3 min.**
+  - **13. Reuse data across workgroups — 2 min.**
     - Chunked program remapping groups logical work for locality; cluster configuration uses eight logical XCDs and chunk size two.
     - Two workgroups share B; four share A and B. Each recipient issues a matching TDM request.
     - Four-rank A masks: `0101/1010`; B masks: `0011/1100`; each transfer has two recipients.
@@ -102,14 +102,18 @@
     - Cluster barrier before refill: finish local LDS readers, then cluster arrival/wait; prevent overwrites of data still used by a neighbor.
     - Visual: logical 2×2 sharing pattern with nonadjacent M tiles. Commits: `acae400635`, `f676cb6304`; [masks and remapping](../third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/amd_grouped_gemm_gfx1250_test.py).
 
-- **14. Directions to explore — 5 min, including discussion.**
+- **14. Grouped GEMM performance — 1 min.**
+  - Show all twelve [supplied results](gfx1250-slides/grouped-gemm-performance.csv); G=1–32, all reported status values ok.
+  - Throughput: 2707.87–2918.71 TFLOPS; no per-optimization speedup claim.
+
+- **15. Directions to explore — 5 min, including discussion.**
   - LDS/operand delivery: B padding, interleaved A/B slots, native WMMA reuse hints; separate bank, partition, and register effects (`069a0121aa`, `647b1a4e05`).
   - Multicast: compare cluster-barrier intervals with matched multicast-off controls; preserve local completion and buffer reuse (`5920df0408`).
   - Shape-specific scheduling: alias-C versus hybrid versus cross-group prefetch; vary group sizes and tiles/program; use the [recorded comparison](gfx1250-slides/efficiency.md) as a starting point.
   - MXFP: data/scale rings, BK128/BK256, output reuse, and operand lifetimes; check each format before extending to grouped workloads (`70ea55c702`, `d55b4d22f1`, `255abe4594`).
   - Related-branch experiments are candidate directions, not measured improvements for the deck's code reference. Ask which experiment to prioritize.
 
-- **15. Divider — Backup.**
+- **16. Divider — Backup.**
   - Marks the end of the main talk; ten optional technical references follow outside the 30-minute schedule.
 
 - **Backup — Wait counters and completion order.**

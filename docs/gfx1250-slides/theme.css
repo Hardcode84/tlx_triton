@@ -169,3 +169,8 @@ section.operand-schedule h1 { margin-bottom: 12px; }
 section.operand-schedule .diagram { height: 370px; object-fit: contain; }
 section.operand-schedule li { font-size: 22px; margin: 6px 0; }
 section.tile-boundary .diagram { height: 300px; object-fit: contain; }
+
+section.gemm-performance h1 { margin-bottom: 12px; }
+section.gemm-performance .subtitle { font-size: 22px; margin-bottom: 8px; }
+section.gemm-performance table { font-size: 20px; margin: 8px 0; font-variant-numeric: tabular-nums; }
+section.gemm-performance th, section.gemm-performance td { padding: 4px 12px; line-height: 1.2; }
