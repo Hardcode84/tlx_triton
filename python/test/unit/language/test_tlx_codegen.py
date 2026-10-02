@@ -5444,8 +5444,11 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constant
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
                                                          ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128)])
 @pytest.mark.parametrize("sched_mode_2", [False, True])
-def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2):
-    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, SCHED_MODE_2=sched_mode_2)
+@pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2, cluster_size,
+                                                          barrier_interval):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, SCHED_MODE_2=sched_mode_2,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=barrier_interval)
     asm = compiled.asm["amdgcn"]
     assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
     assert "ds_load_b128" in asm and "ds_store_b128" in asm
@@ -5470,10 +5473,15 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     body = min(loops, key=len)
     wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
     load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
-    assert any("v_wmma" in inst for inst in body[load + 1:]), "no matrix work overlaps the next operand loads"
+    # A periodic cluster barrier can put the refill block before the compute
+    # block in assembly order. Do not count the next iteration's WMMAs as
+    # overlap: independent matrix work must remain in the refill block itself.
+    block_end = next((i for i in range(load + 1, len(body)) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", body[i])),
+                     len(body))
+    assert any("v_wmma" in inst for inst in body[load + 1:block_end]), "no matrix work overlaps the next operand loads"
     if block_k == 256 and dtype_b == "e2m1":
         assert sum("v_wmma" in inst
-                   for inst in body[wait + 1:]) >= 64, "too little deferred matrix work covers the refill"
+                   for inst in body[wait + 1:block_end]) >= 64, "too little deferred matrix work covers the refill"
 
 
 @pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 3, True, "CROSS_TILE_PREFETCH=False"),

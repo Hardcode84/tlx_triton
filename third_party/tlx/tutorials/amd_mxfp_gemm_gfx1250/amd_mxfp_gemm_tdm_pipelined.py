@@ -1450,10 +1450,10 @@ def mxgemm_tdm_persistent_kernel(
             tl.static_assert(NUM_BUFFERS == 2 or (NUM_BUFFERS == 3 and DB == 2))
         else:
             tl.static_assert(NUM_BUFFERS <= 3)
-    # With staged A8W4 output, computing all quadrants before the refill lets
-    # LLVM schedule every WMMA ahead of the next operand loads. Keep independent
-    # bottom-half work after those loads to cover their latency.
-    DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and DB == 2 and BLOCK_K == 128
+    # Keep independent bottom-half work after the refill and next operand loads.
+    # In particular, periodic cluster barriers prevent LLVM from moving earlier
+    # WMMAs across that boundary to cover the load latency.
+    DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and BLOCK_K == 128
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE)
         LOADS: tl.constexpr = 1
