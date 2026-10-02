@@ -226,7 +226,7 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-@pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, 64), (96, 96)])
+@pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, -32), (0, 64), (96, 96)])
 @pytest.mark.parametrize("clamp,set_bounds,pred", [(False, False, True), (True, False, True), (False, True, True),
                                                    (False, False, False)])
 def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set_bounds, pred):
@@ -235,13 +235,17 @@ def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set
     output = torch.empty((2, 64, 64), device=device, dtype=torch.float16)
     _tdm_fused_positioned_kernel[(1, )](a, b, output, row_offset, col_offset, pred, clamp, set_bounds)
     for index, source in enumerate((a, b)):
-        expected = source[32 + row_offset:96 + row_offset, col_offset:64 + col_offset].clone()
+        # Address the backing allocation directly: an unclamped negative
+        # column offset reads the preceding row's padding before column zero.
+        rows = 32 + row_offset + torch.arange(64, device=device)
+        cols = col_offset + torch.arange(64, device=device)
+        expected = source.flatten()[rows[:, None] * 256 + cols[None, :]]
         if set_bounds:
             expected[16:, :] = 0
             expected[:, 32:] = 0
         elif clamp:
             rows = 0 if row_offset < 0 else min(64, max(0, 128 - row_offset))
-            cols = min(64, max(0, 128 - col_offset))
+            cols = 0 if col_offset < 0 else min(64, max(0, 128 - col_offset))
             expected[rows:, :] = 0
             expected[:, cols:] = 0
         if index == 0 and not pred:
@@ -547,26 +551,35 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("K,NUM_BUFFERS", [(512, 2), (768, 2), (768, 3), (1024, 3), (1280, 3)])
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
-def test_mxgemm_persistent_ring_phase(K, NUM_BUFFERS, CROSS_TILE_PREFETCH):
+@pytest.mark.parametrize(
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING",
+    [(k, buffers, dtype, bk, staging)
+     for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
+     for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] + [(k, 4, "float8_e4m3", 128, True)
+                                                                                        for k in (4, 5, 6, 7)],
+)
+def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING):
     # Ten tiles over three programs exercise uneven tile counts, changes in
-    # both M and N, the zero-length steady loop, and every ring phase modulo 3.
+    # both M and N, the zero-length steady loop, and every three/four-slot phase.
     M, N = 1280, 512
+    K = K_ITERS * BLOCK_K
     torch.manual_seed(123)
     a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
-    b = _gfx1250_mxfp._init_data("float4", K, N)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
     a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
     b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
     ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+    b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
     out = _gfx1250_mxfp.matmul(
         a.cuda(),
-        b.to_packed_tensor(dim=0).T.contiguous().cuda(),
+        b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
         _gfx1250_mxfp.pack_scale(b_scale).cuda(),
-        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3", DTYPE_B="e2m1",
-                    TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=3,
-                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH))
+        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=3, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
+                    OUTPUT_STAGING=OUTPUT_STAGING))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 

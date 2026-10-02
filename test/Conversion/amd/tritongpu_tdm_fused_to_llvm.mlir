@@ -112,13 +112,81 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // Share the positioned descriptor between two destinations. Its address
     // must not be updated/repacked before the copy stamps its LDS address.
     // The dynamic offset retains the signed descriptor-update semantics.
-    // FOLD-NOT: llvm.bitcast
-    // FOLD: llvm.sext %arg1 : i32 to i64
-    // FOLD-NOT: llvm.bitcast
+    // The common inner advance belongs after the per-wave selection, so it
+    // does not have to be repeated for both members in a pipelined K loop.
+    // FOLD-NOT: llvm.sext %arg1
     // FOLD: llvm.ptrtoint
+    // FOLD: llvm.select {{.*}} : i1, i32
+    // FOLD: llvm.select {{.*}} : i1, i32
+    // FOLD: %[[BASE:.*]] = llvm.select {{.*}} : i1, i64
+    // FOLD: llvm.sext %arg1 : i32 to i64
+    // FOLD: llvm.add %[[BASE]], {{.*}} : i64
+    // FOLD-NOT: llvm.sext %arg1
     // FOLD: llvm.call_intrinsic "llvm.amdgcn.tensor.load.to.lds"
     %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %offset] : !tt.tensordesc<32x32xf16, #shared>
     %0 = amdg.async_tdm_fused_copy_global_to_local %positioned, %positioned into %da, %db {warp_used_hints = array<i32: 1, 2>} : !tt.tensordesc<32x32xf16, #shared>, !tt.tensordesc<32x32xf16, #shared> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_common_inner_offset
+  // LLVM-LABEL: tdm_fused_common_inner_offset
+  // FOLD-LABEL: llvm.func @tdm_fused_common_inner_offset
+  tt.func public @tdm_fused_common_inner_offset(
+      %a: !tt.tensordesc<32x32xf16, #shared>,
+      %b: !tt.tensordesc<32x32xf16, #shared>,
+      %row_a: i32, %row_b: i32, %k: i32,
+      %da: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>,
+      %db: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>) {
+    // Independent bases and row offsets must still share the inner advance.
+    // Signed extension preserves negative descriptor-position updates.
+    // FOLD: llvm.sext %arg2 : i32 to i64
+    // FOLD: llvm.sext %arg3 : i32 to i64
+    // FOLD-NOT: llvm.sext %arg4
+    // FOLD: llvm.select {{.*}} : i1, i32
+    // FOLD: llvm.select {{.*}} : i1, i32
+    // FOLD: %[[BASE:.*]] = llvm.select {{.*}} : i1, i64
+    // FOLD: %[[K:.*]] = llvm.sext %arg4 : i32 to i64
+    // FOLD: %[[BYTES:.*]] = llvm.mul %[[K]], {{.*}} : i64
+    // FOLD: llvm.add %[[BASE]], %[[BYTES]] : i64
+    // FOLD-NOT: llvm.sext %arg4
+    // FOLD: llvm.call_intrinsic "llvm.amdgcn.tensor.load.to.lds"
+    %ad = amdg.update_tensor_descriptor %a add_offsets = [%row_a, %k] : !tt.tensordesc<32x32xf16, #shared>
+    %bd = amdg.update_tensor_descriptor %b add_offsets = [%row_b, %k] : !tt.tensordesc<32x32xf16, #shared>
+    %0 = amdg.async_tdm_fused_copy_global_to_local %ad, %bd into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x32xf16, #shared>, !tt.tensordesc<32x32xf16, #shared> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_inner_offset_different_element_sizes
+  // LLVM-LABEL: tdm_fused_inner_offset_different_element_sizes
+  // FOLD-LABEL: llvm.func @tdm_fused_inner_offset_different_element_sizes
+  tt.func public @tdm_fused_inner_offset_different_element_sizes(
+      %a: !tt.tensordesc<32x32xf16, #shared>,
+      %b: !tt.tensordesc<32x32xf32, #shared>,
+      %k: i32,
+      %da: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>,
+      %db: !ttg.memdesc<32x32xf32, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    // An equal element offset is not a common byte offset for mixed sizes.
+    // Each member must apply its advance before descriptor selection.
+    // FOLD: llvm.sext %arg2 : i32 to i64
+    // FOLD: llvm.select {{.*}} : i1, vector<4xi32>
+    // FOLD-NOT: llvm.add
+    // FOLD: llvm.call_intrinsic "llvm.amdgcn.tensor.load.to.lds"
+    %ad = amdg.update_tensor_descriptor %a add_offsets = [%c0, %k] : !tt.tensordesc<32x32xf16, #shared>
+    %bd = amdg.update_tensor_descriptor %b add_offsets = [%c0, %k] : !tt.tensordesc<32x32xf32, #shared>
+    %0 = amdg.async_tdm_fused_copy_global_to_local %ad, %bd into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x32xf16, #shared>, !tt.tensordesc<32x32xf32, #shared> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
     tt.return
   }
 }
