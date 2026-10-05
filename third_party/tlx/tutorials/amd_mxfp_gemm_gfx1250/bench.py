@@ -10,6 +10,9 @@ With four waves, MX8xMX8 also supports four input buffers: --num-buffers 4
 uses smaller output staging chunks and an explicit LDS/WMMA prefetch schedule.
 Use --num-warps 8 to test two waves per SIMD on persistent 256x256 tiles;
 four waves remain the default.
+For the A8W8 register pipeline, use --variant mx8xmx8 --register-pipeline.
+This selects BK256, two input buffers, and four FP32 output panels, retaining
+one prefetched input stage while the other stage holds output.
 Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
 tutorial kernel's timed region. The default timing budget is 256 ms, matching
@@ -22,6 +25,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-buffers 4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-warps 8
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --register-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
@@ -29,8 +33,8 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 
-For a single dispatch per shape/variant under a simulator, select
---benchmark-mode none and --output-dir to keep each run's model artifacts in
+For a single dispatch per shape/variant, select
+--benchmark-mode none and --output-dir to keep each run's artifacts in
 its own directory.
 """
 
@@ -60,9 +64,12 @@ def _parse_case(value):
 def _variant_args(args, dtype_b):
     resolved = argparse.Namespace(**vars(args))
     if resolved.block_k is None:
-        resolved.block_k = 256 if dtype_b == "float4" else 128
+        resolved.block_k = 256 if dtype_b == "float4" or resolved.register_pipeline else 128
+    if resolved.num_buffers is None:
+        resolved.num_buffers = 2 if resolved.register_pipeline else 3
     if resolved.cross_tile_prefetch is None:
-        resolved.cross_tile_prefetch = not (resolved.output_staging and resolved.block_k == 256)
+        resolved.cross_tile_prefetch = resolved.register_pipeline or not (resolved.output_staging
+                                                                          and resolved.block_k == 256)
     return resolved
 
 
@@ -123,6 +130,8 @@ def _command(args, case, dtype_b):
         command.append("--persistent")
     if args.output_staging:
         command.append("--output_staging")
+    if args.register_pipeline:
+        command.append("--register_pipeline")
     if args.sched_mode_2:
         command.append("--sched_mode_2")
     if not args.cluster_multicast:
@@ -144,9 +153,12 @@ def main():
     parser.add_argument("-K", type=int)
     parser.add_argument("-BM", "--block-m", dest="block_m", type=int, choices=(128, 256), default=256)
     parser.add_argument("-BN", "--block-n", dest="block_n", type=int, choices=(128, 256), default=256)
-    parser.add_argument("-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=None,
-                        help="default: 128 for MX8xMX8, 256 for MX8xMX4; an override applies to all selected variants")
-    parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=3)
+    parser.add_argument(
+        "-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=None,
+        help="default: 128 for MX8xMX8, 256 for MX8xMX4 or --register-pipeline; "
+        "an override applies to all selected variants")
+    parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=None,
+                        help="input buffers (default: 3, or 2 with --register-pipeline)")
     parser.add_argument("--num-warps", type=int, choices=(4, 8), default=4,
                         help="waves per workgroup; eight waves require persistent 256x256 M/N tiles")
     parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
@@ -158,12 +170,14 @@ def main():
     parser.add_argument("--tdm-fusion", choices=("none", "2way", "4way", "partial"), default="partial")
     parser.add_argument("--tdm-split", action="store_true", help="split descriptors in the nonpersistent kernel")
     parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--register-pipeline", action="store_true",
+                        help="A8W8 BK256 register pipeline with four FP32 output panels; use --variant mx8xmx8")
     parser.add_argument("--sched-mode-2", action=argparse.BooleanOptionalAction, default=False,
                         help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: disabled)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
-                        help="stage persistent FP32 output for TDM stores; BK256 reuses the A ring")
+                        help="stage persistent FP32 output for TDM stores; BK256 reuses input storage")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
-                        help="default: disabled for BK256 output staging, enabled otherwise")
+                        help="default: enabled for the register pipeline and BK128; disabled for BK256 output reuse")
     parser.add_argument("--num-programs", type=int, default=256,
                         help="persistent program count, capped by tile count (default: 256)")
     parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none",
@@ -182,7 +196,7 @@ def main():
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path)
-    parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's model artifacts")
+    parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
     args = parser.parse_args()
 
@@ -229,8 +243,14 @@ def main():
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
+        if run_args.register_pipeline and not (
+                run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial"
+                and run_args.num_warps == 4 and run_args.num_buffers == 2 and
+            (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 256) and dtype_b != "float4"):
+            parser.error("--register-pipeline requires A8W8, persistent 256x256x256 tiles, two buffers, "
+                         "four warps, partial TDM fusion, and output staging; select --variant mx8xmx8")
         if run_args.output_staging:
-            if run_args.block_k == 256 and run_args.cross_tile_prefetch:
+            if run_args.block_k == 256 and run_args.cross_tile_prefetch and not run_args.register_pipeline:
                 parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
             max_buffers = 4 if run_args.block_k == 128 else (3 if dtype_b == "float4" else 2)
             if run_args.num_buffers > max_buffers:
@@ -285,8 +305,9 @@ def main():
                       block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
                       num_warps=run_args.num_warps, group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion,
                       tdm_split=run_args.tdm_split, output_staging=run_args.output_staging,
-                      sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-                      xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+                      register_pipeline=run_args.register_pipeline, sched_mode_2=run_args.sched_mode_2,
+                      xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk,
+                      cluster_size=run_args.cluster_size,
                       cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
                       cluster_barrier_interval=run_args.cluster_barrier_interval,
                       cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
@@ -305,6 +326,7 @@ def main():
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}, warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
+            f"register_pipeline={run_args.register_pipeline}, "
             f"sched_mode_2={run_args.sched_mode_2}, "
             f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "
             f"cluster_size={run_args.cluster_size}, "

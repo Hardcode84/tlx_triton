@@ -558,18 +558,26 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
 @pytest.mark.parametrize(
-    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS",
-    [(k, buffers, dtype, bk, staging, 4)
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE",
+    [(k, buffers, dtype, bk, staging, 4, False, False, 1)
      for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
      for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] +
-    [(k, 4, "float8_e4m3", 128, True, 4)
-     for k in (4, 5, 6, 7)] + [(k, 3, dtype, 128, True, 8) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")],
+    [(k, 4, "float8_e4m3", 128, True, 4, False, False, 1) for k in (4, 5, 6, 7)] +
+    [(k, 3, dtype, 128, True, 8, False, False, 1) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")] + [
+        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, mode, 1, id=f"register-{k}-sched-{mode}")
+        for k in (2, 3, 5)
+        for mode in (False, True)
+    ] + [pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, True, 4, id=f"register-cluster-{k}") for k in (3, 5, 9)],
 )
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
-                                      NUM_WARPS):
+                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE):
     # Ten tiles over three programs exercise uneven tile counts, changes in
-    # both M and N, the zero-length steady loop, and every three/four-slot phase.
-    M, N = 1280, 512
+    # both M and N, the zero-length steady loop, and input/output slot reuse
+    # across ring wrap. Register-pipeline cases cover odd two-slot phases.
+    # Cluster cases give each program two tiles. K5/K9 also exercise periodic
+    # cluster synchronization in the steady loop and across the tile handoff.
+    M, N = (2048, 1024) if CLUSTER_SIZE > 1 else (1280, 512)
+    programs = 16 if CLUSTER_SIZE > 1 else 3
     K = K_ITERS * BLOCK_K
     torch.manual_seed(123)
     a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
@@ -585,8 +593,10 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         _gfx1250_mxfp.pack_scale(b_scale).cuda(),
         config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
                     DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=3, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-                    OUTPUT_STAGING=OUTPUT_STAGING, num_warps=NUM_WARPS))
+                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
+                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
+                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
+                    CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 

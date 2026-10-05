@@ -121,8 +121,8 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--input-mode", choices=("signed", "tutorial"), default="signed")
-    parser.add_argument("--grid-x", type=int, help="Bound the physical CTA grid for a model run; default M/512")
-    parser.add_argument("--grid-y", type=int, help="Bound the physical CTA grid for a model run; default N/512")
+    parser.add_argument("--grid-x", type=int, help="Bound the physical CTA grid for a partial check; default M/512")
+    parser.add_argument("--grid-y", type=int, help="Bound the physical CTA grid for a partial check; default N/512")
     args = parser.parse_args()
     M, N, K = args.m, args.n, args.k
     gx = M // 512 if args.grid_x is None else args.grid_x
