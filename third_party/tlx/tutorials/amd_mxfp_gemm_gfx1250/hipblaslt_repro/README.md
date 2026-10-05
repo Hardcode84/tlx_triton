@@ -77,14 +77,12 @@ the next tile's prefetched input. The requested K=4096 and K=8192 shapes use a
 fixed output half and the same binary.
 
 The final input-loop cluster wait is consumed before the output workgroup
-barriers. This ordering completes validation in both FFM and AM; leaving that
-cluster wait pending across the added output barriers stalled in AM. The
-adaptation preserves the rendezvous count and local memory lifetime waits.
+barriers. The adaptation preserves the rendezvous count and local memory
+lifetime waits.
 
-## Model checks and measurement scope
+## Correctness checks
 
-`--benchmark-mode none` performs one dispatch and correctness check. In an
-environment configured for FFM or AM, for example:
+`--benchmark-mode none` performs one dispatch and correctness check:
 
 ```bash
 python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py \
@@ -92,8 +90,8 @@ python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py
 ```
 
 M and N must be positive multiples of 2048; K must be a multiple of 256 and at
-least 768. `--grid-x` and `--grid-y` bound the physical workgroup grid for model
-runs; both dimensions must remain multiples of four. For example, this checks
+least 768. `--grid-x` and `--grid-y` bound the physical workgroup grid for partial
+checks; both dimensions must remain multiples of four. For example, this checks
 64 output tiles across all four quadrants using full 8192-sized strides:
 
 ```bash
@@ -106,42 +104,7 @@ The harness checks every visited output and verifies that the unvisited region
 remains NaN. Bounded launches are not complete 8192x8192 output validation.
 Default hardware launches cover the complete output.
 
-Validation with r8.05 FFM/AM and `~/llvm/llvm-build`:
-
-| Check | Output coverage | Maximum absolute error |
-| --- | --- | ---: |
-| FFM, 2048x2048x2048, signed inputs | Complete | 0.00006104 |
-| FFM, 8192x8192x4096, signed inputs | 4194304 of 67108864 elements | 0.00012207 |
-| FFM, 8192x8192x8192, signed inputs | 4194304 of 67108864 elements | 0.00024414 |
-| FFM, 2048x4096x768, signed inputs | Complete | 0.00005341 |
-| FFM, 2048x2048x1280, signed inputs | Complete | 0.00004578 |
-| AM, 2048x2048x2048, tutorial input distribution | Complete | 0.00003052 |
-
-All checks used nonuniform scales and the fixed tolerance `atol=2e-3,
-rtol=1e-4`. The default input distribution is signed normal values scaled by
-0.5 and quantized to E4M3. `--input-mode tutorial` uses positive E4M3 byte codes
-20 through 39 for the matched AM comparison. The same staged HSACO and input
-bytes also passed FFM; bitwise equality between FFM and AM is not required by
-the numerical check.
-
-On the complete 2048-cubed problem with 16 workgroups and four tiles per
-workgroup, the following AM results were observed:
-
-| FP32 kernel | Dispatch cycles | Official steady XDL, active CUs | Sampled final compute tile XDL |
-| --- | ---: | ---: | ---: |
-| Public compute + direct output | 191061 | 21.28% | 95.96% |
-| Public compute + staged output | 121734 | 31.94% | 91.99% |
-| Current TLX persistent A8W8 | 108596 | 36.16% | 60.83% |
-
-The TLX control at revision `52d3e7c4bd541faeddd5fa6462d46723c5ee5130` uses
-256x256x128 tiles, three buffers, group-M 8, partial fusion, four-workgroup
-multicast with barrier interval 4, output staging, and cross-tile prefetch.
-It uses 16 persistent programs to cover the same complete 2048-cubed problem.
-
-The sampled compute percentages count actual XDL service clocks between the
-first and last WMMA service in the final tile on one SIMD. Each has 8192 matrix
-service clocks; the intervals are 8537, 8905, and 13466 clocks respectively.
-These percentages are distinct from AM's official steady XDL statistic.
-Only 16 of the model's 32 CUs are active. Startup, output, and tile handoff
-account for the different dispatch ranking; these results do not establish
-hardware throughput at the full 8192 shapes.
+The numerical check uses nonuniform scales and the fixed tolerance
+`atol=2e-3, rtol=1e-4`. The default input distribution is signed normal values
+scaled by 0.5 and quantized to E4M3. `--input-mode tutorial` uses positive E4M3
+byte codes 20 through 39.

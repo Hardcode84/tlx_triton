@@ -39,6 +39,30 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
 
+Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --variant mx8xmx8 --register-pipeline --sched-mode-2 --csv mxfp-register.csv
+```
+
+This selects 256x256x256 tiles, two input buffers, and four waves. Each K256
+input stage supplies two K128 register stages, with upcoming operand reads
+interleaved with independent matrix work. After the refill, three quadrants
+provide 48 WMMAs per wave to cover the next operand reads. The register
+pipeline uses cluster rendezvous points to align multicast requests; local
+TDM barriers still protect the input slots. Four 256x64 FP32 output panels
+reuse the free A/B input stage while one stage of the next output tile stays
+prefetched. It requires FP8 A and B, both scales, partial TDM fusion, and
+output staging. The existing benchmark defaults remain available for paired
+hardware comparisons. `--no-cross-tile-prefetch` disables the tile prefetch
+while retaining the register pipeline and output panels.
+
+The standalone flag is `--register_pipeline`; the Python API and `matmul`
+configuration use `REGISTER_PIPELINE=True`. Specify the required BK256 and
+two buffers when using those interfaces. The summary and CSV record
+`register_pipeline`.
+
 Use `--sched-mode-2` to enable the persistent kernel's hardware WMMA queuing
 setting (`SCHED_MODE[2]`). It is disabled by default; `--no-sched-mode-2`
 selects the default behavior. The summary and CSV record `sched_mode_2`.
@@ -138,7 +162,7 @@ selects a single weight dtype (`float8_e4m3`, `float8_e5m2`, or `float4`) and
 cannot be combined with `--variant`. Three buffers with 256x256x256 tiles are
 supported for `mx8xmx4`; `mx8xmx8` exceeds LDS capacity with that configuration.
 
-For one simulator dispatch per shape/variant, use `--benchmark-mode none
+For one dispatch per shape/variant, use `--benchmark-mode none
 --output-dir <directory>` to keep each run's artifacts in a fresh subdirectory
 whose name includes the variant. This mode leaves timing fields blank. Both
 scripts provide `--help` for configuration options.

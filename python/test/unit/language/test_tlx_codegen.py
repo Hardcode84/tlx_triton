@@ -5470,7 +5470,7 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
                   BLOCK_K=block_k, GROUP_SIZE_M=8, NUM_BUFFERS=num_buffers, WITH_A_SCALE=True, TDM_FUSION="partial",
                   NUM_PROGRAMS=256, CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False,
                   XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
-                  CLUSTER_BARRIER_INTERVAL=1)
+                  CLUSTER_BARRIER_INTERVAL=1, REGISTER_PIPELINE=False)
     config.update(constants)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     return triton_compile(
@@ -5552,6 +5552,82 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         minimum_deferred = 64 if num_warps == 4 else 8
         deferred = sum("v_wmma" in inst for inst in body[overlap_start + 1:block_end])
         assert deferred >= minimum_deferred, "too little deferred matrix work covers the refill"
+
+
+@pytest.mark.parametrize("k", [512, 768, 4096, 8192])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("sched_mode_2", [False, True])
+def test_gfx1250_mxgemm_register_pipeline_overlaps_refill(k, prefetch, sched_mode_2):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 2, 256, K=k, REGISTER_PIPELINE=True,
+                                                  CROSS_TILE_PREFETCH=prefetch, CLUSTER_SIZE=4,
+                                                  CLUSTER_BARRIER_INTERVAL=4, SCHED_MODE_2=sched_mode_2)
+    asm = compiled.asm["amdgcn"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    # Each of the four FP32 panels stores its native accumulator distribution.
+    # Additional LDS stores here would indicate a layout exchange.
+    stores = re.findall(r"\bds_store_\w+", asm)
+    assert stores == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 4
+    assert "ds_load_b128" in asm
+    if k <= 768:
+        return  # The prologue/tail and at most one steady step are unrolled.
+
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    # Each K256 step reads two K128 halves. Payloads and scales must stay in
+    # their native register layouts across both the half-step and loop edges.
+    assert sum("v_wmma" in inst for inst in body) == 128
+    assert sum("ds_load_" in inst for inst in body) == 136, "duplicate operand loads in the K loop"
+    assert not any("ds_store_" in inst for inst in body), "layout exchange in the K loop"
+    wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
+    fence = "sched_barrier mask(0x00000000)"
+    begin = next(i for i in range(wait + 1, len(body)) if fence in body[i]) + 1
+    regions = []
+    cursor = begin
+    for sync_id, reads in ((401, 17), (402, 34), (403, 17)):
+        end = next(i for i in range(cursor, len(body)) if fence in body[i])
+        region = body[cursor:end]
+        assert f"SyncID({sync_id})" in "\n".join(region)
+        assert sum("v_wmma" in inst for inst in region) == 16
+        assert sum("ds_load_" in inst for inst in region) == reads
+        regions.extend(region)
+        cursor = end + 1
+    load = next(i for i, inst in enumerate(regions) if "ds_load_b128" in inst)
+    # C10/C01/C11 give the incoming operands 48 WMMAs of independent work.
+    # One WMMA may precede the first LDS request in the scheduler group.
+    assert sum("v_wmma" in inst for inst in regions[load + 1:]) >= 47, "lost independent math after the refill"
+
+
+@pytest.mark.parametrize("changes", [
+    {"PERSISTENT": False},
+    {"NUM_BUFFERS": 3},
+    {"BLOCK_K": 128},
+    {"NUM_WARPS": 8},
+    {"WITH_A_SCALE": False},
+    {"TDM_FUSION": "4way"},
+    {"OUTPUT_STAGING": False},
+    {"DTYPE_B": "e2m1"},
+])
+def test_gfx1250_mxgemm_register_pipeline_rejects_incompatible_config(changes):
+    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True, NUM_BUFFERS=2, DTYPE_A="e4m3",
+                  DTYPE_B="e4m3", SCHEDULE="sliceMNK", WITH_A_SCALE=True, TDM_FUSION="partial", PERSISTENT=True,
+                  OUTPUT_STAGING=True, REGISTER_PIPELINE=True)
+    config.update(changes)
+    a = torch.empty((256, 1024), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((256, 512 if config["DTYPE_B"] == "e2m1" else 1024), dtype=torch.uint8, device="meta")
+    scale = torch.empty((2, 4096), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="REGISTER_PIPELINE requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, **config)
 
 
 @pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 3, True, "CROSS_TILE_PREFETCH=False"),
