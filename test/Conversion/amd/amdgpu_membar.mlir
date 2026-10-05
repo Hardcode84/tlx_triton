@@ -384,3 +384,154 @@ tt.func @lone_sched_fence_still_needs_barrier(%A: !tt.ptr<f16>) {
 }
 
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#row_blocked = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [0, 1]}>
+#rows = #ttg.slice<{dim = 1, parent = #row_blocked}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // The wait token establishes that the consumer's producer is complete.
+  // A subsequent prefetch targets the other ring slot. Allocation analysis
+  // cannot separate the dynamic slices, so the async dependency filter must
+  // avoid a second barrier before this consumer.
+  // CHECK-LABEL: tdm_waited_consumer_after_other_slot_prefetch
+  tt.func @tdm_waited_consumer_after_other_slot_prefetch(
+      %a: !tt.tensordesc<64x64xf16, #shared>,
+      %b: !tt.tensordesc<64x64xf16, #shared>, %index: i32) {
+    %one = arith.constant 1 : i32
+    %i = arith.andi %index, %one : i32
+    %j = arith.xori %i, %one : i32
+    %ring = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %current = ttg.memdesc_index %ring[%i] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %next = ttg.memdesc_index %ring[%j] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_copy_global_to_local %a into %current : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_global_to_local
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = true
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: tt.return
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    %prefetch = amdg.async_tdm_copy_global_to_local %b into %next : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %value = ttg.local_load %current token %wait : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+
+  // Both fused destinations participate in the dependency filter.
+  // CHECK-LABEL: tdm_fused_waited_consumers_after_other_slot_prefetch
+  tt.func @tdm_fused_waited_consumers_after_other_slot_prefetch(
+      %a: !tt.tensordesc<64x64xf16, #shared>,
+      %b: !tt.tensordesc<64x64xf16, #shared>, %index: i32) {
+    %one = arith.constant 1 : i32
+    %i = arith.andi %index, %one : i32
+    %j = arith.xori %i, %one : i32
+    %ring_a = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %ring_b = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %current_a = ttg.memdesc_index %ring_a[%i] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %current_b = ttg.memdesc_index %ring_b[%i] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %next_a = ttg.memdesc_index %ring_a[%j] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %next_b = ttg.memdesc_index %ring_b[%j] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_fused_copy_global_to_local %a, %b into %current_a, %current_b {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_fused_copy_global_to_local
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = true
+    // CHECK-NEXT: {{.*}}ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = true
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: tt.return
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    %prefetch = amdg.async_tdm_fused_copy_global_to_local %a, %b into %next_a, %next_b {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %value_a = ttg.local_load %current_a token %wait : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    %value_b = ttg.local_load %current_b token %wait : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: tdm_gather_waited_consumer_after_other_slot_prefetch
+  tt.func @tdm_gather_waited_consumer_after_other_slot_prefetch(
+      %a: !tt.tensordesc<64x64xf16, #shared>, %index: i32) {
+    %one = arith.constant 1 : i32
+    %i = arith.andi %index, %one : i32
+    %j = arith.xori %i, %one : i32
+    %indices = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32, #rows>
+    %ring = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %current = ttg.memdesc_index %ring[%i] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %next = ttg.memdesc_index %ring[%j] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_gather %a[%indices] to %current : tensor<64xi32, #rows>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_gather
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = true
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: tt.return
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    %prefetch = amdg.async_tdm_gather %a[%indices] to %next : tensor<64xi32, #rows>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    %value = ttg.local_load %current token %wait : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+
+  // No token or relaxed-load contract is present. Keep the conservative RAW
+  // dependency when the two dynamic slices cannot be proven disjoint.
+  // CHECK-LABEL: tdm_unmarked_consumer_retains_barrier
+  tt.func @tdm_unmarked_consumer_retains_barrier(
+      %a: !tt.tensordesc<64x64xf16, #shared>, %index: i32) {
+    %one = arith.constant 1 : i32
+    %i = arith.andi %index, %one : i32
+    %j = arith.xori %i, %one : i32
+    %ring = ttg.local_alloc : () -> !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>
+    %current = ttg.memdesc_index %ring[%i] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %next = ttg.memdesc_index %ring[%j] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_copy_global_to_local %a into %current : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_global_to_local
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = false
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    %prefetch = amdg.async_tdm_copy_global_to_local %a into %next : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %value = ttg.local_load %current : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+
+  // The wait orders the producer before the consumer. It cannot release the
+  // consumer's storage for a subsequent write, including a fused TDM member.
+  // CHECK-LABEL: tdm_waited_consumer_retains_refill_barrier
+  tt.func @tdm_waited_consumer_retains_refill_barrier(
+      %a: !tt.tensordesc<64x64xf16, #shared>,
+      %b: !tt.tensordesc<64x64xf16, #shared>) {
+    %current_a = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %current_b = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_copy_global_to_local %a into %current_a : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}ttg.local_load
+    // CHECK-SAME: syncedViaAsyncWait = true
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_copy_global_to_local
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    %value_a = ttg.local_load %current_a token %wait : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    %reload = amdg.async_tdm_copy_global_to_local %a into %current_a : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}ttg.local_load
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: {{.*}}amdg.async_tdm_fused_copy_global_to_local
+    %wait_again = amdg.async_tdm_wait %reload {num = 0 : i32}
+    %value_again = ttg.local_load %current_a token %wait_again : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    %refill = amdg.async_tdm_fused_copy_global_to_local %b, %a into %current_b, %current_a {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}

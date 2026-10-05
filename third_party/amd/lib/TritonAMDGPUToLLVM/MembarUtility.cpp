@@ -14,47 +14,39 @@ namespace {
 bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
                                        bool op1IsRead, bool op2IsRead,
                                        Allocation *allocation) {
-  auto isAsyncLDSWrite = [](Operation *op) {
-    return llvm::isa<triton::gpu::AsyncCopyGlobalToLocalOp,
-                     triton::amdgpu::BufferLoadToLocalOp>(op);
-  };
-  auto isLocalLoadSyncedViaAsyncWait = [](Operation *op) {
-    auto localLoad = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op);
-    return localLoad && isSyncedViaAsyncWait(localLoad);
-  };
-  auto getMemdescValue = [](Operation *op) -> Value {
-    return llvm::TypeSwitch<Operation *, Value>(op)
+  auto getAsyncDestinations = [](Operation *op) -> SmallVector<Value> {
+    return llvm::TypeSwitch<Operation *, SmallVector<Value>>(op)
         .Case<triton::amdgpu::BufferLoadToLocalOp>(
-            [](auto op) { return op.getDest(); })
-        .Case<triton::gpu::AsyncCopyGlobalToLocalOp>(
-            [](auto op) { return op.getResult(); })
-        .Case<triton::gpu::LocalLoadOp>([](auto op) { return op.getSrc(); })
-        .Default([](Operation *) { return Value(); });
+            [](auto op) { return SmallVector<Value>{op.getDest()}; })
+        .Case<triton::gpu::AsyncCopyGlobalToLocalOp,
+              triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+            [](auto op) { return SmallVector<Value>{op.getResult()}; })
+        .Case<triton::amdgpu::AsyncTDMGatherOp>(
+            [](auto op) { return SmallVector<Value>{op.getDst()}; })
+        .Case<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+            [](auto op) { return llvm::to_vector(op.getDests()); })
+        .Default([](Operation *) { return SmallVector<Value>{}; });
   };
 
   // Only filter a RAW dependency from a prior async LDS write to its local
   // consumer. In particular, never filter the opposite LocalLoad-to-prefetch
   // WAR dependency: a wait says nothing about consumer completion.
-  if (op1IsRead || !op2IsRead || !isAsyncLDSWrite(op1) ||
-      !isLocalLoadSyncedViaAsyncWait(op2)) {
+  auto localLoad = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op2);
+  if (op1IsRead || !op2IsRead || !localLoad ||
+      !isSyncedViaAsyncWait(localLoad)) {
     return false;
   }
 
-  Value op1Memdesc = getMemdescValue(op1);
-  Value op2Memdesc = getMemdescValue(op2);
-  if (!op1Memdesc || !op2Memdesc)
-    return false;
-  auto op1BufferIds = allocation->getAllBufferIdsWithAliases(op1Memdesc);
-  auto op2BufferIds = allocation->getAllBufferIdsWithAliases(op2Memdesc);
-
-  // Check if operations access the same buffer
-  bool sameBuffer = llvm::any_of(
-      op1BufferIds, [&](auto id) { return op2BufferIds.count(id); });
-
-  if (!sameBuffer)
-    return false;
-
-  return true;
+  auto consumerBufferIds =
+      allocation->getAllBufferIdsWithAliases(localLoad.getSrc());
+  // A fused TDM copy can produce several independent buffers. Match each
+  // destination, not just the first member. The wait marker covers the actual
+  // producer; a later prefetch can alias the same allocation's other ring slot.
+  return llvm::any_of(getAsyncDestinations(op1), [&](Value dest) {
+    auto producerBufferIds = allocation->getAllBufferIdsWithAliases(dest);
+    return llvm::any_of(producerBufferIds,
+                        [&](auto id) { return consumerBufferIds.count(id); });
+  });
 }
 
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
