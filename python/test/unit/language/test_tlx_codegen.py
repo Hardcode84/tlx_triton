@@ -5566,7 +5566,10 @@ def test_gfx1250_mxgemm_persistent_output_reuse_rejects_conflict(dtype_b, buffer
                                            PERSISTENT=True, OUTPUT_STAGING=True, CROSS_TILE_PREFETCH=prefetch)
 
 
-def test_gfx1250_mxgemm_tdm_split_compiles():
+@pytest.mark.parametrize("DTYPE_B", ["e4m3", "e2m1"])
+@pytest.mark.parametrize("TDM_SPLIT", [False, True])
+@pytest.mark.parametrize("BLOCK_M", [128, 256])
+def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
 
@@ -5574,7 +5577,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         fn=_gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e4nv",
-            "b_ptr": "*u8",
+            "b_ptr": "*u8" if DTYPE_B == "e2m1" else "*fp8e4nv",
             "c_ptr": "*fp32",
             "a_scale": "*i8",
             "b_scale": "*i8",
@@ -5591,20 +5594,20 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         },
         constexprs={
             "DTYPE_A": "e4m3",
-            "DTYPE_B": "e2m1",
+            "DTYPE_B": DTYPE_B,
             "SCALE_BLOCK": 32,
-            "BLOCK_M": 256,
+            "BLOCK_M": BLOCK_M,
             "BLOCK_N": 256,
             "BLOCK_K": 256,
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
-            "NUM_BUFFERS": 3,
+            "NUM_BUFFERS": 3 if DTYPE_B == "e2m1" else 2,
             "SCALE_PRESHUFFLE": True,
             "WITH_A_SCALE": True,
             "SCHEDULE": "sliceMNK",
             "TDM_FUSION": "partial",
             "L2_PREFETCH_DISTANCE": -1,
-            "TDM_SPLIT": True,
+            "TDM_SPLIT": TDM_SPLIT,
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
@@ -5612,10 +5615,18 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
     assert "amdg.async_tdm_copy_local_to_global" in ttgir
-    assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    if TDM_SPLIT:
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # Scale distributions must survive the loop edge without an LDS exchange.
+    # Output quadrants should vectorize directly, avoiding paired-address
+    # stores and their high-register DATA1 path.
+    lds_stores = re.findall(r"\bds_store_\w+", amdgcn)
+    assert set(lds_stores) == {"ds_store_b128"}
+    assert len(lds_stores) == BLOCK_M * 256 // (4 * 32 * 4)
+    assert amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds") == 1
 
 
 def test_gfx1250_attn_fwd_tdm_pipelined_compiles():

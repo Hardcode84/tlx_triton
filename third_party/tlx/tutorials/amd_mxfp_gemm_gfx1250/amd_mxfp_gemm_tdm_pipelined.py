@@ -1018,6 +1018,24 @@ def mxgemm_tdm_pipelined_kernel(
                 WITH_A_SCALE,
                 TDM_FUSION,
             )
+        # Keep the first subtile's scales in the WMMA distribution across the
+        # loop edge. Converting blocked loop-carried scales adds LDS exchanges
+        # and barriers before the next iteration's first dot.
+        PIN_LOOP_SCALES: tl.constexpr = (SCALE_PRESHUFFLE and SCALE_BLOCK == 32 and BLOCK_K == 256
+                                         and STORE_INSTR_M == 16 and tlx.num_warps() == 4 and BLOCK_N == 256
+                                         and (BLOCK_M == 128 or BLOCK_M == 256))
+        if PIN_LOOP_SCALES:
+            if BLOCK_M == 128:
+                # A 64x128 subtile distributes all four waves along N.
+                SCALE_A_LOOP_LAYOUT: tl.constexpr = tlx.layout(shape=((32, 4), (4, 2)), stride=((4, 0), (1, 128)))
+                SCALE_B_LOOP_LAYOUT: tl.constexpr = tlx.layout(shape=((32, 4), (4, )), stride=((4, 128), (1, )))
+            else:
+                SCALE_A_LOOP_LAYOUT: tl.constexpr = tlx.layout(shape=((32, 2, 2), (4, 2)),
+                                                               stride=((4, 0, 128), (1, 256)))
+                SCALE_B_LOOP_LAYOUT: tl.constexpr = tlx.layout(shape=((32, 2, 2), (4, 2)),
+                                                               stride=((4, 128, 0), (1, 256)))
+            scale_a00 = tlx.require_layout(scale_a00, SCALE_A_LOOP_LAYOUT)
+            scale_b00 = tlx.require_layout(scale_b00, SCALE_B_LOOP_LAYOUT)
         c00 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         c01 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         c10 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
@@ -1142,12 +1160,18 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
                                                         TRANSPOSE_B, SCALE_PRESHUFFLE)
-        acc_top = tl.join(c00, c01).permute(0, 2, 1).reshape((SUBTILE_M, BLOCK_N))
-        acc_bot = tl.join(c10, c11).permute(0, 2, 1).reshape((SUBTILE_M, BLOCK_N))
-        acc = tl.join(acc_top, acc_bot).permute(2, 0, 1).reshape((BLOCK_M, BLOCK_N))
+            if PIN_LOOP_SCALES:
+                scale_a00 = tlx.require_layout(scale_a00, SCALE_A_LOOP_LAYOUT)
+                scale_b00 = tlx.require_layout(scale_b00, SCALE_B_LOOP_LAYOUT)
+        # Stage each quadrant in its native WMMA register order. Joining them
+        # puts the quadrant selectors first and defeats b128 LDS vectorization.
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1)
         c_view = tlx.local_view(c_buf, 0)
-        tlx.local_store(c_view, acc.to(tlx.dtype_of(c_ptr)))
+        tlx.local_store(tlx.local_slice(c_view, [0, 0], [SUBTILE_M, SUBTILE_N]), c00.to(tlx.dtype_of(c_ptr)))
+        tlx.local_store(tlx.local_slice(c_view, [0, SUBTILE_N], [SUBTILE_M, SUBTILE_N]), c01.to(tlx.dtype_of(c_ptr)))
+        tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, 0], [SUBTILE_M, SUBTILE_N]), c10.to(tlx.dtype_of(c_ptr)))
+        tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, SUBTILE_N], [SUBTILE_M, SUBTILE_N]),
+                        c11.to(tlx.dtype_of(c_ptr)))
         tlx.async_amd_descriptor_store(c_desc, c_view, [c_off_m, c_off_n], clamp_bounds=True)
         tlx.async_amd_descriptor_wait(0)
     elif SCHEDULE == "sliceNK":
