@@ -5456,7 +5456,7 @@ def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, rema
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
 
 
-def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constants):
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
                      b_scale="*u8")
@@ -5473,28 +5473,41 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, **constant
                   CLUSTER_BARRIER_INTERVAL=1)
     config.update(constants)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
-    return triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
-                          options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+    return triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=num_warps, waves_per_eu=num_warps // 4,
+                                                                  ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
 
 
-@pytest.mark.parametrize("dtype_b,num_buffers,block_k", [("e2m1", 2, 128), ("e2m1", 3, 128), ("e2m1", 2, 256),
-                                                         ("e2m1", 3, 256), ("e4m3", 2, 256), ("e4m3", 3, 128),
-                                                         ("e4m3", 4, 128), ("e2m1", 4, 128)])
+@pytest.mark.parametrize("dtype_b,num_buffers,block_k,num_warps", [
+    ("e2m1", 2, 128, 4),
+    ("e2m1", 3, 128, 4),
+    ("e2m1", 2, 256, 4),
+    ("e2m1", 3, 256, 4),
+    ("e4m3", 2, 256, 4),
+    ("e4m3", 3, 128, 4),
+    ("e4m3", 4, 128, 4),
+    ("e2m1", 4, 128, 4),
+    ("e4m3", 3, 128, 8),
+    ("e2m1", 3, 256, 8),
+    ("e4m3", 2, 256, 8),
+])
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("sched_mode_2", [False, True])
 @pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
 def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2, cluster_size,
-                                                          barrier_interval, k):
-    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, K=k, SCHED_MODE_2=sched_mode_2,
-                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=barrier_interval)
+                                                          barrier_interval, k, num_warps):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=num_warps, K=k,
+                                                  SCHED_MODE_2=sched_mode_2, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=barrier_interval)
     asm = compiled.asm["amdgcn"]
     assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
     assert "ds_load_b128" in asm and "ds_store_b128" in asm
-    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    if num_warps == 4:
+        assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
     assert compiled.metadata.shared <= 320 * 1024
     assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else (16 if num_buffers == 4 else 8))
-    grouped_prefetch = block_k == 128 and num_buffers == 4 and dtype_b == "e4m3"
+    grouped_prefetch = block_k == 128 and (num_buffers == 4 or num_warps == 8) and dtype_b == "e4m3"
     assert ("sched_group_barrier" in asm) == grouped_prefetch
 
     # Find the innermost loop containing both compute and a TDM refill. Merely
@@ -5511,6 +5524,10 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
                 loops.append(body)
     assert loops, "missing steady compute/refill loop"
     body = min(loops, key=len)
+    assert not any("scratch_" in inst for inst in body), "register spills in the steady K loop"
+    if num_warps == 8:
+        assert compiled.metadata.num_warps == 8
+        assert sum("v_wmma" in inst for inst in body) == 32 * (block_k // 128)
     if dtype_b == "e4m3" and block_k == 128:
         # Each wave selects its data/scale base once, outside the K loop.
         # The two fused refills then need only their common K advances.
@@ -5528,8 +5545,13 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         for sync_id in (101, 102, 103, 104):
             assert f"SyncID({sync_id})" in "\n".join(body)
     if block_k == 256 and dtype_b == "e2m1":
-        assert sum("v_wmma" in inst
-                   for inst in body[wait + 1:block_end]) >= 64, "too little deferred matrix work covers the refill"
+        # Eight waves finish more work before the refill to avoid register
+        # spills. Some C10 WMMAs can cover the tensor wait; at least the full
+        # eight-WMMA C11 quadrant must remain after the new operand reads.
+        overlap_start = wait if num_warps == 4 else load
+        minimum_deferred = 64 if num_warps == 4 else 8
+        deferred = sum("v_wmma" in inst for inst in body[overlap_start + 1:block_end])
+        assert deferred >= minimum_deferred, "too little deferred matrix work covers the refill"
 
 
 @pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 3, True, "CROSS_TILE_PREFETCH=False"),

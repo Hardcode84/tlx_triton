@@ -553,13 +553,15 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
 @pytest.mark.parametrize(
-    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING",
-    [(k, buffers, dtype, bk, staging)
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS",
+    [(k, buffers, dtype, bk, staging, 4)
      for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
-     for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] + [(k, 4, "float8_e4m3", 128, True)
-                                                                                        for k in (4, 5, 6, 7)],
+     for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] +
+    [(k, 4, "float8_e4m3", 128, True, 4)
+     for k in (4, 5, 6, 7)] + [(k, 3, dtype, 128, True, 8) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")],
 )
-def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING):
+def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
+                                      NUM_WARPS):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and every three/four-slot phase.
     M, N = 1280, 512
@@ -579,19 +581,22 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
                     DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
                     TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=3, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-                    OUTPUT_STAGING=OUTPUT_STAGING))
+                    OUTPUT_STAGING=OUTPUT_STAGING, num_warps=NUM_WARPS))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS,BLOCK_M", [
-    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 128),
-    ("float4", "float4", True, "2way", 32, 128),
-    ("float8_e4m3", "float4", False, "none", 2, 128),
-    ("float8_e4m3", "float4", False, "2way", None, 128),
-    ("float8_e4m3", "float8_e4m3", True, "partial", 2, 256),
+@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS,BLOCK_M,NUM_WARPS", [
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 128, 4),
+    ("float4", "float4", True, "2way", 32, 128, 4),
+    ("float8_e4m3", "float4", False, "none", 2, 128, 4),
+    ("float8_e4m3", "float4", False, "2way", None, 128, 4),
+    ("float8_e4m3", "float8_e4m3", True, "partial", 2, 256, 4),
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 256, 8),
+    ("float8_e4m3", "float4", False, "none", 2, 256, 8),
+    ("float8_e4m3", "float4", False, "2way", None, 256, 8),
 ])
-def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS, BLOCK_M):
+def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS, BLOCK_M, NUM_WARPS):
     M, N, K = 3 * BLOCK_M, 512, 768
     torch.manual_seed(7)
     a = _gfx1250_mxfp._init_data(DTYPE_A, M, K)
@@ -608,7 +613,7 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
                                              BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_A],
                                              DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True,
                                              WITH_A_SCALE=WITH_A_SCALE, SCHEDULE="sliceMNK", TDM_FUSION=FUSION,
-                                             PERSISTENT=True, NUM_PROGRAMS=NUM_PROGRAMS)
+                                             PERSISTENT=True, NUM_PROGRAMS=NUM_PROGRAMS, NUM_WARPS=NUM_WARPS)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
