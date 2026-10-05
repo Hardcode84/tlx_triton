@@ -6,6 +6,8 @@ MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 - `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
   `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
+- [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
+  assembly reproduction with FP32 output and a standalone HIP benchmark.
 
 The benchmark runs both variants at M=N=8192 with K=8192 and K=4096, for four
 runs by default:
