@@ -6,8 +6,10 @@ partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
 BK256 with cross-tile prefetch disabled so output can reuse the A ring.
 Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
 multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
-MX8xMX8 also supports four input buffers: --num-buffers 4 uses smaller output
-staging chunks and an explicit LDS/WMMA prefetch schedule.
+With four waves, MX8xMX8 also supports four input buffers: --num-buffers 4
+uses smaller output staging chunks and an explicit LDS/WMMA prefetch schedule.
+Use --num-warps 8 to test two waves per SIMD on persistent 256x256 tiles;
+four waves remain the default.
 Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
 tutorial kernel's timed region. The default timing budget is 256 ms, matching
@@ -19,6 +21,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-buffers 4
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-warps 8
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
@@ -86,6 +89,8 @@ def _command(args, case, dtype_b):
         dtype_b,
         "--num_buffers",
         str(args.num_buffers),
+        "--num_warps",
+        str(args.num_warps),
         "--group_size_m",
         str(args.group_m),
         "--schedule",
@@ -142,6 +147,8 @@ def main():
     parser.add_argument("-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=None,
                         help="default: 128 for MX8xMX8, 256 for MX8xMX4; an override applies to all selected variants")
     parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=3)
+    parser.add_argument("--num-warps", type=int, choices=(4, 8), default=4,
+                        help="waves per workgroup; eight waves require persistent 256x256 M/N tiles")
     parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
     parser.add_argument("--variant", action="append", choices=tuple(VARIANT_DTYPES_B),
                         help="repeatable variant selection; default: sweep both variants")
@@ -201,6 +208,11 @@ def main():
         parser.error("--tdm-split requires --no-persistent")
     if args.sched_mode_2 and not args.persistent:
         parser.error("--sched-mode-2 requires --persistent")
+    if args.num_warps == 8:
+        if not args.persistent or args.block_m != 256 or args.block_n != 256:
+            parser.error("--num-warps 8 requires persistent 256x256 M/N tiles")
+        if args.output_staging and args.num_buffers == 4:
+            parser.error("eight-wave output staging supports at most three input buffers")
     if args.num_xcds <= 0 or args.xcd_chunk <= 0:
         parser.error("--num-xcds and --xcd-chunk must be positive")
     if args.cluster_barrier_interval < 0:
@@ -269,17 +281,18 @@ def main():
         status = "ok" if returncode == 0 else f"exit {returncode}"
         if status == "ok" and args.benchmark_mode != "none" and ms is None:
             status = "missing timing"
-        config = dict(
-            kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
-            block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
-            group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
-            output_staging=run_args.output_staging, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
-            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
-            cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
-            cluster_barrier_interval=run_args.cluster_barrier_interval,
-            cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
-            requested_programs=run_args.num_programs if run_args.persistent else None,
-            benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
+        config = dict(kernel="persistent" if run_args.persistent else "nonpersistent", block_m=run_args.block_m,
+                      block_n=run_args.block_n, block_k=run_args.block_k, num_buffers=run_args.num_buffers,
+                      num_warps=run_args.num_warps, group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion,
+                      tdm_split=run_args.tdm_split, output_staging=run_args.output_staging,
+                      sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
+                      xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+                      cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
+                      cluster_barrier_interval=run_args.cluster_barrier_interval,
+                      cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
+                      requested_programs=run_args.num_programs if run_args.persistent else None,
+                      benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
+                      seed=run_args.seed)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
                  tflops=tflops, status=status, **config, command=shlex.join(command)))
@@ -290,7 +303,7 @@ def main():
         print(
             f"\nConfiguration ({variant}): {'persistent' if run_args.persistent else 'nonpersistent'}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
-            f"buffers={run_args.num_buffers}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
+            f"buffers={run_args.num_buffers}, warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
             f"sched_mode_2={run_args.sched_mode_2}, "
             f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "

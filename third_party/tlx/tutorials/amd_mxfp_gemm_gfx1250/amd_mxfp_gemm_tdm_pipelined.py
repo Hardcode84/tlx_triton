@@ -228,27 +228,34 @@ def _mxgemm_issue_loads(
     else:
         scale_offsets = [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED // 128]
 
+    # Spread each fused member over the same fraction of the workgroup when
+    # two waves run on each SIMD. The additional waves load disjoint rows.
+    WAVE_MASK_REPEAT: tl.constexpr = 0x11 if tlx.num_warps() == 8 else 1
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE, "4-way TDM fusion requires WITH_A_SCALE")
         tlx.async_amd_descriptor_load_fused([
             (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), 1),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf, slot), 2),
-            (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(a_scale_buf, slot), 4),
-            (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(b_scale_buf, slot), 8),
+                                              pred), tlx.local_view(a_buf, slot), 1 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
+                                                                                       slot), 2 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
+                a_scale_buf, slot), 4 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
+                b_scale_buf, slot), 8 * WAVE_MASK_REPEAT),
         ], multicast_masks=all_masks)
     elif TDM_FUSION == "2way":
         tlx.async_amd_descriptor_load_fused([
             (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), 3),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf, slot), 12),
+                                              pred), tlx.local_view(a_buf, slot), 3 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
+                                                                                       slot), 12 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
         if WITH_A_SCALE:
             tlx.async_amd_descriptor_load_fused([
-                (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(a_scale_buf,
-                                                                                                     slot), 3),
-                (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(b_scale_buf,
-                                                                                                     slot), 12),
+                (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
+                    a_scale_buf, slot), 3 * WAVE_MASK_REPEAT),
+                (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
+                    b_scale_buf, slot), 12 * WAVE_MASK_REPEAT),
             ], multicast_masks=data_masks)
         else:
             _mxgemm_issue_load_b_scale(b_scale_desc, b_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED,
@@ -257,13 +264,15 @@ def _mxgemm_issue_loads(
         tl.static_assert(WITH_A_SCALE, "partial TDM fusion requires WITH_A_SCALE")
         tlx.async_amd_descriptor_load_fused([
             (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), 5),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf, slot), 10),
+                                              pred), tlx.local_view(a_buf, slot), 5 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
+                                                                                       slot), 10 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
         tlx.async_amd_descriptor_load_fused([
-            (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(a_scale_buf, slot), 5),
-            (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(b_scale_buf,
-                                                                                                 slot), 10),
+            (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
+                a_scale_buf, slot), 5 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
+                b_scale_buf, slot), 10 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
     else:
         tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way, partial")
@@ -1283,13 +1292,18 @@ def _mxgemm_persistent_a(a_buf, as_buf, slot, m: tl.constexpr, k: tl.constexpr, 
                          DA: tl.constexpr, BUFFERS: tl.constexpr, WITH_A_SCALE: tl.constexpr):
     tl.assume(slot >= 0)
     tl.assume(slot < BUFFERS)
-    a, scale = _mxgemm_load_a_operand(a_buf, as_buf, slot, m, k, BM, BK, DA, 32, BK // 32, BM // 128, 4, BUFFERS, 2,
-                                      BK // 128, True, WITH_A_SCALE, SCALES_FIRST=BUFFERS == 4 and BK == 128 and DA == 1
-                                      and WITH_A_SCALE)
+    a, scale = _mxgemm_load_a_operand(
+        a_buf, as_buf, slot, m, k, BM, BK, DA, 32, BK // 32, BM // 128, 4, BUFFERS, 2, BK // 128, True, WITH_A_SCALE,
+        SCALES_FIRST=(BUFFERS == 4 or tlx.num_warps() == 8) and BK == 128 and DA == 1 and WITH_A_SCALE)
     # Preserve the scale distribution across loop edges. A generic blocked
     # layout here adds an LDS exchange and barriers before the first dot in
     # each K iteration.
-    scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BM // 128)), stride=((4, 0, 128), (1, 256))))
+    if tlx.num_warps() == 8:
+        scale = tlx.require_layout(scale, tlx.layout(shape=((32, 4, 2), (4, BM // 128)),
+                                                     stride=((4, 0, 128), (1, 256))))
+    else:
+        scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BM // 128)),
+                                                     stride=((4, 0, 128), (1, 256))))
     return a, scale
 
 
@@ -1299,8 +1313,13 @@ def _mxgemm_persistent_b(b_buf, bs_buf, slot, k: tl.constexpr, n: tl.constexpr, 
     tl.assume(slot >= 0)
     tl.assume(slot < BUFFERS)
     b, scale = _mxgemm_load_b_operand(b_buf, bs_buf, slot, k, n, BN, BK, DB, 32, BK // 32, BN // 128, 4, BUFFERS, 2,
-                                      BK // 128, True, True, SCALES_FIRST=BUFFERS == 4 and BK == 128 and DB == 1)
-    scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BN // 128)), stride=((4, 128, 0), (1, 256))))
+                                      BK // 128, True, True, SCALES_FIRST=(BUFFERS == 4 or tlx.num_warps() == 8)
+                                      and BK == 128 and DB == 1)
+    if tlx.num_warps() == 8:
+        scale = tlx.require_layout(scale, tlx.layout(shape=((32, 4, 2), (4, )), stride=((4, 128, 0), (1, ))))
+    else:
+        scale = tlx.require_layout(scale, tlx.layout(shape=((32, 2, 2), (4, BN // 128)),
+                                                     stride=((4, 128, 0), (1, 256))))
     return b, scale
 
 
@@ -1341,16 +1360,19 @@ def _mxgemm_persistent_compute(c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, 
 
 
 @triton.jit
-def _mxgemm_schedule_prefetch(sync_id: tl.constexpr):
-    # One quadrant has sixteen WMMAs. Its incoming FP8 operand needs sixteen
-    # b128 reads and one paired scale read. Issue the scale in the first group
-    # and leave seven WMMAs after the final read to cover completion latency.
-    for _ in tl.static_range(8):
+def _mxgemm_schedule_prefetch(sync_id: tl.constexpr, OPERAND_A: tl.constexpr = False):
+    # Four waves have sixteen WMMAs per quadrant and sixteen operand reads.
+    # Eight waves have eight WMMAs, sixteen A reads, and eight B reads.
+    # Issue the scale early, leaving matrix work after the final payload read.
+    GROUPS: tl.constexpr = 4 if tlx.num_warps() == 8 else 8
+    READS: tl.constexpr = 4 if tlx.num_warps() == 8 and OPERAND_A else 2
+    TAIL: tl.constexpr = 3 if tlx.num_warps() == 8 else 7
+    for _ in tl.static_range(GROUPS):
         tlx.amd_sched_group_barrier(0x8, 1, sync_id)
-        tlx.amd_sched_group_barrier(0x100, 2, sync_id)
+        tlx.amd_sched_group_barrier(0x100, READS, sync_id)
     tlx.amd_sched_group_barrier(0x8, 1, sync_id)
     tlx.amd_sched_group_barrier(0x100, 1, sync_id)
-    tlx.amd_sched_group_barrier(0x8, 7, sync_id)
+    tlx.amd_sched_group_barrier(0x8, TAIL, sync_id)
 
 
 @triton.jit
@@ -1367,7 +1389,7 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
     a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     c01 = tlx.dot_scaled(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
-        _mxgemm_schedule_prefetch(102)
+        _mxgemm_schedule_prefetch(102, True)
     tlx.amd_sched_barrier()
     # Retain the bottom-half operands in registers so the caller can refill
     # this LDS slot and read the next stage before finishing C10/C11.
@@ -1387,15 +1409,16 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
     c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
     b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
     a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
-    if DB != 2:
+    if DB != 2 or tlx.num_warps() == 8:
         c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
     # Bound operand lifetimes before gathering the remaining second half.
-    # A8W4 keeps C11's first-half operands live for work after the refill.
+    # Four-wave A8W4 keeps the first-half operands live across the refill.
+    # Eight waves finish them here to fit two waves in each SIMD's registers.
     tlx.amd_sched_barrier()
-    if DB != 2:
+    if DB != 2 or tlx.num_warps() == 8:
         c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
     b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS)
-    if DB != 2:
+    if DB != 2 or tlx.num_warps() == 8:
         c01 = tlx.dot_scaled(a01, sa01, DTYPE_A, b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
     a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     tlx.amd_sched_barrier()
@@ -1410,7 +1433,8 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                              QUADRANT: tl.constexpr = 0, C_COLS: tl.constexpr = 128):
     # Pin values so output extraction stays in registers. Direct stores also
     # pin their offsets below to avoid an implicit LDS transpose.
-    acc = tlx.require_amd_wmma_layout(acc, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
+    WARP_BASES: tl.constexpr = ((0, 2), (0, 4), (2, 0)) if tlx.num_warps() == 8 else ((0, 2), (2, 0))
+    acc = tlx.require_amd_wmma_layout(acc, warp_bases=WARP_BASES, reg_bases=((0, 1), (1, 0)),
                                       instr_shape=(INSTR_M, 16, 128))
     base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
     if c_buf is not None:
@@ -1443,7 +1467,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                 tlx.async_amd_descriptor_store(desc, view, [row, col], clamp_bounds=False)
     else:
         offsets = tl.arange(0, BM)[:, None] * stride_cm + tl.arange(0, BN)[None, :]
-        offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
+        offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=WARP_BASES, reg_bases=((0, 1), (1, 0)),
                                               instr_shape=(INSTR_M, 16, 128))
         tlx.buffer_store(acc, base, offsets)
 
@@ -1497,6 +1521,10 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert(NUM_PROGRAMS % 16 == 0)
     DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+    tl.static_assert(tlx.num_warps() == 4 or tlx.num_warps() == 8)
+    if tlx.num_warps() == 8:
+        tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and DA == 1,
+                         "eight-wave MXFP requires 256x256 M/N tiles and FP8 A")
     OUTPUT_REUSE: tl.constexpr = OUTPUT_STAGING and BLOCK_K == 256
     if OUTPUT_STAGING:
         tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and DA == 1)
@@ -1505,11 +1533,15 @@ def mxgemm_tdm_persistent_kernel(
             tl.static_assert(NUM_BUFFERS == 2 or (NUM_BUFFERS == 3 and DB == 2))
         else:
             tl.static_assert(NUM_BUFFERS <= 4)
+            tl.static_assert(tlx.num_warps() == 4 or NUM_BUFFERS <= 3,
+                             "eight-wave output staging supports at most three input buffers")
     # Keep independent bottom-half work after the refill and next operand loads.
     # In particular, periodic cluster barriers prevent LLVM from moving earlier
     # WMMAs across that boundary to cover the load latency.
     DEFER_BOTTOM: tl.constexpr = OUTPUT_STAGING and BLOCK_K == 128
-    GROUPED_PREFETCH: tl.constexpr = DEFER_BOTTOM and NUM_BUFFERS == 4 and DA == 1 and DB == 1 and WITH_A_SCALE
+    GROUPED_PREFETCH: tl.constexpr = DEFER_BOTTOM and (NUM_BUFFERS == 4
+                                                       or tlx.num_warps() == 8) and DA == 1 and DB == 1 and WITH_A_SCALE
+    PREFETCH_B_AFTER_C10: tl.constexpr = GROUPED_PREFETCH or (DEFER_BOTTOM and tlx.num_warps() == 8)
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE)
         LOADS: tl.constexpr = 1
@@ -1595,10 +1627,10 @@ def mxgemm_tdm_persistent_kernel(
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                              WITH_A_SCALE)
-            if not GROUPED_PREFETCH:
+            if not PREFETCH_B_AFTER_C10:
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
             if OUTPUT_REUSE:
-                if DB == 2:
+                if DB == 2 and tlx.num_warps() == 4:
                     c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
                     c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
@@ -1612,9 +1644,9 @@ def mxgemm_tdm_persistent_kernel(
             if DEFER_BOTTOM:
                 c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
                 if GROUPED_PREFETCH:
-                    _mxgemm_schedule_prefetch(103)
+                    _mxgemm_schedule_prefetch(103, True)
                 tlx.amd_sched_barrier()
-                if GROUPED_PREFETCH:
+                if PREFETCH_B_AFTER_C10:
                     # C10 is the last user of old B0. Prefetching here permits
                     # register reuse and gives every quadrant one incoming operand.
                     b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
@@ -1666,7 +1698,7 @@ def mxgemm_tdm_persistent_kernel(
                                                  WITH_A_SCALE)
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
             if OUTPUT_REUSE:
-                if DB == 2:
+                if DB == 2 and tlx.num_warps() == 4:
                     c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
                     c00 = tlx.dot_scaled(a01, sa01, DTYPE_A, b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
@@ -1821,6 +1853,7 @@ def mxgemm_tdm_pipelined(
     CLUSTER_SIZE: int = 1,
     CLUSTER_MULTICAST: bool = True,
     CLUSTER_BARRIER_INTERVAL: int = 1,
+    NUM_WARPS: int = 4,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -1833,7 +1866,8 @@ def mxgemm_tdm_pipelined(
     ``CROSS_TILE_PREFETCH=False`` retains persistence but primes each tile
     after the previous output store, providing a control for input overlap.
     ``OUTPUT_STAGING`` requires persistence, 256x256 M/N tiles, and FP8 A.
-    BK128 uses two dedicated 64x128 output slots and 2/3 input buffers.
+    BK128 uses two dedicated output slots: 64x128 with 2/3 input buffers,
+    or 64x64 with four input buffers and four waves.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
     supports two input buffers for A8W8 and two or three for A8W4.
     ``SCHED_MODE_2`` optionally enables hardware WMMA queuing in the persistent
@@ -1849,6 +1883,9 @@ def mxgemm_tdm_pipelined(
     full M groups of four or eight tiles, even N tile counts, and fused loads
     with both scales. The program count must be divisible by 16 and divide the
     total tile count so cluster members take identical loop boundaries.
+    ``NUM_WARPS=8`` experiments with two waves per SIMD on persistent
+    256x256 tiles with FP8 A. Four input buffers currently require direct
+    output stores with eight waves.
     """
     if M is None:
         M = a.shape[0]
@@ -1864,6 +1901,13 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    if NUM_WARPS not in (4, 8):
+        raise ValueError("MXFP supports four or eight warps")
+    if NUM_WARPS == 8:
+        if not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or DTYPE_A == "e2m1":
+            raise ValueError("eight-wave MXFP requires persistent 256x256 M/N tiles and FP8 A")
+        if OUTPUT_STAGING and NUM_BUFFERS == 4:
+            raise ValueError("eight-wave output staging supports at most three input buffers")
     if SCHED_MODE_2 and not PERSISTENT:
         raise ValueError("SCHED_MODE_2 requires persistence")
     if OUTPUT_STAGING:
@@ -1903,7 +1947,7 @@ def mxgemm_tdm_pipelined(
                 NUM_PROGRAMS=NUM_PROGRAMS, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
                 SCHED_MODE_2=SCHED_MODE_2, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
-                CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=4, waves_per_eu=1,
+                CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
                 ctas_per_cga=(CLUSTER_SIZE, 1, 1))
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
@@ -2007,8 +2051,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                                                          2), cluster_size=cfg.get("CLUSTER_SIZE", 1),
                                   cluster_barrier_interval=cfg.get("CLUSTER_BARRIER_INTERVAL", 1))
     if cfg.get("PERSISTENT", False):
-        if cfg["num_warps"] != 4 or cfg["waves_per_eu"] != 1 or cfg["SCALE_BLOCK"] != 32:
-            raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
+        if (cfg["num_warps"] not in (4, 8) or cfg["waves_per_eu"] not in (1, cfg["num_warps"] // 4)
+                or cfg["SCALE_BLOCK"] != 32):
+            raise ValueError("persistent MXFP requires four/eight warps, one/two waves per SIMD, and SCALE_BLOCK=32")
         return mxgemm_tdm_pipelined(
             a, b, a_scale, b_scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, TRANSPOSE_B=TRANSPOSE_B,
             NUM_BUFFERS=cfg["NUM_BUFFERS"], DTYPE_A=cfg["DTYPE_A"], DTYPE_B=cfg["DTYPE_B"],
@@ -2023,7 +2068,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                                                 False), XCD_REMAP=cfg.get("XCD_REMAP", "none"),
             NUM_XCDS=cfg.get("NUM_XCDS", 8), XCD_CHUNK=cfg.get("XCD_CHUNK", 2), CLUSTER_SIZE=cfg.get("CLUSTER_SIZE", 1),
             CLUSTER_MULTICAST=cfg.get("CLUSTER_MULTICAST",
-                                      True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL", 1))
+                                      True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL",
+                                                                              1), NUM_WARPS=cfg["num_warps"])
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -2075,7 +2121,7 @@ if __name__ == "__main__":
     parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
     parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
     parser.add_argument("-BK", type=int, default=256, help="BLOCK_K")
-    parser.add_argument("--num_warps", type=int, default=4, choices=[4], help="kernel num_warps")
+    parser.add_argument("--num_warps", type=int, default=4, choices=[4, 8], help="kernel waves per workgroup")
     parser.add_argument("--num_buffers", type=int, default=3, choices=[2, 3, 4])
     parser.add_argument("--group_size_m", type=int, default=8, choices=[1, 2, 4, 8])
     parser.add_argument("--dtype_a", type=str, default="float8_e4m3", choices=tuple(DTYPE_TO_TRITON))
@@ -2174,4 +2220,5 @@ if __name__ == "__main__":
         CLUSTER_SIZE=args.cluster_size,
         CLUSTER_MULTICAST=args.cluster_multicast,
         CLUSTER_BARRIER_INTERVAL=args.cluster_barrier_interval,
+        NUM_WARPS=args.num_warps,
     )
