@@ -211,6 +211,7 @@ def _mxgemm_issue_loads(
     GROUP_SIZE_M: tl.constexpr = 8,
     XCD_REMAP_MODE: tl.constexpr = 0,
     load_slot=None,
+    SCALES_FIRST: tl.constexpr = False,
 ):
     slot = load_idx % NUM_BUFFERS if load_slot is None else load_slot
     if CLUSTER_SIZE > 1 and CLUSTER_MULTICAST:
@@ -271,18 +272,28 @@ def _mxgemm_issue_loads(
                                        NUM_BUFFERS, SCALE_PRESHUFFLE, load_slot=slot)
     elif TDM_FUSION == "partial":
         tl.static_assert(WITH_A_SCALE, "partial TDM fusion requires WITH_A_SCALE")
+        if SCALES_FIRST:
+            # The register pipeline consumes scales early. Enqueue their small
+            # transfers before the larger payload copies.
+            tlx.async_amd_descriptor_load_fused([
+                (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
+                    a_scale_buf, slot), 5 * WAVE_MASK_REPEAT),
+                (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
+                    b_scale_buf, slot), 10 * WAVE_MASK_REPEAT),
+            ], multicast_masks=data_masks)
         tlx.async_amd_descriptor_load_fused([
             (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
                                               pred), tlx.local_view(a_buf, slot), 5 * WAVE_MASK_REPEAT),
             (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
                                                                                        slot), 10 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
-        tlx.async_amd_descriptor_load_fused([
-            (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
-                a_scale_buf, slot), 5 * WAVE_MASK_REPEAT),
-            (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
-                b_scale_buf, slot), 10 * WAVE_MASK_REPEAT),
-        ], multicast_masks=data_masks)
+        if not SCALES_FIRST:
+            tlx.async_amd_descriptor_load_fused([
+                (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
+                    a_scale_buf, slot), 5 * WAVE_MASK_REPEAT),
+                (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
+                    b_scale_buf, slot), 10 * WAVE_MASK_REPEAT),
+            ], multicast_masks=data_masks)
     else:
         tl.static_assert(TDM_FUSION == "none", "TDM_FUSION must be one of: none, 2way, 4way, partial")
         _mxgemm_issue_load_a_scale(a_scale_desc, a_scale_buf, load_idx, pred, BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS,
@@ -1323,7 +1334,7 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
                     tlx.cluster_barrier()
     _mxgemm_issue_loads(ad, bd, asd, bsd, a_buf, b_buf, as_buf, bs_buf, k, None, BK // DA, BK // DB, BK // 32 * 128,
                         BUFFERS, True, True, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                        XCD_REMAP_MODE, load_slot=slot)
+                        XCD_REMAP_MODE, load_slot=slot, SCALES_FIRST=REGISTER_PIPELINE)
 
 
 @triton.jit

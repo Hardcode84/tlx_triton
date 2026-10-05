@@ -5561,6 +5561,12 @@ def test_gfx1250_mxgemm_register_pipeline_overlaps_refill(k, prefetch, sched_mod
     compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 2, 256, K=k, REGISTER_PIPELINE=True,
                                                   CROSS_TILE_PREFETCH=prefetch, CLUSTER_SIZE=4,
                                                   CLUSTER_BARRIER_INTERVAL=4, SCHED_MODE_2=sched_mode_2)
+    copies = re.findall(r"amdg\.async_tdm_fused_copy_global_to_local[^\n]*", compiled.asm["ttgir"])
+    assert copies and len(copies) % 2 == 0
+    # Preserve scale-first transfer order through lowering, including the
+    # prologue and cross-tile prefetches as well as the steady refill.
+    assert all("!tt.tensordesc<2x1024xui8" in copy for copy in copies[::2])
+    assert all("!tt.tensordesc<256x256xf8E4M3FN" in copy for copy in copies[1::2])
     asm = compiled.asm["amdgcn"]
     assert compiled.metadata.shared <= 320 * 1024
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
