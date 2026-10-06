@@ -5651,7 +5651,8 @@ def test_gfx1250_mxgemm_persistent_output_reuse_rejects_conflict(dtype_b, buffer
 @pytest.mark.parametrize("DTYPE_B", ["e4m3", "e2m1"])
 @pytest.mark.parametrize("TDM_SPLIT", [False, True])
 @pytest.mark.parametrize("BLOCK_M", [128, 256])
-def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M):
+@pytest.mark.parametrize("BLOCK_K", [128, 256])
+def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
 
@@ -5680,10 +5681,10 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M):
             "SCALE_BLOCK": 32,
             "BLOCK_M": BLOCK_M,
             "BLOCK_N": 256,
-            "BLOCK_K": 256,
+            "BLOCK_K": BLOCK_K,
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
-            "NUM_BUFFERS": 3 if DTYPE_B == "e2m1" else 2,
+            "NUM_BUFFERS": 4 if BLOCK_K == 128 else (3 if DTYPE_B == "e2m1" else 2),
             "SCALE_PRESHUFFLE": True,
             "WITH_A_SCALE": True,
             "SCHEDULE": "sliceMNK",
@@ -5702,6 +5703,22 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M):
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # K128 stages need one native K128 contribution per output quadrant.
+    # Two padded K64 halves pass numerical checks but double the matrix work.
+    lines = amdgcn.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    assert sum("v_wmma" in inst for inst in body) == BLOCK_M * 256 // (4 * 16 * 16) * (BLOCK_K // 128)
+    assert not any("scratch_" in inst for inst in body)
+    assert compiled.metadata.shared <= 320 * 1024
     # Scale distributions must survive the loop edge without an LDS exchange.
     # Output quadrants should vectorize directly, avoiding paired-address
     # stores and their high-register DATA1 path.
