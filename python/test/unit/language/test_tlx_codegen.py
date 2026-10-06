@@ -5456,6 +5456,78 @@ def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, rema
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
 
 
+def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work():
+    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline import (
+        mxgemm_tdm_operand_pipeline_kernel as kernel, )
+
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*fp8e4nv", c_ptr="*fp32", a_scale="*u8", b_scale="*u8", M="i32", N="i32",
+                     K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32", stride_scale="i32")
+    attrs = {(kernel.arg_names.index(name), ): [["tt.divisibility", 16]] for name in signature}
+    for name in ("a_ptr", "b_ptr", "c_ptr", "a_scale", "b_scale"):
+        attrs[(kernel.arg_names.index(name), )].append(["tt.pointer_range", 32])
+    config = dict(DTYPE_A="e4m3", DTYPE_B="e4m3", SCALE_BLOCK=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_SIZE_M=8,
+                  TRANSPOSE_B=True, NUM_BUFFERS=4, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True, SCHEDULE="sliceMNK",
+                  TDM_FUSION="partial", L2_PREFETCH_DISTANCE=-1, TDM_SPLIT=False, stride_ak=1, stride_bk=1, stride_cn=1)
+    compiled = triton_compile(ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config),
+                              target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
+    asm = compiled.asm["amdgcn"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            loops.append(lines[labels[branch[1]]:i])
+    assert len(loops) == 1, "unexpected remainder or nested loop in the paired K schedule"
+    body = "\n".join(loops[0])
+    assert body.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 128
+    # Two K128 steps: one payload read per operand, four packed-scale reads
+    # per step, and no LDS exchanges or bulk operand copies at the backedge.
+    assert len(re.findall(r"\bds_load_\w+", body)) == 136
+    assert "ds_store_" not in body
+    assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+    assert body.count("s_barrier_wait") <= 4
+
+
+@pytest.mark.parametrize("changes", [
+    {"PERSISTENT": True},
+    {"WARP_PIPELINE": True},
+    {"REGISTER_PIPELINE": True},
+    {"NUM_BUFFERS": 3},
+    {"NUM_WARPS": 8},
+    {"BLOCK_K": 256},
+    {"OUTPUT_STAGING": False},
+    {"WITH_A_SCALE": False},
+    {"SCALE_PRESHUFFLE": False},
+    {"TDM_SPLIT": True},
+    {"GROUP_SIZE_M": 0},
+])
+def test_gfx1250_mxgemm_operand_pipeline_rejects_incompatible_config(changes):
+    config = dict(OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=4, DTYPE_A="e4m3",
+                  DTYPE_B="e4m3", TRANSPOSE_B=True, WITH_A_SCALE=True, SCALE_PRESHUFFLE=True, SCHEDULE="sliceMNK",
+                  TDM_FUSION="partial", OUTPUT_STAGING=True)
+    config.update(changes)
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="OPERAND_PIPELINE requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
+
+
+@pytest.mark.parametrize("m,n,k", [(128, 256, 512), (256, 384, 512), (256, 256, 256), (256, 256, 640)])
+def test_gfx1250_mxgemm_operand_pipeline_rejects_partial_tiles(m, n, k):
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="meta")
+    sa = torch.empty((m // 128, k * 4), dtype=torch.uint8, device="meta")
+    sb = torch.empty((n // 128, k * 4), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="OPERAND_PIPELINE requires full"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, sa, sb, OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                                           NUM_BUFFERS=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True,
+                                           SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True)
+
+
 def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",

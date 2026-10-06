@@ -14,6 +14,10 @@ Use --warp-pipeline to test the nonpersistent eight-wave E4M3 kernel with
 two K256 payload slots, three scale slots, partitioned LDS, and FP32 output.
 It selects MX8xMX8 and disables clustering by default; K must be divisible
 by 512 and at least 1024.
+Use --operand-pipeline to test the nonpersistent four-wave E4M3 kernel with
+four K128 payload/scale slots, rolling A prefetch, and two B register sets.
+It selects MX8xMX8 and disables clustering; K must be divisible by 256 and
+at least 512. FP32 output is retained.
 For the A8W8 register pipeline, use --variant mx8xmx8 --register-pipeline.
 This selects BK256, two input buffers, and four FP32 output panels, retaining
 one prefetched input stage while the other stage holds output.
@@ -30,6 +34,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-buffers 4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-warps 8
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --warp-pipeline
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --operand-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --register-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-output-staging
@@ -71,11 +76,20 @@ def _variant_args(args, dtype_b):
     if resolved.block_k is None:
         resolved.block_k = 256 if dtype_b == "float4" or resolved.register_pipeline or resolved.warp_pipeline else 128
     if resolved.num_buffers is None:
-        resolved.num_buffers = 2 if resolved.register_pipeline or resolved.warp_pipeline else 3
+        resolved.num_buffers = 4 if resolved.operand_pipeline else (
+            2 if resolved.register_pipeline or resolved.warp_pipeline else 3)
     if resolved.cross_tile_prefetch is None:
-        resolved.cross_tile_prefetch = resolved.register_pipeline or not (resolved.output_staging
-                                                                          and resolved.block_k == 256)
+        resolved.cross_tile_prefetch = not resolved.operand_pipeline and (
+            resolved.register_pipeline or not (resolved.output_staging and resolved.block_k == 256))
     return resolved
+
+
+def _kernel_name(args):
+    if args.operand_pipeline:
+        return "operand_pipeline"
+    if args.warp_pipeline:
+        return "warp_pipeline"
+    return "persistent" if args.persistent else "nonpersistent"
 
 
 def _command(args, case, dtype_b):
@@ -139,6 +153,8 @@ def _command(args, case, dtype_b):
         command.append("--register_pipeline")
     if args.warp_pipeline:
         command.append("--warp_pipeline")
+    if args.operand_pipeline:
+        command.append("--operand_pipeline")
     if args.sched_mode_2:
         command.append("--sched_mode_2")
     if not args.cluster_multicast:
@@ -164,8 +180,10 @@ def main():
         "-BK", "--block-k", dest="block_k", type=int, choices=(128, 256), default=None,
         help="default: 128 for MX8xMX8, 256 for MX8xMX4, --register-pipeline, or --warp-pipeline; "
         "an override applies to all selected variants")
-    parser.add_argument("--num-buffers", type=int, choices=(2, 3, 4), default=None,
-                        help="input buffers (default: 3, or 2 with --register-pipeline/--warp-pipeline)")
+    parser.add_argument(
+        "--num-buffers", type=int, choices=(2, 3, 4), default=None,
+        help="input buffers (default: 3, 2 with --register-pipeline/--warp-pipeline, "
+        "or 4 with --operand-pipeline)")
     parser.add_argument("--num-warps", type=int, choices=(4, 8), default=None,
                         help="waves per workgroup (default: 4, or 8 with --warp-pipeline)")
     parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
@@ -176,12 +194,15 @@ def main():
                         help="select a single weight dtype instead of --variant")
     parser.add_argument("--tdm-fusion", choices=("none", "2way", "4way", "partial"), default="partial")
     parser.add_argument("--tdm-split", action="store_true", help="split descriptors in the nonpersistent kernel")
-    parser.add_argument("--persistent", action=argparse.BooleanOptionalAction, default=None,
-                        help="persistent tile scheduling (default: enabled, except with --warp-pipeline)")
+    parser.add_argument(
+        "--persistent", action=argparse.BooleanOptionalAction, default=None,
+        help="persistent tile scheduling (default: enabled, except with --warp-pipeline/--operand-pipeline)")
     parser.add_argument("--warp-pipeline", action="store_true",
                         help="nonpersistent E4M3 eight-wave pipeline with two payload and three scale slots")
     parser.add_argument("--register-pipeline", action="store_true",
                         help="A8W8 BK256 register pipeline with four FP32 output panels; use --variant mx8xmx8")
+    parser.add_argument("--operand-pipeline", action="store_true",
+                        help="nonpersistent E4M3 four-wave K128 pipeline with four payload/scale slots")
     parser.add_argument("--sched-mode-2", action=argparse.BooleanOptionalAction, default=False,
                         help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: disabled)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
@@ -195,7 +216,7 @@ def main():
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
     parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=None,
-                        help="workgroups per cluster (default: 4, or 1 with --warp-pipeline); 1 disables clustering")
+                        help="workgroups per cluster (default: 4, or 1 with --warp-pipeline/--operand-pipeline)")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument(
@@ -209,12 +230,14 @@ def main():
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
     args = parser.parse_args()
+    if sum((args.warp_pipeline, args.register_pipeline, args.operand_pipeline)) > 1:
+        parser.error("select only one of --warp-pipeline, --register-pipeline, and --operand-pipeline")
     if args.persistent is None:
-        args.persistent = not args.warp_pipeline
+        args.persistent = not (args.warp_pipeline or args.operand_pipeline)
     if args.num_warps is None:
         args.num_warps = 8 if args.warp_pipeline else 4
     if args.cluster_size is None:
-        args.cluster_size = 1 if args.warp_pipeline else 4
+        args.cluster_size = 1 if args.warp_pipeline or args.operand_pipeline else 4
 
     dims = (args.M, args.N, args.K)
     if any(dim is not None for dim in dims):
@@ -229,7 +252,7 @@ def main():
         variant = "mx8xmx4" if args.dtype_b == "float4" else "mx8xmx8"
         variants = [(variant, args.dtype_b)]
     else:
-        default_variants = ("mx8xmx8", ) if args.warp_pipeline else VARIANT_DTYPES_B
+        default_variants = ("mx8xmx8", ) if args.warp_pipeline or args.operand_pipeline else VARIANT_DTYPES_B
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
     if args.num_programs is not None and args.num_programs <= 0:
         parser.error("--num-programs must be positive")
@@ -255,11 +278,19 @@ def main():
             parser.error("clustering requires --xcd-remap none or chunked with --num-xcds 8 --xcd-chunk 2")
         if args.group_m not in (4, 8) or args.tdm_fusion == "none":
             parser.error("clustering requires --group-m 4 or 8 and partial, 2way, or 4way TDM fusion")
-    if args.output_staging and not args.warp_pipeline:
+    if args.output_staging and not (args.warp_pipeline or args.operand_pipeline):
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
+        if run_args.operand_pipeline and not (not run_args.persistent and run_args.output_staging
+                                              and run_args.num_warps == 4 and run_args.num_buffers == 4 and
+                                              (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
+                                              and run_args.dtype_a == dtype_b == "float8_e4m3"
+                                              and run_args.tdm_fusion == "partial" and not run_args.tdm_split
+                                              and not run_args.cross_tile_prefetch):
+            parser.error("--operand-pipeline requires nonpersistent E4M3 x E4M3, 256x256x128 tiles, four warps, "
+                         "four payload/scale buffers, staged output, partial unsplit TDM, and no cross-tile prefetch")
         if run_args.warp_pipeline and not (
                 not run_args.persistent and not run_args.register_pipeline and run_args.output_staging
                 and run_args.num_warps == 8 and run_args.num_buffers == 2 and
@@ -290,6 +321,8 @@ def main():
         if ring_bytes > 320 * 1024:
             parser.error("input rings exceed gfx1250 LDS capacity; reduce --block-k, --num-buffers, or M/N tiles")
         for m, n, k in cases:
+            if run_args.operand_pipeline and (k < 512 or k % 256):
+                parser.error("--operand-pipeline requires K >= 512 divisible by 256")
             if run_args.warp_pipeline and (k < 1024 or k % 512):
                 parser.error("--warp-pipeline requires K >= 1024 divisible by 512")
             if run_args.cluster_size > 1:
@@ -329,8 +362,7 @@ def main():
         status = "ok" if returncode == 0 else f"exit {returncode}"
         if status == "ok" and args.benchmark_mode != "none" and ms is None:
             status = "missing timing"
-        kernel_name = "warp_pipeline" if run_args.warp_pipeline else (
-            "persistent" if run_args.persistent else "nonpersistent")
+        kernel_name = _kernel_name(run_args)
         config = dict(kernel=kernel_name, block_m=run_args.block_m, block_n=run_args.block_n, block_k=run_args.block_k,
                       num_buffers=run_args.num_buffers,
                       scale_buffers=3 if run_args.warp_pipeline else run_args.num_buffers, num_warps=run_args.num_warps,
@@ -351,8 +383,7 @@ def main():
     if args.dry_run:
         return 0
     for variant, _, run_args in variants:
-        kernel_name = "warp_pipeline" if run_args.warp_pipeline else (
-            "persistent" if run_args.persistent else "nonpersistent")
+        kernel_name = _kernel_name(run_args)
         print(
             f"\nConfiguration ({variant}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "

@@ -1,0 +1,26 @@
+{
+  "name": "Synthetic stream with an exact analytical answer",
+  "clock": "arbitrary model tick",
+  "parameters": {
+    "slots": {"value": 3, "unit": "buffers", "source": "synthetic example"},
+    "load_latency": {"value": 12, "unit": "ticks", "source": "synthetic example"}
+  },
+  "resources": {
+    "memory": {"capacity": 1, "unit": "words/tick"},
+    "compute": {"capacity": 1, "unit": "service ticks/tick"}
+  },
+  "operations": [
+    {"id": "load", "kind": "load", "latency": "load_latency", "uses": [{"resource": "memory", "work": 4}]},
+    {"id": "compute", "kind": "compute", "latency": 8, "uses": [{"resource": "compute", "work": 8}]}
+  ],
+  "dependencies": [
+    {"source": "load", "target": "compute"},
+    {"source": "compute", "target": "compute", "distance": 1}
+  ],
+  "buffers": [
+    {"id": "input", "producer": "load", "consumers": ["compute"], "slots": "slots", "size": 4, "space": "local"}
+  ],
+  "storage": {"local": {"capacity": 64, "unit": "words"}},
+  "compute_resources": ["compute"],
+  "assumptions": ["All values in this example are synthetic, independent of any GPU."]
+}

@@ -563,6 +563,30 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("M,N,K", [(256, 256, 512), (768, 512, 768), (3328, 768, 1024), (512, 768, 4096),
+                                   (512, 256, 8192)])
+def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K):
+    # The six-stage case wraps the four-slot ring. Thirteen M tiles exercise
+    # an incomplete five-tile group; longer K checks repeated register reuse.
+    torch.manual_seed(123)
+    a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
+    b = (torch.randn((K, N)) * 0.5).to(torch.float8_e4m3fn)
+    sa = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    sb = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    expected = _gfx1250_mxfp.torch_gemm_mxfp(a, b, sa, sb, 32, M, N, K)
+    result = _gfx1250_mxfp.matmul(
+        a.cuda(),
+        b.T.contiguous().cuda(),
+        _gfx1250_mxfp.pack_scale(sa).cuda(),
+        _gfx1250_mxfp.pack_scale(sb).cuda(),
+        config=dict(OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=4, num_warps=4,
+                    DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True,
+                    SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True))
+    assert result.dtype == torch.float32
+    torch.testing.assert_close(result.cpu(), expected, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
 @pytest.mark.parametrize(
     "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE",
