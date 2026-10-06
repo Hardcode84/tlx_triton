@@ -784,7 +784,9 @@ def mxgemm_tdm_pipelined_kernel(
     if SCHEDULE == "sliceMNK":
         NUM_SUBTILES_M: tl.constexpr = 2
         NUM_SUBTILES_N: tl.constexpr = 2
-        NUM_SUBTILES_K: tl.constexpr = 2
+        # Native MXFP WMMAs consume K128; two K64 halves would double the
+        # matrix instructions for a K128 input stage.
+        NUM_SUBTILES_K: tl.constexpr = 1 if BLOCK_K == 128 else 2
     elif SCHEDULE == "sliceNK":
         NUM_SUBTILES_M: tl.constexpr = 1
         NUM_SUBTILES_N: tl.constexpr = 2
@@ -1041,7 +1043,7 @@ def mxgemm_tdm_pipelined_kernel(
         # Keep the first subtile's scales in the WMMA distribution across the
         # loop edge. Converting blocked loop-carried scales adds LDS exchanges
         # and barriers before the next iteration's first dot.
-        PIN_LOOP_SCALES: tl.constexpr = (SCALE_PRESHUFFLE and SCALE_BLOCK == 32 and BLOCK_K == 256
+        PIN_LOOP_SCALES: tl.constexpr = (SCALE_PRESHUFFLE and SCALE_BLOCK == 32 and (BLOCK_K == 128 or BLOCK_K == 256)
                                          and STORE_INSTR_M == 16 and tlx.num_warps() == 4 and BLOCK_N == 256
                                          and (BLOCK_M == 128 or BLOCK_M == 256))
         if PIN_LOOP_SCALES:
@@ -1061,6 +1063,10 @@ def mxgemm_tdm_pipelined_kernel(
         c10 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         c11 = tl.zeros((SUBTILE_M, SUBTILE_N), dtype=tl.float32)
         for i in tl.range(0, K_ITERS):
+            if NUM_SUBTILES_K == 1:
+                # Make the short stage's refill predicate available before its math.
+                pred_load = i + 1 - epilogue_lb
+                pred_load = (pred_load >> 31) & 1
             c00 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b00, scale_b00, DTYPE_B, c00, tiles_per_warp=[2, 2])
             if TDM_SPLIT:
                 b01, scale_b01 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 0, 1, BLOCK_N,
@@ -1097,58 +1103,65 @@ def mxgemm_tdm_pipelined_kernel(
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
                                                         SCALE_PRESHUFFLE, WITH_A_SCALE)
             c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=[2, 2])
-            if TDM_SPLIT:
-                b10, scale_b10 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N,
-                                                              BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                              BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                              NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                              SCALE_PRESHUFFLE)
-            else:
-                b10, scale_b10 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N, BLOCK_K,
-                                                        DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                        TRANSPOSE_B, SCALE_PRESHUFFLE)
+            if NUM_SUBTILES_K == 2:
+                if TDM_SPLIT:
+                    b10, scale_b10 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N,
+                                                                  BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                                  BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                                  NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                                  SCALE_PRESHUFFLE)
+                else:
+                    b10, scale_b10 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N, BLOCK_K,
+                                                            DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                            BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                            NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                            SCALE_PRESHUFFLE)
             c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=[2, 2])
-            if TDM_SPLIT:
-                a01, scale_a01 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M,
-                                                              BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                              BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                              NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                              WITH_A_SCALE)
-            else:
-                a01, scale_a01 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M, BLOCK_K,
-                                                        DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
-                                                        SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00, tiles_per_warp=[2, 2])
-            if TDM_SPLIT:
-                b11, scale_b11 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N,
-                                                              BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                              BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                              NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                              SCALE_PRESHUFFLE)
-            else:
-                b11, scale_b11 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N, BLOCK_K,
-                                                        DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                        TRANSPOSE_B, SCALE_PRESHUFFLE)
-            c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01, tiles_per_warp=[2, 2])
-            if TDM_SPLIT:
-                a11, scale_a11 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M,
-                                                              BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                              BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                              NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                              WITH_A_SCALE)
-            else:
-                a11, scale_a11 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M, BLOCK_K,
-                                                        DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
-                                                        SCALE_PRESHUFFLE, WITH_A_SCALE)
+            if NUM_SUBTILES_K == 2:
+                if TDM_SPLIT:
+                    a01, scale_a01 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M,
+                                                                  BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                                  BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                                  NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                                  WITH_A_SCALE)
+                else:
+                    a01, scale_a01 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M, BLOCK_K,
+                                                            DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                            BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                            NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                            WITH_A_SCALE)
+                c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+                if TDM_SPLIT:
+                    b11, scale_b11 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N,
+                                                                  BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                                  BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                                  NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                                  SCALE_PRESHUFFLE)
+                else:
+                    b11, scale_b11 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N, BLOCK_K,
+                                                            DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                            BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                            NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                            SCALE_PRESHUFFLE)
+                c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+                if TDM_SPLIT:
+                    a11, scale_a11 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M,
+                                                                  BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                                  BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                                  NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                                  WITH_A_SCALE)
+                else:
+                    a11, scale_a11 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M, BLOCK_K,
+                                                            DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                            BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                            NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                            WITH_A_SCALE)
             wmma_idx += 1
-            c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10, tiles_per_warp=[2, 2])
-            c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11, tiles_per_warp=[2, 2])
-            pred_load = i + 1 - epilogue_lb
-            pred_load = (pred_load >> 31) & 1
+            if NUM_SUBTILES_K == 2:
+                c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10, tiles_per_warp=[2, 2])
+                c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                pred_load = i + 1 - epilogue_lb
+                pred_load = (pred_load >> 31) & 1
             if TDM_SPLIT:
                 load_idx = _mxgemm_issue_split_loads(a0_desc, a1_desc, b0_desc, b1_desc, a_scale_desc, b_scale_desc,
                                                      a0_buf, a1_buf, b0_buf, b1_buf, a_scale_buf, b_scale_buf, load_idx,
