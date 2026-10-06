@@ -1292,19 +1292,32 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit(node.context_expr)
 
     def visit_With(self, node):
-        assert len(node.items) == 1
-        context = node.items[0].context_expr
-        # Facebook begins
-        # In upstream repo, `with` statements are lowered by constructing context managers
-        # and it will require non-trivial changes in TLX dispatcher for async_task
-        # which will be done later
-        if isinstance(context, ast.Call):
-            withitemClass = self.visit(context.func)
-            handler = WITH_DISPATCH.get(withitemClass)
-            if handler:
-                return handler(self, node)
-        return self.visit_compound_statement(node.body)
-        # Facebook ends
+        # TLX async regions use custom AST handlers. Other context managers,
+        # including Gluon warp-pipeline stages, must run their enter/exit hooks.
+        if len(node.items) == 1:
+            context = node.items[0].context_expr
+            if isinstance(context, ast.Call):
+                handler = WITH_DISPATCH.get(self.visit(context.func))
+                if handler:
+                    return handler(self, node)
+
+        cm_list = []
+        for item in node.items:
+            call = item.context_expr
+            fn = self.visit(call.func)
+            args = [self.visit(arg) for arg in call.args]
+            kws = dict(self.visit(kw) for kw in call.keywords)
+            cm_list.append(fn(*args, _semantic=self.semantic, **kws))
+        for cm, item in zip(cm_list, node.items):
+            res = cm.__enter__()
+            if item.optional_vars is not None:
+                var_name = self.visit(item.optional_vars)
+                self.set_value(var_name, res)
+        if ContainsReturnChecker(self.gscope).visit(node):
+            raise self._unsupported(node, "Cannot have `return` statements inside `with` statements in triton ")
+        self.visit_compound_statement(node.body)
+        for cm in reversed(cm_list):
+            cm.__exit__(None, None, None)
 
     def _apply_loop_options(self, loop_op, opts):
         """Emit the AutoWS/pipelining loop attributes carried by an

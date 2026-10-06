@@ -1719,6 +1719,7 @@ def async_amd_descriptor_load(
     offsets: Optional[list[tl.tensor]] = None,
     pred: tl.tensor = None,
     clamp_bounds: tl.constexpr = True,
+    warp_used_hint: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
@@ -1731,6 +1732,10 @@ def async_amd_descriptor_load(
     convenience that advances the descriptor and clamps its remaining bounds
     by default; set ``clamp_bounds=False`` for position-only advancement.
 
+    ``warp_used_hint`` optionally selects the issuing waves with a bitmask.
+    The selected waves must form an axis-aligned set; partitioned destinations
+    also require a whole number of waves per logical piece.
+
     Available only on AMD TDM-capable targets (gfx1250+).
     """
     assert isinstance(desc, tl.tensor_descriptor_base)
@@ -1742,7 +1747,8 @@ def async_amd_descriptor_load(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = result.type.layout
-    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, (tlx.padded_shared_layout_encoding, tlx.partitioned_shared_layout_encoding))):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
@@ -1779,6 +1785,13 @@ def async_amd_descriptor_load(
         result.handle,
         None,
     )
+    warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+    if warp_used_hint is not None:
+        if not isinstance(warp_used_hint, int) or isinstance(warp_used_hint, bool) or warp_used_hint <= 0:
+            raise ValueError("warp_used_hint must be a positive integer bitmask")
+        if warp_used_hint >= 1 << _semantic.builder.options.num_warps:
+            raise ValueError("warp_used_hint sets bits beyond num_warps")
+        token_handle.set_attr("warp_used_hint", _semantic.builder.get_int32_attr(warp_used_hint))
     return tlx.async_token(token_handle)
 
 
@@ -1898,7 +1911,8 @@ def async_amd_descriptor_store(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = source.type.layout
-    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, (tlx.padded_shared_layout_encoding, tlx.partitioned_shared_layout_encoding))):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(

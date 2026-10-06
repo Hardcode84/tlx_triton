@@ -503,31 +503,37 @@ static LogicalResult reconcileEncodingUniformOps(ModuleOp mod, bool &changed) {
 }
 
 static LogicalResult reconcileDotLayouts(ModuleOp mod, bool &changed) {
-  // A concrete accumulator fixes a tt.dot result's layout. The Python
-  // frontend constructs both with encoding-free types, so a helper or
+  // A concrete accumulator fixes a tt.dot/tt.dot_scaled result's layout. The
+  // Python frontend constructs both with encoding-free types, so a helper or
   // predicated region may specialize C before D and trip DotOp's exact type
   // verifier. Mirror the accumulator type here; operand requirements are
   // synthesized later by TLXInsertRequireLayout.
   bool conflict = false;
-  mod.walk([&](::mlir::triton::DotOp dot) {
-    Type target = dot.getC().getType();
-    if (!isConcreteDistributed(target) || dot.getType() == target)
+  auto reconcile = [&](Operation *dot, Value accumulator) {
+    Type target = accumulator.getType();
+    if (!isConcreteDistributed(target) || dot->getResult(0).getType() == target)
       return;
     auto targetTy = cast<RankedTensorType>(target);
-    auto resultTy = dyn_cast<RankedTensorType>(dot.getType());
+    auto resultTy = dyn_cast<RankedTensorType>(dot->getResult(0).getType());
     if (!resultTy || resultTy.getShape() != targetTy.getShape() ||
         resultTy.getElementType() != targetTy.getElementType()) {
-      dot.emitError("dot result has inconsistent accumulator payload type");
+      dot->emitError("dot result has inconsistent accumulator payload type");
       conflict = true;
       return;
     }
     if (isConcreteDistributed(resultTy) && resultTy != targetTy) {
-      dot.emitError("dot result conflicts with concrete accumulator layout");
+      dot->emitError("dot result conflicts with concrete accumulator layout");
       conflict = true;
       return;
     }
-    dot.getResult().setType(targetTy);
+    dot->getResult(0).setType(targetTy);
     changed = true;
+  };
+  mod.walk([&](Operation *op) {
+    if (auto dot = dyn_cast<::mlir::triton::DotOp>(op))
+      reconcile(op, dot.getC());
+    else if (auto dot = dyn_cast<::mlir::triton::DotScaledOp>(op))
+      reconcile(op, dot.getC());
   });
   return success(!conflict);
 }
@@ -1320,6 +1326,15 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
           changed |= retypeWithEncoding(result, enc);
           bridgeOrRetype(yielded, enc, yield, i);
         }
+        return;
+      }
+      // Scaled dot has an exact accumulator/result type constraint, but no
+      // InferTypeOpInterface. A helper ABI may acquire the accumulator's
+      // deferred layout during this fixpoint, after concrete reconciliation.
+      if (auto dot = dyn_cast<::mlir::triton::DotScaledOp>(op)) {
+        auto accType = cast<RankedTensorType>(dot.getC().getType());
+        if (isPlaceholderEncoding(accType.getEncoding()))
+          changed |= retypeWithEncoding(dot.getResult(), accType.getEncoding());
         return;
       }
       // Re-infer any op whose operands acquired a layout after frontend

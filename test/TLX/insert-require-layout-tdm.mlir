@@ -588,6 +588,33 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
   }
 }
 
+// -----
+
+// A partitioned allocation must keep its physical partition mapping through
+// TDM anchoring, ring indexing, and descriptor layout assignment.
+// CHECK-DAG: #[[$PART:.*]] = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #{{.*}}}>
+// PROP-DAG: #[[$PART:.*]] = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #{{.*}}}>
+#padded = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 256]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #padded}>
+#pinned = #tlx.user_layout<#partitioned>
+#smem = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_preserves_pinned_partitioned
+  // PROP-LABEL: @tdm_preserves_pinned_partitioned
+  // PROP-SAME: %[[DESC:.*]]: !tt.tensordesc<256x256xf8E4M3FN, #[[$PART]]>
+  tt.func public @tdm_preserves_pinned_partitioned(%desc: !tt.tensordesc<256x256xf8E4M3FN>, %slot: i32) {
+    // PROP: ttg.local_alloc : () -> !ttg.memdesc<2x256x256xf8E4M3FN, #[[$PART]], #smem, mutable>
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x256x256xf8E4M3FN, #pinned, #smem, mutable>
+    // PROP: %[[BUF:.*]] = ttg.memdesc_index {{.*}} -> !ttg.memdesc<256x256xf8E4M3FN, #[[$PART]], #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<2x256x256xf8E4M3FN, #pinned, #smem, mutable> -> !ttg.memdesc<256x256xf8E4M3FN, #pinned, #smem, mutable>
+    // CHECK: %[[REQ:.*]] = tlx.require_layout {{.*}} -> !ttg.memdesc<256x256xf8E4M3FN, #[[$PART]], #smem, mutable>
+    // CHECK-NEXT: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[REQ]]
+    // PROP: amdg.async_tdm_copy_global_to_local %[[DESC]] into %[[BUF]]
+    %tok = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<256x256xf8E4M3FN> -> !ttg.memdesc<256x256xf8E4M3FN, #pinned, #smem, mutable>
+    tt.return
+  }
+}
+
 //--- invalid.mlir
 
 // Genuine swizzling remains unsupported and is rejected by the TDM verifier.

@@ -987,6 +987,12 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
     bufEncoding = pinned.getPinnedLayout();
   if (isa<ttg::PaddedSharedEncodingAttr>(bufEncoding))
     return bufEncoding;
+  // Partitioned TDM buffers retain the physical partition mapping while the
+  // descriptor pass derives its padding from the per-partition encoding.
+  if (auto partitioned =
+          dyn_cast<ttg::PartitionedSharedEncodingAttr>(bufEncoding))
+    if (isa<ttg::PaddedSharedEncodingAttr>(partitioned.getPartitionLayout()))
+      return bufEncoding;
 
   if (isExplicit) {
     // maxPhase=1 is an unpadded layout supported by TDM, including the
@@ -999,7 +1005,8 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
         return bufEncoding;
     }
     tdmOp->emitError()
-        << "TDM operand requires a padded or non-swizzled shared encoding, "
+        << "TDM operand requires a padded, partitioned padded, or non-swizzled "
+           "shared encoding, "
            "but the view carries "
         << bufEncoding
         << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "

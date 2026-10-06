@@ -21,6 +21,90 @@ def doesnt_compile(kernel):
     return test_fn
 
 
+def test_scaled_dot_helper_pinned_wmma_layout():
+    """Preserve an explicit WMMA accumulator across a scaled-dot helper ABI."""
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def accumulate(a, b, scale_a, scale_b, acc):
+        return tl.dot_scaled(a, scale_a, "e4m3", b, scale_b, "e4m3", acc)
+
+    @triton.jit
+    def kernel():
+        mma: tl.constexpr = tlx.amd_wmma_layout([[8, 4], [4, 0], [8, 0]], [[0, 1], [0, 2], [1, 0], [2, 0]])
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 16]], [128, 128])
+        shared: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 0, piece)
+        a_buf = tlx.local_alloc((256, 128), tl.float8e4nv, 1, layout=shared)
+        b_buf = tlx.local_alloc((128, 128), tl.float8e4nv, 1, layout=piece)
+        a = tlx.local_load(tlx.local_view(a_buf, 0), layout=tlx.dot_operand_layout(0, mma, 16))
+        b = tlx.local_load(tlx.local_view(b_buf, 0), layout=tlx.dot_operand_layout(1, mma, 16))
+        acc = tlx.require_layout(tl.zeros((256, 128), tl.float32), mma)
+        scale_a = tl.full((256, 4), 127, tl.uint8)
+        scale_b = tl.full((128, 4), 127, tl.uint8)
+        acc = accumulate(a, b, scale_a, scale_b, acc)
+        out = tlx.local_alloc((256, 128), tl.float32, 1)
+        tlx.local_store(tlx.local_view(out, 0), acc)
+
+    module = run_parser(kernel, kwargs={"num_warps": 8}, target=GPUTarget("hip", "gfx1250", 32))
+    text = module.str_nodebug()
+    assert "#ttg.partitioned_shared" in text
+    assert "tt.dot_scaled" in text
+    assert "#ttg.amd_wmma" in text
+
+
+def test_amd_layout_constexpr_cache_identity():
+    import triton.language.extra.tlx as tlx
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        pass
+
+    def cache_key(layout):
+        return ASTSource(kernel, {"LAYOUT": "constexpr"}, {"LAYOUT": layout}).hash()
+
+    piece0 = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [128, 128])
+    piece1 = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 128])
+    assert cache_key(piece0) != cache_key(piece1)
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, piece0)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, piece1))
+    row_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major = tlx.swizzled_shared_layout_encoding.make_default(2)
+    column_major.order = [0, 1]
+    assert cache_key(tlx.partitioned_shared_layout_encoding(2, 1, 0, row_major)) != cache_key(
+        tlx.partitioned_shared_layout_encoding(2, 1, 0, column_major))
+    assert cache_key(tlx.amd_wmma_layout([[1, 0], [0, 1]])) != cache_key(tlx.amd_wmma_layout([[0, 1], [1, 0]]))
+
+
+@pytest.mark.parametrize("hint", [None, 15, 0, -1, 1.5, 256])
+def test_amd_tdm_load_warp_hint(hint):
+    import triton.language.extra.tlx as tlx
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel(HINT: tl.constexpr):
+        ptr = tl.full((), 0, tl.int64).to(tl.pointer_type(tl.float16))
+        desc = tl.make_tensor_descriptor(ptr, [256, 256], [256, 1], [256, 256])
+        piece: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], [128, 256])
+        shared: tl.constexpr = tlx.partitioned_shared_layout_encoding(2, 1, 0, piece)
+        buf = tlx.local_alloc((256, 256), tl.float16, 1, layout=shared)
+        tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, 0), warp_used_hint=HINT)
+
+    kwargs = {"HINT": hint, "num_warps": 8}
+    target = GPUTarget("hip", "gfx1250", 32)
+    if hint not in (None, 15):
+        with pytest.raises(CompilationError, match="warp_used_hint"):
+            run_parser(kernel, kwargs=kwargs, target=target)
+        return
+    text = run_parser(kernel, kwargs=kwargs, target=target).str_nodebug()
+    assert "amdg.async_tdm_copy_global_to_local" in text
+    if hint is None:
+        assert "warp_used_hint" not in text
+    else:
+        assert "warp_used_hint = 15 : i32" in text
+
+
 @triton.jit
 def anchor(v):
     pass

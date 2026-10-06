@@ -4428,7 +4428,7 @@ def test_amd_wmma_scale_layout_for_multicta(target):
                 transposed=True,
                 warp_bases=[[0, 1], [1, 0]],
                 instr_shape=[16, 16, 64],
-                cga_layout=[[0, 0], [1, 0]],
+                cga_layout=[[0, 1], [1, 0]],
             ),  #
             k_width=16,
         )
@@ -4442,7 +4442,7 @@ def test_amd_wmma_scale_layout_for_multicta(target):
                 transposed=True,
                 warp_bases=[[0, 1], [1, 0]],
                 instr_shape=[16, 16, 64],
-                cga_layout=[[1, 0], [0, 0]],
+                cga_layout=[[0, 1], [1, 0]],
             ),  #
             k_width=16,
         )

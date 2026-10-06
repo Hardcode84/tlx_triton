@@ -171,6 +171,10 @@ def get_wmma_scale_layout(dot_operand_layout, shape, scale_factor=32):
     transposed = parent.transposed
     reg_bases = parent.reg_bases
     warp_bases = parent.warp_bases
-    cga_bases = parent.cga_layout
+    cga_bases = [list(basis) for basis in dot_operand_layout.cga_layout]
+    # The backend helper takes the CGA layout in scale order. A scales use
+    # [M, K/32], while B scales use [N, K/32] instead of the operand's [K, N].
+    if op_idx == 1:
+        cga_bases = [basis[:-2] + [basis[-1], basis[-2]] for basis in cga_bases]
     return _get_wmma_scale_layout_impl(op_idx, shape, mdim, ndim, transposed, scale_factor, reg_bases, warp_bases,
                                        cga_bases)
