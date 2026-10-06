@@ -1,5 +1,29 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx1250" | FileCheck %s
 
+// An explicitly selected WMMA must not take the generic scaled-dot fallback
+// while its layout still carries TLX's inference and pinning wrappers.
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
+#result = #tlx.no_verify_layout<#tlx.user_layout<#mma>>
+#operand_a = #tlx.no_verify_layout<#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>
+#operand_b = #tlx.no_verify_layout<#ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>
+#scale_a = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
+#scale_b = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @wmma_dot_scaled_pinned
+  // CHECK-NEXT: %[[DOT:.*]] = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %arg4 lhs = e4m3 rhs = e4m3
+  // CHECK-NEXT: tt.return %[[DOT]]
+  tt.func @wmma_dot_scaled_pinned(%a: tensor<32x128xf8E4M3FN, #operand_a>,
+                                 %b: tensor<128x32xf8E4M3FN, #operand_b>,
+                                 %sa: tensor<32x4xi8, #scale_a>,
+                                 %sb: tensor<32x4xi8, #scale_b>,
+                                 %c: tensor<32x32xf32, #result>) -> tensor<32x32xf32, #result> {
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<32x128xf8E4M3FN, #operand_a>, tensor<32x4xi8, #scale_a> * tensor<128x32xf8E4M3FN, #operand_b>, tensor<32x4xi8, #scale_b> -> tensor<32x32xf32, #result>
+    tt.return %dot : tensor<32x32xf32, #result>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

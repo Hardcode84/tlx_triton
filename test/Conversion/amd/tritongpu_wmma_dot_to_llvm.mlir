@@ -354,6 +354,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+#mma_acc = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, CGALayout = [[1, 0], [0, 1]], instrShape = [16, 16, 32]}>
+#mma_a = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, CGALayout = [[1, 0], [0, 0]], instrShape = [16, 16, 32]}>
+#mma_b = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, CGALayout = [[0, 0], [0, 1]], instrShape = [16, 16, 32]}>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Each CTA computes one 32x32 result tile. The CGA dimensions select tiles
+  // and must not create additional per-CTA WMMA repetitions.
+  // GFX1250-LABEL: wmma3_dot_clustered
+  // GFX1250: wmma.f32.16x16x32.f16
+  // GFX1250-NOT: wmma.f32.16x16x32.f16
+  tt.func @wmma3_dot_clustered(
+      %a: tensor<64x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 8}>>,
+      %b: tensor<16x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 8}>>,
+      %acc: tensor<64x64xf32, #mma_acc>) {
+    %result = tt.dot %a, %b, %acc, inputPrecision = ieee :
+      tensor<64x16xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 8}>> *
+      tensor<16x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 8}>> ->
+      tensor<64x64xf32, #mma_acc>
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
 #mma1 = #ttg.amd_wmma<{version = 1, rank = 3, ctaLayout = {warp = [[0, 0, 1], [0, 0, 2], [1, 0, 0]]}}>
 #smem = #ttg.shared_memory

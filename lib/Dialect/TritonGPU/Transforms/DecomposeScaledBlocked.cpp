@@ -38,9 +38,13 @@ static bool isUE5M3ScaleTensor(DotScaledOp dotOp, Value scale) {
 LogicalResult
 DecomposeScaledBlocked::matchAndRewrite(DotScaledOp scaledDotOp,
                                         PatternRewriter &rewriter) const {
-  if (isa_and_nonnull<MmaEncodingTrait>(
+  // Only the generic blocked form needs decomposition. In particular, a
+  // deferred or pinned hardware layout must survive until layout resolution;
+  // it cannot be used as the parent of a newly synthesized dot operand.
+  if (!isa_and_nonnull<BlockedEncodingAttr>(
           scaledDotOp.getResult().getType().getEncoding()))
-    return failure();
+    return rewriter.notifyMatchFailure(scaledDotOp,
+                                       "expected blocked result encoding");
 
   // Types
   auto computeType = getComputeType(scaledDotOp.getAElemType(),

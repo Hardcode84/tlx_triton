@@ -228,6 +228,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
         self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
 
+    def __repr__(self):
+        return f"padded_shared_layout_encoding({vars(self)!r})"
+
     @staticmethod
     @constexpr_function
     def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
@@ -311,6 +314,48 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
         )
+
+
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor's pieces between physical LDS partitions on gfx1250.
+
+    ``partition_layout`` describes one piece. Along ``partition_dim``, each
+    of ``num_groups`` groups contains ``num_partitions`` consecutive pieces.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        self.num_partitions = int(num_partitions)
+        self.num_groups = int(num_groups)
+        self.partition_dim = int(partition_dim)
+        self.partition_layout = tl._unwrap_if_constexpr(partition_layout)
+        for name, value in (("num_partitions", self.num_partitions), ("num_groups", self.num_groups)):
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{name} must be a positive power of two")
+        if self.partition_dim < 0:
+            raise ValueError("partition_dim must be non-negative")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared-memory layout")
+
+    def __repr__(self):
+
+        def describe(layout):
+            fields = {
+                name: describe(value) if isinstance(value, layout_encoding) else value
+                for name, value in vars(layout).items()
+            }
+            return type(layout).__name__, fields
+
+        return repr(describe(self))
+
+    def make_permute(self, dims):
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups,
+                                                  tuple(dims).index(self.partition_dim),
+                                                  self.partition_layout.make_permute(dims))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
 
 
 class shared_linear_layout_encoding(shared_layout_encoding):
@@ -427,6 +472,29 @@ class amd_mfma_layout(layout_encoding):
         del shape, element_type
         return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class amd_wmma_layout(layout_encoding):
+    """Explicit AMD WMMA accumulator distribution for one CTA."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 128), version=3, transposed=True):
+        super().__init__()
+        self.warp_bases = [list(b) for b in tl._unwrap_if_constexpr(warp_bases)]
+        self.reg_bases = [list(b) for b in tl._unwrap_if_constexpr(reg_bases)]
+        self.instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        if len(self.instr_shape) != 3 or any(dim <= 0 for dim in self.instr_shape):
+            raise ValueError("instr_shape must contain three positive dimensions")
+        if any(len(basis) != 2 or any(value < 0 for value in basis) for basis in (*self.warp_bases, *self.reg_bases)):
+            raise ValueError("WMMA bases must contain two nonnegative coordinates")
+
+    def __repr__(self):
+        return f"amd_wmma_layout({vars(self)!r})"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, 2)
 
 
 class slice_layout(layout_encoding):
