@@ -2110,6 +2110,7 @@ def mxgemm_tdm_pipelined(
     NUM_WARPS: int = 4,
     REGISTER_PIPELINE: bool = False,
     WARP_PIPELINE: bool = False,
+    OPERAND_PIPELINE: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -2150,6 +2151,10 @@ def mxgemm_tdm_pipelined(
     eight-wave kernel, with two K256 payload slots and three scale slots.
     It requires 256x256 tiles, preshuffled scales, partial fusion, staged FP32
     output, and K divisible by 512 with K >= 1024.
+    ``OPERAND_PIPELINE`` selects the experimental nonpersistent E4M3 x E4M3
+    four-wave kernel with four K128 payload/scale slots, rolling A prefetch,
+    and two B register sets. It requires 256x256 tiles, preshuffled scales,
+    partial unsplit TDM, staged FP32 output, and K >= 512 divisible by 256.
     """
     if M is None:
         M = a.shape[0]
@@ -2165,6 +2170,28 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    if OPERAND_PIPELINE:
+        if not (not PERSISTENT and not REGISTER_PIPELINE and not WARP_PIPELINE and NUM_WARPS == 4 and NUM_BUFFERS == 4
+                and (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and DTYPE_A == DTYPE_B == "e4m3" and TRANSPOSE_B
+                and SCALE_PRESHUFFLE and WITH_A_SCALE and OUTPUT_STAGING and TDM_FUSION == "partial" and not TDM_SPLIT
+                and SCHEDULE == "sliceMNK" and L2_PREFETCH_DISTANCE == -1):
+            raise ValueError("OPERAND_PIPELINE requires nonpersistent E4M3 x E4M3, 256x256x128 tiles, "
+                             "four warps, four payload/scale buffers, transposed B, preshuffled scales, "
+                             "partial unsplit TDM, sliceMNK, staged output, and no L2 prefetch")
+        if min(M, N) <= 0 or M % 256 or N % 256 or K < 512 or K % 256 or GROUP_SIZE_M <= 0:
+            raise ValueError("OPERAND_PIPELINE requires full M/N tiles, positive GROUP_SIZE_M, "
+                             "and K >= 512 divisible by 256")
+        if (a.shape != (M, K) or b.shape != (N, K) or a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn
+                or a.stride(1) != 1 or b.stride(1) != 1 or a_scale is None or b_scale is None
+                or a_scale.dtype != torch.uint8 or b_scale.dtype != torch.uint8 or not a_scale.is_contiguous()
+                or not b_scale.is_contiguous() or a_scale.shape != (M // 128, K * 4)
+                or b_scale.shape != (N // 128, K * 4)):
+            raise ValueError("OPERAND_PIPELINE requires matching E4M3 input shapes, contiguous K, "
+                             "and packed uint8 scales of shape (rows // 128, K * 4)")
+        if __package__:
+            from .amd_mxfp_gemm_operand_pipeline import mxgemm_tdm_operand_pipeline_kernel
+        else:
+            from amd_mxfp_gemm_operand_pipeline import mxgemm_tdm_operand_pipeline_kernel
     if WARP_PIPELINE:
         if not (not PERSISTENT and not REGISTER_PIPELINE and NUM_WARPS == 8 and NUM_BUFFERS == 2 and
                 (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 256) and DTYPE_A == DTYPE_B == "e4m3" and TRANSPOSE_B
@@ -2195,7 +2222,7 @@ def mxgemm_tdm_pipelined(
             raise ValueError("eight-wave output staging supports at most three input buffers")
     if SCHED_MODE_2 and not PERSISTENT:
         raise ValueError("SCHED_MODE_2 requires persistence")
-    if OUTPUT_STAGING and not WARP_PIPELINE:
+    if OUTPUT_STAGING and not (WARP_PIPELINE or OPERAND_PIPELINE):
         if not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or DTYPE_A == "e2m1":
             raise ValueError("output staging requires persistent 256x256 M/N tiles and FP8 A")
         if BLOCK_K == 128:
@@ -2239,7 +2266,8 @@ def mxgemm_tdm_pipelined(
                 CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
                 ctas_per_cga=(CLUSTER_SIZE, 1, 1))
-        return mxgemm_tdm_pipelined_kernel[grid](
+        kernel = mxgemm_tdm_operand_pipeline_kernel if OPERAND_PIPELINE else mxgemm_tdm_pipelined_kernel
+        return kernel[grid](
             a,
             b,
             c,
@@ -2330,7 +2358,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
 
     if cfg.get("REGISTER_PIPELINE", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("REGISTER_PIPELINE requires persistence")
-    if cfg.get("OUTPUT_STAGING", False) and not (cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False)):
+    if cfg.get("OUTPUT_STAGING", False) and not (cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False)
+                                                 or cfg.get("OPERAND_PIPELINE", False)):
         raise ValueError("output staging requires persistence")
     if cfg.get("SCHED_MODE_2", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("SCHED_MODE_2 requires persistence")
@@ -2342,7 +2371,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                                    8), xcd_chunk=cfg.get("XCD_CHUNK",
                                                                          2), cluster_size=cfg.get("CLUSTER_SIZE", 1),
                                   cluster_barrier_interval=cfg.get("CLUSTER_BARRIER_INTERVAL", 1))
-    if cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False):
+    if cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False) or cfg.get("OPERAND_PIPELINE", False):
         if (cfg["num_warps"] not in (4, 8) or cfg["waves_per_eu"] not in (1, cfg["num_warps"] // 4)
                 or cfg["SCALE_BLOCK"] != 32):
             raise ValueError("pipelined MXFP requires four/eight warps, one/two waves per SIMD, and SCALE_BLOCK=32")
@@ -2362,9 +2391,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                    False), SCHED_MODE_2=cfg.get("SCHED_MODE_2",
                                                                 False), XCD_REMAP=cfg.get("XCD_REMAP", "none"),
             NUM_XCDS=cfg.get("NUM_XCDS", 8), XCD_CHUNK=cfg.get("XCD_CHUNK", 2), CLUSTER_SIZE=cfg.get("CLUSTER_SIZE", 1),
-            CLUSTER_MULTICAST=cfg.get("CLUSTER_MULTICAST", True), CLUSTER_BARRIER_INTERVAL=cfg.get(
-                "CLUSTER_BARRIER_INTERVAL",
-                1), NUM_WARPS=cfg["num_warps"], REGISTER_PIPELINE=cfg.get("REGISTER_PIPELINE", False))
+            CLUSTER_MULTICAST=cfg.get("CLUSTER_MULTICAST",
+                                      True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL",
+                                                                              1), NUM_WARPS=cfg["num_warps"],
+            REGISTER_PIPELINE=cfg.get("REGISTER_PIPELINE", False), OPERAND_PIPELINE=cfg.get("OPERAND_PIPELINE", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -2435,6 +2465,8 @@ if __name__ == "__main__":
                         help="use the A8W8 BK256/two-buffer register pipeline and four FP32 output panels")
     parser.add_argument("--warp_pipeline", action="store_true",
                         help="use the nonpersistent E4M3 eight-wave pipeline with two payload and three scale slots")
+    parser.add_argument("--operand_pipeline", action="store_true",
+                        help="use the nonpersistent E4M3 four-wave K128 pipeline with four payload/scale buffers")
     parser.add_argument("--sched_mode_2", action=argparse.BooleanOptionalAction, default=False,
                         help="set SCHED_MODE[2] for persistent WMMA queuing (default: disabled)")
     parser.add_argument("--output_staging", action="store_true", help="stage persistent FP32 output for TDM stores")
@@ -2522,4 +2554,5 @@ if __name__ == "__main__":
         NUM_WARPS=args.num_warps,
         REGISTER_PIPELINE=args.register_pipeline,
         WARP_PIPELINE=args.warp_pipeline,
+        OPERAND_PIPELINE=args.operand_pipeline,
     )

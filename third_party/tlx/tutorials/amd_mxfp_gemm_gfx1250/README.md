@@ -6,6 +6,10 @@ MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 - `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
   `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
+- `amd_mxfp_gemm_operand_pipeline.py`: experimental four-wave A8W8 kernel
+  with operand prefetch across K steps and FP32 output.
+- [`../../tools/perf_model/`](../../tools/perf_model/README.md): generic resource,
+  dependency, and buffer-overlap model with an MXFP work-graph generator.
 - [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
   assembly reproduction with FP32 output and a standalone HIP benchmark.
 
@@ -38,6 +42,38 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
+
+Use `--operand-pipeline` to test the four-wave operand pipeline:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline --csv mxfp-operands.csv
+```
+
+This selects nonpersistent E4M3 x E4M3, 256x256x128 tiles, four payload/scale
+buffers, and four waves. Both default K shapes run with a 256 ms timing budget.
+The kernel retains one rolling A register set, one extra 64-row A fragment,
+and two B register sets. Next-stage operands load while current-stage matrix
+instructions execute. A two-step K loop rotates the register banks without
+bulk operand copies. A and B scales share the payload ring's four-slot lifetime,
+avoiding a separate scale-reuse synchronization point. The 64x64 subtiles keep
+scales in the matrix layout; payload reads and FP32 output stores use b128.
+
+The path requires full M/N tiles and K >= 512 divisible by 256. It is available
+as an explicit experiment for hardware comparison; benchmark defaults remain
+the selected persistent configurations. To compare with the existing four-wave
+kernel at the same tile and input-ring depth:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --variant mx8xmx8 --no-persistent --cluster-size 1 --num-buffers 4 \
+  --no-output-staging --csv mxfp-baseline.csv
+```
+
+The standalone flag is `--operand_pipeline`; the Python API and `matmul`
+configuration use `OPERAND_PIPELINE=True`, together with BK128, four buffers,
+four waves, partial fusion, and staged output. The summary and CSV identify
+the kernel as `operand_pipeline`.
 
 Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
 
