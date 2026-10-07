@@ -9,11 +9,11 @@ import json
 from pathlib import Path
 
 
-def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, block_k=256,
-               data_slots=2, scale_slots=3, register_slots=1, scale_register_slots=2,
-               packet_bytes=256, memory_path="cache", scalar_ops=8, vector_ops=0,
-               a_register_slots=None, b_register_slots=None, mma_order="mn", array_mapping="pooled",
-               lds_release="source"):
+def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, block_k=256, data_slots=2, scale_slots=3,
+               register_slots=1, scale_register_slots=2, packet_bytes=256, memory_path="cache", scalar_ops=8,
+               vector_ops=0, a_register_slots=None, b_register_slots=None, mma_order="mn", array_mapping="pooled",
+               lds_release="workgroup", transport="staged", scale_read_bytes=256, lds_order="interleaved",
+               wave_partitions=None):
     if weight_bits not in (4, 8) or block_k not in (128, 256):
         raise ValueError("require A8W8/A8W4 and BK128/BK256")
     if min(tile_m, tile_n, waves_m, waves_n, data_slots, scale_slots, register_slots,
@@ -29,9 +29,19 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
         raise ValueError("require pooled or striped array port mapping")
     if lds_release not in ("source", "completion", "workgroup"):
         raise ValueError("require source, completion, or workgroup LDS release")
+    if transport not in ("staged", "fixed") or lds_order not in ("operand", "interleaved"):
+        raise ValueError("require staged/fixed transport and operand/interleaved LDS admission")
+    if scale_read_bytes not in (128, 256, 512):
+        raise ValueError("scale reads must return 128, 256, or 512 bytes per wave instruction")
     waves = waves_m * waves_n
     if waves not in (4, 8):
         raise ValueError("this topology has four SIMDs and supports four or eight waves")
+    if wave_partitions is None:
+        wave_partitions = [(wave % 4) // 2 for wave in range(waves)]
+    if len(wave_partitions) != waves or any(port not in (0, 1) for port in wave_partitions):
+        raise ValueError("wave_partitions must select port 0 or 1 for each wave")
+    if array_mapping == "pooled" and wave_partitions != [(wave % 4) // 2 for wave in range(waves)]:
+        raise ValueError("wave partition placement requires striped array mapping")
     wave_m, wave_n = tile_m // waves_m, tile_n // waves_n
     substeps = block_k // 128
     parameters = {}
@@ -43,22 +53,21 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     # A bindings profile supplies values and replaces their provenance.
     raw = {
         "shader_period_ps": "ps", "gfx_period_ps": "ps", "fabric_period_ps": "ps", "memory_period_ps": "ps",
-        "ds_decode_native": "shader cycles", "ds_scheduler_native": "gfx cycles",
-        "ds_ram_native": "gfx cycles", "ds_read_output_native": "gfx cycles",
-        "ds_return_native": "gfx cycles", "sp_bypass_native": "shader cycles",
+        "ds_decode_native": "shader cycles", "ds_scheduler_native": "gfx cycles", "ds_ram_native": "gfx cycles",
+        "ds_read_output_native": "gfx cycles", "ds_return_native": "gfx cycles", "sp_bypass_native": "shader cycles",
         "ta_native": "gfx cycles", "tcp_input_native": "gfx cycles", "tcp_output_native": "gfx cycles",
-        "l1_input_native": "fabric cycles", "tcx_request_native": "fabric cycles",
-        "tcx_return_native": "fabric cycles", "df_request_native": "fabric cycles",
-        "df_return_native": "fabric cycles", "cache_input_native": "fabric cycles",
-        "cache_output_native": "fabric cycles", "mc_read_request_native": "memory cycles",
-        "mc_read_return_native": "memory cycles", "mc_write_request_native": "memory cycles",
-        "mc_write_return_native": "memory cycles", "dram_activate_native": "memory cycles",
-        "dram_sequence_native": "memory cycles", "memory_cycles_per_32bytes": "memory cycles / 32 bytes / channel",
-        "array_port_width": "bytes / gfx cycle / port", "return_link_width": "bytes / gfx cycle / DS group",
-        "store_link_width": "bytes / gfx cycle / DS group", "cache_link_width": "bytes / fabric cycle / CU",
-        "memory_channels": "channels in modeled scope", "active_cus": "CUs sharing those channels",
-        "barrier_cycles": "shader cycles", "tdm_command_ii": "shader cycles / logical command",
-        "address_vgprs": "VGPRs / lane / wave", "lds_padding": "allocated bytes / logical byte"
+        "l1_input_native": "fabric cycles", "tcx_request_native": "fabric cycles", "tcx_return_native": "fabric cycles",
+        "df_request_native": "fabric cycles", "df_return_native": "fabric cycles", "cache_input_native":
+        "fabric cycles", "cache_output_native": "fabric cycles", "mc_read_request_native": "memory cycles",
+        "mc_read_return_native": "memory cycles", "mc_write_request_native": "memory cycles", "mc_write_return_native":
+        "memory cycles", "dram_activate_native": "memory cycles", "dram_sequence_native": "memory cycles",
+        "memory_cycles_per_32bytes": "memory cycles / 32 bytes / channel", "array_port_width":
+        "bytes / gfx cycle / port", "return_link_width": "bytes / gfx cycle / DS group", "store_link_width":
+        "bytes / gfx cycle / DS group", "cache_link_width": "bytes / fabric cycle / CU", "memory_channels":
+        "channels in modeled scope", "active_cus": "CUs sharing those channels", "barrier_cycles": "shader cycles",
+        "tdm_command_ii": "shader cycles / logical command", "address_vgprs": "VGPRs / lane / wave", "lds_padding":
+        "allocated bytes / logical byte", "lds_outstanding": "instructions / wave, held through result completion",
+        "lds_residency_capacity": "aggregate LDS bytes available to resident CTAs / CU"
     }
     for name, unit in raw.items():
         param(name, None, unit, "unfilled: supply a calibration or explicit scenario", "unfilled")
@@ -143,7 +152,9 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     for simd in range(4):
         resources[f"xdl{simd}"] = dict(capacity=1, unit="service cycles/cycle")
         resources[f"issue{simd}"] = dict(capacity="issue_rate", unit="instructions/cycle")
-    operations, dependencies, buffers, queues = [], [], [], []
+    operations, dependencies, buffers, queues, requests, waits = [], [], [], [], [], []
+    requests_by_completion = {}
+    lds_entries = {wave: [] for wave in range(waves)}
 
     def op(name, kind, latency=0, uses=(), domain=None, phase="loop", window_domain=None):
         operations.append(dict(id=name, kind=kind, latency=latency, uses=list(uses), domain=domain,
@@ -165,8 +176,8 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             item["delay"] = delay
         dependencies.append(item)
 
-    def queue(name, capacity, entries, role):
-        queues.append(dict(id=name, capacity=capacity, entries=entries, role=role))
+    def queue(name, capacity, entries, role, scope="CU", unit="credits"):
+        queues.append(dict(id=name, capacity=capacity, entries=entries, role=role, scope=scope, unit=unit))
 
     def entry(acquire, release, units=1, release_delay=None):
         item = dict(acquire=acquire, release=release, units=units)
@@ -175,7 +186,13 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
         return item
 
     def sync(name, phase="loop"):
-        return op(name, "control", "barrier_cycles", [use(f"issue{s}", 1) for s in range(4)], phase=phase)
+        return op(name, "control", "barrier_cycles", [use(f"issue{s}", waves // 4) for s in range(4)], phase=phase)
+
+    def request(name, issue, complete, stages, kind, scope, amount, **extra):
+        item = dict(id=name, issue=issue, complete=complete, stages=stages, kind=kind, scope=scope, bytes=amount,
+                    consumers=[], **extra)
+        requests.append(item)
+        requests_by_completion[complete] = item
 
     # Initial address setup is outside K. Further non-memory work is explicit,
     # one instruction per node, so it can fit nonconsecutive coexecution slots.
@@ -206,20 +223,44 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             reservations.append(use("cache_read_link", amount, link_offset))
             array_offset = f"{link_offset} + ceil({amount} / cache_link_bw) + tcp_output_cycles"
             reservations.append(array_use(amount, port, array_offset))
-            packet = op(f"input_{name}_{index}", "tdm_packet", uses=reservations)
+            packet_name = f"input_{name}_{index}"
+            stages = []
+            if transport == "staged":
+                packet = op(packet_name, "tdm_packet", "cache_request_cycles")
+                previous = packet
+                if memory_path == "memory":
+                    memory = op(packet_name + "_memory", "tdm_memory",
+                                f"read_miss_request_cycles + ceil({amount} / memory_bw) + read_miss_return_cycles",
+                                [use("memory_channels", amount, "read_miss_request_cycles")])
+                    edge(previous, memory)
+                    stages.append(memory)
+                    previous = memory
+                returned = op(packet_name + "_return", "tdm_transport",
+                              f"cache_return_cycles + ceil({amount} / cache_link_bw) + tcp_output_cycles",
+                              [use("cache_read_link", amount, "cache_return_cycles")])
+                edge(previous, returned)
+                stages.append(returned)
+                finished = op(packet_name + "_array", "tdm_array", uses=[array_use(amount, port)])
+                edge(returned, finished)
+            else:
+                packet = op(packet_name, "tdm_packet", uses=reservations)
+                finished = packet
             edge(commands[name], packet)
-            edge(packet, complete)
-            packets[name].append((packet, amount))
+            edge(finished, complete)
+            request(packet_name, packet, finished, stages, "tdm_input", "CU", amount)
+            requests_by_completion[finished]["consumers"].append(visibility[name])
+            packets[name].append((packet, finished, amount))
     queue("input_descriptors", "tdm_descriptors", descriptor_entries,
-          "one issuing SIMD; scale command consumes two descriptor credits")
+          "one issuing SIMD; scale command consumes two descriptor credits", scope="SIMD0", unit="descriptors")
     # Model an interleaving policy explicitly. Admission order is not inferred
     # from the order in which Python happens to construct the resource nodes.
-    packet_entries = [entry(packet, packet, f"ceil({amount} / transfer_sector_bytes)")
-                      for index in range(max(map(len, packets.values())))
-                      for stream in packets.values() if index < len(stream)
-                      for packet, amount in [stream[index]]]
+    packet_entries = [
+        entry(packet, finished, f"ceil({amount} / transfer_sector_bytes)")
+        for index in range(max(map(len, packets.values())))
+        for stream in packets.values() if index < len(stream) for packet, finished, amount in [stream[index]]
+    ]
     queue("input_transactions", "transfer_credits", packet_entries,
-          "outstanding sectors, from admission through final array write")
+          "outstanding sectors, from admission through final array write", unit="sectors")
 
     mma = {}
     payload_registers, scale_registers = {}, {}
@@ -228,19 +269,42 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
         address_acquire[wave] = op(f"address_acquire_w{wave}", "register_acquire")
         address_release[wave] = op(f"address_release_w{wave}", "register_release")
 
-    def lds_read(name, amount, wave):
+    def lds_read(name, amount, wave, step, operand, index=0, chunk=0):
         issue, group = f"issue{wave % 4}", (wave % 4) // 2
         hold = f"ds_array_offset + ceil({amount} / array_bw) + ds_ram_cycles"
         return_offset = f"{hold} + ds_read_output_cycles + ds_return_cycles"
         ready = f"{return_offset} + ceil({amount} / return_bw) + sp_bypass_native"
-        node = op(name, "lds", ready, [
-            use(issue, 1),
-            use(f"ds_scheduler{group}", "ds_scheduler_cycles", "ds_decode_native", rate=1),
-            array_use(amount, group, "ds_array_offset"),
-            use(f"lds_return{group}", amount, return_offset)
-        ], issue)
+        stages = []
+        if transport == "staged":
+            node = op(name, "lds", "ds_decode_native", [use(issue, 1)], issue)
+            scheduler = op(name + "_scheduler", "lds_stage", "ds_scheduler_cycles",
+                           [use(f"ds_scheduler{group}", "ds_scheduler_cycles", rate=1)])
+            array = op(name + "_array", "lds_array", f"ceil({amount} / array_bw) + ds_ram_cycles",
+                       [array_use(amount, wave_partitions[wave])])
+            returned = op(name + "_return", "lds_return",
+                          f"ds_read_output_cycles + ds_return_cycles + ceil({amount} / return_bw) + sp_bypass_native",
+                          [use(f"lds_return{group}", amount, "ds_read_output_cycles + ds_return_cycles")])
+            edge(node, scheduler)
+            edge(scheduler, array)
+            edge(array, returned)
+            complete = op(name + "_complete", "completion")
+            edge(returned, complete)
+            stages = [scheduler, array, returned]
+            source = dict(op=array)
+        else:
+            node = op(name, "lds", ready, [
+                use(issue, 1),
+                use(f"ds_scheduler{group}", "ds_scheduler_cycles", "ds_decode_native", rate=1),
+                array_use(amount, wave_partitions[wave], "ds_array_offset"),
+                use(f"lds_return{group}", amount, return_offset)
+            ], issue)
+            complete, source = node, dict(op=node, delay=hold)
         edge(node, address_release[wave], delay="ds_decode_native", reason="address source read")
-        return node, hold
+        request(name, node, complete, stages, "lds", f"wave{wave}", amount, source_release=source,
+                compute_resource=f"xdl{wave % 4}")
+        order = ((index, operand, chunk) if lds_order == "interleaved" else (operand, index, chunk))
+        lds_entries[wave].append(((step, not name.startswith("scale_"), *order), entry(node, complete)))
+        return node, complete, source
 
     for step in range(substeps):
         for wave in range(waves):
@@ -271,12 +335,13 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                 # permit prefetch without doubling all payload registers.
                 loads = []
                 acquire = op(f"scale_acquire_{name}_k{step}_w{wave}", "register_acquire")
-                for index, offset in enumerate(range(0, rows * 4, 512)):
-                    load, hold = lds_read(f"scale_{name}_{index}_k{step}_w{wave}", min(512, rows * 4 - offset), wave)
-                    edge(acquire, load)
-                    edge(visibility["S"], load)
-                    edge(address, load)
-                    readers["S"].append((load, hold))
+                for index, offset in enumerate(range(0, rows * 4, scale_read_bytes)):
+                    issued, load, source = lds_read(f"scale_{name}_{index}_k{step}_w{wave}",
+                                                    min(scale_read_bytes, rows * 4 - offset), wave, step, name, index)
+                    edge(acquire, issued)
+                    edge(visibility["S"], issued)
+                    edge(address, issued)
+                    readers["S"].append((issued, load, source))
                     loads.append(load)
                 scales[name] = loads
                 release = op(f"scale_release_{name}_k{step}_w{wave}", "register_release")
@@ -287,11 +352,11 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                     acquire = op(f"acquire_{fragment}", "register_acquire")
                     loads = []
                     for chunk in range(16 * 128 * bits // 8 // 512):
-                        load, hold = lds_read(f"read_{fragment}_{chunk}", 512, wave)
-                        edge(acquire, load)
-                        edge(visibility[name], load)
-                        edge(address, load)
-                        readers[name].append((load, hold))
+                        issued, load, source = lds_read(f"read_{fragment}_{chunk}", 512, wave, step, name, index, chunk)
+                        edge(acquire, issued)
+                        edge(visibility[name], issued)
+                        edge(address, issued)
+                        readers[name].append((issued, load, source))
                         loads.append(load)
                     fragments[name, index] = loads
                     release = op(f"release_{fragment}", "register_release")
@@ -308,23 +373,29 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                     for name, index in (("A", m), ("B", n)):
                         for load in fragments[name, index] + scales[name]:
                             edge(load, issue_mma)
+                            requests_by_completion[load]["consumers"].append(issue_mma)
                         edge(execute, consumed_by[name, index], delay="mma_payload_hold")
                         edge(issue_mma, f"scale_release_{name}_k{step}_w{wave}", delay="mma_scale_hold")
             control = op(f"loop_control_k{step}_w{wave}", "control", uses=[use(issue, 1)], domain=issue)
             edge(mma[step, wave, wave_m // 16 - 1, wave_n // 16 - 1][0], control)
     for wave in range(waves):
+        queue(f"lds_pending_w{wave}", "lds_outstanding", [e for _, e in sorted(lds_entries[wave])],
+              "LDS instruction credits held from issue through result completion; separate from DS scheduler entries",
+              scope=f"wave{wave}", unit="instructions")
         queue(f"address_register_w{wave}", "address_slots", [entry(address_acquire[wave], address_release[wave])],
-              "address set remains live through all DS source reads in a physical BK tile")
+              "address set remains live through all DS source reads in a physical BK tile", scope=f"wave{wave}",
+              unit="address sets")
         for step in range(substeps):
             following = (step + 1) % substeps
             edge(f"loop_control_k{step}_w{wave}", mma[following, wave, 0, 0][0], int(following == 0),
                  reason="loop control before next compute step")
     for key, entries in payload_registers.items():
         queue("payload_register_" + "_".join(map(str, key)), key[1].lower() + "_register_slots", entries,
-              "per-fragment overwrite after every last payload source read; depth measured in K128 steps")
+              "per-fragment overwrite after every last payload source read; depth measured in K128 steps",
+              scope=f"wave{key[0]}", unit="K128 fragments")
     for key, entries in scale_registers.items():
         queue("scale_register_" + "_".join(map(str, key)), "scale_register_slots", entries,
-              "packed scales released after issue-time scale read")
+              "packed scales released after issue-time scale read", scope=f"wave{key[0]}", unit="scale sets")
 
     # Pick a realizable matrix order; other work remains free to move. Waves on
     # each SIMD alternate instructions. This is a design choice, not a hardware
@@ -337,7 +408,7 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                    for step in range(substeps) for m, n in coordinates
                    for wave in range(simd, waves, 4)]
         queue(f"matrix_pending{simd}", "mma_pending", [entry(i, e, release_delay="mma_cycles") for i, e in ordered],
-              "running plus pending matrix instructions on one SIMD")
+              "running plus pending matrix instructions on one SIMD", scope=f"SIMD{simd}", unit="instructions")
         for index, (_, execute) in enumerate(ordered):
             following = ordered[(index + 1) % len(ordered)][1]
             edge(execute, following, int(index + 1 == len(ordered)), "mma_cycles", "matrix execution order")
@@ -349,19 +420,26 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     if lds_release == "workgroup":
         # A full LDS wait cannot release one operand independently while the
         # other operands/scales from this stage still return to registers.
-        released_all = op("released_all", "buffer_release", "barrier_cycles")
+        released_all = sync("released_all")
+        arrived_all = op("reuse_arrival_all", "arrival")
+        completions = []
         for operand_readers in readers.values():
-            for load, _ in operand_readers:
-                edge(load, released_all, reason="all stage LDS results complete before workgroup reuse")
+            for issued, load, _ in operand_readers:
+                edge(issued, arrived_all, delay=1, reason="all reads issued before reuse wait")
+                completions.append(load)
+        waits.append(
+            dict(id="reuse_all", arrival=arrived_all, target=released_all, completions=completions,
+                 role="full-stage workgroup LDS completion"))
     for name, size in sizes.items():
         if lds_release == "workgroup":
             released = released_all
         else:
             released = op(f"released_{name}", "buffer_release", "barrier_cycles")
-            for load, hold in readers[name]:
+            for _, load, source in readers[name]:
                 # Source release is an optimistic hardware-lifetime bound.
                 # Completion retains the slot until its result has returned.
-                edge(load, released, delay=hold if lds_release == "source" else None,
+                edge(source["op"] if lds_release == "source" else load, released,
+                     delay=source.get("delay") if lds_release == "source" else None,
                      reason="LDS last source read" if lds_release == "source" else "operand LDS results complete")
         buffers.append(dict(id=f"lds_{name}", producer=commands[name], consumers=[released],
                             size=f"ceil({size} * lds_padding / lds_granularity) * lds_granularity",
@@ -402,7 +480,8 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
         edge(output_command, packet)
         edge(packet, output_complete)
         output_entries.append(entry(packet, packet, f"ceil({amount} / transfer_sector_bytes)"))
-    queue("output_transactions", "transfer_credits", output_entries, "output sectors through modeled acknowledgment")
+    queue("output_transactions", "transfer_credits", output_entries, "output sectors through modeled acknowledgment",
+          unit="sectors")
 
     accumulators = tile_m * tile_n // (32 * waves)
     a_vgprs = wave_m * 128 // (32 * 4)
@@ -410,11 +489,26 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     scale_vgprs = (wave_m + wave_n) * 4 / (32 * 4)
     vgprs = (f"{accumulators} + {a_vgprs} * a_register_slots + {b_vgprs} * b_register_slots + "
              f"{scale_vgprs} * scale_register_slots + address_vgprs * address_slots")
+    param("vgpr_next_free", vgprs, "VGPRs / lane / wave",
+          "working-set estimate; replace with the compiled descriptor, including occupancy reservations", "derived")
+    derived("vgpr_allocated_per_wave", "ceil(vgpr_next_free / vgpr_granularity) * vgpr_granularity",
+            "VGPRs / lane / wave")
     storage = {"lds": dict(capacity="lds_limit", phase_fixed=dict(
         epilogue=f"ceil({output_bytes} * lds_padding / lds_granularity) * lds_granularity"))}
+    lds_per_cta = "max(" + " + ".join(f"({b['size']}) * {b['slots']}"
+                                      for b in buffers) + ", " + storage["lds"]["phase_fixed"]["epilogue"] + ")"
+    residency = [
+        dict(resource="lds", capacity="lds_residency_capacity", per_cta=lds_per_cta, scope="CU",
+             source="separate aggregate admission capacity; lds_limit is only a per-workgroup launch limit")
+    ]
     for simd in range(4):
-        storage[f"vgpr_simd{simd}"] = dict(capacity="vgprs_per_simd", unit="VGPRs/lane/SIMD",
-                                           fixed=f"{len(range(simd, waves, 4))} * ceil(({vgprs}) / vgpr_granularity) * vgpr_granularity")
+        allocated = f"{len(range(simd, waves, 4))} * vgpr_allocated_per_wave"
+        storage[f"vgpr_simd{simd}"] = dict(
+            capacity="vgprs_per_simd", unit="VGPRs/lane/SIMD",
+            fixed=f"{len(range(simd, waves, 4))} * ceil(({vgprs}) / vgpr_granularity) * vgpr_granularity",
+            allocated=allocated, allocation_basis="rounded next_free_vgpr; estimate until descriptor calibration")
+        residency.append(
+            dict(resource=f"vgpr_simd{simd}", capacity="vgprs_per_simd", per_cta=allocated, scope=f"SIMD{simd}"))
     # LLVM's scaled eight-cycle pattern. The first scale-read issue is a
     # separate node, so the S slot can admit the next instruction at offset 7
     # without incorrectly turning eight cycles of matrix service into seven.
@@ -427,19 +521,23 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     return dict(
         name=f"A8W{weight_bits} {tile_m}x{tile_n} BK{block_k}, {waves_m}x{waves_n} waves, {memory_path} path",
         clock="one shader-clock cycle", parameters=parameters, resources=resources, operations=operations,
-        dependencies=dependencies, buffers=buffers, queues=queues, storage=storage,
+        dependencies=dependencies, buffers=buffers, queues=queues, storage=storage, requests=requests, waits=waits,
+        residency=residency, code=dict(
+            total_bytes=None, hot_loop_bytes=None, tail_bytes=None, interpretation=
+            "static footprint is evidence, not dynamic work; represent fetch delays as explicit operations"),
         coexecution={"mma_execute": [classes[c] for c in "0EEIEEISVV"]},
-        compute_resources=[f"xdl{s}" for s in range(4)],
-        workload=dict(tile_m=tile_m, tile_n=tile_n, k_step=block_k, native_k=128, waves=waves,
-                      waves_m=waves_m, waves_n=waves_n, weight_bits=weight_bits, packet_bytes=packet_bytes, mma_order=mma_order,
-                      array_mapping=array_mapping, lds_release=lds_release,
-                      memory_path=memory_path, flops_per_period=2 * tile_m * tile_n * block_k,
-                      wmma_instructions=tile_m * tile_n // 256 * substeps, unique_input_bytes=sum(sizes.values()),
-                      lds_payload_read_bytes=payload_reads, lds_scale_read_bytes=scale_reads,
-                      array_bytes_per_period=payload_reads + scale_reads + sum(sizes.values()),
-                      fp32_output_bytes=output_bytes, staged_output_array_bytes=2 * output_bytes,
-                      scalar_instructions=waves * scalar_ops, vector_instructions=waves * vector_ops * substeps,
-                      control_instructions=waves * substeps, vgprs_per_wave_expression=vgprs),
+        compute_resources=[f"xdl{s}" for s in range(4)], workload=dict(
+            tile_m=tile_m, tile_n=tile_n, k_step=block_k, native_k=128, waves=waves, waves_m=waves_m, waves_n=waves_n,
+            weight_bits=weight_bits, packet_bytes=packet_bytes, mma_order=mma_order, array_mapping=array_mapping,
+            wave_partitions=wave_partitions, lds_release=lds_release, transport=transport, lds_order=lds_order,
+            scale_read_bytes=scale_read_bytes, memory_path=memory_path, flops_per_period=2 * tile_m * tile_n * block_k,
+            wmma_instructions=tile_m * tile_n // 256 * substeps, unique_input_bytes=sum(sizes.values()),
+            lds_payload_read_bytes=payload_reads, lds_scale_read_bytes=scale_reads,
+            lds_instructions=sum(len(entries) for entries in lds_entries.values()),
+            array_bytes_per_period=payload_reads + scale_reads + sum(sizes.values()), fp32_output_bytes=output_bytes,
+            staged_output_array_bytes=2 * output_bytes, scalar_instructions=waves * scalar_ops,
+            vector_instructions=waves * vector_ops * substeps, control_instructions=waves * substeps,
+            vgprs_per_wave_expression=vgprs),
         assumptions=[
             "A design-space graph with a chosen matrix order, not a model of an existing kernel's instruction order.",
             "One CTA on one CU; four SIMD matrix engines, round-robin wave placement, adjacent-SIMD DS pairing.",
@@ -448,15 +546,22 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             "S/A/B commands model partial fusion. Scales consume two descriptor credits; wave zero issues all commands.",
             "Input sector admission interleaves S/A/B. Array mapping is explicitly pooled or fixed-striped.",
             "Pooled array service allows either of two ports, at most one per request; striped fixes DS and packet mapping.",
-            "LDS read/store routes have fixed stage offsets; structural conflicts delay issue, not individual stages.",
+            ("LDS loads and TDM inputs have separately scheduled stages; contention extends request lifetimes."
+             if transport == "staged" else
+             "Fixed-route reservations delay issue for future conflicts; they do not reproduce internal queueing."),
+            "Output uses fixed-route reservations. Input and output are serial in this single-tile graph.",
             "Two array ports serve both TDM and DS traffic; two distinct LDS return links serve only register loads.",
             "A DS scheduler entry is reserved only for its configured stage, not until data reaches registers.",
+            "A distinct per-wave LDS instruction pool is held through result completion. Counter bit width is not its calibration.",
+            "LDS admission order is explicit. Operand order groups A then B; interleaved order alternates matching fragments.",
+            "Scale instruction width is independent of packed-scale bytes; use the final instruction stream to choose it.",
             "Interface widths, pairing, route composition and queue interpretations require separate calibration.",
             "Cache path bypasses memory-channel traffic; memory path misses every input. No inter-CTA reuse is assumed.",
             "Memory bandwidth is a configurable fair share across active CUs; cache links are independent by direction.",
             "Per-fragment register reuse waits for all final source reads. Packed scales have a separate small ring.",
             "LDS release is explicit: source read, per-operand register completion, or all-stage workgroup completion.",
-            "Workgroup release joins this stage's reads; younger unrelated reads need additional ordering edges.",
+            "Workgroup release records an earliest arrival after all stage issues. ISA ordering can delay that arrival.",
+            "Workgroup release joins this stage's reads; add younger completions explicitly when an emitted wait also covers them.",
             "Register credits are acquired before loads issue, a conservative overwrite rule; no bank conflicts modeled.",
             "Scaled issue precedes matrix execution; LLVM 0EEIEEISVV gates issue at actual execution, not queue admission.",
             "Eight cycles of matrix service remain eight even when the next scaled issue fits at execution offset seven.",
@@ -465,6 +570,8 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             "Local visibility/reuse delays are supplied independently. There are no cluster barriers or multicast here.",
             "FP32 stores retain the WMMA-to-memory hazard. TDM output reads the array but not the LDS register-return link.",
             "Output drains after all loop work. Input/output LDS allocations reuse space; VGPR allocation rounds per wave.",
+            "One-CTA launch limits do not establish aggregate residency capacity or hardware admission policy.",
+            "Used VGPR counts do not establish allocation; calibrate vgpr_next_free from the descriptor before predicting residency.",
             "Predictions are conditional on the profile. Configured component values are not measured end-to-end latencies."
         ])
 
@@ -481,8 +588,15 @@ def main():
     p.add_argument("--b-register-slots", type=int)
     p.add_argument("--mma-order", choices=("mn", "nm"), default="mn")
     p.add_argument("--array-mapping", choices=("pooled", "striped"), default="pooled")
-    p.add_argument("--lds-release", choices=("source", "completion", "workgroup"), default="source",
+    p.add_argument("--lds-release", choices=("source", "completion", "workgroup"), default="workgroup",
                    help="LDS reuse fence: source-read bound, operand completion, or full-stage workgroup completion")
+    p.add_argument("--transport", choices=("staged", "fixed"), default="staged",
+                   help="queue at individual input stages, or reserve each complete route at fixed offsets")
+    p.add_argument("--scale-read-bytes", type=int, choices=(128, 256, 512), default=256,
+                   help="packed-scale bytes returned by one wave instruction; match the compiled load width")
+    p.add_argument("--lds-order", choices=("operand", "interleaved"), default="interleaved")
+    p.add_argument("--wave-partitions", type=lambda value: [int(v) for v in value.split(",")],
+                   help="array port per wave, e.g. 0,1,0,1; requires striped array mapping")
     p.add_argument("--memory-path", choices=("cache", "memory"), default="cache")
     p.add_argument("-o", "--output", type=Path, required=True)
     args = vars(p.parse_args())

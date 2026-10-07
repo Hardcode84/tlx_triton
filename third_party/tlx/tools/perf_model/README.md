@@ -71,6 +71,14 @@ credits, held from acquisition through a specified release. This models
 outstanding sectors, descriptors, or register slots without confusing them
 with software tile-buffer depth.
 
+Keep the queues' units and scopes explicit. An LDS instruction can leave a
+short scheduler stage while still occupying its wave's outstanding-instruction
+credit until the result returns. Transfer sectors, descriptors, scheduler
+entries, instruction credits, and software buffer slots are separate limits.
+The width of an instruction's wait-count field does not establish any of
+those capacities. An unfilled queue capacity leaves bounds partial and
+prevents scheduling; it never becomes an unlimited pool.
+
 For minimum lifetimes `L_j`, credit demands `q_j`, and queue capacity `Q`:
 
 ```text
@@ -81,7 +89,14 @@ necessary queue depth:   Q >= ceil(sum(q_j * L_j) / target_T)
 These lifetimes follow the dependency graph. Resource conflicts can extend
 them; a necessary depth is not a sufficient depth. Reports include minimum
 buffer leads, queue lifetime bounds, and independently checked finite peak
-credit occupancy.
+credit occupancy. Finite reports also include credit-ticks, time at capacity,
+and the minimum slack between buffer retirement and its next overwrite.
+
+Increasing prefetch distance has two deadlines. The final required read must
+complete before consumption, and all reads of a recycled LDS slot must finish
+before refill. Moving a read later can avoid exhausting instruction credits
+while exposing that second wait. The minimum lifetime/area bound cannot
+predict this burst behavior by itself.
 
 Compute utilization is total declared compute service divided by available
 compute-resource time. It is a CU-level fraction when the graph describes one
@@ -128,6 +143,13 @@ wait time are different quantities. Do not add a loaded mean to reservations
 that already model its contention. Keep uncertain endpoint units, sharing,
 queue scope, and additive route composition identifiable as assumptions.
 
+A structured profile can retain `observations` separately from its parameter
+bindings. Record scope, clock, window, sample count, source revision, binary,
+and input/launch conditions there. Observations are copied into reports and
+do not change operation latencies. A loaded latency distribution is useful
+for checking a scheduled route, but inserting its mean into a component
+delay would count the modeled contention again.
+
 The MXFP graph retains individual stage values and converts their clock domains:
 
 ```text
@@ -154,6 +176,9 @@ The generator describes a new design space, independently of existing kernels:
 - Independent payload and scale LDS rings, A and B register depths, and a small
   packed-scale register ring. Register slots are measured in K128 steps.
 - Packetized TDM traffic with descriptor and sector credits.
+- A separate pool of outstanding LDS instruction credits per wave, held
+  through register-result completion. Packed scales consume instruction
+  credits independently of their byte count.
 - Two shared array ports, two LDS return links, separate store ingress, and
   CU/cache links. Array service can use a pooled two-port capacity, with each
   request using at most one port, or a fixed striped mapping.
@@ -162,6 +187,19 @@ The generator describes a new design space, independently of existing kernels:
 - Explicit scalar, vector-address, control, visibility, and setup work.
 - Native FP32 output stores followed by packetized TDM output. Drained input
   LDS is reused for output storage.
+
+The default input transport is `--transport staged`: issue/decode, scheduler,
+array access, return transport, and completion are separate nodes. A request
+can issue and then queue at a shared stage while continuing to hold its
+completion credit. TDM writes and LDS reads compete at the array, but only
+LDS reads use the register-return link. This allows refill traffic to extend
+loaded LDS latency without changing the isolated stage delays.
+
+`--transport fixed` retains the earlier reservation model for comparison.
+It reserves every stage at a fixed offset from issue; future contention can
+therefore delay the issue itself. It cannot reproduce internal queueing in
+the same way. Both modes are abstract arbitration scenarios. Output transport
+still uses fixed reservations and runs after the loop in this generator.
 
 ```bash
 python3 third_party/tlx/tools/perf_model/mxfp.py \
@@ -172,7 +210,9 @@ python3 third_party/tlx/tools/perf_model/mxfp.py \
 python3 third_party/tlx/tools/perf_model/model.py /tmp/a8w8-model.json
 ```
 
-For 256x256 output, work per native K128 step is:
+For 256x256 output, work per native K128 step is shown below. Four-wave
+ownership is 2x2; eight-wave ownership is 4x2. Other eight-wave aspect ratios
+can change A8W4 operand replication.
 
 | Work per CU | A8W8, 4 waves | A8W8, 8 waves | A8W4, 4 waves | A8W4, 8 waves |
 | --- | ---: | ---: | ---: | ---: |
@@ -190,25 +230,57 @@ A8W8 and A8W4 have equal matrix-service demand here. Their operand traffic and
 register footprints differ. Eight-wave ownership increases operand replication
 even though total useful math stays fixed.
 
-By default, LDS storage is released after its final array read, before return
-transport finishes. This is an optimistic source-lifetime bound. Use
-`--lds-release completion` when reuse must wait for each operand's register
-results, or `--lds-release workgroup` when a full LDS wait joins the payload
-and scale results before releasing the stage. The latter matches a common
-payload/scale ring with a workgroup reuse barrier. If a barrier also drains
-younger reads from another stage, add those dependencies to the graph; the
-generator cannot infer them from the instruction stream.
+By default, `--lds-release workgroup` joins the payload and scale results
+before releasing a stage, matching a common ring with a workgroup reuse
+barrier. Its declared arrival is the earliest point after all that stage's
+read instructions have issued. A particular ISA schedule can put independent
+matrix work before that arrival. Use `--lds-release completion` for separate
+operand completion, or `--lds-release source` for the optimistic bound that
+releases storage after its final array read, before return transport finishes.
+If a counter wait also drains younger reads from another stage, include those
+completions in the graph's `waits`; the generator cannot infer emitted waits.
+
+`--scale-read-bytes 256` models four scale instructions per wave for the
+four-wave 256x256x128 A8W8 tile: 64 payload instructions plus four scale
+instructions, or 68 outstanding-credit acquisitions per K128 step. A
+load returning 512 bytes per wave reduces instruction count without changing scale
+traffic. Select the width from the compiled layout. The LDS admission order
+is explicit: `--lds-order operand` groups A then B, while `interleaved`
+alternates matching fragments. This is a chosen realizable order, not a
+claim about an unconstrained optimal schedule.
+
+For a placement sensitivity study, use `--array-mapping striped` and
+`--wave-partitions 0,1,0,1`. This changes the input-read array port assigned
+to each wave while retaining its return-link grouping. It does not infer
+register layout or bank addresses. A source-level partition change that
+introduces layout exchanges needs extra stores, reads and visibility edges;
+it is not equivalent to changing only this mapping.
 
 Register storage is released after its last matrix source read.
 Those are different lifetimes. A row-major matrix traversal keeps B live late
 in each step; a second B register set can ease the refill burst without doubling
 A. `--mma-order nm` tests the transposed traversal. Storage checks round each
-wave's VGPR allocation before adding resident waves on each SIMD.
+wave's VGPR allocation before adding resident waves on each SIMD. The report
+separates the modeled working set from allocated storage. Calibrate
+`vgpr_next_free` from the compiled descriptor, including any occupancy
+reservation, then apply allocation granularity. Used VGPR counts alone can
+give a different residency limit.
+
+`lds_limit` is a per-workgroup legality limit. `lds_residency_capacity` is a
+separate aggregate capacity requiring admission evidence. The `residency`
+report gives only necessary upper bounds from known constraints; it does not
+multiply throughput by that number or assume a second CTA is admitted.
 
 Address sets also have a bounded lifetime, through DS source decode. This
 prevents the scheduler from precomputing arbitrarily many iterations of
 addresses into unaccounted registers. Loop control follows the last matrix
 issue in each native K step and precedes the next step's compute issue.
+For instructions that retain scalar descriptors or vector offsets through
+address translation, extend the corresponding address-credit release to
+that endpoint. Result completion, payload source read, and address-source
+release are distinct lifetimes. A late scale result that overwrites a payload
+address also needs that allocated-register dependency, even if source code
+places the scale load first.
 
 The initial scaled-WMMA issue pattern follows the selected LLVM backend's
 `AMDGPUCoExecInfo.h` and `SISchedule.td`: `0EEIEEISVV`. Matrix execution takes
@@ -222,6 +294,15 @@ The default cache path assumes input hits in the modeled shared cache. The
 Its bandwidth is a configurable share over `active_cus`; channel and CU counts
 must describe the same scope. Inter-CTA cache reuse, multicast, bank conflicts,
 fetch misses, and dispatch overhead require additional work or resources.
+
+The structured profile's optional `code` section records static instruction
+footprint and its provenance. It does not turn bytes into a fetch latency.
+Represent a demonstrated cold fetch cost as an explicit operation at the
+affected boundary. A compact tail can reduce finite-dispatch cost with the
+same dynamic matrix work and a slower selected interior. Compare prologue,
+first compute, later compute, tile handoff, and final drain separately.
+One `prologue` and `epilogue` surround the entire modeled loop; they are not
+automatically repeated at persistent tile boundaries.
 
 ## Run schedules and sensitivity analysis
 
@@ -254,6 +335,14 @@ change wave ownership, matrix order, packet size, memory path, or fixed versus
 pooled port mapping; use bindings for numeric machine parameters and ring
 depths. Packet-size sensitivity checks the effect of transfer granularity.
 
+Sweep `lds_outstanding` independently of `ds_scheduler_depth`,
+`transfer_credits`, and register/LDS slot counts. The synthetic profile fills
+the instruction-credit and residency capacities with invented values; a
+machine profile must supply its own evidence. Compare `requests.by_kind`,
+`waits`, `queue_occupancy`, and `buffer_lifetimes` as well as the final period.
+A lower counter or shorter wait at one instruction can move the delay to
+another wait or to the following workgroup rendezvous.
+
 The full JSON contains operations, resource reservations, queue occupancy,
 serial-phase windows, and the certified periodic template when available.
 Retimed templates carry their own period and start offsets; they are distinct
@@ -269,8 +358,12 @@ no periodic schedule exists.
 | `operations` | `id`, `kind`, `latency`, `uses`, optional `domain`, `window_domain`, `phase`. |
 | `dependencies` | `{source, target, distance, delay}`; distance defaults to zero, delay to source completion. |
 | `buffers` | `{id, producer, consumers, slots, size, space}`, optional `release_delay`. |
-| `queues` | `{id, capacity, entries, role}`; entries have `acquire`, `release`, `units`, optional `release_delay`. |
-| `storage` | Per-space `capacity`, `unit`, `fixed`, and `phase_fixed` allocations. |
+| `queues` | `{id, capacity, entries, role, scope, unit}`; entries have `acquire`, `release`, `units`, optional `release_delay`. |
+| `waits` | `{id, arrival, target, completions, role}`; adds arrival and completion dependencies to the target. |
+| `requests` | `{id, issue, complete, stages, consumers, kind, scope}`, optional `source_release` and `compute_resource`. |
+| `storage` | Per-space `capacity`, `unit`, `fixed`, `phase_fixed`, optional `allocated` and `allocation_basis`. |
+| `residency` | Separate aggregate capacity constraints `{resource, capacity, per_cta, scope, source}`. |
+| `code` | Static footprint and provenance; metadata only, with no implicit fetch-cost formula. |
 | `compute_resources` | Resources whose normalized service is reported as compute utilization. |
 | `coexecution` | A producer class maps to allowed issue classes at each relative tick. |
 
@@ -293,3 +386,101 @@ model persistent output overlap, place output nodes in the periodic graph and
 add their actual storage lifetimes. `phase_fixed` storage can reuse a drained
 loop allocation; it is not added as simultaneously live storage. The tool
 does not emit assembly or allocate physical registers.
+
+Storage accounting is not alias analysis. Two differently shaped views can
+overlap the same physical bytes. Supply their cross-view read/write ordering
+edges using the real padded stage stride; separate buffer names do not prove
+disjoint storage. A missing correctness dependency is not an overlap gain.
+
+`requests` annotate existing connected routes; they do not create timing
+edges. Their stage list must follow issue to completion. Consumers name
+operation starts, optionally with an iteration `distance` and a `delay`.
+`source_release` names an endpoint on the route, with delay defaulting to
+that operation's latency. Request reports include issue, source release,
+completion, consumer, first covering wait, and queueing between stages.
+`route_queue_ticks` is scheduled stage delay; it is not an independently
+measured hardware counter.
+
+A wait's `arrival` and `completions` can be operation names or
+`{op, distance, delay}` endpoints. Distance looks backward from the wait
+iteration; delay defaults to endpoint completion. For example:
+
+```json
+{
+  "id": "refill_wait",
+  "arrival": {"op": "independent_math_done"},
+  "target": "slot_reusable",
+  "completions": ["old_payload_done", "old_scales_done", "younger_read_done"],
+  "role": "emitted LDS counter wait before refill"
+}
+```
+
+Include `younger_read_done` only if the actual wait covers it. A loop-header
+merge can force a more conservative count than the steady incoming path
+alone suggests. The useful latency-hiding lead then ends at this first wait,
+even if the younger operand's arithmetic consumer is much later. The wait
+report separates completion delay from later scheduling delay and names the
+last completions. These intervals can overlap across waits and waves.
+
+The `issue_windows` report counts permitted empty slots by issue domain and
+instruction class, intersecting overlapping window rules. It does not assume
+an instruction was ready to use an empty slot. Register dependencies,
+address-source holds, request credits, or another resource can prevent issue.
+Scheduling markers constrain ordering; they do not replace data waits or
+workgroup visibility dependencies. The selected compiler's coexecution table
+and wave arbitration settings remain separate inputs to an ISA comparison.
+
+## Compare schedules with observations
+
+`window_metrics(start, end, service, stalls)` accepts half-open intervals
+keyed by explicitly named compute resources. Combine both partner waves on
+the same SIMD before computing utilization. The result gives its numerator
+and denominator, clips every event to the common window, intersects stalls
+with matrix idle time, and reports both per-category counts and their union.
+Categories are not additive: a completion delay can coincide with a peer's
+barrier wait. A long gap after a scalar instruction needs direct event
+evidence before it is assigned to instruction fetch or scalar execution.
+
+`latency_statistics(bins)` combines count/sum/min/max bins using sample
+weights. Zero samples produce unknown latency, not zero. Missing min/max
+coverage also remains unknown. The caller must select complete bins in the
+same clock domain and scope; interval endpoints cannot be reconstructed from
+an aggregate counter. Ratios of partition-conflict and active-port counts
+are not fractions of conflicting instructions unless those counters have
+matching event definitions.
+
+Use the following mapping when refining a graph from generated code:
+
+| Finding | Model change or evidence needed |
+| --- | --- |
+| Layout conversion adds LDS traffic | Add the actual exchange reads/stores and their visibility edges; preserve useful matrix work. |
+| A view changes physical stage stride | Use padded allocation sizes and actual alias lifetimes, including nested slices and output aliases. |
+| A scale load overwrites an address register | Retain the address credit until source decode/translation, then permit the overwrite. |
+| Fewer partition conflicts, longer reads | Check both array placement and loaded completion/credit occupancy; do not subtract a counter ratio from latency. |
+| Delayed refill improves LDS latency | Include the shorter TDM-to-visibility lead and total dispatch cost. |
+| Full-drain tail is fast | Treat it as evidence about concurrent transfer interference, not sustainable loop throughput. |
+| Larger unroll improves an interior | Retain cold fetch, tail, output, and register-allocation costs in the finite comparison. |
+| Fewer output transfers | Model output-slot reuse and final acknowledgment; one large reused slot can serialize stores. |
+| More waves | Recount replicated operands and issue work, then normalize combined matrix service per SIMD. |
+| Smaller used-register count | Inspect the descriptor's allocation reservation and actual admission; do not infer another resident CTA. |
+| Spills despite spare total VGPRs | Represent constrained register classes as separate storage pools; a low-register operand constraint can exhaust one class. |
+| Multicast or periodic cluster rendezvous | Model matching-request overlap and rendezvous cost separately from local correctness waits and remapping. |
+
+For independent CTA-local copies, multicast requests that do not overlap can
+fall back to independent transfers. Removing a performance rendezvous does
+not remove each CTA's storage lifetime protection. The one-CTA generator
+does not predict cross-CTA matching, cache reuse, cluster admission, or XCD
+placement; represent those mechanisms explicitly before assigning a benefit.
+
+Compare identical useful work, K ranges, allocation sizes, binary revisions,
+and launch coverage. Preserve first dispatch, repeated dispatch, and later
+tiles as distinct observations: a second dispatch is not guaranteed faster.
+Check at least two K lengths when a change affects ring phase or tail code.
+A certified abstract schedule and a sampled service fraction are different
+metrics from a device profiler's utilization statistic or full-device timing.
+
+Run the CPU regressions without a compiler rebuild:
+
+```bash
+python3 -m pytest -s --tb=short third_party/tlx/tools/perf_model/test_model.py
+```
