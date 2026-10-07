@@ -5700,6 +5700,34 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         assert deferred >= minimum_deferred, "too little deferred matrix work covers the refill"
 
 
+@pytest.mark.parametrize("dtype_b,num_buffers,num_warps,first_use", [
+    ("e4m3", 2, 4, False),
+    ("e4m3", 3, 4, False),
+    ("e4m3", 4, 4, False),
+    ("e4m3", 3, 4, True),
+    ("e4m3", 3, 8, False),
+    ("e2m1", 3, 4, False),
+])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_output_staging_waits_on_reuse(dtype_b, num_buffers, num_warps, first_use, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, 128, num_warps=num_warps, K=4096,
+                                                  FIRST_USE_PREFETCH=first_use, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    lines = compiled.asm["amdgcn"].splitlines()
+    stores = [i for i, line in enumerate(lines) if "tensor_store_from_lds" in line]
+    assert len(stores) >= 3
+    output_start = max(i for i in range(stores[0]) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", lines[i]))
+    # The first two slots are free. Waiting here would drain next-tile
+    # A/B transfers instead of protecting an outstanding output reader.
+    assert not any("s_wait_tensorcnt" in line for line in lines[output_start:stores[1]])
+    # The third chunk reuses slot zero, so the older C transfer must finish
+    # before the first local store into that slot, leaving slot one in flight.
+    reuse = lines[stores[1] + 1:stores[2]]
+    wait = next(i for i, line in enumerate(reuse) if re.search(r"s_wait_tensorcnt\s+(?:0x0*1|1)\b", line))
+    write = next(i for i, line in enumerate(reuse) if "ds_store_" in line)
+    assert wait < write
+
+
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("cluster_size", [1, 4])

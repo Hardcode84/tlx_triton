@@ -1495,7 +1495,8 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
 @triton.jit
 def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constexpr, BN: tl.constexpr,
                              INSTR_M: tl.constexpr, c_buf=None, C_ROWS: tl.constexpr = 64, C_SLOTS: tl.constexpr = 2,
-                             QUADRANT: tl.constexpr = 0, C_COLS: tl.constexpr = 128):
+                             QUADRANT: tl.constexpr = 0, C_COLS: tl.constexpr = 128,
+                             INITIAL_C_SLOTS_FREE: tl.constexpr = False):
     # Pin values so output extraction stays in registers. Direct stores also
     # pin their offsets below to avoid an implicit LDS transpose.
     WARP_BASES: tl.constexpr = ((0, 2), (0, 4), (2, 0)) if tlx.num_warps() == 8 else ((0, 2), (2, 0))
@@ -1513,9 +1514,11 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
         else:
             tl.static_assert(C_ROWS == 64 and C_SLOTS == 2 and (C_COLS == 64 or C_COLS == 128))
             for part in tl.static_range(2 * (BN // C_COLS)):
-                # Each quadrant writes the two slots in order, so wait(1) retires
-                # the previous use even across quadrant/tile boundaries.
-                tlx.async_amd_descriptor_wait(1)
+                # Dedicated slots are free on entry: the current tile's input
+                # waits retired any previous C stores. Start both chunks while
+                # next-tile inputs remain in flight, then wait only on reuse.
+                if not INITIAL_C_SLOTS_FREE or QUADRANT > 0 or part >= C_SLOTS:
+                    tlx.async_amd_descriptor_wait(1)
                 lo, hi = tl.split(tl.reshape(acc, (2, 64, BN)).permute(1, 2, 0))
                 if C_COLS == 128:
                     chunk = lo if part == 0 else hi
@@ -2240,14 +2243,16 @@ def mxgemm_tdm_persistent_kernel(
             else:
                 output_buf = c_buf
             INSTR_M: tl.constexpr = 32 if DA == 2 and DB == 2 else 16
+            INITIAL_C_SLOTS_FREE: tl.constexpr = OUTPUT_STAGING and not (OUTPUT_REUSE or OUTPUT_TAIL_REUSE)
             _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M,
-                                     output_buf, C_ROWS, C_SLOTS, 0, C_COLS)
+                                     output_buf, C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
             _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                     INSTR_M, output_buf, C_ROWS, C_SLOTS, 1, C_COLS)
+                                     INSTR_M, output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE)
             _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                     INSTR_M, output_buf, C_ROWS, C_SLOTS, 2, C_COLS)
+                                     INSTR_M, output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE)
             _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
-                                     BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 3, C_COLS)
+                                     BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 3, C_COLS,
+                                     INITIAL_C_SLOTS_FREE)
             if OUTPUT_REUSE or OUTPUT_TAIL_REUSE:
                 tlx.async_amd_descriptor_wait(0)
             tlx.amd_sched_barrier()
