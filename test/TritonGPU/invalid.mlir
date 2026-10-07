@@ -295,7 +295,7 @@ tt.func public @result_rank_too_large(%arg0: !ttg.memdesc<3x8x16xf32, #shared, #
 #smem = #ttg.shared_memory
 tt.func public @memdesc_index_result_alloc_shape_mismatch(%arg0: !ttg.memdesc<3x8x16xf32, #shared, #smem>) {
     %zero = arith.constant 0 : i32
-    // expected-error @+1 {{alloc shape must match shape for the result}}
+    // expected-error @+1 {{result must preserve the source allocation shape after dropping the buffer dimension}}
     %a = ttg.memdesc_index %arg0[%zero] : !ttg.memdesc<3x8x16xf32, #shared, #smem> -> !ttg.memdesc<8x16xf32, #shared, #smem, 3x8x16>
     tt.return
 }
@@ -305,7 +305,7 @@ tt.func public @memdesc_index_result_alloc_shape_mismatch(%arg0: !ttg.memdesc<3x
 #smem = #ttg.shared_memory
 tt.func public @memdesc_index_inner_subview(%arg0: !ttg.memdesc<3x8x8xf32, #shared, #smem, 3x8x16>) {
     %zero = arith.constant 0 : i32
-    // expected-error @+1 {{We only support memdesc_index of a multibuffer-prefix subview}}
+    // expected-error @+1 {{result must preserve the source allocation shape after dropping the buffer dimension}}
     %a = ttg.memdesc_index %arg0[%zero] : !ttg.memdesc<3x8x8xf32, #shared, #smem, 3x8x16> -> !ttg.memdesc<8x8xf32, #shared, #smem>
     tt.return
 }

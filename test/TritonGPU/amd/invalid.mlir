@@ -341,6 +341,10 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 #shared_32 = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [128, 64]}>
 #shared_2_intervals = #ttg.padded_shared<[64:+4, 128:+4] {order = [1, 0], shape = [128, 64]}>
+#part_inner_32 = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#part_32 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #part_inner_32}>
+#part_inner_swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#part_swizzled = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #part_inner_swizzled}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @interval_not_matching_innermost_block_dimension(
@@ -360,6 +364,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{TDM store only supports single interval paddings}}
     amdg.async_tdm_copy_local_to_global %tensorDesc from %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable> -> !tt.tensordesc<128x64xf16>
+    tt.return
+  }
+
+  tt.func @tdm_store_partitioned_padding_mismatch(%desc: !tt.tensordesc<128x64xf16>, %src: !ttg.memdesc<128x64xf16, #part_32, #smem, mutable>) {
+    // expected-error @+1 {{TDM store padding is only supported when padding interval equals the innermost block dimension}}
+    amdg.async_tdm_copy_local_to_global %desc from %src : !ttg.memdesc<128x64xf16, #part_32, #smem, mutable> -> !tt.tensordesc<128x64xf16>
+    tt.return
+  }
+
+  tt.func @tdm_store_partitioned_unsupported_swizzle(%desc: !tt.tensordesc<128x64xf16>, %src: !ttg.memdesc<128x64xf16, #part_swizzled, #smem, mutable>) {
+    // expected-error @+1 {{TDM does not support swizzling in partitioned layout}}
+    amdg.async_tdm_copy_local_to_global %desc from %src : !ttg.memdesc<128x64xf16, #part_swizzled, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
 

@@ -1269,8 +1269,11 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("result shape must equal to srcShape[1:]");
   }
 
-  if (dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding()) !=
-      layoutShape) {
+  bool indexesSharedBuffer = isa<SharedEncodingTrait>(srcTy.getEncoding()) &&
+                             layoutShape.size() + 1 == srcTy.getRank();
+  if (!indexesSharedBuffer &&
+      dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding()) !=
+          layoutShape) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1285,7 +1288,14 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  if (dstTy.getAllocShape() != dstTy.getShape()) {
+  // A slice within each stage still has the original stage stride. Retain
+  // its allocation shape when indexing away the pipeline dimension.
+  if (indexesSharedBuffer &&
+      dstTy.getAllocShape() != srcTy.getAllocShape().drop_front()) {
+    return emitError("result must preserve the source allocation shape after "
+                     "dropping the buffer dimension");
+  }
+  if (!indexesSharedBuffer && dstTy.getAllocShape() != dstTy.getShape()) {
     return emitError("alloc shape must match shape for the result");
   }
 

@@ -985,14 +985,15 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
       isa<ttg::PinnedEncodingTrait>(bufEncoding) || isUserPinnedMemDesc(buf);
   while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(bufEncoding))
     bufEncoding = pinned.getPinnedLayout();
-  if (isa<ttg::PaddedSharedEncodingAttr>(bufEncoding))
-    return bufEncoding;
   // Partitioned TDM buffers retain the physical partition mapping while the
-  // descriptor pass derives its padding from the per-partition encoding.
+  // descriptor pass derives padding (including an unpadded layout) from the
+  // per-partition encoding.
+  Attribute innerEncoding = bufEncoding;
   if (auto partitioned =
           dyn_cast<ttg::PartitionedSharedEncodingAttr>(bufEncoding))
-    if (isa<ttg::PaddedSharedEncodingAttr>(partitioned.getPartitionLayout()))
-      return bufEncoding;
+    innerEncoding = partitioned.getPartitionLayout();
+  if (isa<ttg::PaddedSharedEncodingAttr>(innerEncoding))
+    return bufEncoding;
 
   if (isExplicit) {
     // maxPhase=1 is an unpadded layout supported by TDM, including the
@@ -1000,7 +1001,7 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
     // Only preserve it when pinned; generic default allocations still need
     // the descriptor-compatible encoding selected below.
     if (auto swizzled =
-            dyn_cast<ttg::SwizzledSharedEncodingAttr>(bufEncoding)) {
+            dyn_cast<ttg::SwizzledSharedEncodingAttr>(innerEncoding)) {
       if (swizzled.getMaxPhase() == 1)
         return bufEncoding;
     }

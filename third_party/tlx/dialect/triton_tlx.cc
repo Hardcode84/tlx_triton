@@ -146,7 +146,8 @@ void init_triton_tlx_ir(py::module_ &m) {
               memDescType = ttg::MemDescType::get(
                   localAllocShape.drop_front(), localAllocType.getElementType(),
                   localAllocType.getEncoding(), localAllocType.getMemorySpace(),
-                  /*mutableMemory=*/localAllocType.getMutableMemory());
+                  /*mutableMemory=*/localAllocType.getMutableMemory(),
+                  localAllocType.getAllocShape().drop_front());
             }
             return self.create<ttg::MemDescIndexOp>(memDescType, localAlloc,
                                                     bufferIdx);
@@ -167,7 +168,7 @@ void init_triton_tlx_ir(py::module_ &m) {
                  newShape, localAllocType.getElementType(),
                  localAllocType.getEncoding(), localAllocType.getMemorySpace(),
                  /*mutableMemory=*/localAllocType.getMutableMemory(),
-                 localAllocShape);
+                 localAllocType.getAllocShape());
 
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
@@ -176,6 +177,7 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value localAlloc,
               std::vector<Value> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
+             localAlloc = materializeConcreteMemDesc(self, localAlloc);
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              if (localAllocShape.size() != offsets.size() ||

@@ -3788,6 +3788,50 @@ def test_local_slice_runtime_offset_compiles_gfx950():
     assert "ttg.memdesc_dynamic_subslice" not in compiled.asm["llir"]
 
 
+@triton.jit
+def _local_slice_buffer_ring_load(view, slot):
+    # Passing the sliced ring through a JIT call must preserve its allocation
+    # shape, including when another slice is taken inside the callee.
+    indexed = view[slot]
+    lower = tlx.local_slice(indexed, [8, 0], [8, 64])
+    return tlx.local_load(lower)
+
+
+@pytest.mark.parametrize("num_buffers", [3, 4])
+@pytest.mark.parametrize("dynamic_offset", [False, True])
+def test_local_slice_buffer_ring_preserves_indexing(num_buffers, dynamic_offset):
+
+    @triton.jit
+    def kernel(output_ptr, slot, row, BUFFERS: tl.constexpr, DYNAMIC: tl.constexpr):
+        layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [32, 64], [1, 0])
+        buffers = tlx.local_alloc((32, 64), tl.float32, BUFFERS, layout=layout)
+        if DYNAMIC:
+            view = tlx.local_slice(buffers, [0, row, 0], [BUFFERS, 16, 64])
+        else:
+            view = tlx.local_slice(buffers, [0, 16, 0], [BUFFERS, 16, 64])
+        # A ring count need not be a power of two. It must stay separate from
+        # the logical tensor shape when the sliced ring is indexed later.
+        tl.static_assert(view.type.num == BUFFERS)
+        tl.static_assert(len(view.shape) == 2 and view.shape[0] == 16)
+        offsets = tl.arange(0, 32)[:, None] * 64 + tl.arange(0, 64)[None, :]
+        for index in tl.static_range(BUFFERS):
+            tlx.local_store(buffers[index], (offsets + index * 2048).to(tl.float32))
+        values = _local_slice_buffer_ring_load(view, slot)
+        out_offsets = tl.arange(0, 8)[:, None] * 64 + tl.arange(0, 64)[None, :]
+        tl.store(output_ptr + out_offsets, values)
+
+    compiled = triton_compile(
+        ASTSource(kernel, signature=dict(output_ptr="*fp32", slot="i32", row="i32"),
+                  constexprs=dict(BUFFERS=num_buffers, DYNAMIC=dynamic_offset)), target=GPUTarget("hip", "gfx1250", 32),
+        options=dict(num_warps=4))
+    subslice_op = "ttg.memdesc_dynamic_subslice" if dynamic_offset else "ttg.memdesc_subslice"
+    assert subslice_op in compiled.asm["ttgir"]
+    # The final padding interval has no following row, so it need not be
+    # allocated. Interior stages must still keep the full padded stride.
+    assert compiled.metadata.shared >= (num_buffers * 32 * 68 - 4) * 4
+    assert re.search(r"!ttg\.memdesc<16x64xf32, [^>]*, 32x64>", compiled.asm["ttgir"])
+
+
 def test_padded_local_slice_uses_transposed_lds_read_gfx950():
     """A padded dS-style subslice should retain the CDNA4 transposed load."""
     compiled = compile_for_gfx950(

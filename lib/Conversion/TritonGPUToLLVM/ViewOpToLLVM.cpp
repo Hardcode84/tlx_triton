@@ -509,6 +509,11 @@ struct MemDescSubsliceOpConversion
       if (auto partEnc = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
         stride /= partEnc.getNumPartitions();
       Value offset = b.i32_val(opOffsetVals.front() * stride);
+      if (auto padEnc = getPaddedEncoding(encoding)) {
+        auto shifts = getPaddedSharedShifts(
+            padEnc, srcTy.getElementTypeBitWidth(), /*offsetInBytes=*/false);
+        offset = applyPadding(loc, rewriter, offset, shifts);
+      }
       for (Value &base : newBases)
         base = b.gep(base.getType(), llvmElemTy, base, offset);
     }
@@ -559,12 +564,27 @@ struct MemDescDynamicSubsliceOpConversion
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
 
+    SmallVector<Value> newBases = llvm::to_vector(smemObj.getBases());
+    auto encoding = srcTy.getEncoding();
+    auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
+    if (allocShape.size() < srcTy.getRank()) {
+      int64_t stride = getAllocationElems(encoding, allocShape);
+      Value offset = b.mul(adaptor.getOffsets().front(), b.i32_val(stride));
+      if (auto padEnc = getPaddedEncoding(encoding)) {
+        auto shifts = getPaddedSharedShifts(
+            padEnc, srcTy.getElementTypeBitWidth(), /*offsetInBytes=*/false);
+        offset = applyPadding(loc, rewriter, offset, shifts);
+      }
+      for (Value &base : newBases)
+        base = b.gep(base.getType(), llvmElemTy, base, offset);
+    }
+
     SmallVector<Value> offsetVals;
     for (auto [oldOffset, dynamicOffset] :
          llvm::zip_equal(smemObj.getOffsets(), adaptor.getOffsets()))
       offsetVals.push_back(b.add(oldOffset, dynamicOffset));
 
-    SharedMemoryObject resultObj(smemObj.getBases(), llvmElemTy, offsetVals);
+    SharedMemoryObject resultObj(newBases, llvmElemTy, offsetVals);
     rewriter.replaceOp(
         op, getStructFromSharedMemoryObject(loc, resultObj, rewriter));
     return success();

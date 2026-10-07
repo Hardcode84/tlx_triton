@@ -330,6 +330,37 @@ tt.func @missing_barrier_reused_allocation(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
   tt.return
 }
 
+// Reusing a ring allocation with a different slot size can overlap an earlier
+// read. Narrow each allocation interval exactly once: slot 1 of a four-slot
+// ring covers bytes [8192, 16384), while slot 3 of an eight-slot ring covers
+// [12288, 16384). Narrowing twice incorrectly makes these intervals disjoint.
+// CHECK-LABEL: reused_allocation_overlapping_ring_slots
+tt.func @reused_allocation_overlapping_ring_slots(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
+  %c1_i32 = arith.constant 1 : i32
+  %c3_i32 = arith.constant 3 : i32
+  %offset_a = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %offset_b = arith.constant dense<0> : tensor<64x32xi32, #AL>
+  %alloc_a = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot_a = ttg.memdesc_index %alloc_a[%c1_i32] : !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %load_a = amdg.buffer_load_to_local %A[%offset_a] into %slot_a : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %commit_a = ttg.async_commit_group tokens %load_a
+  %wait_a = amdg.async_wait %commit_a {num_inst = 0 : i32}
+  %value = ttg.local_load %slot_a token %wait_a : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  // CHECK: ttg.local_load
+  ttg.local_dealloc %alloc_a : !ttg.memdesc<4x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %alloc_b = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<8x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot_b = ttg.memdesc_index %alloc_b[%c3_i32] : !ttg.memdesc<8x64x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: {{.*}}amdg.buffer_load_to_local
+  %load_b = amdg.buffer_load_to_local %B[%offset_b] into %slot_b : <f16>[tensor<64x32xi32, #AL>] -> <64x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %commit_b = ttg.async_commit_group tokens %load_b
+  %wait_b = amdg.async_wait %commit_b {num_inst = 0 : i32}
+  // CHECK: amdg.async_wait
+  // CHECK: ttg.barrier local
+  // CHECK: tt.return
+  tt.return
+}
+
 // tlx.workgroup_barrier lowers to `rocdl.sched.barrier none; ttg.barrier local;
 // rocdl.sched.barrier none`. When Membar scans forward from an async wait for a
 // sync point it must look THROUGH the scheduling-only sched fences to reach the

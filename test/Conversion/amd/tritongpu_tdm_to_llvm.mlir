@@ -372,6 +372,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+// The store path selects a partition base just as the load path does.
+// Padding still expands the innermost tile extent and clips the tensor bound.
+#inner = #ttg.padded_shared<[128:+8] {order = [3, 2, 1, 0], shape = [1, 128, 2, 128]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_store_partitioned_padded_f32
+  tt.func @tdm_store_partitioned_padded_f32(%desc: !tt.tensordesc<2x128x2x128xf32>) {
+    %out = ttg.local_alloc : () -> !ttg.memdesc<2x128x2x128xf32, #partitioned, #smem, mutable>
+    // tile_dim0 = (128 + 8) << 16; tensor_dim0 remains at most 128.
+    // CHECK-DAG: %[[PADDED_TILE:.*]] = llvm.mlir.constant(8912896 : i32)
+    // CHECK-DAG: %[[BOUND:.*]] = llvm.mlir.constant(128 : i32)
+    // CHECK: llvm.extractelement {{.*}} : vector<2x!llvm.ptr<3>>
+    // CHECK: %[[IN_BOUNDS:.*]] = llvm.icmp "ult" %[[EXTENT:.*]], %[[BOUND]] : i32
+    // CHECK: llvm.select %[[IN_BOUNDS]], %[[EXTENT]], %[[BOUND]] : i1, i32
+    // CHECK: llvm.or {{.*}}, %[[PADDED_TILE]] : i32
+    // CHECK: "llvm.amdgcn.tensor.store.from.lds"
+    amdg.async_tdm_copy_local_to_global %desc from %out : !ttg.memdesc<2x128x2x128xf32, #partitioned, #smem, mutable> -> !tt.tensordesc<2x128x2x128xf32>
+    tt.return
+  }
+}
+
+// -----
+
 // TDM stride slots are 48 bits wide. Verify that an i64 stride is split
 // into low-32 and high-16 pieces and not silently truncated to i32.
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>

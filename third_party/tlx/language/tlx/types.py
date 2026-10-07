@@ -1,4 +1,5 @@
 import enum
+import hashlib
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1352,7 +1353,8 @@ class buffered_tensor(tl.base_value):
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout,
+                                         ir_type=handle.get_type() if handle is not None else None)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -1380,6 +1382,7 @@ class buffered_tensor_type(tl.block_type):
         num: int,
         storage: storage_kind,
         layout: Optional[shared_layout_encoding] = None,
+        ir_type=None,
     ):
         super().__init__(element_ty, shape)
         # Storage
@@ -1388,6 +1391,10 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
+        # Views carry an allocation shape and concrete encoding that cannot be
+        # reconstructed from their logical shape and frontend layout alone.
+        # Keep that type across JIT calls, just as the descriptor value does.
+        self._ir_type = ir_type
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
         value = buffered_tensor(
@@ -1405,19 +1412,24 @@ class buffered_tensor_type(tl.block_type):
         shape = "_".join(map(str, self.shape))
         if self.num > 0:
             shape += f"_{self.num}"
-        return f"buffered_{elt}S{shape}"
+        suffix = ""
+        if self._ir_type is not None:
+            suffix = "M" + hashlib.sha256(str(self._ir_type).encode()).hexdigest()[:16]
+        return f"buffered_{elt}S{shape}{suffix}"
 
     def __str__(self) -> str:
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
 
     def __eq__(self, other) -> bool:
         return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
-                and self.num == other.num)
+                and self.num == other.num and self._ir_type == other._ir_type)
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self._ir_type is not None:
+            return self._ir_type
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
