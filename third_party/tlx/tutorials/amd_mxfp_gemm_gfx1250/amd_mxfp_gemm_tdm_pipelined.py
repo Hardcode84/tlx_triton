@@ -1659,15 +1659,6 @@ def _mxgemm_first_use_pack_operand(value):
 
 
 @triton.jit
-def _mxgemm_first_use_copy_operand(value, zero):
-    # A native zero-bit shift preserves every payload bit and makes the
-    # transfer visible to VALU scheduling groups. LLVM can pair these
-    # operations without an inline-assembly payload register constraint.
-    packed = _mxgemm_first_use_pack_operand(value)
-    return packed << zero
-
-
-@triton.jit
 def _mxgemm_first_use_unpack_operand(packed):
     parent: tl.constexpr = tlx.amd_wmma_layout(((0, 2), (2, 0)), ((0, 1), (1, 0)))
     even = tl.join(packed.to(tl.uint8), (packed >> 16).to(tl.uint8))
@@ -1697,27 +1688,23 @@ def _mxgemm_first_use_prefetch_12(sync_id: tl.constexpr):
 
 @triton.jit
 def _mxgemm_first_use_prefetch_16(sync_id: tl.constexpr):
-    # Use one pipeline so LDS reads cannot split pairable word copies.
-    # Four pre-pairing shifts become two native transfers per WMMA;
-    # the first eight groups also request next A1 two reads at a time.
+    # The paired K iterations rotate operand registers without word copies.
+    # Keep next A1 reads spread across independent C11 matrix instructions.
     tlx.amd_sched_group_barrier(0x100, 1, sync_id)
     for group in tl.static_range(16):
         if group < 8:
             tlx.amd_sched_group_barrier(0x100, 2, sync_id)
-        tlx.amd_sched_group_barrier(0x2, 4, sync_id)
         tlx.amd_sched_group_barrier(0x8, 1, sync_id)
 
 
 @triton.jit
-def _mxgemm_first_use_c00_copy_prefetch(sync_id: tl.constexpr):
-    # C00 consumes A0, leaving its matrix windows available for A1
-    # transfers. Keep B1 reads and pairable copies in the same pipeline.
+def _mxgemm_first_use_c00_prefetch(sync_id: tl.constexpr):
+    # A1 rotates between register sets; C00 covers current B1 reads.
     tlx.amd_sched_group_barrier(0x100, 1, sync_id)
     for group in tl.static_range(16):
         tlx.amd_sched_group_barrier(0x8, 1, sync_id)
         if group < 8:
             tlx.amd_sched_group_barrier(0x100, 2, sync_id)
-        tlx.amd_sched_group_barrier(0x2, 4, sync_id)
 
 
 @triton.jit
@@ -1974,32 +1961,30 @@ def mxgemm_tdm_persistent_kernel(
                                            PREFETCH_SCALES=True)
             tlx.amd_sched_barrier(0xE)
             tlx.amd_sched_barrier()
-            # Keep an opaque zero in one SGPR. The tied operand guarantees
-            # identity while retaining schedulable native shifts for copies.
-            copy_zero = tl.inline_asm_elementwise("", "=s,0", [tl.full((), 0, tl.uint32)], dtype=tl.uint32,
-                                                  is_pure=False, pack=1)
             a0_words = _mxgemm_first_use_pack_operand(a0)
             a1_words = _mxgemm_first_use_pack_operand(a1)
             sa1_words = _mxgemm_first_use_pack_a_scale(sa1)
             slot = phase
-            for i in tl.range(k_iters - 1, loop_unroll_factor=1):
+            # A single-step backedge needs copies between the operand register
+            # sets. Two steps return to the original assignment without copies.
+            # Keep the last K step here too, avoiding a separate matrix body
+            # for the even K counts used by the benchmark.
+            for i in tl.range(k_iters, loop_unroll_factor=2):
                 tl.assume(slot >= 0)
                 tl.assume(slot < NUM_BUFFERS)
                 next_slot = tl.where(slot == NUM_BUFFERS - 1, 0, slot + 1)
                 # B1 is consumed in this iteration instead of being copied
                 # at the preceding backedge, which would advance its deadline.
                 a0 = _mxgemm_first_use_unpack_operand(a0_words)
-                # A1 is unused by C00. Materialize it here so its transfers
-                # overlap current matrix work instead of the backedge.
-                a1 = _mxgemm_first_use_unpack_operand(a1_words << copy_zero)
+                a1 = _mxgemm_first_use_unpack_operand(a1_words)
                 b1, sb1 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS,
                                                PREFETCH_SCALES=True)
                 c00 = _mxgemm_first_use_dot(a0, sa0, DTYPE_A, b0, sb0, DTYPE_B, c00)
-                _mxgemm_first_use_c00_copy_prefetch(703)
+                _mxgemm_first_use_c00_prefetch(703)
                 tlx.amd_sched_barrier()
                 # C00 does not consume A1 scales. Keep their raw words
-                # across the backedge and copy them for the first C10 use.
-                sa1 = _mxgemm_first_use_unpack_a_scale(sa1_words << copy_zero)
+                # across the backedge until the first C10 use.
+                sa1 = _mxgemm_first_use_unpack_a_scale(sa1_words)
                 refill_k = i + NUM_BUFFERS
                 refill_next = refill_k >= k_iters
                 load_k = tl.where(refill_next, refill_k - k_iters, refill_k)
@@ -2036,9 +2021,7 @@ def mxgemm_tdm_persistent_kernel(
                                         CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
                                         REGISTER_PIPELINE)
                 tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
-                # A0's scheduled copies need its result before B0's matrix
-                # use. Issue A0 first so the ordered LDS counter does not
-                # hold those copies behind the later B0 reads.
+                # C01 and C11 cover next A0/B0 before their first C00 use.
                 na0, nsa0 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                                  WITH_A_SCALE, PREFETCH_SCALES=True)
                 tlx.amd_sched_barrier(0xE)
@@ -2051,9 +2034,9 @@ def mxgemm_tdm_persistent_kernel(
                 na1, nsa1 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 1, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                                  WITH_A_SCALE, PREFETCH_SCALES=True)
                 tlx.amd_sched_barrier(0xE)
-                # Move next A0 during C11 and retain packed word loop carries.
-                # Unpack only at the following matrix consumers.
-                na0_words = _mxgemm_first_use_copy_operand(na0, copy_zero)
+                # Keep packed word carries so register rotation does not
+                # introduce byte permutations at the loop boundary.
+                na0_words = _mxgemm_first_use_pack_operand(na0)
                 c11 = _mxgemm_first_use_dot(a1, sa1, DTYPE_A, b1, sb1, DTYPE_B, c11)
                 _mxgemm_first_use_prefetch_16(702)
                 tlx.amd_sched_barrier()
@@ -2062,25 +2045,6 @@ def mxgemm_tdm_persistent_kernel(
                 a0_words, sa0, a1_words, sa1_words, b0, sb0 = na0_words, nsa0, na1_words, nsa1_words, nb0, nsb0
                 slot = next_slot
 
-            tlx.amd_sched_barrier()
-            a0 = _mxgemm_first_use_unpack_operand(a0_words)
-            a1 = _mxgemm_first_use_unpack_operand(a1_words << copy_zero)
-            b1, sb1 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS,
-                                           PREFETCH_SCALES=True)
-            c00 = _mxgemm_first_use_dot(a0, sa0, DTYPE_A, b0, sb0, DTYPE_B, c00)
-            _mxgemm_first_use_c00_copy_prefetch(703)
-            tlx.amd_sched_barrier()
-            sa1 = _mxgemm_first_use_unpack_a_scale(sa1_words << copy_zero)
-            c10 = _mxgemm_first_use_dot(a1, sa1, DTYPE_A, b0, sb0, DTYPE_B, c10)
-            tlx.amd_sched_barrier()
-            if CROSS_TILE_PREFETCH and has_next and not OUTPUT_TAIL_REUSE:
-                _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
-                                        NUM_BUFFERS - 1, slot, BLOCK_K, DA, DB, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION,
-                                        CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                        CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE)
-            c01 = _mxgemm_first_use_dot(a0, sa0, DTYPE_A, b1, sb1, DTYPE_B, c01)
-            tlx.amd_sched_barrier()
-            c11 = _mxgemm_first_use_dot(a1, sa1, DTYPE_A, b1, sb1, DTYPE_B, c11)
             tlx.amd_sched_barrier()
 
         else:
@@ -2437,8 +2401,8 @@ def mxgemm_tdm_pipelined(
     64x128 FP32 output panels. It requires E4M3 x E4M3, three BK128 buffers,
     four waves, both scales, and partial fusion. The first two next-tile
     stages stay prefetched; the third is loaded after output completes.
-    ``FIRST_USE_PREFETCH`` keeps B1 local to each K step and interleaves packed
-    A0 copies with LDS reads and WMMAs in C00/C10/C01/C11 order. It requires
+    ``FIRST_USE_PREFETCH`` keeps B1 local to each K step and rotates operand
+    registers across two K steps in C00/C10/C01/C11 order. It requires
     persistent E4M3 x E4M3, three BK128 buffers, four waves, partial fusion,
     and dedicated FP32 output staging. It is an explicit scheduling experiment.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it

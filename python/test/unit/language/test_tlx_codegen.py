@@ -5730,53 +5730,34 @@ def test_gfx1250_mxgemm_first_use_prefetch_preserves_native_work(k, prefetch, cl
     assert loops, "missing steady compute/refill loop"
     body = min(loops, key=len)
     instructions = [line.strip().split(";")[0].rstrip() for line in body if re.match(r"\s+[vsdt]\w+", line)]
-    assert sum(inst.startswith("v_wmma") for inst in instructions) == 64
-    assert sum(inst.startswith("ds_load_b128") for inst in instructions) == 64
-    assert sum(inst.startswith("ds_load_2addr_b32") for inst in instructions) == 4
-    assert sum(inst.startswith("tensor_load_to_lds") for inst in instructions) == 2
+    # Two K steps rotate register ownership; the backedge must not restore
+    # the old single-step schedule's 130 copied operand/scale words per K.
+    assert sum(inst.startswith("v_wmma") for inst in instructions) == 128
+    assert sum(inst.startswith("ds_load_b128") for inst in instructions) == 128
+    assert sum(inst.startswith("ds_load_2addr_b32") for inst in instructions) == 8
+    assert sum(inst.startswith("tensor_load_to_lds") for inst in instructions) == 4
+    assert not re.search(r"\bv_(?:dual_)?(?:mov|lshlrev)_b(?:32|64)(?:_e32|_e64)?\b", "\n".join(instructions))
 
-    # Rotate the steady body to its input-visibility wait, so the checks use
-    # C01/C11/C00/C10 order regardless of the chosen loop-header block.
-    wait = next(i for i, inst in enumerate(instructions) if inst.startswith("s_wait_tensorcnt"))
-    instructions = instructions[wait + 1:] + instructions[:wait + 1]
-    reads = matrix = pending = 0
-    read_groups = []
-    for inst in instructions:
-        if inst.startswith("ds_load"):
-            reads += 1
-            pending += 1
-            if reads == 34:
+    # Check C01 in both K steps, independently of loop-header placement.
+    waits = [i for i, inst in enumerate(instructions) if inst.startswith("s_wait_tensorcnt")]
+    assert len(waits) == 2
+    for wait in waits:
+        rotated = instructions[wait + 1:] + instructions[:wait + 1]
+        reads = matrix = pending = 0
+        read_groups = []
+        for inst in rotated:
+            if inst.startswith("ds_load"):
+                reads += 1
+                pending += 1
+                if reads == 34:
+                    read_groups.append(pending)
+                    break
+            elif inst.startswith("v_wmma"):
                 read_groups.append(pending)
-                break
-        elif inst.startswith("v_wmma"):
-            read_groups.append(pending)
-            pending = 0
-            matrix += 1
-    assert reads == 34 and matrix == 16
-    assert read_groups == [2, 0] + [4, 0] * 7 + [4], "C01 operand reads clumped between matrix groups"
-
-    # Count copied words, including both halves of a paired instruction.
-    # A0 moves during C11; A1 payload/scales move during C00, before C10 use.
-    # Allow one extra bundle when register allocation splits a native pair.
-    register = r"\d+(?:\s*/\*[^*]*\*/)?"
-    copy_pattern = rf"\bv_(?:dual_)?lshlrev_b32(?:_e32|_e64)?\s+v{register},\s*s{register},"
-    word_groups, bundle_groups = [], []
-    words = bundles = 0
-    for inst in instructions:
-        copies = re.findall(copy_pattern, inst)
-        if copies:
-            words += len(copies)
-            bundles += 1
-        elif inst.startswith("v_wmma"):
-            word_groups.append(words)
-            bundle_groups.append(bundles)
-            words = bundles = 0
-    word_groups.append(words)
-    bundle_groups.append(bundles)
-    assert sum(word_groups) == 130, "missing scheduled payload or scale transfers"
-    assert sum(word_groups[16:32]) == 64, "A0 copies moved out of C11"
-    assert sum(word_groups[33:49]) == 66, "A1 payload/scale copies moved away from their first use"
-    assert max(word_groups) <= 6 and max(bundle_groups) <= 3, "operand copies clumped between matrix groups"
+                pending = 0
+                matrix += 1
+        assert reads == 34 and matrix == 16
+        assert read_groups == [2, 0] + [4, 0] * 7 + [4], "C01 operand reads clumped between matrix groups"
 
 
 @pytest.mark.parametrize("changes", [
