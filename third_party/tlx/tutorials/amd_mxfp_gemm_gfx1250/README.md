@@ -41,6 +41,13 @@ It carries the physical ring slot across the tail and selects the required
 immediate wait counts as pending transfers drain. This limits the tail's
 code footprint while retaining cross-tile prefetch and native K128 WMMAs.
 
+As the tail retires input slots, it fills them with the next tile's A/B and
+scales. The two dedicated C slots can start their first output chunks while
+those inputs remain in flight. Output waits begin with the third chunk,
+when a C slot is reused, and leave the other chunk in flight. The current
+tile's input waits retire any previous tile's C stores before this output
+phase, so there is no need to drain incoming A/B before the first C chunk.
+
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash
