@@ -431,6 +431,36 @@ def test_tdm_copy_view_correctness_gfx1250(device, view, padded, mode):
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@triton.jit(do_not_specialize=["first_buffer", "first_row"])
+def _local_slice_buffer_ring_kernel(output_ptr, first_buffer, first_row, BUFFERS: tl.constexpr, DYNAMIC: tl.constexpr,
+                                    OFFSET: tl.constexpr):
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [32, 64], [1, 0])
+    buffers = tlx.local_alloc((32, 64), tl.float32, BUFFERS + 1, layout=layout)
+    offsets = tl.arange(0, 32)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    for index in tl.static_range(BUFFERS + 1):
+        tlx.local_store(buffers[index], (offsets + index * 2048).to(tl.float32))
+    if DYNAMIC:
+        view = tlx.local_slice(buffers, [first_buffer, first_row, 0], [BUFFERS, 16, 64])
+    else:
+        view = tlx.local_slice(buffers, [OFFSET, 16, 0], [BUFFERS, 16, 64])
+    slot = tl.program_id(0)
+    values = tlx.local_load(view[slot])
+    out_offsets = tl.arange(0, 16)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    tl.store(output_ptr + slot * 1024 + out_offsets, values)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("num_buffers", [3, 4])
+@pytest.mark.parametrize("dynamic_offset", [False, True])
+@pytest.mark.parametrize("first_buffer", [0, 1])
+def test_local_slice_buffer_ring_correctness_gfx1250(device, num_buffers, dynamic_offset, first_buffer):
+    output = torch.empty((num_buffers, 16, 64), device=device, dtype=torch.float32)
+    _local_slice_buffer_ring_kernel[(num_buffers, )](output, first_buffer, 16, BUFFERS=num_buffers,
+                                                     DYNAMIC=dynamic_offset, OFFSET=first_buffer, num_warps=4)
+    expected = torch.arange((num_buffers + 1) * 2048, device=device, dtype=torch.float32).reshape(-1, 32, 64)
+    torch.testing.assert_close(output, expected[first_buffer:first_buffer + num_buffers, 16:, :], rtol=0, atol=0)
+
+
 @triton.jit
 def _tdm_reused_descriptor_kernel(input_ptr, output_ptr, FUSED: tl.constexpr):
     first_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(256, 8)], [64, 128])
