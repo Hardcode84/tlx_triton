@@ -176,8 +176,9 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             item["delay"] = delay
         dependencies.append(item)
 
-    def queue(name, capacity, entries, role, scope="CU", unit="credits"):
-        queues.append(dict(id=name, capacity=capacity, entries=entries, role=role, scope=scope, unit=unit))
+    def queue(name, capacity, entries, role, scope="CU", unit="credits", ordered_retirement=False):
+        queues.append(dict(id=name, capacity=capacity, entries=entries, role=role, scope=scope, unit=unit,
+                           ordered_retirement=ordered_retirement))
 
     def entry(acquire, release, units=1, release_delay=None):
         item = dict(acquire=acquire, release=release, units=units)
@@ -298,12 +299,17 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                 array_use(amount, wave_partitions[wave], "ds_array_offset"),
                 use(f"lds_return{group}", amount, return_offset)
             ], issue)
-            complete, source = node, dict(op=node, delay=hold)
+            returned, source = node, dict(op=node, delay=hold)
+            complete = op(name + "_complete", "completion")
+            edge(returned, complete)
         edge(node, address_release[wave], delay="ds_decode_native", reason="address source read")
         request(name, node, complete, stages, "lds", f"wave{wave}", amount, source_release=source,
                 compute_resource=f"xdl{wave % 4}")
         order = ((index, operand, chunk) if lds_order == "interleaved" else (operand, index, chunk))
-        lds_entries[wave].append(((step, not name.startswith("scale_"), *order), entry(node, complete)))
+        # Array/return work may finish independently. Counter retirement and
+        # consumers must also wait for earlier same-wave LDS instructions.
+        pending = dict(entry(node, returned), retire=complete)
+        lds_entries[wave].append(((step, not name.startswith("scale_"), *order), pending))
         return node, complete, source
 
     for step in range(substeps):
@@ -371,7 +377,11 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
                     edge(issue_mma, execute)
                     mma[step, wave, m, n] = (issue_mma, execute)
                     for name, index in (("A", m), ("B", n)):
-                        for load in fragments[name, index] + scales[name]:
+                        # One native operand uses four scale bytes for each
+                        # of its 16 rows. Scales for other M/N fragments can
+                        # still be in flight when this instruction starts.
+                        scale_chunk = index * 16 * 4 // scale_read_bytes
+                        for load in fragments[name, index] + [scales[name][scale_chunk]]:
                             edge(load, issue_mma)
                             requests_by_completion[load]["consumers"].append(issue_mma)
                         edge(execute, consumed_by[name, index], delay="mma_payload_hold")
@@ -381,7 +391,7 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
     for wave in range(waves):
         queue(f"lds_pending_w{wave}", "lds_outstanding", [e for _, e in sorted(lds_entries[wave])],
               "LDS instruction credits held from issue through result completion; separate from DS scheduler entries",
-              scope=f"wave{wave}", unit="instructions")
+              scope=f"wave{wave}", unit="instructions", ordered_retirement=True)
         queue(f"address_register_w{wave}", "address_slots", [entry(address_acquire[wave], address_release[wave])],
               "address set remains live through all DS source reads in a physical BK tile", scope=f"wave{wave}",
               unit="address sets")
@@ -554,6 +564,7 @@ def make_model(tile_m=256, tile_n=256, waves_m=2, waves_n=2, weight_bits=8, bloc
             "A DS scheduler entry is reserved only for its configured stage, not until data reaches registers.",
             "A distinct per-wave LDS instruction pool is held through result completion. Counter bit width is not its calibration.",
             "LDS admission order is explicit. Operand order groups A then B; interleaved order alternates matching fragments.",
+            "Same-wave LDS results retire in admission order; internal stages may finish earlier. Mixed event types need separate contracts.",
             "Scale instruction width is independent of packed-scale bytes; use the final instruction stream to choose it.",
             "Interface widths, pairing, route composition and queue interpretations require separate calibration.",
             "Cache path bypasses memory-channel traffic; memory path misses every input. No inter-CTA reuse is assumed.",

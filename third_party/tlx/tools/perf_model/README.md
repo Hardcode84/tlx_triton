@@ -71,6 +71,17 @@ credits, held from acquisition through a specified release. This models
 outstanding sectors, descriptors, or register slots without confusing them
 with software tile-buffer depth.
 
+Admission order alone does not imply retirement order. Set
+`ordered_retirement: true` when a queue must hold younger entries until older
+entries have retired. The engine inserts zero-latency retirement events after
+each entry's release time, including its `release_delay`, and orders those
+events across iteration boundaries. An entry can name an existing zero-latency
+event with `retire`; consumers and waits can depend on that event. Internal
+array or return stages can still finish out of order. The MXFP generator uses
+this contract for same-wave LDS instruction completion, matching the ordered
+counter prefixes used by the compiler. It does not impose it on unrelated
+memory types or transport queues.
+
 Keep the queues' units and scopes explicit. An LDS instruction can leave a
 short scheduler stage while still occupying its wave's outstanding-instruction
 credit until the result returns. Transfer sectors, descriptors, scheduler
@@ -98,6 +109,27 @@ before refill. Moving a read later can avoid exhausting instruction credits
 while exposing that second wait. The minimum lifetime/area bound cannot
 predict this burst behavior by itself.
 
+Use the allocated instruction stream to identify consumers. A loop-carried
+register copy can need a load result before its first matrix instruction does.
+Represent load-to-copy readiness, copy-to-matrix visibility, and the previous
+iteration's last read before overwriting the destination registers. An
+aggregate copy count alone does not capture these deadlines. Count encoded
+paired instructions once, and reserve the next matrix issue in its overlap
+window before assigning the remaining slots to vector work. Register-class
+restrictions can also cause spills even when the total register count fits.
+Include those transfers in each request's `consumers` list as well as its
+dependency edges, so readiness reports use the first register copy. Packed
+scale transfers need the same treatment as payload transfers.
+
+Include the ordering imposed by source scheduling groups. Eight copies placed
+before four matrix instructions cannot use the same slots as two copies
+between each pair of matrix instructions. Keep pre-pairing group sizes
+separate from the final encoded instruction count. Independent scheduling
+groups can insert memory operations between otherwise pairable vector
+operations, so verify both the grouping and pairing in the generated assembly.
+Apply these constraints to memory groups too: a read burst placed between two
+matrix issues can require a gap even when average memory bandwidth suffices.
+
 Compute utilization is total declared compute service divided by available
 compute-resource time. It is a CU-level fraction when the graph describes one
 CU. The tool does not infer whole-device PFLOPS from it. Issue-window packing
@@ -107,6 +139,17 @@ Finite bounds combine the longest dependency chain in the unfolded graph with
 the resource bound for each serial phase. Startup and output drain therefore
 remain visible. A steady-state bound multiplied by a short trip count is not
 used as a finite-dispatch bound.
+
+Check phase improvements against the complete dispatch. Shortening one matrix
+phase can expose a later input wait or move delay to a workgroup rendezvous.
+For multiple SIMD streams, sum service over a common clock interval rather
+than averaging percentages from different windows. Record both the local
+instruction-cadence change and the resulting compute, handoff, and drain costs.
+Cluster rendezvous couple participating workgroups: a single-workgroup graph
+omits time spent waiting for the others. Check simultaneous wait regions across
+the local waves and their arrival spread before attributing that delay to local
+instruction scheduling. A high multicast matching rate does not establish
+that cluster rendezvous are inexpensive.
 
 ## Calibration and clocks
 
@@ -142,6 +185,9 @@ Configured stage delays, measured isolated latency, loaded latency, and exposed
 wait time are different quantities. Do not add a loaded mean to reservations
 that already model its contention. Keep uncertain endpoint units, sharing,
 queue scope, and additive route composition identifiable as assumptions.
+A mean prefetch lead does not establish readiness of the final required
+request. Cache-only and memory-path schedules are separate traffic scenarios;
+an aggregate cache hit rate does not identify the misses on a critical path.
 
 A structured profile can retain `observations` separately from its parameter
 bindings. Record scope, clock, window, sample count, source revision, binary,
@@ -184,6 +230,8 @@ The generator describes a new design space, independently of existing kernels:
   request using at most one port, or a fixed striped mapping.
 - Separate WMMA issue and execution, pending-instruction credits, source-read
   lifetimes, and accumulator dependencies.
+- Each WMMA waits for the packed-scale chunk covering its own M/N fragment.
+  Scale reads for later quadrants can overlap the current matrix work.
 - Explicit scalar, vector-address, control, visibility, and setup work.
 - Native FP32 output stores followed by packetized TDM output. Drained input
   LDS is reused for output storage.

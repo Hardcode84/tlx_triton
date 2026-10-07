@@ -245,7 +245,9 @@ class Model:
         self.waits = self.data.get("waits", [])
         self.requests = self.data.get("requests", [])
         self.add_wait_edges()
-        self.queues = self.data.get("queues", [])
+        # Ordered retirement normalizes release points without changing the
+        # input graph or the readiness of its internal transport stages.
+        self.queues = copy.deepcopy(self.data.get("queues", []))
         self.unresolved_queues = {}
         self.add_queue_edges()
         self.buffers = data.get("buffers", [])
@@ -372,6 +374,9 @@ class Model:
         Each acquisition can own several credits. A future acquisition waits
         for every release whose credits it reuses. This is a realizable ordered
         allocation policy, not an assertion about a particular device's arbiter.
+        Ordered retirement holds a ready entry until all older entries retire.
+        Zero-latency retirement events keep this distinct from raw completion,
+        including when release operations have different completion delays.
         """
         names = set()
         forward = defaultdict(list)
@@ -405,8 +410,13 @@ class Model:
             entries = queue["entries"]
             if not entries:
                 raise ValueError(f"empty queue: {name}")
+            ordered = queue.get("ordered_retirement", False)
+            if type(ordered) is not bool:
+                raise ValueError(f"queue {name} ordered_retirement must be a boolean")
             ends, total, phases = [], 0, set()
             for entry in entries:
+                if "retire" in entry and not ordered:
+                    raise ValueError(f"queue {name} needs ordered_retirement to name a retirement event")
                 for endpoint in ("acquire", "release"):
                     if entry[endpoint] not in self.raw_ops:
                         raise ValueError(f"unknown queue endpoint: {entry[endpoint]}")
@@ -432,12 +442,34 @@ class Model:
                 if delay is not None:
                     item["delay"] = delay
                 self.raw_edges.append(item)
+                if distance == 0:
+                    forward[source].append(target)
+
+            if ordered:
+                for index, entry in enumerate(entries):
+                    retired = entry.get("retire", f"queue_retire:{name}:{index}")
+                    if "retire" in entry:
+                        raw = self.raw_ops.get(retired)
+                        if (raw is None or raw.get("phase", "loop") not in phases or raw.get("uses")
+                                or self.value(raw.get("latency", 0)) != 0):
+                            raise ValueError(f"queue {name} needs a zero-latency retirement event in the same phase")
+                    else:
+                        if retired in self.raw_ops:
+                            raise ValueError(f"generated queue retirement id already exists: {retired}")
+                        self.raw_ops[retired] = dict(id=retired, phase=next(iter(phases)), kind="retirement", latency=0)
+                    edge(entry["release"], retired, 0, entry.get("release_delay"), f"queue-ready:{name}")
+                    entry["release"] = retired
+                    entry.pop("release_delay", None)
 
             for index, entry in enumerate(entries):
                 if index + 1 < len(entries):
                     edge(entry["acquire"], entries[index + 1]["acquire"], 0, 0, f"queue-order:{name}")
+                    if ordered:
+                        edge(entry["release"], entries[index + 1]["release"], 0, 0, f"queue-retire:{name}")
                 elif cyclic:
                     edge(entry["acquire"], entries[0]["acquire"], 1, 0, f"queue-order:{name}")
+                    if ordered:
+                        edge(entry["release"], entries[0]["release"], 1, 0, f"queue-retire:{name}")
                 if capacity is None:
                     # Preserve admission order for a partial lower bound. A
                     # schedule must never silently omit the capacity edges.
@@ -741,7 +773,8 @@ class Model:
                  entries=len(q["entries"]), phase=self.raw_ops[q["entries"][0]["acquire"]].get("phase", "loop"),
                  credits_per_phase=sum(self.value(e.get("units", 1))
                                        for e in q["entries"]), policy="ordered circular credits",
-                 role=q.get("role", "unspecified"), scope=q.get("scope", "unspecified"), unit=q.get("unit", "credits"))
+                 ordered_retirement=q.get("ordered_retirement", False), role=q.get("role", "unspecified"),
+                 scope=q.get("scope", "unspecified"), unit=q.get("unit", "credits"))
             for q in self.queues
         ]
         result["unresolved_queues"] = dict(self.unresolved_queues)
@@ -1328,8 +1361,8 @@ class Model:
         """Independently validate finite credit occupancy from the witness."""
         rows = []
         for queue in self.queues:
-            changes, lifetimes = defaultdict(float), []
-            for entry in queue["entries"]:
+            changes, lifetimes, retirements = defaultdict(float), [], []
+            for index, entry in enumerate(queue["entries"]):
                 phase = ops[entry["acquire"]].phase
                 delay = ticks(self.value(entry["release_delay"])) if "release_delay" in entry else ops[entry["release"]].latency
                 for iteration in (range(iterations) if phase == "loop" else [-1]):
@@ -1341,6 +1374,11 @@ class Model:
                     changes[begin] += units
                     changes[end] -= units
                     lifetimes.append(end - begin)
+                    retirements.append((iteration, index, end))
+            if queue.get("ordered_retirement", False):
+                ends = [end for _, _, end in sorted(retirements)]
+                if any(a > b for a, b in zip(ends, ends[1:])):
+                    raise AssertionError(f"queue {queue['id']} retires entries out of order")
             occupied = peak = area = saturated = previous = 0
             capacity = self.value(queue["capacity"])
             for time, delta in sorted(changes.items()):
@@ -1355,8 +1393,8 @@ class Model:
             rows.append(
                 dict(queue=queue["id"], capacity=capacity, peak_credits=peak, scope=queue.get("scope", "unspecified"),
                      unit=queue.get("unit", "credits"), credit_ticks=area, saturated_ticks=saturated,
-                     minimum_lifetime=min(lifetimes), maximum_lifetime=max(lifetimes),
-                     mean_lifetime=sum(lifetimes) / len(lifetimes)))
+                     ordered_retirement=queue.get("ordered_retirement", False), minimum_lifetime=min(lifetimes),
+                     maximum_lifetime=max(lifetimes), mean_lifetime=sum(lifetimes) / len(lifetimes)))
         return rows
 
 

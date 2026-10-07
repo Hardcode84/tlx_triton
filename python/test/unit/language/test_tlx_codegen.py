@@ -5500,18 +5500,24 @@ def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, rema
     assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
 
 
-def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work():
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline import (
-        mxgemm_tdm_operand_pipeline_kernel as kernel, )
+@pytest.mark.parametrize("block_k,num_buffers,prefetch", [(128, 4, -1), (256, 2, -1), (256, 2, 1), (256, 2, 2)])
+def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work(block_k, num_buffers, prefetch):
+    if block_k == 256:
+        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline_paired import (
+            mxgemm_tdm_operand_pipeline_kernel as kernel, )
+    else:
+        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline import (
+            mxgemm_tdm_operand_pipeline_kernel as kernel, )
 
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*fp8e4nv", c_ptr="*fp32", a_scale="*u8", b_scale="*u8", M="i32", N="i32",
                      K="i32", stride_am="i32", stride_bn="i32", stride_cm="i32", stride_scale="i32")
     attrs = {(kernel.arg_names.index(name), ): [["tt.divisibility", 16]] for name in signature}
     for name in ("a_ptr", "b_ptr", "c_ptr", "a_scale", "b_scale"):
         attrs[(kernel.arg_names.index(name), )].append(["tt.pointer_range", 32])
-    config = dict(DTYPE_A="e4m3", DTYPE_B="e4m3", SCALE_BLOCK=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, GROUP_SIZE_M=8,
-                  TRANSPOSE_B=True, NUM_BUFFERS=4, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True, SCHEDULE="sliceMNK",
-                  TDM_FUSION="partial", L2_PREFETCH_DISTANCE=-1, TDM_SPLIT=False, stride_ak=1, stride_bk=1, stride_cn=1)
+    config = dict(DTYPE_A="e4m3", DTYPE_B="e4m3", SCALE_BLOCK=32, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k,
+                  GROUP_SIZE_M=8, TRANSPOSE_B=True, NUM_BUFFERS=num_buffers, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True,
+                  SCHEDULE="sliceMNK", TDM_FUSION="partial", L2_PREFETCH_DISTANCE=prefetch, TDM_SPLIT=False,
+                  stride_ak=1, stride_bk=1, stride_cn=1)
     compiled = triton_compile(ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config),
                               target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
     asm = compiled.asm["amdgcn"]
@@ -5528,12 +5534,26 @@ def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work():
     assert len(loops) == 1, "unexpected remainder or nested loop in the paired K schedule"
     body = "\n".join(loops[0])
     assert body.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 128
-    # Two K128 steps: one payload read per operand, four packed-scale reads
-    # per step, and no LDS exchanges or bulk operand copies at the backedge.
-    assert len(re.findall(r"\bds_load_\w+", body)) == 136
+    # Two native K128 steps, with each payload read once per consuming wave.
+    # Partitioning changes packed-scale vectorization, not the payload traffic.
+    assert body.count("ds_load_b128") == 128
+    assert len(re.findall(r"\bds_load_\w+", body)) == (133 if block_k == 256 else 136)
     assert "ds_store_" not in body
     assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
     assert body.count("s_barrier_wait") <= 4
+    if block_k == 256:
+        assert body.count("tensor_load_to_lds") == 2
+        assert body.count("s_barrier_wait") == 2
+        assert body.count("global_prefetch_b8") == (4 if prefetch > 0 else 0)
+        # The high half's first two rows do independent math before waiting
+        # for next-batch visibility. Keep that latency-hiding window intact.
+        before_wait, after_wait = body.split("s_wait_tensorcnt", 1)
+        assert before_wait.count("v_wmma_scale_") == 96
+        assert after_wait.count("v_wmma_scale_") == 32
+        if prefetch > 0:
+            # Prefetch addresses use one clamped scalar K index; per-lane
+            # selection of decoded, advancing descriptors must not return.
+            assert "v_cndmask" not in body
 
 
 @pytest.mark.parametrize("changes", [
@@ -5547,6 +5567,9 @@ def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work():
     {"WITH_A_SCALE": False},
     {"SCALE_PRESHUFFLE": False},
     {"TDM_SPLIT": True},
+    {"L2_PREFETCH_DISTANCE": 1},
+    {"BLOCK_K": 256, "NUM_BUFFERS": 2, "L2_PREFETCH_DISTANCE": 0},
+    {"BLOCK_K": 256, "NUM_BUFFERS": 2, "L2_PREFETCH_DISTANCE": 3},
     {"GROUP_SIZE_M": 0},
 ])
 def test_gfx1250_mxgemm_operand_pipeline_rejects_incompatible_config(changes):
@@ -5560,16 +5583,18 @@ def test_gfx1250_mxgemm_operand_pipeline_rejects_incompatible_config(changes):
         _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
 
 
+@pytest.mark.parametrize("block_k,num_buffers", [(128, 4), (256, 2)])
 @pytest.mark.parametrize("m,n,k", [(128, 256, 512), (256, 384, 512), (256, 256, 256), (256, 256, 640)])
-def test_gfx1250_mxgemm_operand_pipeline_rejects_partial_tiles(m, n, k):
+def test_gfx1250_mxgemm_operand_pipeline_rejects_partial_tiles(m, n, k, block_k, num_buffers):
     a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="meta")
     b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="meta")
     sa = torch.empty((m // 128, k * 4), dtype=torch.uint8, device="meta")
     sb = torch.empty((n // 128, k * 4), dtype=torch.uint8, device="meta")
     with pytest.raises(ValueError, match="OPERAND_PIPELINE requires full"):
-        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, sa, sb, OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
-                                           NUM_BUFFERS=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True,
-                                           SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True)
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, sa, sb, OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256,
+                                           BLOCK_K=block_k, NUM_BUFFERS=num_buffers, DTYPE_A="e4m3", DTYPE_B="e4m3",
+                                           TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial",
+                                           OUTPUT_STAGING=True)
 
 
 def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, **constants):
@@ -5625,6 +5650,11 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
     assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else (16 if num_buffers == 4 else 8))
     grouped_prefetch = block_k == 128 and (num_buffers == 4 or num_warps == 8) and dtype_b == "e4m3"
     assert ("sched_group_barrier" in asm) == grouped_prefetch
+    if dtype_b == "e4m3" and block_k == 128 and num_buffers == 3 and num_warps == 4:
+        # One steady body and one rolled tail retain the native K128 work.
+        # Expanding the tail per ring slot used to duplicate three full bodies.
+        native_mma = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4\s", asm, re.MULTILINE)
+        assert len(native_mma) <= 128, "duplicated native A8W8 compute bodies in the persistent tail"
 
     # Find the innermost loop containing both compute and a TDM refill. Merely
     # emitting both kinds of instructions is insufficient: the regression put
@@ -5668,6 +5698,146 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         minimum_deferred = 64 if num_warps == 4 else 8
         deferred = sum("v_wmma" in inst for inst in body[overlap_start + 1:block_end])
         assert deferred >= minimum_deferred, "too little deferred matrix work covers the refill"
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_first_use_prefetch_preserves_native_work(k, prefetch, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, FIRST_USE_PREFETCH=True,
+                                                  CROSS_TILE_PREFETCH=prefetch, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    asm = compiled.asm["amdgcn"]
+    # Packed loop carries must preserve native operand/accumulator layouts:
+    # no FP8 byte permutations or LDS exchanges in the compute loop.
+    assert "v_perm" not in asm
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 8
+    assert asm.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 128
+    assert "ds_load_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert compiled.metadata.shared <= 320 * 1024
+
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    instructions = [line.strip().split(";")[0].rstrip() for line in body if re.match(r"\s+[vsdt]\w+", line)]
+    assert sum(inst.startswith("v_wmma") for inst in instructions) == 64
+    assert sum(inst.startswith("ds_load_b128") for inst in instructions) == 64
+    assert sum(inst.startswith("ds_load_2addr_b32") for inst in instructions) == 4
+    assert sum(inst.startswith("tensor_load_to_lds") for inst in instructions) == 2
+
+    # Rotate the steady body to its input-visibility wait, so the checks use
+    # C01/C11/C00/C10 order regardless of the chosen loop-header block.
+    wait = next(i for i, inst in enumerate(instructions) if inst.startswith("s_wait_tensorcnt"))
+    instructions = instructions[wait + 1:] + instructions[:wait + 1]
+    reads = matrix = pending = 0
+    read_groups = []
+    for inst in instructions:
+        if inst.startswith("ds_load"):
+            reads += 1
+            pending += 1
+            if reads == 34:
+                read_groups.append(pending)
+                break
+        elif inst.startswith("v_wmma"):
+            read_groups.append(pending)
+            pending = 0
+            matrix += 1
+    assert reads == 34 and matrix == 16
+    assert read_groups == [2, 0] + [4, 0] * 7 + [4], "C01 operand reads clumped between matrix groups"
+
+    # Count copied words, including both halves of a paired instruction.
+    # A0 moves during C11; A1 payload/scales move during C00, before C10 use.
+    # Allow one extra bundle when register allocation splits a native pair.
+    register = r"\d+(?:\s*/\*[^*]*\*/)?"
+    copy_pattern = rf"\bv_(?:dual_)?lshlrev_b32(?:_e32|_e64)?\s+v{register},\s*s{register},"
+    word_groups, bundle_groups = [], []
+    words = bundles = 0
+    for inst in instructions:
+        copies = re.findall(copy_pattern, inst)
+        if copies:
+            words += len(copies)
+            bundles += 1
+        elif inst.startswith("v_wmma"):
+            word_groups.append(words)
+            bundle_groups.append(bundles)
+            words = bundles = 0
+    word_groups.append(words)
+    bundle_groups.append(bundles)
+    assert sum(word_groups) == 130, "missing scheduled payload or scale transfers"
+    assert sum(word_groups[16:32]) == 64, "A0 copies moved out of C11"
+    assert sum(word_groups[33:49]) == 66, "A1 payload/scale copies moved away from their first use"
+    assert max(word_groups) <= 6 and max(bundle_groups) <= 3, "operand copies clumped between matrix groups"
+
+
+@pytest.mark.parametrize("changes", [
+    {"PERSISTENT": False},
+    {"OUTPUT_STAGING": False},
+    {"OUTPUT_TAIL_REUSE": True},
+    {"NUM_BUFFERS": 4},
+    {"BLOCK_K": 256},
+    {"NUM_WARPS": 8},
+    {"DTYPE_B": "e2m1"},
+    {"WITH_A_SCALE": False},
+    {"TDM_FUSION": "4way"},
+])
+def test_gfx1250_mxgemm_first_use_prefetch_rejects_incompatible_config(changes):
+    config = dict(PERSISTENT=True, OUTPUT_STAGING=True, FIRST_USE_PREFETCH=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                  NUM_BUFFERS=3, NUM_WARPS=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, WITH_A_SCALE=True,
+                  SCALE_PRESHUFFLE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial")
+    config.update(changes)
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((256, 256), dtype=torch.uint8, device="meta") if config["DTYPE_B"] == "e2m1" else a
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="FIRST_USE_PREFETCH requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, **config)
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_output_tail_reuse_preserves_native_work(k, prefetch, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, OUTPUT_TAIL_REUSE=True,
+                                                  CROSS_TILE_PREFETCH=prefetch, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    asm = compiled.asm["amdgcn"]
+    # Only the input rings occupy LDS. Each reused output slot must retain
+    # its input stage's physical stride, with no separate output allocation.
+    assert compiled.metadata.shared < 216 * 1024
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 8
+    assert "ds_load_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("changes", [
+    {"PERSISTENT": False},
+    {"OUTPUT_STAGING": False},
+    {"NUM_BUFFERS": 2},
+    {"BLOCK_K": 256},
+    {"NUM_WARPS": 8},
+    {"DTYPE_B": "e5m2"},
+    {"WITH_A_SCALE": False},
+    {"TDM_FUSION": "4way"},
+])
+def test_gfx1250_mxgemm_output_tail_reuse_rejects_incompatible_config(changes):
+    config = dict(PERSISTENT=True, OUTPUT_STAGING=True, OUTPUT_TAIL_REUSE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                  NUM_BUFFERS=3, NUM_WARPS=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, WITH_A_SCALE=True,
+                  SCALE_PRESHUFFLE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial")
+    config.update(changes)
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="OUTPUT_TAIL_REUSE requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
 
 
 @pytest.mark.parametrize("k", [512, 768, 4096, 8192])

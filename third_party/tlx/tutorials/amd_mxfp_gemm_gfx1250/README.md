@@ -8,6 +8,8 @@ MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 - `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
 - `amd_mxfp_gemm_operand_pipeline.py`: experimental four-wave A8W8 kernel
   with operand prefetch across K steps and FP32 output.
+- `amd_mxfp_gemm_operand_pipeline_paired.py`: two K256 input stages feeding
+  native K128 computation, with partitioned input storage and cache prefetch.
 - [`../../tools/perf_model/`](../../tools/perf_model/README.md): generic resource,
   dependency, and buffer-overlap model with an MXFP work-graph generator.
 - [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
@@ -34,6 +36,11 @@ configuration across both default shapes. Interval 8 was slightly faster
 at K8192, while interval 4 was faster at K4096, so the benchmark uses 4
 for both. The eager timing budget remains 256 ms.
 
+The default MX8xMX8 kernel handles its final three K stages in one loop.
+It carries the physical ring slot across the tail and selects the required
+immediate wait counts as pending transfers drain. This limits the tail's
+code footprint while retaining cross-tile prefetch and native K128 WMMAs.
+
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash
@@ -42,6 +49,52 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
+
+Use `--first-use-prefetch` to test the model-derived operand schedule:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --first-use-prefetch --csv mxfp-first-use.csv
+```
+
+This selects persistent E4M3 x E4M3 with three BK128 buffers, four waves,
+and dedicated FP32 output staging. The C00/C10/C01/C11 compute order lets the
+final two quadrants cover the next stage's operand loads after the C10 refill.
+B1 stays in the current iteration. Next A0 is requested before B0 because
+A0's register copies need the data earlier. C01 places four LDS reads between
+pairs of WMMAs, spreading the reads across its available matrix windows.
+
+A0 and A1 travel through the loop as packed 32-bit words. During C11, one
+scheduling pipeline interleaves next A1 reads, paired A0 transfers, and
+individual WMMAs. A1 payload transfers overlap the current C00; its scale
+transfer waits until just before C10. This avoids requiring A1 copies to
+finish at the preceding loop backedge. Global packing and scale packing are
+the same as the default kernel. Both default K shapes run with the usual
+256 ms timing budget.
+The standalone flag is `--first_use_prefetch`; the API and `matmul`
+configuration use `FIRST_USE_PREFETCH=True`. Compare it with
+`--variant mx8xmx8` using interleaved runs on the target hardware before
+selecting a default. This is an opt-in scheduling experiment; shorter local
+matrix phases alone do not establish a complete-dispatch speedup.
+
+Use `--output-tail-reuse` to test output staging in the retired third A/B
+input stage:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --output-tail-reuse --csv mxfp-output-reuse.csv
+```
+
+This selects persistent E4M3 x E4M3 with three BK128 buffers and four waves.
+Two next-tile input stages remain prefetched while the third A/B stage holds
+two 64x128 FP32 output panels. After the output stores complete, that stage
+is refilled before its next consumer. The output views retain the input
+ring's physical slot stride across tile boundaries. This removes the separate
+output allocation while retaining b128 stores and eight output transfers per
+tile; the tradeoff is later prefetch of the third next-tile stage.
+The standalone flag is `--output_tail_reuse`; the API and `matmul`
+configuration use `OUTPUT_TAIL_REUSE=True`. The saved benchmark defaults
+remain available without this flag.
 
 Use `--operand-pipeline` to test the four-wave operand pipeline:
 
@@ -71,9 +124,35 @@ gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
 ```
 
 The standalone flag is `--operand_pipeline`; the Python API and `matmul`
-configuration use `OPERAND_PIPELINE=True`, together with BK128, four buffers,
-four waves, partial fusion, and staged output. The summary and CSV identify
-the kernel as `operand_pipeline`.
+configuration use `OPERAND_PIPELINE=True`, with four waves, partial fusion,
+and staged output. The summary and CSV identify the kernel as `operand_pipeline`.
+
+Add `-BK 256` to transfer two native K128 steps in each batch:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --csv mxfp-paired.csv
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --l2-prefetch-distance -1 --csv mxfp-paired-no-prefetch.csv
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --l2-prefetch-distance 2 --csv mxfp-paired-prefetch-2.csv
+```
+
+This selects two payload/scale buffers. Partitioned input storage separates
+simultaneous read streams. The kernel reads the high K128 half early, refills
+the retired input stage, and computes two high-half rows before waiting for
+the next batch. It then reads A0 and all B fragments first, since the next
+step uses them in its first row. Scheduling groups place address preparation
+and LDS reads between independent matrix instructions. FP32 output uses
+padded storage, b128 stores, and one TDM transfer.
+
+The default cache-prefetch distance for this experiment is one input batch;
+two gives more lookahead with the same LDS capacity, and -1 disables it.
+Prefetch uses fixed descriptors and clamps the K index to the last valid
+batch, including short K and the tail. The standalone/API settings are
+`BLOCK_K=256`, `NUM_BUFFERS=2`, and `L2_PREFETCH_DISTANCE=1` (or 2/-1).
+The original operand path uses `BLOCK_K=128`, `NUM_BUFFERS=4`, and
+`L2_PREFETCH_DISTANCE=-1`. Persistent benchmark defaults remain unchanged.
 
 Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
 
