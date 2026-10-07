@@ -593,11 +593,14 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("BLOCK_K,NUM_BUFFERS,L2_PREFETCH_DISTANCE", [(128, 4, -1), (256, 2, -1), (256, 2, 1),
+                                                                      (256, 2, 2)])
 @pytest.mark.parametrize("M,N,K", [(256, 256, 512), (768, 512, 768), (3328, 768, 1024), (512, 768, 4096),
                                    (512, 256, 8192)])
-def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K):
-    # The six-stage case wraps the four-slot ring. Thirteen M tiles exercise
-    # an incomplete five-tile group; longer K checks repeated register reuse.
+def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM_BUFFERS, L2_PREFETCH_DISTANCE):
+    # K768 wraps both rings, including an odd number of K256 batches. K512
+    # exercises the clamped prefetch tail. Thirteen M tiles leave a partial
+    # M group; longer K checks repeated register and LDS-slot reuse.
     torch.manual_seed(123)
     a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
     b = (torch.randn((K, N)) * 0.5).to(torch.float8_e4m3fn)
@@ -609,9 +612,10 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K):
         b.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(sa).cuda(),
         _gfx1250_mxfp.pack_scale(sb).cuda(),
-        config=dict(OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=4, num_warps=4,
-                    DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True,
-                    SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True))
+        config=dict(OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS,
+                    num_warps=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, SCALE_PRESHUFFLE=True,
+                    WITH_A_SCALE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True,
+                    L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE))
     assert result.dtype == torch.float32
     torch.testing.assert_close(result.cpu(), expected, atol=2e-3, rtol=1e-4)
 
@@ -619,24 +623,39 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K):
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
 @pytest.mark.parametrize(
-    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE",
-    [(k, buffers, dtype, bk, staging, 4, False, False, 1)
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE,"
+    "OUTPUT_TAIL_REUSE",
+    [(k, buffers, dtype, bk, staging, 4, False, False, 1, False)
      for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
      for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] +
-    [(k, 4, "float8_e4m3", 128, True, 4, False, False, 1) for k in (4, 5, 6, 7)] +
-    [(k, 3, dtype, 128, True, 8, False, False, 1) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")] + [
-        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, mode, 1, id=f"register-{k}-sched-{mode}")
+    [(k, 4, "float8_e4m3", 128, True, 4, False, False, 1, False) for k in (4, 5, 6, 7)] +
+    [(k, 3, dtype, 128, True, 8, False, False, 1, False) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")] + [
+        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, mode, 1, False, id=f"register-{k}-sched-{mode}")
         for k in (2, 3, 5)
         for mode in (False, True)
-    ] + [pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, True, 4, id=f"register-cluster-{k}") for k in (3, 5, 9)],
+    ] + [
+        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, True, 4, False, id=f"register-cluster-{k}")
+        for k in (3, 5, 9)
+    ] + [
+        pytest.param(k, 3, "float8_e4m3", 128, True, 4, False, False, 4, False, id=f"staged-cluster-{k}")
+        for k in (3, 4, 5, 6, 9)
+    ] + [
+        pytest.param(k, 3, "float8_e4m3", 128, True, 4, False, False, cluster, True,
+                     id=f"tail-reuse-k{k}-cluster{cluster}")
+        for cluster, ks in ((1, (3, 4, 5, 6)), (4, (3, 6, 9)))
+        for k in ks
+    ],
 )
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
-                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE):
+                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
+                                      FIRST_USE_PREFETCH=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
     # Cluster cases give each program two tiles. K5/K9 also exercise periodic
     # cluster synchronization in the steady loop and across the tile handoff.
+    # Tail-reuse cases keep two prefetched stages live while A/B's third stage
+    # holds output, including a full ring rotation and a zero-length steady loop.
     M, N = (2048, 1024) if CLUSTER_SIZE > 1 else (1280, 512)
     programs = 16 if CLUSTER_SIZE > 1 else 3
     K = K_ITERS * BLOCK_K
@@ -657,8 +676,20 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
                     CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
                     REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS))
+                    CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
+                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_first_use_prefetch_ring_phase(k_iters, prefetch, cluster_size):
+    # Reuse the signed reference and coverage of uneven tile assignments,
+    # short K, ring wrap, and cluster/tile transitions for the new read order.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, prefetch, "float8_e4m3", 128, True, 4, False, False, cluster_size,
+                                      False, FIRST_USE_PREFETCH=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

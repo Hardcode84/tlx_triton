@@ -24,6 +24,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A register-only accumulator slice has a linear encoding before matmul
+// acceleration. It must still select native WMMA operand and scale layouts.
+#input = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#scales = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [2, 2], order = [1, 0]}>
+#acc = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 16], [16, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]], warp = [[0, 32], [32, 0]], block = []}>
+// CHECK-DAG: #[[$LINEAR_MMA:.+]] = #ttg.amd_wmma<{{.*}}instrShape = [16, 16, 128]{{.*}}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @wmma_dot_scaled_linear_accumulator
+  // CHECK: ttg.convert_layout %arg4 {{.*}} -> tensor<64x64xf32, #[[$LINEAR_MMA]]>
+  // CHECK: tt.dot_scaled {{.*}} -> tensor<64x64xf32, #[[$LINEAR_MMA]]>
+  // CHECK: ttg.convert_layout {{.*}} : tensor<64x64xf32, #[[$LINEAR_MMA]]> -> tensor<64x64xf32, #linear{{.*}}>
+  // CHECK: tt.return
+  tt.func @wmma_dot_scaled_linear_accumulator(%a: tensor<64x128xf8E4M3FN, #input>,
+                                             %b: tensor<128x64xf8E4M3FN, #input>,
+                                             %sa: tensor<64x4xi8, #scales>,
+                                             %sb: tensor<64x4xi8, #scales>,
+                                             %c: tensor<64x64xf32, #acc>) -> tensor<64x64xf32, #acc> {
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e4m3 rhs = e4m3 {fastMath = false, amdg.wmma_tiles_per_warp = array<i32: 2, 2>} : tensor<64x128xf8E4M3FN, #input>, tensor<64x4xi8, #scales> * tensor<128x64xf8E4M3FN, #input>, tensor<64x4xi8, #scales> -> tensor<64x64xf32, #acc>
+    tt.return %dot : tensor<64x64xf32, #acc>
+  }
+
+  // TLX defers verification of layouts inferred through register-only views.
+  // CHECK-LABEL: tt.func @wmma_dot_scaled_wrapped_linear_accumulator
+  // CHECK: ttg.convert_layout %arg4 {{.*}} -> tensor<64x64xf32, #[[$LINEAR_MMA]]>
+  // CHECK: tt.dot_scaled {{.*}} -> tensor<64x64xf32, #[[$LINEAR_MMA]]>
+  // CHECK: ttg.convert_layout {{.*}} : tensor<64x64xf32, #[[$LINEAR_MMA]]> -> tensor<64x64xf32, #tlx.no_verify_layout<#linear{{.*}}>>
+  // CHECK: tt.return
+  tt.func @wmma_dot_scaled_wrapped_linear_accumulator(%a: tensor<64x128xf8E4M3FN, #tlx.no_verify_layout<#input>>,
+                                                     %b: tensor<128x64xf8E4M3FN, #tlx.no_verify_layout<#input>>,
+                                                     %sa: tensor<64x4xi8, #tlx.no_verify_layout<#scales>>,
+                                                     %sb: tensor<64x4xi8, #tlx.no_verify_layout<#scales>>,
+                                                     %c: tensor<64x64xf32, #tlx.no_verify_layout<#acc>>) -> tensor<64x64xf32, #tlx.no_verify_layout<#acc>> {
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e4m3 rhs = e4m3 {fastMath = false, amdg.wmma_tiles_per_warp = array<i32: 2, 2>} : tensor<64x128xf8E4M3FN, #tlx.no_verify_layout<#input>>, tensor<64x4xi8, #tlx.no_verify_layout<#scales>> * tensor<128x64xf8E4M3FN, #tlx.no_verify_layout<#input>>, tensor<64x4xi8, #tlx.no_verify_layout<#scales>> -> tensor<64x64xf32, #tlx.no_verify_layout<#acc>>
+    tt.return %dot : tensor<64x64xf32, #tlx.no_verify_layout<#acc>>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

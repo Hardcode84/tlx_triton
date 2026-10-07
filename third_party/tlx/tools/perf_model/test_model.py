@@ -52,14 +52,75 @@ def test_completion_credits_survive_source_release(credits, period):
     assert queue["credit_ticks"] == 8 * 20
 
 
-def test_unknown_queue_capacity_is_partial_and_blocks_scheduling():
-    model = Model(completion_credit_graph(None))
+@pytest.mark.parametrize("ordered", [False, True])
+def test_unknown_queue_capacity_is_partial_and_blocks_scheduling(ordered):
+    graph = completion_credit_graph(None)
+    graph["queues"][0]["ordered_retirement"] = ordered
+    model = Model(graph)
     report = model.bounds(target_period=4)
     assert report["bound_is_partial"]
     assert report["queues"][0]["capacity"] is None
     assert report["queue_lifetimes"][0]["minimum_credits_at_target"] == 5
     with pytest.raises(Unknown, match="queue capacities"):
         model.schedule()
+
+
+@pytest.mark.parametrize("release_delay", [None, 7])
+@pytest.mark.parametrize("explicit_retirement", [False, True])
+def test_ordered_credits_wait_for_older_completion_without_serializing_transport(release_delay, explicit_retirement):
+    entries = [dict(acquire=f"issue{i}", release=f"ready{i}") for i in range(2)]
+    if release_delay is not None:
+        entries[0]["release_delay"] = release_delay
+    graph = dict(
+        resources=dict(issue=dict(capacity=1)),
+        operations=[dict(id=f"issue{i}", uses=[dict(resource="issue", work=1)]) for i in range(2)] +
+        [dict(id="ready0", latency=20), dict(id="ready1", latency=1)],
+        dependencies=[dict(source=f"issue{i}", target=f"ready{i}") for i in range(2)],
+        queues=[dict(id="loads", capacity=2, ordered_retirement=True, entries=entries)],
+    )
+    if explicit_retirement:
+        for i, entry in enumerate(entries):
+            entry["retire"] = f"retire{i}"
+            graph["operations"].append(dict(id=entry["retire"]))
+    model = Model(graph)
+    schedule = model.schedule(iterations=3, warmup=0)
+    old_ready = event(schedule, "ready0")["start"] + (20 if release_delay is None else release_delay)
+    young_ready = event(schedule, "ready1")["end"]
+    assert young_ready < old_ready
+    # A younger result can be ready while both instruction credits remain
+    # occupied. The next pair cannot issue using that younger credit early.
+    for i in range(2):
+        retired = model.queues[0]["entries"][i]["release"]
+        assert event(schedule, retired)["start"] == old_ready
+        assert event(schedule, f"issue{i}", 1)["start"] >= old_ready
+    # Normalizing a queue must not rewrite the caller's release contract.
+    assert graph["queues"][0]["entries"][0]["release"] == "ready0"
+
+
+def test_ordered_retirement_includes_the_iteration_boundary():
+    graph = dict(
+        resources=dict(issue=dict(capacity=1)),
+        operations=[
+            dict(id="issue", uses=[dict(resource="issue", work=1)]),
+            dict(id="fast", latency=1),
+            dict(id="slow", latency=20),
+            dict(id="next")
+        ],
+        dependencies=[dict(source="issue", target=name)
+                      for name in ("fast", "next")] + [dict(source="next", target="slow")],
+        queues=[
+            dict(id="loads", capacity=10, ordered_retirement=True,
+                 entries=[dict(acquire="issue", release="fast"),
+                          dict(acquire="next", release="slow")])
+        ],
+    )
+    model = Model(graph)
+    schedule = model.schedule(iterations=3, warmup=0)
+    younger = event(schedule, "fast", 1)["end"]
+    older = event(schedule, "slow")["end"]
+    assert younger < older
+    retired = model.queues[0]["entries"][0]["release"]
+    assert event(schedule, retired, 1)["start"] >= older
 
 
 def test_shared_array_delays_an_already_issued_request():
@@ -222,6 +283,32 @@ def test_mxfp_staged_schedule_reports_retirement_and_full_drain():
     assert all(row["reuse_slack"]["minimum"] >= 0 for row in schedule["buffer_lifetimes"])
     assert schedule["phase_windows"]["epilogue"][1] == schedule["makespan"]
     assert len(schedule["waits"]) == 4
+    requests = {(row["request"], row["iteration"]): row for row in schedule["requests"]["events"]}
+    for queue in graph["queues"]:
+        if queue["id"].startswith("lds_pending"):
+            completions = [
+                requests[entry["acquire"], iteration]["complete"]
+                for iteration in range(4)
+                for entry in queue["entries"]
+            ]
+            assert completions == sorted(completions)
+
+
+@pytest.mark.parametrize("scale_read_bytes,last_chunk", [(128, 3), (256, 1), (512, 0)])
+def test_mxfp_matrix_waits_only_for_its_packed_scale_fragment(scale_read_bytes, last_chunk):
+    graph = make_model(block_k=256, scale_read_bytes=scale_read_bytes)
+    requests = {request["id"]: request for request in graph["requests"]}
+    # C00 can start before scales used by the opposite edge of the wave tile.
+    # A scales follow M; B scales follow N, independently in each K128 step.
+    for step in (0, 1):
+        for operand, far, near in (("A", "7_0", "0_7"), ("B", "0_7", "7_0")):
+            first = requests[f"scale_{operand}_0_k{step}_w0"]["consumers"]
+            last = requests[f"scale_{operand}_{last_chunk}_k{step}_w0"]["consumers"]
+            assert f"mma_issue_k{step}_w0_0_0" in first
+            assert f"mma_issue_k{step}_w0_{near}" in first
+            assert f"mma_issue_k{step}_w0_{far}" in last
+            assert (f"mma_issue_k{step}_w0_{far}" in first) == (last_chunk == 0)
+            assert not any(f"_k{1 - step}_" in consumer for consumer in first + last)
 
 
 def test_partition_placement_preserves_transport_and_compute_work():

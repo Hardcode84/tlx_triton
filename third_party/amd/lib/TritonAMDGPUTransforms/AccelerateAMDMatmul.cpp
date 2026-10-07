@@ -9,6 +9,7 @@
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
@@ -1182,9 +1183,13 @@ public:
     }
 
     RankedTensorType oldRetType = dotOp.getType();
-    if (!isa_and_nonnull<BlockedEncodingAttr>(oldRetType.getEncoding())) {
+    // Register-only slices can give an unaccelerated dot a linear encoding,
+    // including one behind TLX's inference wrappers. They still need native
+    // operand and scale layouts; already selected WMMA layouts do not.
+    if (!isa_and_nonnull<BlockedEncodingAttr, ttg::LinearEncodingAttr>(
+            tt::unwrapTlxWrappers(oldRetType.getEncoding()))) {
       return rewriter.notifyMatchFailure(
-          dotOp, "expected blocked encoding result tensor");
+          dotOp, "expected blocked or linear encoding result tensor");
     }
 
     unsigned rank = oldRetType.getRank();
