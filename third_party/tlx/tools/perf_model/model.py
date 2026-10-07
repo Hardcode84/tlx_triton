@@ -69,6 +69,106 @@ def ticks(value):
     return math.ceil(value)
 
 
+def window_metrics(start, end, service, stalls=None):
+    """Summarize half-open intervals on explicitly named matrix resources.
+
+    Partner waves on the same SIMD belong in the same service list. Stall
+    categories may overlap; only their union can be subtracted from idle.
+    An instruction's issue timestamp alone is not a stall interval.
+    """
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start or not service:
+        raise ValueError("a window needs positive duration and explicit compute resources")
+    stalls = stalls or {}
+    if set(stalls) - set(service):
+        raise ValueError("stall scope contains an unreported compute resource")
+
+    def merge(intervals):
+        clipped = []
+        for a, b in intervals:
+            if not math.isfinite(a) or not math.isfinite(b) or b < a:
+                raise ValueError("reversed interval")
+            a, b = max(start, a), min(end, b)
+            if a < b:
+                clipped.append((a, b))
+        result = []
+        for a, b in sorted(clipped):
+            if result and a <= result[-1][1]:
+                result[-1] = (result[-1][0], max(b, result[-1][1]))
+            else:
+                result.append((a, b))
+        return result
+
+    def intersect(a, b):
+        i = j = 0
+        result = []
+        while i < len(a) and j < len(b):
+            lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+            if lo < hi:
+                result.append((lo, hi))
+            if a[i][1] <= b[j][1]:
+                i += 1
+            else:
+                j += 1
+        return result
+
+    def length(intervals):
+        return sum(b - a for a, b in intervals)
+
+    rows = {}
+    for resource, spans in service.items():
+        busy = merge(spans)
+        idle, cursor = [], start
+        for a, b in busy:
+            if cursor < a:
+                idle.append((cursor, a))
+            cursor = b
+        if cursor < end:
+            idle.append((cursor, end))
+        exposed = {kind: intersect(merge(intervals), idle) for kind, intervals in stalls.get(resource, {}).items()}
+        union = merge([span for intervals in exposed.values() for span in intervals])
+        rows[resource] = dict(service_ticks=length(busy), idle_ticks=length(idle),
+                              exposed_by_category={kind: length(intervals)
+                                                   for kind, intervals in exposed.items()},
+                              exposed_union_ticks=length(union), unattributed_idle_ticks=length(idle) - length(union))
+    numerator = sum(row["service_ticks"] for row in rows.values())
+    denominator = len(service) * (end - start)
+    return dict(window=[start, end], resources=rows, service_ticks=numerator, available_resource_ticks=denominator,
+                service_fraction=numerator / denominator, stall_categories_are_non_additive=True)
+
+
+def latency_statistics(bins):
+    """Combine count/sum latency bins without averaging per-bin means.
+
+    The caller must supply bins with the same scope, unit, and complete time
+    coverage. No samples means unknown latency, including min/max sentinels.
+    """
+    count = total = 0
+    minima, maxima = [], []
+    complete_minima = complete_maxima = True
+    for sample in bins:
+        n, value = sample["count"], sample["sum"]
+        if not math.isfinite(n) or not math.isfinite(value) or n < 0 or int(n) != n or value < 0 or (not n and value):
+            raise ValueError("invalid latency counter bin")
+        if n:
+            count += n
+            total += value
+            if sample.get("minimum") is not None:
+                if not 0 <= sample["minimum"] <= value / n:
+                    raise ValueError("latency minimum exceeds mean or is negative")
+                minima.append(sample["minimum"])
+            else:
+                complete_minima = False
+            if sample.get("maximum") is not None:
+                if not math.isfinite(sample["maximum"]) or sample["maximum"] < value / n:
+                    raise ValueError("latency maximum is below mean or non-finite")
+                maxima.append(sample["maximum"])
+            else:
+                complete_maxima = False
+    return dict(count=count, sum=total, mean=total / count if count else None,
+                minimum=min(minima) if minima and complete_minima else None,
+                maximum=max(maxima) if maxima and complete_maxima else None)
+
+
 @dataclass(frozen=True)
 class Use:
     resource: str
@@ -106,8 +206,12 @@ class Model:
         profile = bindings or {}
         structured = "parameters" in profile
         self.calibration = copy.deepcopy(profile.get("metadata", {})) if structured else {}
+        # Observations describe a measurement, not an additive route delay.
+        self.observations = copy.deepcopy(profile.get("observations", [])) if structured else []
         if structured and "coexecution" in profile:
             self.data["coexecution"] = copy.deepcopy(profile["coexecution"])
+        if structured and "code" in profile:
+            self.data["code"] = copy.deepcopy(profile["code"])
         for entries, source in ((profile.get("parameters", {}) if structured else profile, "bindings"),
                                 (overrides or {}, "command-line override")):
             unknown = set(entries) - self.parameter_metadata.keys()
@@ -126,7 +230,7 @@ class Model:
             except Unknown:
                 self.resolved_parameters[name] = None
         self._value_cache = {}
-        self.raw_ops = {op["id"]: op for op in data["operations"]}
+        self.raw_ops = {op["id"]: op for op in self.data["operations"]}
         if len(self.raw_ops) != len(data["operations"]):
             raise ValueError("duplicate operation id")
         self.resources = data["resources"]
@@ -137,8 +241,12 @@ class Model:
                                                      for slot in pattern)
                 for pattern in windows.values()):
             raise ValueError("coexecution rules must map classes to lists of allowed-class lists")
-        self.raw_edges = list(data.get("dependencies", []))
-        self.queues = data.get("queues", [])
+        self.raw_edges = list(self.data.get("dependencies", []))
+        self.waits = self.data.get("waits", [])
+        self.requests = self.data.get("requests", [])
+        self.add_wait_edges()
+        self.queues = self.data.get("queues", [])
+        self.unresolved_queues = {}
         self.add_queue_edges()
         self.buffers = data.get("buffers", [])
         for buf in self.buffers:
@@ -174,6 +282,7 @@ class Model:
             if phases[src_phase] > phases[dst_phase] or (distance and (src_phase != "loop" or dst_phase != "loop")):
                 raise ValueError(f"invalid dependency between phases: {edge}")
         self.order = self.topological_order()
+        self.validate_requests()
         for resource in data.get("compute_resources", []):
             if resource not in self.resources:
                 raise ValueError(f"unknown compute resource: {resource}")
@@ -182,6 +291,80 @@ class Model:
         if expr not in self._value_cache:
             self._value_cache[expr] = number(expr, self.resolved_parameters)
         return self._value_cache[expr]
+
+    @staticmethod
+    def endpoint(point):
+        return dict(op=point) if isinstance(point, str) else dict(point)
+
+    def add_wait_edges(self):
+        """A wait has an issue-frontier arrival and an explicit completion set.
+
+        Include younger requests when an emitted counter wait covers them.
+        The gate cannot open until every supplied completion has arrived.
+        A compiler scheduling marker alone is not a completion dependency.
+        """
+        names = set()
+        for wait in self.waits:
+            if wait["id"] in names:
+                raise ValueError(f"duplicate wait: {wait['id']}")
+            names.add(wait["id"])
+            if not wait["completions"]:
+                raise ValueError(f"empty wait completion set: {wait['id']}")
+            for point, role in [(wait["arrival"], "arrival")] + [(p, "completion") for p in wait["completions"]]:
+                point = self.endpoint(point)
+                edge = dict(source=point["op"], target=wait["target"], distance=point.get("distance", 0),
+                            reason=f"wait-{role}:{wait['id']}")
+                if "delay" in point:
+                    edge["delay"] = point["delay"]
+                self.raw_edges.append(edge)
+
+    def validate_requests(self):
+        names = set()
+        forward = defaultdict(list)
+        for edge in self.raw_edges:
+            if not edge.get("distance", 0):
+                forward[edge["source"]].append(edge["target"])
+
+        def follows(source, target):
+            pending, seen = [source], set()
+            while pending:
+                name = pending.pop()
+                if name == target:
+                    return True
+                if name not in seen:
+                    seen.add(name)
+                    pending.extend(forward[name])
+            return False
+
+        for request in self.requests:
+            if request["id"] in names:
+                raise ValueError(f"duplicate request: {request['id']}")
+            names.add(request["id"])
+            chain = [request["issue"], *request.get("stages", []), request["complete"]]
+            if any(name not in self.raw_ops for name in chain):
+                raise ValueError(f"unknown request endpoint: {request['id']}")
+            if len({self.raw_ops[name].get("phase", "loop") for name in chain}) != 1:
+                raise ValueError(f"request route crosses serial phases: {request['id']}")
+            if any(not follows(a, b) for a, b in zip(chain, chain[1:])):
+                raise ValueError(f"request stages must follow issue in route order: {request['id']}")
+            for point in request.get("consumers",
+                                     []) + ([request["source_release"]] if "source_release" in request else []):
+                point = self.endpoint(point)
+                if point["op"] not in self.raw_ops or type(point.get("distance", 0)) is not int or point.get(
+                        "distance", 0) < 0:
+                    raise ValueError(f"invalid request checkpoint: {request['id']}")
+            for raw in request.get("consumers", []):
+                point = self.endpoint(raw)
+                if not point.get("distance", 0) and not follows(request["complete"], point["op"]):
+                    raise ValueError(f"request consumer does not depend on completion: {request['id']}")
+            if "source_release" in request:
+                point = self.endpoint(request["source_release"])
+                if point.get("distance", 0) or not follows(request["issue"], point["op"]) or not follows(
+                        point["op"], request["complete"]):
+                    raise ValueError(f"request source release must lie on its completion path: {request['id']}")
+            if request.get("compute_resource") is not None and request["compute_resource"] not in self.data.get(
+                    "compute_resources", []):
+                raise ValueError("request compute_resource must name a compute resource")
 
     def add_queue_edges(self):
         """Allocate a circular pool of credits in an explicit acquisition order.
@@ -212,8 +395,12 @@ class Model:
             if name in names:
                 raise ValueError(f"duplicate queue: {name}")
             names.add(name)
-            capacity = self.value(queue["capacity"])
-            if capacity < 1 or int(capacity) != capacity:
+            try:
+                capacity = self.value(queue["capacity"])
+            except Unknown as exc:
+                capacity = None
+                self.unresolved_queues[name] = str(exc)
+            if capacity is not None and (capacity < 1 or int(capacity) != capacity):
                 raise ValueError(f"queue {name} needs a positive integer credit capacity")
             entries = queue["entries"]
             if not entries:
@@ -227,7 +414,7 @@ class Model:
                 if not reachable(entry["acquire"], entry["release"]):
                     raise ValueError(f"queue {name} releases credits without depending on their acquisition")
                 units = self.value(entry.get("units", 1))
-                if units < 1 or int(units) != units or units > capacity:
+                if units < 1 or int(units) != units or (capacity is not None and units > capacity):
                     raise ValueError(f"invalid credit demand for queue {name}: {units}")
                 total += int(units)
                 ends.append(total)
@@ -251,6 +438,10 @@ class Model:
                     edge(entry["acquire"], entries[index + 1]["acquire"], 0, 0, f"queue-order:{name}")
                 elif cyclic:
                     edge(entry["acquire"], entries[0]["acquire"], 1, 0, f"queue-order:{name}")
+                if capacity is None:
+                    # Preserve admission order for a partial lower bound. A
+                    # schedule must never silently omit the capacity edges.
+                    continue
                 begin = ends[index - 1] if index else 0
                 for credit in range(begin, ends[index]):
                     distance, position = divmod(credit + int(capacity), total)
@@ -340,11 +531,39 @@ class Model:
             if fixed < 0 or min(by_phase.values()) < 0 or any(size < 0 for _, size in allocations):
                 raise ValueError("storage sizes cannot be negative")
             capacity = None if spec.get("capacity") is None else self.value(spec["capacity"])
-            result[space] = dict(required=required, capacity=capacity,
-                                 fits=None if capacity is None else required <= capacity,
-                                 unit=spec.get("unit",
-                                               "bytes"), fixed=fixed, by_phase=by_phase, buffers=dict(allocations))
+            allocated = self.value(spec["allocated"]) if "allocated" in spec else required
+            if allocated < 0:
+                raise ValueError("allocated storage cannot be negative")
+            result[space] = dict(
+                required=required, allocated=allocated, capacity=capacity, covers_modeled_requirement=allocated
+                >= required, allocation_basis=spec.get(
+                    "allocation_basis",
+                    "declared allocation" if "allocated" in spec else "modeled storage rounded by the graph"),
+                fits=False if allocated < required else None if capacity is None else allocated <= capacity,
+                unit=spec.get("unit", "bytes"), fixed=fixed, by_phase=by_phase, buffers=dict(allocations))
         return result
+
+    def residency(self):
+        """Necessary admission limits, separate from per-workgroup legality."""
+        rows = []
+        for spec in self.data.get("residency", []):
+            row = dict(resource=spec["resource"], scope=spec.get("scope", "unspecified"),
+                       source=spec.get("source", "unspecified"))
+            try:
+                capacity = self.value(spec["capacity"]) if spec.get("capacity") is not None else None
+                per_cta = self.value(spec["per_cta"])
+                if per_cta <= 0 or (capacity is not None and capacity < 0):
+                    raise ValueError("invalid residency capacity or per-CTA allocation")
+                row.update(capacity=capacity, per_cta=per_cta,
+                           cta_upper_bound=math.floor(capacity / per_cta) if capacity is not None else None)
+            except Unknown as exc:
+                row.update(cta_upper_bound=None, unknown=str(exc))
+            rows.append(row)
+        known = [row["cta_upper_bound"] for row in rows if row["cta_upper_bound"] is not None]
+        return dict(
+            constraints=rows, upper_bound_from_known_constraints=min(known) if known else None,
+            all_constraints_resolved=bool(rows) and all(row["cta_upper_bound"] is not None for row in rows),
+            interpretation="necessary capacity limits; admission policy and launch coverage require separate evidence")
 
     @staticmethod
     def recurrence(ops, edges):
@@ -491,11 +710,12 @@ class Model:
                 unresolved.add(str(exc))
                 row["unknown"] = str(exc)
             rows.append(row)
-        result = dict(name=self.data.get("name",
-                                         "unnamed"), resources=rows, assumptions=self.data.get("assumptions", []),
-                      parameter_values=self.resolved_parameters, parameter_metadata=self.parameter_metadata,
-                      calibration=self.calibration, clock=self.data.get("clock", "unspecified ticks"),
-                      workload=self.data.get("workload", {}))
+        result = dict(name=self.data.get("name", "unnamed"), resources=rows,
+                      assumptions=self.data.get("assumptions", []), parameter_values=self.resolved_parameters,
+                      parameter_metadata=self.parameter_metadata, calibration=self.calibration,
+                      observations=self.observations, clock=self.data.get("clock", "unspecified ticks"),
+                      workload=self.data.get("workload", {}), code=self.data.get("code", {}))
+        result["residency"] = self.residency()
         known_bound = max([0] + [r["cycles"] for r in rows if "cycles" in r])
         try:
             _, ops, edges = self.resolve({"loop"})
@@ -504,7 +724,9 @@ class Model:
             result["recurrence_witness"] = witness
             known_bound = max(known_bound, rec)
             result["queue_lifetimes"] = self.queue_leads(ops, edges, target_period)
-            known_bound = max([known_bound] + [q["minimum_period"] for q in result["queue_lifetimes"]])
+            known_bound = max(
+                [known_bound] +
+                [q["minimum_period"] for q in result["queue_lifetimes"] if q["minimum_period"] is not None])
             if target_period:
                 result["buffers"] = self.buffer_leads(ops, edges, target_period)
         except Unknown as exc:
@@ -514,11 +736,15 @@ class Model:
         except Unknown as exc:
             unresolved.add(str(exc))
         unresolved.update(k for k, v in self.resolved_parameters.items() if v is None)
-        result["queues"] = [dict(id=q["id"], capacity=self.value(q["capacity"]), entries=len(q["entries"]),
-                                  phase=self.raw_ops[q["entries"][0]["acquire"]].get("phase", "loop"),
-                                  credits_per_phase=sum(self.value(e.get("units", 1)) for e in q["entries"]),
-                                  policy="ordered circular credits", role=q.get("role", "unspecified"))
-                            for q in self.queues]
+        result["queues"] = [
+            dict(id=q["id"], capacity=None if q["id"] in self.unresolved_queues else self.value(q["capacity"]),
+                 entries=len(q["entries"]), phase=self.raw_ops[q["entries"][0]["acquire"]].get("phase", "loop"),
+                 credits_per_phase=sum(self.value(e.get("units", 1))
+                                       for e in q["entries"]), policy="ordered circular credits",
+                 role=q.get("role", "unspecified"), scope=q.get("scope", "unspecified"), unit=q.get("unit", "credits"))
+            for q in self.queues
+        ]
+        result["unresolved_queues"] = dict(self.unresolved_queues)
         fits = [row["fits"] for row in result.get("storage", {}).values()]
         result["storage_feasible"] = (False if False in fits else None
                                       if "storage" not in result or None in fits else True)
@@ -565,10 +791,10 @@ class Model:
                                                if "release_delay" in entry else ops[target].latency)
                 lifetimes.append(lifetime)
                 area += self.value(entry.get("units", 1)) * lifetime
-            capacity = self.value(queue["capacity"])
+            capacity = None if queue["id"] in self.unresolved_queues else self.value(queue["capacity"])
             row = dict(queue=queue["id"], capacity=capacity, minimum_lifetime=min(lifetimes),
                        maximum_minimum_lifetime=max(lifetimes), minimum_credit_ticks_per_period=area,
-                       minimum_period=area / capacity)
+                       minimum_period=area / capacity if capacity is not None else None)
             if target_period is not None:
                 row["minimum_credits_at_target"] = math.ceil(area / target_period)
             rows.append(row)
@@ -699,13 +925,15 @@ class Model:
         return best
 
     def schedule(self, iterations=16, warmup=4, max_cycles=1000000, policy="critical-path", target_period=None):
+        if self.unresolved_queues:
+            raise Unknown("unfilled queue capacities: " + ", ".join(self.unresolved_queues.values()))
         capacities, ops, edges = self.resolve()
         original_ops = dict(ops)
         if iterations < 1 or warmup < 0 or 2 * warmup >= iterations:
             raise ValueError("require iterations > 2 * warmup >= 0")
         storage = self.storage()
         if any(row["fits"] is False for row in storage.values()):
-            raise ValueError("declared buffer allocations exceed storage capacity")
+            raise ValueError("declared storage allocation is insufficient or exceeds capacity")
         keys = [(name, i) for name, op in ops.items() for i in (range(iterations) if op.phase == "loop" else [-1])]
         indegree = dict.fromkeys(keys, 0)
         successors = defaultdict(list)
@@ -914,6 +1142,10 @@ class Model:
             result["dispatch_compute_utilization"] = result["compute_service_ticks"] / (
                 result["makespan"] * sum(capacities[r] for r in compute))
         result["queue_occupancy"] = self.queue_occupancy(placed, original_ops, iterations)
+        result["waits"], coverage = self.wait_diagnostics(placed, original_ops, iterations)
+        result["requests"] = self.request_diagnostics(placed, original_ops, iterations, coverage, calendar)
+        result["buffer_lifetimes"] = self.buffer_lifetimes(placed, original_ops, iterations)
+        result["issue_windows"] = self.issue_windows(events, capacities)
         result["periodic_witness"] = self.periodic_witness(placed, capacities, original_ops, edges, iterations, warmup)
         if len(anchors) == iterations and iterations - warmup > warmup:
             lo, hi = anchors[warmup], anchors[iterations - warmup - 1]
@@ -932,6 +1164,166 @@ class Model:
                                                      for r in compute) / sum(capacities[r] for r in compute))
         return result
 
+    @staticmethod
+    def instance_pairs(source, target, distance, ops, iterations):
+        src, dst = ops[source].phase, ops[target].phase
+        if src == dst == "loop":
+            return [(i, i + distance) for i in range(iterations - distance)]
+        if src == "loop":
+            return [(iterations - 1, -1)]
+        if dst == "loop":
+            return [(-1, 0)]
+        return [(-1, -1)]
+
+    @staticmethod
+    def distribution(values):
+        return dict(count=len(values), minimum=min(values) if values else None,
+                    mean=sum(values) / len(values) if values else None, maximum=max(values) if values else None)
+
+    def wait_diagnostics(self, placed, ops, iterations):
+        """Report completion joins, without charging a slow peer twice.
+
+        The interval is measured from the declared arrival. It is a property
+        of this schedule, not a sum of independently attributable stall causes.
+        """
+        rows, coverage = [], defaultdict(list)
+        for wait in self.waits:
+            points = []
+            for raw in [wait["arrival"], *wait["completions"]]:
+                point = self.endpoint(raw)
+                delay = ticks(self.value(point["delay"])) if "delay" in point else ops[point["op"]].latency
+                times = {
+                    dst: (src, placed[point["op"], src] + delay)
+                    for src, dst in self.instance_pairs(point["op"], wait["target"], point.get("distance", 0), ops,
+                                                        iterations)
+                }
+                points.append((point, times))
+            for i in (range(iterations) if ops[wait["target"]].phase == "loop" else [-1]):
+                arrival = points[0][1].get(i)
+                if arrival is None:
+                    continue
+                complete = [(point["op"], times[i][0], times[i][1]) for point, times in points[1:] if i in times]
+                ready = max([arrival[1]] + [t for _, _, t in complete])
+                start = placed[wait["target"], i]
+                assert start >= ready
+                row = dict(wait=wait["id"], iteration=i, role=wait.get("role", "completion join"), arrival=arrival[1],
+                           ready=ready, start=start, end=start + ops[wait["target"]].latency,
+                           completion_wait_ticks=ready - arrival[1], scheduling_delay_ticks=start - ready,
+                           covered_requests=len(complete),
+                           last_completions=[dict(op=name, iteration=j) for name, j, t in complete if t == ready])
+                rows.append(row)
+                for name, j, _ in complete:
+                    coverage[name, j].append(row)
+        return rows, coverage
+
+    def request_diagnostics(self, placed, ops, iterations, coverage, calendar):
+        rows = []
+        for request in self.requests:
+            issue, complete = request["issue"], request["complete"]
+            route = list(dict.fromkeys([issue, *request.get("stages", []), complete]))
+            for i in (range(iterations) if ops[issue].phase == "loop" else [-1]):
+                begin, end = placed[issue, i], placed[complete, i] + ops[complete].latency
+                route_waits = [max(0, placed[b, i] - placed[a, i] - ops[a].latency) for a, b in zip(route, route[1:])]
+                consumer_times = []
+                for raw in request.get("consumers", []):
+                    point = self.endpoint(raw)
+                    consumer_times.extend(placed[point["op"], dst] + ticks(self.value(point.get("delay", 0)))
+                                          for src, dst in self.instance_pairs(issue, point["op"],
+                                                                              point.get("distance", 0), ops, iterations)
+                                          if src == i)
+                waits = coverage.get((complete, i), [])
+                first_wait = min(waits, key=lambda w: w["arrival"]) if waits else None
+                row = dict(
+                    request=request["id"], iteration=i, kind=request.get("kind", "memory"),
+                    scope=request.get("scope", "unspecified"), issue=begin, complete=end,
+                    bytes=self.value(request["bytes"]) if "bytes" in request else None, latency=end - begin,
+                    route_queue_ticks=sum(route_waits), stages=[
+                        dict(op=name, start=placed[name, i], end=placed[name, i] + ops[name].latency) for name in route
+                    ], first_consumer_start=min(consumer_times) if consumer_times else None,
+                    first_covering_wait=first_wait["wait"] if first_wait else None,
+                    first_wait_arrival=first_wait["arrival"] if first_wait else None,
+                    lead_to_first_wait=first_wait["arrival"] - begin if first_wait else None,
+                    completion_after_first_wait=max(0, end - first_wait["arrival"]) if first_wait else None)
+                if "source_release" in request:
+                    point = self.endpoint(request["source_release"])
+                    delay = ticks(self.value(point["delay"])) if "delay" in point else ops[point["op"]].latency
+                    row["source_release"] = placed[point["op"], i] + delay
+                    if row["source_release"] > end:
+                        raise ValueError(f"request source remains live after result completion: {request['id']}")
+                if consumer_times and min(consumer_times) < end:
+                    raise ValueError(f"request consumed before completion: {request['id']}")
+                resource = request.get("compute_resource")
+                if resource and first_wait:
+                    row["compute_resource"] = resource
+                    row["matrix_service_before_first_wait"] = sum(
+                        calendar[resource].get(t, 0) for t in range(begin, max(begin, first_wait["arrival"])))
+                rows.append(row)
+        return dict(
+            events=rows, by_kind={
+                kind:
+                dict(latency=self.distribution([r["latency"]
+                                                for r in rows
+                                                if r["kind"] == kind]),
+                     route_queue_ticks=self.distribution([r["route_queue_ticks"]
+                                                          for r in rows
+                                                          if r["kind"] == kind]))
+                for kind in sorted({r["kind"]
+                                    for r in rows})
+            })
+
+    def buffer_lifetimes(self, placed, ops, iterations):
+        rows = []
+        for buf in self.buffers:
+            producer, slots = buf["producer"], int(self.value(buf["slots"]))
+            lifetimes, slacks = [], []
+            for i in range(iterations):
+                release = max(placed[c, i] +
+                              (ticks(self.value(buf["release_delay"])) if "release_delay" in buf else ops[c].latency)
+                              for c in buf["consumers"])
+                lifetimes.append(release - placed[producer, i])
+                if i + slots < iterations:
+                    slack = placed[producer, i + slots] - release
+                    assert slack >= 0, "buffer overwritten before its declared retirement"
+                    slacks.append(slack)
+            rows.append(
+                dict(buffer=buf["id"], slots=slots, lifetime=self.distribution(lifetimes),
+                     reuse_slack=self.distribution(slacks)))
+        return rows
+
+    def issue_windows(self, events, capacities):
+        """Count permitted empty issue slots; readiness is not implied."""
+        windows = self.data.get("coexecution", {})
+        allowed = defaultdict(dict)
+        used = defaultdict(lambda: defaultdict(float))
+        classes = {e["kind"] for e in events}
+        for event in events:
+            op = self.raw_ops[event["op"]]
+            domain = op.get("domain")
+            for use in event["reservations"]:
+                if use["resource"] == domain:
+                    for tick in range(use["start"], use["end"]):
+                        used[domain][tick] += use["rate"]
+            window_domain = op.get("window_domain", domain)
+            if window_domain is not None:
+                for offset, kinds in enumerate(windows.get(event["kind"], [])):
+                    tick = event["start"] + offset
+                    permitted = classes if "*" in kinds else set(kinds)
+                    allowed[window_domain][tick] = allowed[window_domain].get(tick, classes) & permitted
+        return [
+            dict(
+                domain=domain, active_ticks=len(timeline), kinds={
+                    kind:
+                    dict(
+                        permitted_ticks=sum(kind in kinds
+                                            for kinds in timeline.values()),
+                        empty_permitted_ticks=sum(kind in kinds and used[domain][tick] == 0
+                                                  for tick, kinds in timeline.items()))
+                    for kind in sorted(classes)
+                },
+                interpretation="empty permitted slots; dependencies, credits and register readiness may prevent issue")
+            for domain, timeline in allowed.items()
+        ]
+
     def queue_occupancy(self, placed, ops, iterations):
         """Independently validate finite credit occupancy from the witness."""
         rows = []
@@ -949,16 +1341,22 @@ class Model:
                     changes[begin] += units
                     changes[end] -= units
                     lifetimes.append(end - begin)
-            occupied = peak = 0
+            occupied = peak = area = saturated = previous = 0
             capacity = self.value(queue["capacity"])
-            for _, delta in sorted(changes.items()):
+            for time, delta in sorted(changes.items()):
+                area += occupied * (time - previous)
+                if occupied == capacity:
+                    saturated += time - previous
+                previous = time
                 occupied += delta
                 peak = max(peak, occupied)
                 if occupied < -1e-8 or occupied > capacity + 1e-8:
                     raise AssertionError(f"queue {queue['id']} exceeds its credit capacity")
-            rows.append(dict(queue=queue["id"], capacity=capacity, peak_credits=peak,
-                             minimum_lifetime=min(lifetimes), maximum_lifetime=max(lifetimes),
-                             mean_lifetime=sum(lifetimes) / len(lifetimes)))
+            rows.append(
+                dict(queue=queue["id"], capacity=capacity, peak_credits=peak, scope=queue.get("scope", "unspecified"),
+                     unit=queue.get("unit", "credits"), credit_ticks=area, saturated_ticks=saturated,
+                     minimum_lifetime=min(lifetimes), maximum_lifetime=max(lifetimes),
+                     mean_lifetime=sum(lifetimes) / len(lifetimes)))
         return rows
 
 
@@ -1007,12 +1405,28 @@ def print_summary(report):
         print("Unfilled parameters: " + ", ".join(report["unresolved"]))
     for space, allocation in report.get("storage", {}).items():
         if allocation["fits"] is False:
-            print(f"Infeasible storage allocation: {space} needs {allocation['required']:g} {allocation['unit']}; "
-                  f"capacity is {allocation['capacity']:g}")
+            print(f"Infeasible storage allocation: {space} needs {allocation['required']:g}, "
+                  f"reserves {allocation['allocated']:g} {allocation['unit']}; "
+                  f"capacity is {allocation['capacity']}")
+    residency = report.get("residency", {})
+    if residency.get("constraints"):
+        print(
+            f"Residency upper bound from known capacities: {residency['upper_bound_from_known_constraints']} CTA(s); "
+            f"capacity inputs {'resolved' if residency['all_constraints_resolved'] else 'partial'}, admission not inferred"
+        )
     if "schedule" in report:
         schedule = report["schedule"]
         print(f"Constructive schedule: {schedule['makespan']} ticks for {schedule['iterations']} iterations and drain")
         print(f"Finite-dispatch lower bound: {schedule['finite_lower_bound']:.3f} ticks")
+        for kind, measurements in schedule["requests"]["by_kind"].items():
+            latency, queued = measurements["latency"], measurements["route_queue_ticks"]
+            print(f"{kind} requests: {latency['count']}, scheduled latency min/mean/max "
+                  f"{latency['minimum']}/{latency['mean']:.2f}/{latency['maximum']} ticks; "
+                  f"mean queueing between stages {queued['mean']:.2f} ticks")
+        if schedule["waits"]:
+            print(
+                f"Longest declared completion wait: {max(w['completion_wait_ticks'] for w in schedule['waits'])} ticks "
+                "(wait intervals can overlap)")
         witness = schedule["periodic_witness"]
         if witness:
             print(f"Verified repeating schedule: {witness['cycles']} ticks / {witness['iterations']} iterations "

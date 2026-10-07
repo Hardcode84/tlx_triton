@@ -9,6 +9,18 @@
     "fabric_period_ps": 1250,
     "memory_period_ps": 1000,
     "ds_decode_native": 8,
+    "lds_outstanding": {
+      "value": 32,
+      "unit": "instructions / wave",
+      "kind": "hypothetical",
+      "source": "invented completion-credit capacity; independent of scheduler depth and counter encoding"
+    },
+    "lds_residency_capacity": {
+      "value": 655360,
+      "unit": "bytes / CU",
+      "kind": "hypothetical",
+      "source": "invented aggregate capacity; not inferred from a per-workgroup launch limit"
+    },
     "ds_scheduler_native": 2,
     "ds_ram_native": 2,
     "ds_read_output_native": 2,
