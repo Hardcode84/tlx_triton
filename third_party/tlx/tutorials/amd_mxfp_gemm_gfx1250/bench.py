@@ -7,8 +7,8 @@ BK256 with cross-tile prefetch disabled so output can reuse the A ring.
 Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
 multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
 Use --first-use-prefetch to test the MX8xMX8 three-buffer schedule with B1 local
-to each K step, packed A0/A1 copies interleaved with individual WMMAs, and
-four-read LDS groups during C01. It retains dedicated FP32 output staging.
+to each K step, operand registers rotating across two K steps, and four-read
+LDS groups during C01. It retains dedicated FP32 output staging.
 Use --output-tail-reuse to keep two next-tile input stages prefetched while
 the retired third A/B stage holds FP32 output. This selects MX8xMX8 with three
 BK128 buffers and removes the separate output allocation.

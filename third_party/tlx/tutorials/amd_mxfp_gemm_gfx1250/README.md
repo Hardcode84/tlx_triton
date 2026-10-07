@@ -60,22 +60,23 @@ gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
 This selects persistent E4M3 x E4M3 with three BK128 buffers, four waves,
 and dedicated FP32 output staging. The C00/C10/C01/C11 compute order lets the
 final two quadrants cover the next stage's operand loads after the C10 refill.
-B1 stays in the current iteration. Next A0 is requested before B0 because
-A0's register copies need the data earlier. C01 places four LDS reads between
-pairs of WMMAs, spreading the reads across its available matrix windows.
+B1 stays in the current iteration. C01 places four LDS reads between pairs
+of WMMAs, spreading next A0/B0 reads across its matrix windows. C11 covers
+next A1 reads, and C00 covers current B1 reads.
 
-A0 and A1 travel through the loop as packed 32-bit words. During C11, one
-scheduling pipeline interleaves next A1 reads, paired A0 transfers, and
-individual WMMAs. A1 payload transfers overlap the current C00; its scale
-transfer waits until just before C10. This avoids requiring A1 copies to
-finish at the preceding loop backedge. Global packing and scale packing are
-the same as the default kernel. Both default K shapes run with the usual
-256 ms timing budget.
+Two K iterations rotate the operand register sets, eliminating the payload
+copies needed by a single-step loop backedge. Packed 32-bit loop carries
+preserve the native FP8 layout. The last K step uses the same loop, keeping
+the even benchmark shapes at two static compute bodies. Its lookahead fills
+the next tile's LDS stages; the final prefetched register operands are unused.
+Global packing and scale packing are the same as the default kernel. Both
+default K shapes run with the usual 256 ms timing budget.
 The standalone flag is `--first_use_prefetch`; the API and `matmul`
 configuration use `FIRST_USE_PREFETCH=True`. Compare it with
 `--variant mx8xmx8` using interleaved runs on the target hardware before
-selecting a default. This is an opt-in scheduling experiment; shorter local
-matrix phases alone do not establish a complete-dispatch speedup.
+selecting a default. This is an opt-in scheduling experiment; fewer loop
+instructions or shorter matrix phases alone do not establish a complete
+dispatch speedup.
 
 Use `--output-tail-reuse` to test output staging in the retired third A/B
 input stage:
