@@ -5625,19 +5625,28 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
 
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("num_buffers", [3, 4])
-def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size, num_buffers):
+@pytest.mark.parametrize("num_buffers,output_tail_reuse", [(3, False), (4, False), (4, True)])
+def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size, num_buffers, output_tail_reuse):
     compiled = _compile_gfx1250_mxgemm_persistent("e4m3", num_buffers, 128, K=k, streamed_operands=True,
-                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4)
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4,
+                                                  OUTPUT_TAIL_REUSE=output_tail_reuse)
     asm = compiled.asm["amdgcn"]
     assert "v_perm" not in asm
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
-    assert asm.count("tensor_store_from_lds") == (8 if num_buffers == 3 else 16)
+    assert asm.count("tensor_store_from_lds") == (8 if num_buffers == 3 or output_tail_reuse else 16)
     assert compiled.metadata.shared <= 320 * 1024
 
     lines = asm.splitlines()
     labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    if output_tail_reuse:
+        # The final store uses dedicated LDS. Retire the preceding aliased
+        # store before tile reentry while allowing that final transfer to run.
+        last_store = max(i for i, line in enumerate(lines) if "tensor_store_from_lds" in line)
+        next_label = min(i for i in labels.values() if i > last_store)
+        output_tail = [line.strip() for line in lines[last_store + 1:next_label]]
+        assert "s_wait_tensorcnt 0x1" in output_tail
+        assert "s_wait_tensorcnt 0x0" not in output_tail
     loops = []
     for i, line in enumerate(lines):
         branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)

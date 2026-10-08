@@ -2413,6 +2413,9 @@ def mxgemm_tdm_pipelined(
     64x128 FP32 output panels. It requires E4M3 x E4M3, three BK128 buffers,
     four waves, both scales, and partial fusion. The first two next-tile
     stages stay prefetched; the third is loaded after output completes.
+    With ``STREAMED_OPERANDS`` and four input buffers, it instead pairs the
+    first next-tile A stage with one dedicated 64x128 output slot. That stage's
+    operands stay in registers, and its output store retires before the refill.
     ``FIRST_USE_PREFETCH`` keeps B1 local to each K step and rotates operand
     registers across two K steps in C00/C10/C01/C11 order. It requires
     persistent E4M3 x E4M3, three BK128 buffers, four waves, partial fusion,
@@ -2423,9 +2426,9 @@ def mxgemm_tdm_pipelined(
     initial matrix rows that cover the next-stage TDM wait. Next-tile
     operands remain in registers through output stores. It requires persistent
     E4M3 x E4M3, three or four BK128 buffers, four waves, partial fusion, cross-tile
-    prefetch, and dedicated FP32 output staging. Four buffers use 64x64 output
-    panels instead of 64x128, trading twice as many output transfers for another
-    input stage of lookahead.
+    prefetch, and FP32 output staging. Four buffers use 64x64 output panels by
+    default, trading twice as many output transfers for another input stage
+    of lookahead; ``OUTPUT_TAIL_REUSE`` restores 64x128 panels as described above.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
     supports two input buffers for A8W8 and two or three for A8W4.
     ``REGISTER_PIPELINE`` selects the A8W8 256x256x256, two-buffer, four-wave
@@ -2480,11 +2483,12 @@ def mxgemm_tdm_pipelined(
                 (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS in (3, 4)
                 and DTYPE_A == DTYPE_B == "e4m3" and TRANSPOSE_B and SCALE_PRESHUFFLE and TDM_FUSION == "partial"
                 and not TDM_SPLIT and SCHEDULE == "sliceMNK" and L2_PREFETCH_DISTANCE == -1 and not REGISTER_PIPELINE
-                and not WARP_PIPELINE and not OPERAND_PIPELINE and not OUTPUT_TAIL_REUSE and not FIRST_USE_PREFETCH):
+                and not WARP_PIPELINE and not OPERAND_PIPELINE and
+                (not OUTPUT_TAIL_REUSE or NUM_BUFFERS == 4) and not FIRST_USE_PREFETCH):
             raise ValueError(
                 "STREAMED_OPERANDS requires persistent E4M3 x E4M3, 256x256x128 tiles, three or four buffers, "
                 "four warps, transposed B, preshuffled scales, partial unsplit TDM, sliceMNK, "
-                "cross-tile prefetch, dedicated output staging, and no L2 prefetch")
+                "cross-tile prefetch, output staging, no L2 prefetch, and four buffers for output tail reuse")
         if __package__:
             from .amd_mxfp_gemm_streamed import mxgemm_tdm_streamed_kernel as persistent_kernel
         else:
@@ -2543,9 +2547,10 @@ def mxgemm_tdm_pipelined(
                          "four warps, both scales, partial TDM fusion, and dedicated output staging")
     if OUTPUT_TAIL_REUSE and not (
             PERSISTENT and OUTPUT_STAGING and WITH_A_SCALE and TDM_FUSION == "partial" and NUM_WARPS == 4 and
-        (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS == 3 and DTYPE_A == DTYPE_B == "e4m3"
-            and not REGISTER_PIPELINE and not WARP_PIPELINE and not OPERAND_PIPELINE):
-        raise ValueError("OUTPUT_TAIL_REUSE requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
+        (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS == (4 if STREAMED_OPERANDS else 3)
+            and DTYPE_A == DTYPE_B == "e4m3" and not REGISTER_PIPELINE and not WARP_PIPELINE and not OPERAND_PIPELINE):
+        raise ValueError("OUTPUT_TAIL_REUSE requires persistent E4M3 x E4M3, 256x256x128 tiles, "
+                         "three buffers (four with STREAMED_OPERANDS), "
                          "four warps, both scales, partial TDM fusion, and output staging")
     if REGISTER_PIPELINE and not (PERSISTENT and OUTPUT_STAGING and WITH_A_SCALE and TDM_FUSION == "partial"
                                   and NUM_WARPS == 4 and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 256
@@ -2820,7 +2825,7 @@ if __name__ == "__main__":
                         help="set SCHED_MODE[2] for persistent WMMA queuing (default: disabled)")
     parser.add_argument("--output_staging", action="store_true", help="stage persistent FP32 output for TDM stores")
     parser.add_argument("--output_tail_reuse", action="store_true",
-                        help="reuse the retired third A/B stage for persistent E4M3 BK128 output")
+                        help="reuse input LDS for E4M3 BK128 output: three persistent buffers or four streamed buffers")
     parser.add_argument("--first_use_prefetch", action="store_true",
                         help="test first-use operand prefetch with persistent E4M3 BK128 and three buffers")
     parser.add_argument("--streamed_operands", action="store_true",
