@@ -2418,11 +2418,14 @@ def mxgemm_tdm_pipelined(
     persistent E4M3 x E4M3, three BK128 buffers, four waves, partial fusion,
     and dedicated FP32 output staging. It is an explicit scheduling experiment.
     ``STREAMED_OPERANDS`` uses native 32x32 accumulator fragments, one rolling
-    A register set with two spare fragments, and two B sets. Two initial rows
-    execute by column to cover late operand reads before LDS reuse. Next-tile
+    A register set with three spare fragments, and two B sets. The final three
+    rows cover operand-read completion before LDS reuse; refills precede two
+    initial matrix rows that cover the next-stage TDM wait. Next-tile
     operands remain in registers through output stores. It requires persistent
-    E4M3 x E4M3, three BK128 buffers, four waves, partial fusion, cross-tile
-    prefetch, and dedicated FP32 output staging.
+    E4M3 x E4M3, three or four BK128 buffers, four waves, partial fusion, cross-tile
+    prefetch, and dedicated FP32 output staging. Four buffers use 64x64 output
+    panels instead of 64x128, trading twice as many output transfers for another
+    input stage of lookahead.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
     supports two input buffers for A8W8 and two or three for A8W4.
     ``REGISTER_PIPELINE`` selects the A8W8 256x256x256, two-buffer, four-wave
@@ -2474,13 +2477,14 @@ def mxgemm_tdm_pipelined(
     persistent_kernel = mxgemm_tdm_persistent_kernel
     if STREAMED_OPERANDS:
         if not (PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and WITH_A_SCALE and NUM_WARPS == 4 and
-                (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS == 3 and DTYPE_A == DTYPE_B == "e4m3"
-                and TRANSPOSE_B and SCALE_PRESHUFFLE and TDM_FUSION == "partial" and not TDM_SPLIT
-                and SCHEDULE == "sliceMNK" and L2_PREFETCH_DISTANCE == -1 and not REGISTER_PIPELINE
+                (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS in (3, 4)
+                and DTYPE_A == DTYPE_B == "e4m3" and TRANSPOSE_B and SCALE_PRESHUFFLE and TDM_FUSION == "partial"
+                and not TDM_SPLIT and SCHEDULE == "sliceMNK" and L2_PREFETCH_DISTANCE == -1 and not REGISTER_PIPELINE
                 and not WARP_PIPELINE and not OPERAND_PIPELINE and not OUTPUT_TAIL_REUSE and not FIRST_USE_PREFETCH):
-            raise ValueError("STREAMED_OPERANDS requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
-                             "four warps, transposed B, preshuffled scales, partial unsplit TDM, sliceMNK, "
-                             "cross-tile prefetch, dedicated output staging, and no L2 prefetch")
+            raise ValueError(
+                "STREAMED_OPERANDS requires persistent E4M3 x E4M3, 256x256x128 tiles, three or four buffers, "
+                "four warps, transposed B, preshuffled scales, partial unsplit TDM, sliceMNK, "
+                "cross-tile prefetch, dedicated output staging, and no L2 prefetch")
         if __package__:
             from .amd_mxfp_gemm_streamed import mxgemm_tdm_streamed_kernel as persistent_kernel
         else:
@@ -2820,7 +2824,7 @@ if __name__ == "__main__":
     parser.add_argument("--first_use_prefetch", action="store_true",
                         help="test first-use operand prefetch with persistent E4M3 BK128 and three buffers")
     parser.add_argument("--streamed_operands", action="store_true",
-                        help="test native operand fragments with persistent E4M3 BK128 and three buffers")
+                        help="test native operand fragments with persistent E4M3 BK128 and three or four buffers")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)

@@ -1,10 +1,10 @@
 """Persistent E4M3 GEMM with native WMMA fragments and pipelined operand reads.
 
-One rolling A register set, two spare A fragments, and two B sets feed
-sixty-four 32x32 accumulator subtiles. The first two rows execute by column
-so the last B fragment has a later first use. Their matrix work covers the
-final A reads before LDS reuse. The remaining rows interleave current matrix
-work with next-step A/B reads.
+One rolling A register set, three spare A fragments, and two B sets feed
+sixty-four 32x32 accumulator subtiles. The final three rows cover completion
+of the next operands before LDS reuse. Refills then precede the first two
+rows, whose matrix work covers TDM completion before the next-stage wait.
+The middle rows interleave current matrix work with next-step A/B reads.
 
 A paired K loop rotates operand registers without backedge copies. Its peeled
 tail prefetches the next output tile while the current tile finishes. Its
@@ -12,8 +12,10 @@ first operands stay in registers through the FP32 store phase, avoiding a
 second load at tile entry. Two separate output slots use b128 LDS stores.
 
 Run through ``bench.py --streamed-operands``. This experimental path requires
-E4M3 inputs, preshuffled block-32 scales, full 256x256 tiles, three K128 buffers,
-four waves, and K >= 384 divisible by 128.
+E4M3 inputs, preshuffled block-32 scales, full 256x256 tiles, three or four K128
+buffers, four waves, and at least one full input ring. Four buffers add a K128
+step of transfer lookahead; two 64x64 output slots keep LDS within capacity,
+at the cost of sixteen output transfers per tile instead of eight.
 """
 
 import triton
@@ -82,9 +84,9 @@ def _scale_unpack(scale, IS_A: tl.constexpr):
 
 
 @triton.jit
-def _scales(scale_buf, slot, IS_A: tl.constexpr):
+def _scales(scale_buf, slot, IS_A: tl.constexpr, NUM_BUFFERS: tl.constexpr):
     tl.assume(slot >= 0)
-    tl.assume(slot < 3)
+    tl.assume(slot < NUM_BUFFERS)
     scale_view = tlx.local_reshape(tlx.local_view(scale_buf, slot), [2, 1, 32, 4, 4])
     scale_view = tlx.local_reshape(tlx.local_trans(scale_view, (0, 3, 2, 1, 4)), [256, 4])
     if IS_A:
@@ -103,9 +105,9 @@ def _scales(scale_buf, slot, IS_A: tl.constexpr):
 
 
 @triton.jit
-def _operand(buf, slot, piece: tl.constexpr, IS_A: tl.constexpr):
+def _operand(buf, slot, piece: tl.constexpr, IS_A: tl.constexpr, NUM_BUFFERS: tl.constexpr):
     tl.assume(slot >= 0)
-    tl.assume(slot < 3)
+    tl.assume(slot < NUM_BUFFERS)
     view = tlx.local_slice(tlx.local_view(buf, slot), [piece * 32, 0], [32, 128])
     mma: tl.constexpr = tlx.amd_wmma_layout(((0, 1), (1, 0)))
     if IS_A:
@@ -147,51 +149,61 @@ def _head(acc, a, sa, bs, scales):
 
 @triton.jit
 def _schedule_pair(sync_id: tl.constexpr):
-    # Bulk scale reads lead the first payload pair. The final two rows also
-    # prefetch the spare A fragments. Pair WMMAs to limit register-bank switches.
+    # Each middle row fetches two B fragments, a recycled A fragment, and
+    # a spare A fragment. Bulk scale reads lead the first payload group;
+    # pair WMMAs to limit register-bank switches.
     if sync_id == 2:
         tlx.amd_sched_group_barrier(0x100, 4, sync_id)
     for _ in tl.static_range(4):
-        tlx.amd_sched_group_barrier(0x100, 4 if sync_id >= 6 else 2, sync_id)
+        tlx.amd_sched_group_barrier(0x100, 4, sync_id)
         tlx.amd_sched_group_barrier(0x8, 2, sync_id)
 
 
 @triton.jit
 def _step(acc, a, b, sa, sb, ad, bd, sad, sbd, ab, bb, sab, sbb, slot, load_m, load_n, load_k,
-          CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
-          XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr):
-    # Interleave the first two rows by column. B7 is first consumed after
-    # fourteen WMMAs. Two spare A fragments move the final reads into the
-    # preceding rows, ahead of this independent matrix work and LDS reuse.
+          NUM_BUFFERS: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr,
+          GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr):
+    # The preceding step finishes its operand reads before three independent
+    # matrix rows. Recycle that completed LDS stage now, giving the incoming
+    # transfers another sixteen WMMAs before the next-stage readiness wait.
+    _mxgemm_persistent_load(ad, bd, sad, sbd, ab, bb, sab, sbb, load_m, load_n, load_k, slot, 128, 1, 1, NUM_BUFFERS,
+                            True, "partial", CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
+                            CLUSTER_BARRIER_INTERVAL)
+    tlx.amd_sched_barrier()
     acc = _head(acc, a, sa, b, sb)
     tlx.amd_sched_barrier()
-    # Launch the new descriptors before waiting for the next readable stage.
-    # A wait placed first would delay the refill whenever that older stage
-    # is still in flight, shortening the memory-overlap window.
-    _mxgemm_persistent_load(ad, bd, sad, sbd, ab, bb, sab, sbb, load_m, load_n, load_k, slot, 128, 1, 1, 3, True,
-                            "partial", CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                            CLUSTER_BARRIER_INTERVAL)
-    tlx.async_amd_descriptor_wait(4)
-    next_slot = tl.where(slot == 2, 0, slot + 1)
-    nsa, nsb = _scales(sab, next_slot, True), _scales(sbb, next_slot, False)
+    # Partial fusion issues two TDM operations per stage. Keep the newer
+    # stages in flight while acquiring the oldest outstanding input stage.
+    tlx.async_amd_descriptor_wait(2 * (NUM_BUFFERS - 1))
+    next_slot = tl.where(slot == NUM_BUFFERS - 1, 0, slot + 1)
+    nsa, nsb = _scales(sab, next_slot, True, NUM_BUFFERS), _scales(sbb, next_slot, False, NUM_BUFFERS)
     na, nb = (), ()
-    for row in tl.static_range(2, 8):
-        av = _operand(ab, next_slot, row - 2, True)
-        bv = _operand(bb, next_slot, row - 2 if row < 7 else 6, False)
-        if row >= 6:
-            extra_b = _operand(bb, next_slot, 5 if row == 6 else 7, False)
-        if row == 6:
-            last_a6 = _operand(ab, next_slot, 6, True)
-        if row == 7:
-            last_a7 = _operand(ab, next_slot, 7, True)
+    for row in tl.static_range(2, 5):
+        av = _operand(ab, next_slot, row - 2, True, NUM_BUFFERS)
+        bv0 = _operand(bb, next_slot, (row - 2) * 2, False, NUM_BUFFERS)
+        bv1 = _operand(bb, next_slot, (row - 2) * 2 + 1, False, NUM_BUFFERS)
+        if row == 2:
+            last_a6 = _operand(ab, next_slot, 6, True, NUM_BUFFERS)
+        if row == 3:
+            last_a7 = _operand(ab, next_slot, 7, True, NUM_BUFFERS)
+        if row == 4:
+            last_a5 = _operand(ab, next_slot, 5, True, NUM_BUFFERS)
         acc = _row(acc, row, a[row], sa[row], b, sb)
         _schedule_pair(row)
         tlx.amd_sched_barrier()
-        na, nb = na + (av, ), nb + (bv, )
-        if row >= 6:
-            nb += (extra_b, )
+        na, nb = na + (av, ), nb + (bv0, bv1)
+    # A3/A4 are dead after rows 3/4; three spare fragments retain A5/A6/A7.
+    # Finish the reads before the final three rows so the next refill's LDS
+    # completion fence has twenty-four independent WMMAs to cover it.
+    last_a3 = _operand(ab, next_slot, 3, True, NUM_BUFFERS)
+    last_a4 = _operand(ab, next_slot, 4, True, NUM_BUFFERS)
+    last_b6 = _operand(bb, next_slot, 6, False, NUM_BUFFERS)
+    last_b7 = _operand(bb, next_slot, 7, False, NUM_BUFFERS)
     tlx.amd_sched_barrier()
-    return acc, na + (last_a6, last_a7), nb, nsa, nsb, next_slot
+    for row in tl.static_range(5, 8):
+        acc = _row(acc, row, a[row], sa[row], b, sb)
+    tlx.amd_sched_barrier()
+    return acc, na + (last_a3, last_a4, last_a5, last_a6, last_a7), nb + (last_b6, last_b7), nsa, nsb, next_slot
 
 
 @triton.jit
@@ -232,11 +244,11 @@ def mxgemm_tdm_streamed_kernel(
     OUTPUT_TAIL_REUSE: tl.constexpr = False,
     FIRST_USE_PREFETCH: tl.constexpr = False,
 ):
-    tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and NUM_BUFFERS == 3)
+    tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and (NUM_BUFFERS == 3 or NUM_BUFFERS == 4))
     tl.static_assert(DTYPE_A == "e4m3" and DTYPE_B == "e4m3" and WITH_A_SCALE and TDM_FUSION == "partial")
     tl.static_assert(OUTPUT_STAGING and CROSS_TILE_PREFETCH and not REGISTER_PIPELINE and tlx.num_warps() == 4)
     tl.static_assert(not OUTPUT_TAIL_REUSE and not FIRST_USE_PREFETCH)
-    tl.static_assert(M > 0 and N > 0 and M % 256 == 0 and N % 256 == 0 and K >= 384 and K % 128 == 0)
+    tl.static_assert(M > 0 and N > 0 and M % 256 == 0 and N % 256 == 0 and K >= NUM_BUFFERS * 128 and K % 128 == 0)
     if SCHED_MODE_2:
         tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     mma: tl.constexpr = tlx.amd_wmma_layout(((0, 1), (1, 0)))
@@ -244,25 +256,28 @@ def mxgemm_tdm_streamed_kernel(
     bd = tl.make_tensor_descriptor(b_ptr, [N, K], [stride_bn, 1], [256, 128])
     sad = tl.make_tensor_descriptor(a_scale, [M // 128, K * 4], [stride_as, 1], [2, 512])
     sbd = tl.make_tensor_descriptor(b_scale, [N // 128, K * 4], [stride_bs, 1], [2, 512])
-    ab = tlx.local_alloc((256, 128), tlx.dtype_of(a_ptr), 3, layout=_operand_shared_layout([256, 128]))
-    bb = tlx.local_alloc((256, 128), tlx.dtype_of(b_ptr), 3, layout=_operand_shared_layout([256, 128]))
-    sab = tlx.local_alloc((2, 512), tl.uint8, 3, layout=_scale_shared_layout([2, 512]))
-    sbb = tlx.local_alloc((2, 512), tl.uint8, 3, layout=_scale_shared_layout([2, 512]))
-    cb = tlx.local_alloc((64, 128), tl.float32, 2)
+    ab = tlx.local_alloc((256, 128), tlx.dtype_of(a_ptr), NUM_BUFFERS, layout=_operand_shared_layout([256, 128]))
+    bb = tlx.local_alloc((256, 128), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=_operand_shared_layout([256, 128]))
+    sab = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
+    sbb = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
+    C_COLS: tl.constexpr = 64 if NUM_BUFFERS == 4 else 128
+    C_PARTS_PER_ROW: tl.constexpr = 256 // C_COLS
+    cb = tlx.local_alloc((64, C_COLS), tl.float32, 2)
     num_m, num_n = M // 256, N // 256
     total_tiles = num_m * num_n
     tile = _mxgemm_remap_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
     phase = 0
     off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, 256, 256)
-    for p in tl.static_range(3):
-        _mxgemm_persistent_load(ad, bd, sad, sbd, ab, bb, sab, sbb, off_m, off_n, p, p, 128, 1, 1, 3, True, "partial",
-                                CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL)
-    tlx.async_amd_descriptor_wait(4)
-    sa, sb = _scales(sab, phase, True), _scales(sbb, phase, False)
+    for p in tl.static_range(NUM_BUFFERS):
+        _mxgemm_persistent_load(ad, bd, sad, sbd, ab, bb, sab, sbb, off_m, off_n, p, p, 128, 1, 1, NUM_BUFFERS, True,
+                                "partial", CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
+                                CLUSTER_BARRIER_INTERVAL)
+    tlx.async_amd_descriptor_wait(2 * (NUM_BUFFERS - 1))
+    sa, sb = _scales(sab, phase, True, NUM_BUFFERS), _scales(sbb, phase, False, NUM_BUFFERS)
     a, b = (), ()
     for row in tl.static_range(8):
-        av = _operand(ab, phase, row, True)
-        bv = _operand(bb, phase, row, False)
+        av = _operand(ab, phase, row, True, NUM_BUFFERS)
+        bv = _operand(bb, phase, row, False, NUM_BUFFERS)
         a, b = a + (av, ), b + (bv, )
     k_iters = K // 128
     while tile < total_tiles:
@@ -276,12 +291,13 @@ def mxgemm_tdm_streamed_kernel(
             acc += (tlx.require_layout(tl.zeros((32, 32), tl.float32), mma), )
         slot = phase
         # Keep descriptor coordinates invariant in the paired steady loop.
-        # Only the last three or four steps can refill the next output tile.
-        steady_end: tl.constexpr = (K // 128 - 3) // 2 * 2
+        # Peel the final input ring, plus one step for an odd paired-loop
+        # remainder. Only this tail can refill the next output tile.
+        steady_end: tl.constexpr = (K // 128 - NUM_BUFFERS) // 2 * 2
         for k in tl.range(steady_end, loop_unroll_factor=2):
             acc, a, b, sa, sb, slot = _step(acc, a, b, sa, sb, ad, bd, sad, sbd, ab, bb, sab, sbb, slot, off_m, off_n,
-                                            k + 3, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                            CLUSTER_BARRIER_INTERVAL)
+                                            k + NUM_BUFFERS, NUM_BUFFERS, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+                                            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL)
         tlx.amd_sched_barrier()
         next_tile = tile + NUM_PROGRAMS
         # Final-tile refills are unused. A valid clamped address keeps the
@@ -290,28 +306,30 @@ def mxgemm_tdm_streamed_kernel(
                                               256)
         tlx.amd_sched_barrier()
         for k in tl.range(steady_end, k_iters, loop_unroll_factor=2):
-            refill_k = k + 3
+            refill_k = k + NUM_BUFFERS
             next_input = refill_k >= k_iters
             load_k = tl.where(next_input, refill_k - k_iters, refill_k)
             load_m = tl.where(next_input, next_m, off_m)
             load_n = tl.where(next_input, next_n, off_n)
             acc, a, b, sa, sb, slot = _step(acc, a, b, sa, sb, ad, bd, sad, sbd, ab, bb, sab, sbb, slot, load_m, load_n,
-                                            load_k, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                            CLUSTER_BARRIER_INTERVAL)
+                                            load_k, NUM_BUFFERS, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+                                            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL)
         tlx.amd_sched_barrier()
-        cd = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [64, 128])
+        cd = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [64, C_COLS])
         # A previous tile leaves at most two output stores pending. The first
-        # two K-step waits retire them, so both slots are free here (K >= 384).
-        for part in tl.static_range(8):
+        # NUM_BUFFERS-1 K-step waits retire them. K contains at least one full
+        # input ring, so both output slots are free again here.
+        for part in tl.static_range(4 * C_PARTS_PER_ROW):
             if part >= 2:
                 tlx.async_amd_descriptor_wait(1)
             view = tlx.local_view(cb, part % 2)
             for r in tl.static_range(2):
-                for c in tl.static_range(4):
-                    value = acc[((part // 2) * 2 + r) * 8 + (part % 2) * 4 + c]
+                for c in tl.static_range(C_COLS // 32):
+                    value = acc[((part // C_PARTS_PER_ROW) * 2 + r) * 8 + (part % C_PARTS_PER_ROW) * (C_COLS // 32) + c]
                     tlx.local_store(tlx.local_slice(view, [r * 32, c * 32], [32, 32]), value)
-            tlx.async_amd_descriptor_store(cd, view, [off_m + (part // 2) * 64, off_n + (part % 2) * 128])
-        phase = (phase + k_iters) % 3
+            tlx.async_amd_descriptor_store(
+                cd, view, [off_m + (part // C_PARTS_PER_ROW) * 64, off_n + (part % C_PARTS_PER_ROW) * C_COLS])
+        phase = (phase + k_iters) % NUM_BUFFERS
         tile = next_tile
     tlx.async_amd_descriptor_wait(0)
     if CLUSTER_SIZE > 1 and CLUSTER_BARRIER_INTERVAL > 0:

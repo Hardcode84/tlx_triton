@@ -5625,14 +5625,15 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
 
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
-    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, streamed_operands=True,
+@pytest.mark.parametrize("num_buffers", [3, 4])
+def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size, num_buffers):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", num_buffers, 128, K=k, streamed_operands=True,
                                                   CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4)
     asm = compiled.asm["amdgcn"]
     assert "v_perm" not in asm
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
-    assert asm.count("tensor_store_from_lds") == 8
+    assert asm.count("tensor_store_from_lds") == (8 if num_buffers == 3 else 16)
     assert compiled.metadata.shared <= 320 * 1024
 
     lines = asm.splitlines()
@@ -5652,16 +5653,20 @@ def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
     assert sum(inst.startswith("v_wmma") for inst in instructions) == 128
     assert sum(inst.startswith("ds_load") for inst in instructions) == 136
     assert all(inst.startswith("ds_load_b128") for inst in instructions if inst.startswith("ds_load"))
+    assert not any(inst.startswith(("v_readlane", "v_writelane")) for inst in instructions)
     refills = [i for i, inst in enumerate(instructions) if inst.startswith("tensor_load_to_lds")]
     assert len(refills) == 4
-    # Launch both fused descriptors before waiting for the next readable
-    # stage; an early wait would delay new requests behind an older transfer.
+    # Launch both fused descriptors before the two-row head. Its independent
+    # WMMAs must separate refill issuance from next-stage readiness, so the
+    # transfer can progress before either scales or operands are acquired.
     for payload, scale in zip(refills[::2], refills[1::2]):
         assert not any(inst.startswith("s_wait_tensorcnt") for inst in instructions[payload:scale])
-        assert next(inst for inst in instructions[scale:] if inst.startswith("s_wait_tensorcnt")) == \
-            "s_wait_tensorcnt 0x4"
-    # The first two rows provide sixteen independent WMMAs after the final
-    # operand reads and before each data refill's LDS reuse boundary.
+        wait = next(i for i in range(scale, len(instructions)) if instructions[i].startswith("s_wait_tensorcnt"))
+        assert instructions[wait] == f"s_wait_tensorcnt {2 * (num_buffers - 1):#x}"
+        assert sum(inst.startswith("v_wmma") for inst in instructions[scale:wait]) >= 16, \
+            "next-stage wait lost the independent matrix work after refill"
+    # The final three rows provide twenty-four independent WMMAs after the final
+    # operand reads and before the following data refill's LDS reuse boundary.
     for refill in refills[::2]:
         preceding = instructions[refill:] + instructions[:refill]
         matrix = 0
@@ -5669,9 +5674,9 @@ def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
             if inst.startswith("ds_load"):
                 break
             matrix += inst.startswith("v_wmma")
-        assert matrix >= 16, "late LDS reads lost their independent matrix-work window"
+        assert matrix >= 24, "late LDS reads lost their independent matrix-work window"
     # The outer register-carry join must not force a full completion wait at
-    # the inner loop's first consumer. Full waits belong after the head.
+    # the inner loop's first consumer. Full waits follow the final three rows.
     for i, inst in enumerate(instructions):
         if inst != "s_wait_dscnt 0x0":
             continue
@@ -5680,7 +5685,7 @@ def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
             if previous.startswith("ds_load"):
                 break
             matrix += previous.startswith("v_wmma")
-        assert matrix >= 16, "full LDS wait moved ahead of the independent matrix-work window"
+        assert matrix >= 24, "full LDS wait moved ahead of the independent matrix-work window"
 
 
 @pytest.mark.parametrize("changes", [
@@ -5689,7 +5694,7 @@ def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
     {"CROSS_TILE_PREFETCH": False},
     {"OUTPUT_TAIL_REUSE": True},
     {"FIRST_USE_PREFETCH": True},
-    {"NUM_BUFFERS": 4},
+    {"NUM_BUFFERS": 5},
     {"BLOCK_K": 256},
     {"NUM_WARPS": 8},
     {"DTYPE_B": "e5m2"},
