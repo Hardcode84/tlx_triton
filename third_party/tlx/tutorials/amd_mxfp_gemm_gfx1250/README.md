@@ -6,6 +6,8 @@ MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 - `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
   `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
+- `collect_traces.py`: real-device instruction traces, eager timings, and
+  timestamped power, clocks, temperatures, and power limits.
 - `amd_mxfp_gemm_operand_pipeline.py`: experimental four-wave A8W8 kernel
   with operand prefetch across K steps and FP32 output.
 - `amd_mxfp_gemm_operand_pipeline_paired.py`: two K256 input stages feeding
@@ -56,6 +58,77 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
+
+To collect hardware evidence for the persistent and streamed A8W8 schedules,
+run the collector on an idle gfx1250 device in the same Python environment:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --output /tmp/mxfp-hardware-01 --package
+```
+
+This compares both schedules at M=N=8192 and K=8192/4096, placing each
+baseline next to its candidate. Each case repeats the ordinary eager
+benchmark for 10 seconds of warmup and 5 seconds of measurement. Individual
+timing batches retain `bench.py`'s 256 ms budget and cache-clearing behavior.
+The power sampler polls the selected device's hwmon sensors every 100 ms.
+Sampling records watts, available clocks and temperatures, the power cap,
+utilization, and performance level, with wall-clock, monotonic, and raw
+monotonic timestamps. The manifest maps every sensor to its source and unit.
+
+ATT collection runs separately, with 1024 matching warmup launches followed
+by one traced launch. Its selected dispatch is **1025, one-based**; the
+collector checks the adjacent kernel trace against the decoded dispatch.
+Cache clearing precedes that launch, matching the eager timing path. The
+default trace selects CU 0, shader-engine mask `0x1`, and SIMD mask `0xF`;
+`--target-cu`, `--shader-engine-mask`, `--simd-select`, and `--activity`
+override these. Activity defaults to the profiler's architecture defaults.
+
+The selected ROCm installation must provide an ATT-capable `rocprofv3` and
+its matching trace decoder. Use `--profiler /path/to/rocprofv3` and
+`--decoder-dir /path/to/decoder/lib` to select them explicitly. Collection
+succeeds only after validating the raw trace, code objects, decoded UI files,
+and results database. The compiled assembly must also match between the
+timing and ATT processes.
+
+The output contains `summary.csv` with timing and measured device power;
+`manifest.json` with device identity, configuration, versions, and commands;
+and a source snapshot. Each case has `power/` and `att/` directories with
+`telemetry.csv`, `telemetry.jsonl`, `telemetry_summary.json`, `workload.json`,
+logs, generated assembly, and the compiled code object. The viewer bundle is
+under `att/trace/`. Available AMD SMI snapshots retain per-domain clocks and
+throttle counters before and after each process. `--package` archives the
+whole collection and prints its SHA-256 digest. Existing non-empty output
+directories and archives are rejected.
+
+Power describes the repeated benchmark workload, including its cache clears
+and host launch gaps. The summary averages the valid samples wholly inside
+the measurement phase. Sensor averaging and update periods are controlled by
+the driver; polling at 100 ms does not give per-dispatch power resolution.
+The ATT run has its own power series and timing windows. GPU limits and clocks
+are read without changing device settings. Existing GPU visibility is
+preserved; `--gpu INDEX_OR_UUID` explicitly selects a physical ROCr device.
+The sampler uses the PCI address reported by HIP to select its sensors.
+
+Preview the cases without accessing a GPU, select one shape, or collect
+timing and power when a decoder is unavailable:
+
+```bash
+python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py --dry-run
+
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --output /tmp/mxfp-k4096 -- --case 8192,8192,4096
+
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --no-att --output /tmp/mxfp-power --duration-seconds 10
+```
+
+Options after `--` use the benchmark's argument validation. For example,
+`--kernels persistent -- --variant mx8xmx4` profiles the A8W4 baseline.
+The streamed schedule supports A8W8. Use `--warmup-seconds`,
+`--duration-seconds`, `--warmup-dispatches`, and `--sample-ms` to adjust
+collection lengths and sampling. These diagnostic runs do not perform
+numerical correctness checks.
 
 Use `--first-use-prefetch` to test the model-derived operand schedule:
 
