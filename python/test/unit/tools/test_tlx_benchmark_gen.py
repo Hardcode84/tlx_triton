@@ -1033,6 +1033,41 @@ def test_mxfp_trace_profiler_prefers_workload_runtime(mxfp_collector, monkeypatc
     assert selected == profiler
 
 
+@pytest.mark.parametrize("suffix", ["", "_linux_x86_64"])
+@pytest.mark.parametrize("devel_runtime", ["hardlink", "symlink", "missing", "stale"])
+def test_mxfp_trace_profiler_prefers_matching_devel_sdk(mxfp_collector, monkeypatch, tmp_path, suffix, devel_runtime):
+    helper = mxfp_collector.load_att_helper()
+    for variable in ("AMD_ROCPROFV3", "TLX_ROCPROFV3", "ROCPROF_ATT_LIBRARY_PATH"):
+        monkeypatch.delenv(variable, raising=False)
+    core = tmp_path / ("_rocm_sdk_core" + suffix)
+    devel = tmp_path / ("_rocm_sdk_devel" + suffix)
+    for sdk in (core, devel):
+        (sdk / "bin").mkdir(parents=True)
+        (sdk / "lib").mkdir()
+        profiler = sdk / "bin/rocprofv3"
+        profiler.write_text("#!/bin/sh\nprintf '%s\\n' '--att'\n")
+        profiler.chmod(0o755)
+        (sdk / "lib/librocprof-trace-decoder.so").touch()
+    runtime = core / "lib/libamdhip64.so.7"
+    runtime.write_bytes(b"workload runtime")
+    devel_hip = devel / "lib" / runtime.name
+    if devel_runtime == "hardlink":
+        devel_hip.hardlink_to(runtime)
+    elif devel_runtime == "symlink":
+        devel_hip.symlink_to(runtime)
+    elif devel_runtime == "stale":
+        devel_hip.write_bytes(b"previous runtime")
+
+    expected = devel if devel_runtime in ("hardlink", "symlink") else core
+    capability = helper.probe(None, None, str(runtime))
+    assert capability["profiler"] == str(expected / "bin/rocprofv3")
+    assert capability["decoder_directory"] == str(expected / "lib")
+    # An explicit profiler retains priority over the matching devel tree.
+    explicit = helper.probe(str(core / "bin/rocprofv3"), None, str(runtime))
+    assert explicit["profiler"] == str(core / "bin/rocprofv3")
+    assert explicit["decoder_directory"] == str(core / "lib")
+
+
 def test_mxfp_trace_explicit_broken_profiler_does_not_fallback(mxfp_collector, tmp_path):
     helper = mxfp_collector.load_att_helper()
     broken = tmp_path / "broken-profiler"

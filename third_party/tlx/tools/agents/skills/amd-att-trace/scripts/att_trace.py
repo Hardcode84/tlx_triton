@@ -53,7 +53,19 @@ def _profiler_candidates(override: str | None = None, runtime_library: str | Non
             raw.append(Path(os.environ[variable]))
     if runtime_library:
         # HIP may come from a Python ROCm SDK package instead of /opt/rocm.
-        raw.append(Path(runtime_library).resolve().parent.parent / "bin" / "rocprofv3")
+        runtime = Path(runtime_library).resolve()
+        runtime_root = runtime.parent.parent
+        if runtime_root.name == "_rocm_sdk_core" or runtime_root.name.startswith("_rocm_sdk_core_"):
+            devel = runtime_root.with_name(runtime_root.name.replace("_rocm_sdk_core", "_rocm_sdk_devel", 1))
+            # TheRock's expanded devel tree supplies library aliases needed by
+            # ROCr (including libhsa-amd-aqlprofile64.so). Prefer it only when
+            # its HIP is linked to the workload's runtime, not a stale SDK.
+            try:
+                if (devel / "lib" / runtime.name).samefile(runtime):
+                    raw.append(devel / "bin" / "rocprofv3")
+            except OSError:
+                pass
+        raw.append(runtime_root / "bin" / "rocprofv3")
     raw.extend(Path(path) for path in glob.glob("/usr/local/fbcode/platform*/lib/rocm-dev/bin/rocprofv3"))
     bundled = Path(sys.base_prefix) / "lib" / "rocm-dev" / "bin" / "rocprofv3"
     raw.append(bundled)
