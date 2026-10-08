@@ -825,16 +825,18 @@ def test_mxfp_trace_timeout_reaps_child(mxfp_collector, mxfp_sensors, tmp_path):
     assert "end" in json.loads((tmp_path / "process.json").read_text())
 
 
-@pytest.mark.parametrize("power_source", ["hwmon", "metrics_8", "metrics_9", "average"])
+@pytest.mark.parametrize("power_source,mode", [("hwmon", "collect"), ("metrics_8", "collect"), ("metrics_9", "collect"),
+                                               ("average", "collect"), ("hwmon", "failure"), ("hwmon", "preflight")])
 def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_collector, mxfp_sensors,
                                                                         mxfp_gpu_metrics_table, monkeypatch, tmp_path,
-                                                                        power_source):
+                                                                        power_source, mode):
     import hashlib
     import sys
     import tarfile
     import textwrap
     from pathlib import Path
 
+    monkeypatch.setenv("MXFP_TEST_PREFLIGHT_FAILURE", str(int(mode == "failure")))
     failed_input = tmp_path / "input failed during warmup"
     hwmon = mxfp_sensors.device / "hwmon/hwmon42"
     if power_source.startswith("metrics_"):
@@ -898,10 +900,17 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
     profiler.write_text(
         textwrap.dedent('''\
         #!/usr/bin/env python3
-        import json, sqlite3, subprocess, sys
+        import json, os, sqlite3, subprocess, sys
         from pathlib import Path
         if '--help' in sys.argv:
             print('--att --rocm-root')
+            raise SystemExit(0)
+        if '--device-info-output' in sys.argv:
+            if os.environ['MXFP_TEST_PREFLIGHT_FAILURE'] == '1':
+                print('aqlprofile API table load failed: HSA_STATUS_ERROR', flush=True)
+                raise SystemExit(6)
+            info = Path(sys.argv[sys.argv.index('--device-info-output') + 1])
+            info.write_text(json.dumps(dict(bdf='0000:66:00.0', arch='gfx1250')))
             raise SystemExit(0)
         subprocess.run(sys.argv[sys.argv.index('--') + 1:], check=True)
         root = Path(sys.argv[sys.argv.index('-d') + 1])
@@ -943,7 +952,8 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         "--output",
         str(root), "--profiler",
         str(profiler), "--decoder-dir",
-        str(decoder), "--sample-ms", "2", "--package", "--warmup-seconds", "0.075", "--duration-seconds", "0.075"
+        str(decoder), "--sample-ms", "2", "--preflight-only" if mode == "preflight" else "--package",
+        "--warmup-seconds", "0.075", "--duration-seconds", "0.075"
     ])
     cases = mxfp_collector.make_cases(args)
     assert len(cases) == 4
@@ -960,9 +970,26 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         return dict(command=command, returncode=0, stdout=json.dumps(output), stderr="")
 
     monkeypatch.setattr(mxfp_collector, "command_record", record)
+    if mode == "failure":
+        with pytest.raises(mxfp_collector.CollectionError, match="initialization failed before benchmarking"):
+            mxfp_collector.collect(args, cases)
+        manifest = json.loads((root / "manifest.json").read_text())
+        assert manifest["status"] == "failed" and manifest["cases"] == []
+        report = json.loads((root / "preflight/preflight.json").read_text())
+        assert report["status"] == "failed" and report["loader_logs"]
+        assert "aqlprofile API table load failed" in (root / "preflight/stdout.log").read_text()
+        assert not list(root.rglob("workload_spec.json"))
+        assert not root.with_name(root.name + ".tar.gz").exists()
+        return
     mxfp_collector.collect(args, cases)
     manifest = json.loads((root / "manifest.json").read_text())
+    if mode == "preflight":
+        assert manifest["status"] == "preflight_complete" and manifest["cases"] == []
+        assert manifest["preflight"]["status"] == "complete"
+        assert not list(root.rglob("workload_spec.json"))
+        return
     assert manifest["status"] == "complete"
+    assert manifest["preflight"]["status"] == "complete"
     assert manifest["power_sensor_priority"] == sensors.power_candidates
     assert len(manifest["cases"]) == 4
     for case in manifest["cases"]:
@@ -989,3 +1016,57 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         names = bundle.getnames()
     assert sum(name.endswith("/power/telemetry.csv") for name in names) == 4
     assert sum(name.endswith("/att/trace/fixture_shader_engine_0_2050.att") for name in names) == 4
+
+
+def test_mxfp_trace_profiler_prefers_workload_runtime(mxfp_collector, monkeypatch, tmp_path):
+    helper = mxfp_collector.load_att_helper()
+    for variable in ("AMD_ROCPROFV3", "TLX_ROCPROFV3"):
+        monkeypatch.delenv(variable, raising=False)
+    profiler = tmp_path / "python-rocm-sdk/bin/rocprofv3"
+    profiler.parent.mkdir(parents=True)
+    profiler.write_text("#!/bin/sh\nprintf '%s\\n' '--att'\n")
+    profiler.chmod(0o755)
+    runtime = tmp_path / "python-rocm-sdk/lib/libamdhip64.so.7"
+    runtime.parent.mkdir()
+    runtime.touch()
+    selected, _ = helper.find_profiler(runtime_library=str(runtime))
+    assert selected == profiler
+
+
+def test_mxfp_trace_explicit_broken_profiler_does_not_fallback(mxfp_collector, tmp_path):
+    helper = mxfp_collector.load_att_helper()
+    broken = tmp_path / "broken-profiler"
+    broken.write_text("#!/bin/sh\nprintf '%s\\n' '--att option failed'\nexit 1\n")
+    broken.chmod(0o755)
+    with pytest.raises(helper.AttError, match="no ATT-capable rocprofv3"):
+        helper.find_profiler(str(broken))
+    with pytest.raises(helper.AttError, match="no ATT decoder"):
+        helper.find_decoder(broken, str(tmp_path / "missing-decoder"))
+
+
+@pytest.mark.parametrize("changed", ["hip_library", "runtime_libraries"])
+def test_mxfp_trace_preflight_rejects_runtime_change(mxfp_collector, tmp_path, changed):
+    import sys
+    from types import SimpleNamespace
+
+    baseline = dict(bdf="0000:66:00.0", arch="gfx1250", hip_library="/runtime/libamdhip64.so.7",
+                    runtime_libraries=["/runtime/libhsa-runtime64.so.1"])
+    profiled = {
+        **baseline, changed:
+        "/other/libamdhip64.so.7" if changed == "hip_library" else ["/other/libhsa-runtime64.so.1"]
+    }
+
+    def command(capability, application, output):
+        path = application[application.index("--device-info-output") + 1]
+        return [
+            sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+            path,
+            json.dumps(profiled)
+        ]
+
+    helper = SimpleNamespace(runtime_check_command=command)
+    with pytest.raises(mxfp_collector.CollectionError, match="initialization failed before benchmarking"):
+        mxfp_collector.profiler_preflight(helper, {}, tmp_path, os.environ.copy(), baseline, 5)
+    report = json.loads((tmp_path / "preflight/preflight.json").read_text())
+    assert report["status"] == "failed"
+    assert "profiling changed" in report["error"]

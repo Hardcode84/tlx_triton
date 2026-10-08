@@ -32,6 +32,8 @@ HERE = Path(__file__).resolve().parent
 ATT_SCRIPT = HERE.parent.parent / "tools/agents/skills/amd-att-trace/scripts/att_trace.py"
 VISIBILITY_VARS = ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
 KERNEL_NAMES = {"persistent": "mxgemm_tdm_persistent_kernel", "streamed_operands": "mxgemm_tdm_streamed_kernel"}
+RUNTIME_LIBRARY_RE = re.compile(r"lib(?:amdhip64|hsa-runtime64|hsa-amd-aqlprofile64|rocprofiler-sdk(?:-tool)?|"
+                                r"rocprof-trace-decoder)\.so(?:\.\d+)*")
 
 
 class CollectionError(RuntimeError):
@@ -68,12 +70,12 @@ def device_info():
         raise CollectionError(f"expected a HIP device, got {target}")
     # Use the HIP library already loaded by PyTorch. Resolving an unversioned
     # soname again can load a different installation from LD_LIBRARY_PATH.
-    hip_paths = {
+    libraries = sorted({
         parts[5].strip()
         for line in Path("/proc/self/maps").read_text().splitlines()
-        if len(parts := line.split(maxsplit=5)) == 6 and re.fullmatch(r"libamdhip64\.so(?:\.\d+)*",
-                                                                      Path(parts[5].strip()).name)
-    }
+        if len(parts := line.split(maxsplit=5)) == 6 and RUNTIME_LIBRARY_RE.fullmatch(Path(parts[5].strip()).name)
+    })
+    hip_paths = {path for path in libraries if re.fullmatch(r"libamdhip64\.so(?:\.\d+)*", Path(path).name)}
     if len(hip_paths) != 1:
         raise CollectionError(f"expected one loaded HIP runtime, found {sorted(hip_paths)}")
     hip_path = hip_paths.pop()
@@ -93,7 +95,7 @@ def device_info():
     return dict(bdf=pci_address, name=properties.name, arch=properties.gcnArchName, target=str(target),
                 compute_units=properties.multi_processor_count, total_memory=properties.total_memory,
                 torch=torch.__version__, hip=torch.version.hip, triton=triton.__version__, triton_path=triton.__file__,
-                hip_library=hip_path, python=sys.executable, timestamp=stamp())
+                hip_library=hip_path, runtime_libraries=libraries, python=sys.executable, timestamp=stamp())
 
 
 def command_record(command, *, environment=None, timeout=30):
@@ -298,7 +300,8 @@ def run_recorded(command, directory, environment, sensors, interval, timeout):
     write_json(directory / "process.json", result)
     process = None
     try:
-        with Sampler(sensors, directory, interval), (directory / "stdout.log").open("x") as log:
+        sampling = Sampler(sensors, directory, interval) if sensors is not None else contextlib.nullcontext()
+        with sampling, (directory / "stdout.log").open("x") as log:
             process = subprocess.Popen(command, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
             result["returncode"] = process.wait(timeout=timeout)
@@ -317,6 +320,52 @@ def run_recorded(command, directory, environment, sensors, interval, timeout):
         write_json(directory / "process.json", result)
     if result["returncode"]:
         raise CollectionError(f"workload exited {result['returncode']}; see {directory / 'stdout.log'}")
+
+
+def profiler_preflight(helper, capability, root, environment, device, timeout):
+    directory = root / "preflight"
+    directory.mkdir()
+    device_file = directory / "device.json"
+    application = [
+        sys.executable,
+        str(Path(__file__).resolve()), "--device-info", "--device-info-output",
+        str(device_file)
+    ]
+    command = helper.runtime_check_command(capability, application, directory / "profiler")
+    diagnostic_env = {**environment, "LD_DEBUG": "libs", "LD_DEBUG_OUTPUT": str(directory / "loader")}
+    report = dict(status="running", capability=capability, baseline_device=device)
+    write_json(directory / "preflight.json", report)
+    try:
+        run_recorded(command, directory, diagnostic_env, None, 0, timeout)
+        profiled_device = json.loads(device_file.read_text())
+        report["profiled_device"] = profiled_device
+        for key in ("bdf", "arch", "hip_library"):
+            if profiled_device.get(key) != device.get(key):
+                raise CollectionError(f"profiling changed {key}: {device.get(key)!r} -> {profiled_device.get(key)!r}")
+        baseline_hsa = {path for path in device.get("runtime_libraries", []) if "libhsa-runtime64.so" in path}
+        profiled_hsa = {path for path in profiled_device.get("runtime_libraries", []) if "libhsa-runtime64.so" in path}
+        if baseline_hsa != profiled_hsa:
+            raise CollectionError(f"profiling changed ROCr libraries: {sorted(baseline_hsa)} -> {sorted(profiled_hsa)}")
+        report["status"] = "complete"
+    except (CollectionError, OSError, ValueError, subprocess.SubprocessError) as error:
+        report.update(status="failed", error=str(error))
+        raise CollectionError("profiler initialization failed before benchmarking; "
+                              f"see {directory / 'preflight.json'} and {directory / 'stdout.log'}. "
+                              "The loader logs record library lookup paths; select --profiler and --decoder-dir "
+                              "from the workload's ROCm installation.") from error
+    finally:
+        logs = sorted(directory.glob("loader.*"))
+        report["loader_logs"] = [str(path) for path in logs]
+        libraries = set()
+        for path in logs:
+            for line in path.read_text(errors="replace").splitlines():
+                if "calling init:" in line:
+                    library = line.split("calling init:", 1)[1].strip()
+                    if RUNTIME_LIBRARY_RE.fullmatch(Path(library).name):
+                        libraries.add(library)
+        report["initialized_libraries"] = sorted(libraries)
+        write_json(directory / "preflight.json", report)
+    return report
 
 
 def power_sources(samples):
@@ -563,7 +612,7 @@ def collect(args, cases):
     if initial.get("gpu_busy_percent", 0) is not None and initial.get("gpu_busy_percent", 0) > 5:
         raise CollectionError("selected GPU is busy; acquire the machine's GPU lock and select an idle device")
     helper = load_att_helper() if args.att else None
-    capability = helper.probe(args.profiler, args.decoder_dir) if helper else None
+    capability = helper.probe(args.profiler, args.decoder_dir, device.get("hip_library")) if helper else None
     if args.profiler and capability and Path(args.profiler).resolve() != Path(capability["profiler"]):
         raise CollectionError(f"requested profiler is not usable: {args.profiler}")
     if args.decoder_dir and capability and Path(args.decoder_dir).resolve() != Path(capability["decoder_directory"]):
@@ -589,6 +638,14 @@ def collect(args, cases):
             shutil.copy2(ATT_SCRIPT, source_root / ATT_SCRIPT.name)
         manifest["git"] = command_record(["git", "-C", str(HERE), "rev-parse", "HEAD"])
         manifest["git_status"] = command_record(["git", "-C", str(HERE), "status", "--short"])
+        if helper:
+            print("Checking profiler initialization in the workload's Python environment...", flush=True)
+            manifest["preflight"] = profiler_preflight(helper, capability, root, environment, device, args.timeout)
+            write_json(root / "manifest.json", manifest)
+            if args.preflight_only:
+                manifest["status"] = "preflight_complete"
+                print(f"Profiler initialization passed: {root / 'preflight/preflight.json'}", flush=True)
+                return
         smi = shutil.which("amd-smi")
         if smi:
             for kind in ("static", "metric", "process"):
@@ -662,6 +719,8 @@ def parser():
     result.add_argument("--att", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--profiler", help="ATT-capable rocprofv3 executable from the target's ROCm installation")
     result.add_argument("--decoder-dir", help="matching directory containing librocprof-trace-decoder.so")
+    result.add_argument("--preflight-only", action="store_true",
+                        help="check profiler initialization and record library paths without benchmarking")
     result.add_argument("--target-cu", type=int, default=0)
     result.add_argument("--shader-engine-mask", default="0x1")
     result.add_argument("--simd-select", default="0xF")
@@ -673,6 +732,7 @@ def parser():
     result.add_argument("--inspect", type=Path,
                         help="report sensor errors and timing-window coverage in an existing capture")
     result.add_argument("--device-info", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--device-info-output", type=Path, help=argparse.SUPPRESS)
     result.add_argument("benchmark_args", nargs=argparse.REMAINDER, help="bench.py options after --")
     return result
 
@@ -688,7 +748,10 @@ def main(argv=None):
             print(json.dumps([telemetry_diagnostics(path.parent) for path in files], indent=2))
             return 0
         if args.device_info:
-            print(json.dumps(device_info()))
+            info = device_info()
+            if args.device_info_output:
+                write_json(args.device_info_output, info)
+            print(json.dumps(info))
             return 0
         if (not all(
                 math.isfinite(value) and value > 0
@@ -697,6 +760,8 @@ def main(argv=None):
             cli.error("durations, sampling interval and warmup count must be positive; CU/activity must be nonnegative")
         if args.package and not args.att:
             cli.error("--package requires ATT bundle validation")
+        if args.preflight_only and (not args.att or args.package):
+            cli.error("--preflight-only requires ATT and cannot be combined with --package")
         cases = make_cases(args)
         if args.att:
             print(f"ATT selection: matching dispatch {args.warmup_dispatches + 1} (one-based), "
