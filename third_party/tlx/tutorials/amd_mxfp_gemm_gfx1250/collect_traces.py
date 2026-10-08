@@ -6,6 +6,7 @@ machine's GPU lock; this script reads device controls but never changes them.
 """
 
 import argparse
+from collections import Counter
 import contextlib
 import csv
 import ctypes
@@ -255,10 +256,42 @@ def run_recorded(command, directory, environment, sensors, interval, timeout):
         raise CollectionError(f"workload exited {result['returncode']}; see {directory / 'stdout.log'}")
 
 
+def telemetry_diagnostics(directory, workload=None, samples=None):
+    if workload is None:
+        workload = json.loads((directory / "workload.json").read_text())
+    if samples is None:
+        samples = [json.loads(line) for line in (directory / "telemetry.jsonl").read_text().splitlines()]
+    errors = Counter(f"{field}: {error}" for sample in samples for field, error in sample.get("errors", {}).items())
+    durations = [(s["read_end_monotonic_ns"] - s["monotonic_ns"]) / 1e6 for s in samples]
+    phases = []
+    for phase in workload["phases"]:
+        if "end" not in phase:
+            phases.append(dict(name=phase["name"], status="unfinished"))
+            continue
+        begin, end = phase["start"]["monotonic_ns"], phase["end"]["monotonic_ns"]
+        inside = [s for s in samples if begin <= s["monotonic_ns"] and s["read_end_monotonic_ns"] <= end]
+        overlap = [s for s in samples if s["monotonic_ns"] < end and s["read_end_monotonic_ns"] > begin]
+        phases.append(
+            dict(name=phase["name"], start_monotonic_ns=begin, end_monotonic_ns=end,
+                 duration_seconds=(end - begin) / 1e9, complete_read_batches=len(inside),
+                 valid_power_samples=sum(s.get("power_w") is not None
+                                         for s in inside), overlapping_read_batches=len(overlap),
+                 overlapping_power_samples=sum(s.get("power_w") is not None for s in overlap)))
+    return dict(directory=str(directory), sample_count=len(samples),
+                samples_with_power=sum(s.get("power_w") is not None for s in samples), first_read_monotonic_ns=min(
+                    (s["monotonic_ns"] for s in samples), default=None), last_read_monotonic_ns=max(
+                        (s["read_end_monotonic_ns"] for s in samples), default=None),
+                read_duration_ms=dict(median=statistics.median(durations), max=max(durations)) if durations else None,
+                sensor_errors=dict(errors), phases=phases)
+
+
 def phase_summary(directory, sensors):
     workload = json.loads((directory / "workload.json").read_text())
     samples = [json.loads(line) for line in (directory / "telemetry.jsonl").read_text().splitlines()]
+    diagnostics = telemetry_diagnostics(directory, workload, samples)
+    write_json(directory / "telemetry_diagnostics.json", diagnostics)
     summaries = []
+    failures = []
     for phase in workload["phases"]:
         begin, end = phase["start"]["monotonic_ns"], phase["end"]["monotonic_ns"]
         selected = [s for s in samples if begin <= s["monotonic_ns"] and s["read_end_monotonic_ns"] <= end]
@@ -270,8 +303,15 @@ def phase_summary(directory, sensors):
         summaries.append(summary)
         if phase["name"] == "measure" and (summary["metrics"]["power_w"] is None
                                            or summary["metrics"]["power_w"]["count"] < 2):
-            raise CollectionError(f"fewer than two valid power samples during measurement: {directory}")
+            details = next(p for p in diagnostics["phases"] if p["name"] == "measure")
+            failures.append(
+                f"{details['valid_power_samples']} valid readings in "
+                f"{details['complete_read_batches']} complete batches over {details['duration_seconds']:.3f}s; "
+                f"{diagnostics['samples_with_power']}/{len(samples)} readings valid across the process")
     write_json(directory / "telemetry_summary.json", summaries)
+    if failures:
+        raise CollectionError("fewer than two valid power samples during measurement: " + "; ".join(failures) +
+                              f". Sensor errors and read timings: {directory / 'telemetry_diagnostics.json'}")
     return summaries
 
 
@@ -556,6 +596,8 @@ def parser():
     result.add_argument("--package", action="store_true",
                         help="validate and archive the entire collection with SHA-256")
     result.add_argument("--dry-run", action="store_true", help="show cases and selection without accessing a GPU")
+    result.add_argument("--inspect", type=Path,
+                        help="report sensor errors and timing-window coverage in an existing capture")
     result.add_argument("--device-info", action="store_true", help=argparse.SUPPRESS)
     result.add_argument("benchmark_args", nargs=argparse.REMAINDER, help="bench.py options after --")
     return result
@@ -565,6 +607,12 @@ def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
     try:
+        if args.inspect is not None:
+            files = sorted(args.inspect.rglob("workload.json"))
+            if not files:
+                raise CollectionError(f"no workload.json files found under {args.inspect}")
+            print(json.dumps([telemetry_diagnostics(path.parent) for path in files], indent=2))
+            return 0
         if args.device_info:
             print(json.dumps(device_info()))
             return 0
