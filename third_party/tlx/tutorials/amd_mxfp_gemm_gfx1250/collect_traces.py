@@ -1,6 +1,7 @@
 """Collect real-device MXFP instruction traces, benchmark timings, and power.
 
 By default compare persistent and streamed A8W8 at both bench.py shapes.
+Successful collections produce a single .tar.gz archive.
 Options after -- are passed to bench.py's argument resolver. Run under the
 machine's GPU lock; this script reads device controls but never changes them.
 """
@@ -596,11 +597,21 @@ def write_summary(root, cases):
             writer.writerows(rows)
 
 
+def collection_paths(args):
+    output = args.output.expanduser().resolve()
+    package = args.package is not False and not args.preflight_only
+    if package and output.name.endswith(".tar.gz"):
+        return output.with_name(output.name[:-7]), output
+    return output, output.with_name(output.name + ".tar.gz") if package else None
+
+
 def collect(args, cases):
     environment = gpu_environment(args.gpu)
-    root = args.output.expanduser().resolve()
+    root, archive = collection_paths(args)
     if root.exists() and (not root.is_dir() or any(root.iterdir())):
         raise CollectionError(f"refusing to overwrite non-empty output: {root}")
+    if archive is not None and (archive.exists() or archive.is_symlink()):
+        raise CollectionError(f"refusing to overwrite archive: {archive}")
     probe = command_record([sys.executable, str(Path(__file__).resolve()), "--device-info"], environment=environment)
     if probe["returncode"] != 0:
         raise CollectionError(f"device probe failed: {probe}")
@@ -697,16 +708,24 @@ def collect(args, cases):
     finally:
         manifest["end"], manifest["controls_after"] = stamp(), sensors.controls()
         write_json(root / "manifest.json", manifest)
-    if args.package:
-        packaged = helper.package_bundle(root, None)
-        write_json(root.with_name(root.name + ".package.json"), packaged)
-        print(f"Archive: {packaged['archive']}\nSHA-256: {packaged['sha256']}")
-    print(f"Collection: {root}")
+    if archive is not None:
+        print(f"Packaging collection: {archive}", flush=True)
+        try:
+            packager = helper or load_att_helper()
+            packaged = packager.package_bundle(root, archive, require_att=args.att)
+        except BaseException:
+            print(f"Archive creation failed; capture retained at {root}", file=sys.stderr)
+            raise
+        print(f"Archive: {packaged['archive']}\nSHA-256: {packaged['sha256']}", flush=True)
+        shutil.rmtree(root)
+    else:
+        print(f"Collection: {root}")
 
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    result.add_argument("--output", type=Path, default=Path("mxfp-hw-" + time.strftime("%Y%m%d-%H%M%S")))
+    result.add_argument("--output", type=Path, default=Path("mxfp-hw-" + time.strftime("%Y%m%d-%H%M%S")),
+                        help="capture path; .tar.gz is appended unless already present")
     result.add_argument("--gpu", help="physical ROCr index or GPU UUID; otherwise preserve existing visibility")
     result.add_argument("--kernels", nargs="+", choices=tuple(KERNEL_NAMES), default=list(KERNEL_NAMES))
     result.add_argument("--warmup-seconds", type=float, default=10,
@@ -726,8 +745,10 @@ def parser():
     result.add_argument("--simd-select", default="0xF")
     result.add_argument("--activity", type=int, default=0, help="ATT activity setting; 0 uses profiler defaults")
     result.add_argument("--timeout", type=float, default=600, help="maximum seconds per subprocess")
-    result.add_argument("--package", action="store_true",
-                        help="validate and archive the entire collection with SHA-256")
+    result.add_argument(
+        "--package", action=argparse.BooleanOptionalAction, default=None,
+        help="produce one archive and remove the work directory (default for full collections); "
+        "--no-package keeps the directory")
     result.add_argument("--dry-run", action="store_true", help="show cases and selection without accessing a GPU")
     result.add_argument("--inspect", type=Path,
                         help="report sensor errors and timing-window coverage in an existing capture")
@@ -758,16 +779,17 @@ def main(argv=None):
                 for value in (args.warmup_seconds, args.duration_seconds, args.sample_ms, args.timeout))
                 or args.warmup_dispatches < 1 or args.target_cu < 0 or args.activity < 0):
             cli.error("durations, sampling interval and warmup count must be positive; CU/activity must be nonnegative")
-        if args.package and not args.att:
-            cli.error("--package requires ATT bundle validation")
-        if args.preflight_only and (not args.att or args.package):
+        if args.preflight_only and (not args.att or args.package is True):
             cli.error("--preflight-only requires ATT and cannot be combined with --package")
         cases = make_cases(args)
         if args.att:
             print(f"ATT selection: matching dispatch {args.warmup_dispatches + 1} (one-based), "
                   f"after {args.warmup_dispatches} warmup launches.")
         if args.dry_run:
-            print(json.dumps(dict(output=str(args.output), cases=cases), indent=2, default=str))
+            root, archive = collection_paths(args)
+            print(
+                json.dumps(dict(output=str(root), archive=str(archive) if archive else None, cases=cases), indent=2,
+                           default=str))
             return 0
         collect(args, cases)
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
