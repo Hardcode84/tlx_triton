@@ -22,6 +22,7 @@ import shutil
 import signal
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -112,15 +113,73 @@ def load_att_helper():
     return module
 
 
+def gpu_metrics_power(data):
+    """Decode socket watts from the Linux amdgpu gpu_metrics ABI."""
+    if len(data) < 4:
+        raise ValueError("truncated gpu_metrics header")
+    size, major, minor = struct.unpack_from("<HBB", data)
+    version = f"{major}.{minor}"
+    if size != len(data):
+        raise ValueError(f"gpu_metrics {version}: header size {size}, read {len(data)} bytes")
+    # kgd_pp_interface.h: v1.4-v1.8 share a header, three u16
+    # temperatures, then u16 curr_socket_power in watts (0xffff = unavailable).
+    if major == 1 and 4 <= minor <= 8:
+        if size < 12:
+            raise ValueError(f"gpu_metrics {version}: truncated socket power")
+        watts, = struct.unpack_from("<H", data, 10)
+        if watts == 0xffff:
+            raise ValueError(f"gpu_metrics {version}: socket power unavailable")
+        return float(watts), version
+    if (major, minor) != (1, 9):
+        raise ValueError(f"unsupported gpu_metrics version {version}")
+    # v1.9 uses packed attributes: u64 encoding followed by typed values.
+    # See AMDGPU_METRICS_ENC_ATTR and DECLARE_SMU_METRICS_CLASS in the driver.
+    if size < 8:
+        raise ValueError("gpu_metrics 1.9: truncated attribute count")
+    count, = struct.unpack_from("<i", data, 4)
+    offset, watts = 8, None
+    if count < 0 or count > (size - offset) // 9:
+        raise ValueError("gpu_metrics 1.9: invalid attribute count")
+    for _ in range(count):
+        if offset + 8 > size:
+            raise ValueError("gpu_metrics 1.9: truncated attribute encoding")
+        encoding, = struct.unpack_from("<Q", data, offset)
+        unit, kind = (encoding >> 24) & 0xff, (encoding >> 20) & 0xf
+        attr_id, instances = (encoding >> 10) & 0x3ff, encoding & 0x3ff
+        offset += 8
+        if kind >= 8 or instances == 0:
+            raise ValueError("gpu_metrics 1.9: invalid attribute type or instance count")
+        fmt = "BbHhIiQq"[kind]
+        width = struct.calcsize("<" + fmt)
+        end = offset + width * instances
+        if end > size:
+            raise ValueError("gpu_metrics 1.9: truncated attribute value")
+        if attr_id == 3:  # AMDGPU_METRICS_ATTR_ID_CURR_SOCKET_POWER
+            if unit != 3 or instances != 1 or watts is not None:
+                raise ValueError("gpu_metrics 1.9: invalid socket power attribute")
+            value, = struct.unpack_from("<" + fmt, data, offset)
+            if value < 0 or data[offset:end] == b"\xff" * width:
+                raise ValueError("gpu_metrics 1.9: socket power unavailable")
+            watts = float(value)
+        offset = end
+    if offset != size or watts is None:
+        raise ValueError("gpu_metrics 1.9: invalid table size or missing socket power")
+    return watts, version
+
+
 class Sensors:
-    """Read the physical device selected by HIP, using documented hwmon units."""
+    """Read the physical device selected by HIP, using documented sensor units."""
 
     def __init__(self, bdf, pci_root=Path("/sys/bus/pci/devices")):
         if not re.fullmatch(r"[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", bdf):
             raise CollectionError(f"invalid HIP PCI address: {bdf!r}")
         self.device = pci_root / bdf
         self.fields = {}
-        self.primary_power = None
+        metrics = self.device / "gpu_metrics"
+        if metrics.exists():
+            # Prefer socket power from the device's metrics table, in watts.
+            self.fields["gpu_metrics_curr_socket_power_w"] = dict(path=str(metrics), divisor=1, unit="w",
+                                                                  label="curr_socket_power", format="gpu_metrics")
         for hwmon in sorted(self.device.glob("hwmon/hwmon*")):
             if (hwmon / "name").read_text().strip() != "amdgpu":
                 continue
@@ -140,34 +199,38 @@ class Sensors:
                 label_path = hwmon / (label + "_label")
                 self.fields[field] = dict(path=str(path), divisor=divisor, unit=unit,
                                           label=label_path.read_text().strip() if label_path.exists() else label)
-                if path.name == "power1_input" or (path.name == "power1_average" and self.primary_power is None):
-                    self.primary_power = field
         for name in ("gpu_busy_percent", "mem_busy_percent"):
             path = self.device / name
             if path.exists():
                 self.fields[name] = dict(path=str(path), divisor=1, unit="percent", label=name)
-        if self.primary_power is None:
-            raise CollectionError(f"no hwmon power1_input or power1_average for {bdf}; device power is required")
+        self.power_candidates = [name for name in self.fields if name == "gpu_metrics_curr_socket_power_w"] + sorted(
+            (name for name in self.fields if "_power1_input_" in name or "_power1_average_" in name),
+            key=lambda name: "_input_" not in name)
+        if not self.power_candidates:
+            raise CollectionError(f"no gpu_metrics or hwmon power sensor for {bdf}; device power is required")
         sample = self.read()
-        candidates = sorted((name for name in self.fields if "_power1_input_" in name or "_power1_average_" in name),
-                            key=lambda name: "_input_" not in name)
-        self.primary_power = next((name for name in candidates if sample[name] is not None), None)
+        self.primary_power = sample["power_source"]
         if self.primary_power is None:
             raise CollectionError(f"cannot read device power for {bdf}: {sample['errors']}")
 
     def read(self):
         sample = stamp()
         sample["errors"] = {}
+        sample["gpu_metrics_version"] = None
         for field, source in self.fields.items():
             try:
-                value = float(Path(source["path"]).read_text().strip()) / source["divisor"]
+                if source.get("format") == "gpu_metrics":
+                    value, sample["gpu_metrics_version"] = gpu_metrics_power(Path(source["path"]).read_bytes())
+                else:
+                    value = float(Path(source["path"]).read_text().strip()) / source["divisor"]
                 if not math.isfinite(value) or value < 0:
                     raise ValueError(f"invalid sensor value {value}")
                 sample[field] = value
             except (OSError, ValueError) as error:
                 sample[field] = None
                 sample["errors"][field] = str(error)
-        sample["power_w"] = sample[self.primary_power]
+        sample["power_source"] = next((name for name in self.power_candidates if sample[name] is not None), None)
+        sample["power_w"] = sample[sample["power_source"]] if sample["power_source"] else None
         try:
             sample["perf_level"] = (self.device / "power_dpm_force_performance_level").read_text().strip()
         except OSError as error:
@@ -200,8 +263,8 @@ class Sampler:
             with (self.output / "telemetry.jsonl").open("x") as raw, (self.output / "telemetry.csv").open(
                     "x", newline="") as csv_file:
                 fields = [
-                    "unix_ns", "monotonic_ns", "monotonic_raw_ns", "read_end_monotonic_ns", "power_w",
-                    *self.sensors.fields, "perf_level", "errors"
+                    "unix_ns", "monotonic_ns", "monotonic_raw_ns", "read_end_monotonic_ns", "power_w", "power_source",
+                    "gpu_metrics_version", *self.sensors.fields, "perf_level", "errors"
                 ]
                 writer = csv.DictWriter(csv_file, fieldnames=fields)
                 writer.writeheader()
@@ -256,6 +319,10 @@ def run_recorded(command, directory, environment, sensors, interval, timeout):
         raise CollectionError(f"workload exited {result['returncode']}; see {directory / 'stdout.log'}")
 
 
+def power_sources(samples):
+    return dict(Counter(s.get("power_source") or "unrecorded" for s in samples if s.get("power_w") is not None))
+
+
 def telemetry_diagnostics(directory, workload=None, samples=None):
     if workload is None:
         workload = json.loads((directory / "workload.json").read_text())
@@ -276,13 +343,17 @@ def telemetry_diagnostics(directory, workload=None, samples=None):
                  duration_seconds=(end - begin) / 1e9, complete_read_batches=len(inside),
                  valid_power_samples=sum(s.get("power_w") is not None
                                          for s in inside), overlapping_read_batches=len(overlap),
-                 overlapping_power_samples=sum(s.get("power_w") is not None for s in overlap)))
-    return dict(directory=str(directory), sample_count=len(samples),
-                samples_with_power=sum(s.get("power_w") is not None for s in samples), first_read_monotonic_ns=min(
-                    (s["monotonic_ns"] for s in samples), default=None), last_read_monotonic_ns=max(
-                        (s["read_end_monotonic_ns"] for s in samples), default=None),
-                read_duration_ms=dict(median=statistics.median(durations), max=max(durations)) if durations else None,
-                sensor_errors=dict(errors), phases=phases)
+                 overlapping_power_samples=sum(s.get("power_w") is not None
+                                               for s in overlap), power_sources=power_sources(inside)))
+    return dict(
+        directory=str(directory), sample_count=len(samples), power_sources=power_sources(samples),
+        gpu_metrics_versions=dict(
+            Counter(s["gpu_metrics_version"] for s in samples if s.get("gpu_metrics_version") is not None)),
+        samples_with_power=sum(s.get("power_w") is not None for s in samples), first_read_monotonic_ns=min(
+            (s["monotonic_ns"] for s in samples), default=None), last_read_monotonic_ns=max(
+                (s["read_end_monotonic_ns"] for s in samples), default=None),
+        read_duration_ms=dict(median=statistics.median(durations), max=max(durations)) if durations else None,
+        sensor_errors=dict(errors), phases=phases)
 
 
 def phase_summary(directory, sensors):
@@ -295,7 +366,8 @@ def phase_summary(directory, sensors):
     for phase in workload["phases"]:
         begin, end = phase["start"]["monotonic_ns"], phase["end"]["monotonic_ns"]
         selected = [s for s in samples if begin <= s["monotonic_ns"] and s["read_end_monotonic_ns"] <= end]
-        summary = dict(name=phase["name"], seconds=(end - begin) / 1e9, samples=len(selected), metrics={})
+        summary = dict(name=phase["name"], seconds=(end - begin) / 1e9, samples=len(selected),
+                       power_sources=power_sources(selected), metrics={})
         for field in ("power_w", *sensors.fields):
             values = [s[field] for s in selected if s.get(field) is not None]
             summary["metrics"][field] = (dict(count=len(values), mean=statistics.mean(values), min=min(values),
@@ -466,7 +538,8 @@ def write_summary(root, cases):
             dict(kernel=case["kernel"], variant=case["variant"], M=m, N=n, K=k, median_ms=workload["median_ms"],
                  median_tflops=workload["median_tflops"], benchmark_batches=len(workload["benchmark_samples"]),
                  measurement_seconds=measured["seconds"], power_sample_mean_w=power["mean"], power_min_w=power["min"],
-                 power_max_w=power["max"], power_samples=power["count"], run_dir=case["root"]))
+                 power_max_w=power["max"], power_samples=power["count"],
+                 power_sources=json.dumps(measured["power_sources"], sort_keys=True), run_dir=case["root"]))
     if rows:
         with (root / "summary.csv").open("w", newline="") as output:
             writer = csv.DictWriter(output, fieldnames=list(rows[0]))
@@ -499,7 +572,8 @@ def collect(args, cases):
     manifest = dict(
         status="running", start=stamp(), hostname=socket.gethostname(), device=device, capability=capability,
         collector_command=sys.argv, parameters=vars(args), sensors=sensors.fields,
-        primary_power_sensor=sensors.primary_power, controls_before=sensors.controls(), environment={
+        primary_power_sensor=sensors.primary_power, power_sensor_priority=sensors.power_candidates,
+        controls_before=sensors.controls(), environment={
             key: environment[key]
             for key in (*VISIBILITY_VARS, "HSA_OVERRIDE_GFX_VERSION", "LD_LIBRARY_PATH", "LD_PRELOAD", "LLVM_SYSPATH",
                         "TRITON_AMDGCN_ASSEMBLER_PATH")

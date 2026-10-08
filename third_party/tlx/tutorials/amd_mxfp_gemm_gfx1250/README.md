@@ -110,6 +110,13 @@ are read without changing device settings. Existing GPU visibility is
 preserved; `--gpu INDEX_OR_UUID` explicitly selects a physical ROCr device.
 The sampler uses the PCI address reported by HIP to select its sensors.
 
+Power sampling prefers `gpu_metrics` socket power in watts, supporting table
+versions 1.4 through 1.9. If that reading is unavailable, each sample tries hwmon
+`power1_input`, then `power1_average`. Unavailable readings remain missing.
+Every sample records `power_source` and `gpu_metrics_version`; phase summaries
+and `summary.csv` include source counts so a fallback to averaged power is
+visible. Raw sensor errors are retained even when another source succeeds.
+
 Preview the cases without accessing a GPU, select one shape, or collect
 timing and power when a decoder is unavailable:
 
@@ -138,8 +145,8 @@ python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
   --inspect /tmp/mxfp-hardware-01
 ```
 
-The report includes total and valid readings, sensor errors, read-batch
-durations, and counts both inside and overlapping each workload phase.
+The report includes total and valid readings, power sources, sensor errors,
+read-batch durations, and counts both inside and overlapping each workload phase.
 Collection also saves `telemetry_diagnostics.json` and
 `telemetry_summary.json` before reporting insufficient power samples.
 
