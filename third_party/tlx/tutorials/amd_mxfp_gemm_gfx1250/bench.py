@@ -17,6 +17,9 @@ prefetches the next tile and keeps its first operands in registers through
 FP32 output stores. It selects MX8xMX8 with three BK128 buffers by default.
 Add --num-buffers 4 for another stage of TDM lookahead, using two 64x64 output
 slots instead of 64x128: sixteen FP32 output transfers per tile instead of eight.
+Add --output-tail-reuse to that four-buffer streamed configuration to restore
+two 64x128 panels and eight transfers. One panel reuses the first next-tile A
+stage after its operands reach registers; the other has dedicated storage.
 Use --output-tail-reuse to keep two next-tile input stages prefetched while
 the retired third A/B stage holds FP32 output. This selects MX8xMX8 with three
 BK128 buffers and removes the separate output allocation.
@@ -53,6 +56,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --operand-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --streamed-operands
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --streamed-operands --num-buffers 4
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --streamed-operands --num-buffers 4 --output-tail-reuse
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --operand-pipeline -BK 256
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --register-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 128 --num-buffers 4 --no-output-staging
@@ -242,8 +246,10 @@ def parse_benchmark_args(argv=None):
                         help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: disabled)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
                         help="stage persistent FP32 output for TDM stores; BK256 reuses input storage")
-    parser.add_argument("--output-tail-reuse", action="store_true",
-                        help="reuse the third A/B stage for output with persistent E4M3 BK128; selects MX8xMX8")
+    parser.add_argument(
+        "--output-tail-reuse", action="store_true",
+        help="reuse input LDS for output with E4M3 BK128: three persistent buffers or "
+        "four streamed buffers; selects MX8xMX8")
     parser.add_argument("--first-use-prefetch", action="store_true",
                         help="test first-use prefetch with persistent E4M3 BK128 and three buffers; selects MX8xMX8")
     parser.add_argument(
@@ -327,15 +333,17 @@ def parse_benchmark_args(argv=None):
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
-        if run_args.streamed_operands and not (
-                run_args.persistent and run_args.output_staging and run_args.cross_tile_prefetch
-                and run_args.tdm_fusion == "partial" and run_args.num_warps == 4 and run_args.num_buffers in (3, 4) and
-            (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
-                and run_args.dtype_a == dtype_b == "float8_e4m3" and not run_args.output_tail_reuse
-                and not run_args.first_use_prefetch and not run_args.tdm_split):
+        if run_args.streamed_operands and not (run_args.persistent and run_args.output_staging
+                                               and run_args.cross_tile_prefetch and run_args.tdm_fusion == "partial"
+                                               and run_args.num_warps == 4 and run_args.num_buffers in (3, 4) and
+                                               (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
+                                               and run_args.dtype_a == dtype_b == "float8_e4m3" and
+                                               (not run_args.output_tail_reuse or run_args.num_buffers == 4)
+                                               and not run_args.first_use_prefetch and not run_args.tdm_split):
             parser.error(
                 "--streamed-operands requires persistent E4M3 x E4M3, 256x256x128 tiles, three or four buffers, "
-                "four warps, partial unsplit TDM, cross-tile prefetch, and dedicated output staging")
+                "four warps, partial unsplit TDM, cross-tile prefetch, output staging, "
+                "and four buffers for output tail reuse")
         if run_args.first_use_prefetch and not (
                 run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial"
                 and run_args.num_warps == 4 and run_args.num_buffers == 3 and
@@ -346,11 +354,12 @@ def parse_benchmark_args(argv=None):
                          "four warps, partial TDM fusion, and dedicated output staging")
         if run_args.output_tail_reuse and not (
                 run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial"
-                and run_args.num_warps == 4 and run_args.num_buffers == 3 and
+                and run_args.num_warps == 4 and run_args.num_buffers == (4 if run_args.streamed_operands else 3) and
             (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
                 and run_args.dtype_a == dtype_b == "float8_e4m3" and not run_args.register_pipeline
                 and not run_args.warp_pipeline and not run_args.operand_pipeline):
-            parser.error("--output-tail-reuse requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
+            parser.error("--output-tail-reuse requires persistent E4M3 x E4M3, 256x256x128 tiles, "
+                         "three buffers (four with --streamed-operands), "
                          "four warps, partial TDM fusion, and output staging")
         if run_args.l2_prefetch_distance < -1:
             parser.error("--l2-prefetch-distance must be at least -1")
