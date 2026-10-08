@@ -189,8 +189,16 @@ LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
   auto cgaLayout = ttg::getCGALayout(resultType.getEncoding());
   auto shapePerCTA =
       ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), resultType.getShape());
-  auto warpsPerTile =
-      planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  SmallVector<unsigned> warpsPerTile;
+  if (auto wmma = dyn_cast<ttg::AMDWmmaEncodingAttr>(
+          tt::unwrapTlxWrappers(resultType.getEncoding()))) {
+    // A pinned WMMA already selected its wave distribution. Replanning it
+    // as a blocked dot can reject a valid tile, especially for chained dots.
+    warpsPerTile = ttg::getWarpsPerCTA(wmma, resultType.getShape());
+  } else {
+    warpsPerTile =
+        planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  }
   SmallVector<unsigned> instrPerDim = {mDim, nDim};
   for (auto [dim, tiles] : llvm::enumerate(requested)) {
     if (tiles <= 0)
