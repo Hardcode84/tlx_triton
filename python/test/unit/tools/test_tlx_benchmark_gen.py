@@ -499,6 +499,144 @@ def test_mxfp_trace_power_falls_back_to_readable_average(mxfp_collector, mxfp_se
         mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
 
 
+@pytest.fixture
+def mxfp_gpu_metrics_table():
+    import struct
+
+    def make(watts=2500, revision=8, kind=2, unit=3, attr_id=3, instances=1):
+        if revision != 9:
+            return struct.pack("<HBB4H", 12, 1, revision, 50, 60, 70, watts)
+        # The v1.9 wire format packs each encoding immediately before its values.
+        # Place array attributes on both sides to exercise variable offsets.
+        before = struct.pack("<Q3H", (2 << 24) | (2 << 20) | 3, 50, 60, 70)
+        power = struct.pack("<Q", (unit << 24) | (kind << 20) | (attr_id << 10) | instances)
+        power += struct.pack("<" + "BbHhIiQq"[kind] * instances, *([watts] * instances))
+        after = struct.pack("<Q2Q", (6 << 20) | (7 << 10) | 2, 123456789, 987654321)
+        body = before + power + after
+        return struct.pack("<HBBi", 8 + len(body), 1, revision, 3) + body
+
+    return make
+
+
+@pytest.mark.parametrize("revision", [4, 5, 6, 7, 8, 9])
+def test_mxfp_trace_gpu_metrics_reads_socket_power(mxfp_collector, mxfp_gpu_metrics_table, revision):
+    assert mxfp_collector.gpu_metrics_power(mxfp_gpu_metrics_table(revision=revision)) == (2500, f"1.{revision}")
+
+
+@pytest.mark.parametrize("kind", [3, 4, 5, 6, 7])
+def test_mxfp_trace_gpu_metrics_dynamic_power_types(mxfp_collector, mxfp_gpu_metrics_table, kind):
+    assert mxfp_collector.gpu_metrics_power(mxfp_gpu_metrics_table(revision=9, kind=kind)) == (2500, "1.9")
+
+
+@pytest.mark.parametrize("condition", [
+    "header",
+    "size",
+    "version",
+    "unavailable_fixed",
+    "unavailable_dynamic",
+    "unit",
+    "instances",
+    "missing_power",
+    "negative",
+    "count",
+    "truncated_attribute",
+    "trailing_bytes",
+])
+def test_mxfp_trace_gpu_metrics_rejects_invalid_tables(mxfp_collector, mxfp_gpu_metrics_table, condition):
+    import struct
+
+    fixed = mxfp_gpu_metrics_table()
+    dynamic = mxfp_gpu_metrics_table(revision=9)
+    tables = {
+        "header": fixed[:3],
+        "size": fixed[:-1],
+        "version": mxfp_gpu_metrics_table(revision=10),
+        "unavailable_fixed": mxfp_gpu_metrics_table(watts=0xffff),
+        "unavailable_dynamic": mxfp_gpu_metrics_table(watts=0xffff, revision=9),
+        "unit": mxfp_gpu_metrics_table(revision=9, unit=2),
+        "instances": mxfp_gpu_metrics_table(revision=9, instances=2),
+        "missing_power": mxfp_gpu_metrics_table(revision=9, attr_id=4),
+        "negative": mxfp_gpu_metrics_table(revision=9, kind=3, watts=-2),
+        "count": dynamic[:4] + struct.pack("<i", 1000) + dynamic[8:],
+        "truncated_attribute": struct.pack("<H",
+                                           len(dynamic) - 1) + dynamic[2:-1],
+        "trailing_bytes": struct.pack("<H",
+                                      len(dynamic) + 1) + dynamic[2:] + b"\0",
+    }
+    with pytest.raises(ValueError):
+        mxfp_collector.gpu_metrics_power(tables[condition])
+
+
+def test_mxfp_trace_gpu_metrics_survives_hwmon_failure_under_load(mxfp_collector, mxfp_sensors, mxfp_gpu_metrics_table,
+                                                                  monkeypatch, tmp_path):
+    from pathlib import Path
+
+    metrics = mxfp_sensors.device / "gpu_metrics"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=400))
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    original_read = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.name == "power1_input":
+            raise OSError(0, "Error")
+        return original_read(path, *args, **kwargs)
+
+    # Idle probing succeeded; only the hwmon power path fails during measurement.
+    monkeypatch.setattr(Path, "read_text", read)
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=2500))
+    samples = [sensors.read(), sensors.read()]
+    for sample in samples:
+        assert sample["power_w"] == 2500
+        assert sample["power_source"] == "gpu_metrics_curr_socket_power_w"
+        assert sample["gpu_metrics_version"] == "1.8"
+        assert sample["errors"]["hwmon42_power1_input_w"] == "[Errno 0] Error"
+    mxfp_collector.write_json(
+        tmp_path / "workload.json",
+        dict(phases=[
+            dict(name="measure", start=dict(monotonic_ns=samples[0]["monotonic_ns"]), end=dict(
+                monotonic_ns=samples[-1]["read_end_monotonic_ns"]))
+        ]))
+    (tmp_path / "telemetry.jsonl").write_text("".join(json.dumps(sample) + "\n" for sample in samples))
+    measured, = mxfp_collector.phase_summary(tmp_path, sensors)
+    assert measured["metrics"]["power_w"] == dict(count=2, mean=2500, min=2500, max=2500)
+    assert measured["power_sources"] == {"gpu_metrics_curr_socket_power_w": 2}
+    diagnostics = json.loads((tmp_path / "telemetry_diagnostics.json").read_text())
+    assert diagnostics["sensor_errors"] == {"hwmon42_power1_input_w: [Errno 0] Error": 2}
+    assert diagnostics["gpu_metrics_versions"] == {"1.8": 2}
+
+
+def test_mxfp_trace_power_fallback_tracks_source_without_stale_samples(mxfp_collector, mxfp_sensors,
+                                                                       mxfp_gpu_metrics_table):
+    metrics = mxfp_sensors.device / "gpu_metrics"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=410))
+    hwmon = mxfp_sensors.device / "hwmon/hwmon42"
+    (hwmon / "power1_average").write_text("375000000\n")
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    assert sensors.read()["power_source"] == "gpu_metrics_curr_socket_power_w"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=0xffff))
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("hwmon42_power1_input_w", 400)
+    (hwmon / "power1_input").write_text("N/A\n")
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("hwmon42_power1_average_w", 375)
+    (hwmon / "power1_average").write_text("N/A\n")
+    sample = sensors.read()
+    assert sample["power_source"] is None and sample["power_w"] is None
+    assert sample["hwmon42_power1_cap_w"] == 750
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=2600))
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("gpu_metrics_curr_socket_power_w", 2600)
+
+
+def test_mxfp_trace_gpu_metrics_power_without_hwmon(mxfp_collector, mxfp_gpu_metrics_table, tmp_path):
+    device = tmp_path / "0000:66:00.0"
+    device.mkdir()
+    (device / "gpu_metrics").write_bytes(mxfp_gpu_metrics_table(revision=9))
+    sensors = mxfp_collector.Sensors(device.name, pci_root=tmp_path)
+    assert sensors.primary_power == "gpu_metrics_curr_socket_power_w"
+    assert sensors.read()["power_w"] == 2500
+
+
 def test_mxfp_trace_power_summary_excludes_setup_and_boundary_samples(mxfp_collector, mxfp_sensors, tmp_path):
     mxfp_collector.write_json(
         tmp_path / "workload.json",
@@ -687,32 +825,74 @@ def test_mxfp_trace_timeout_reaps_child(mxfp_collector, mxfp_sensors, tmp_path):
     assert "end" in json.loads((tmp_path / "process.json").read_text())
 
 
-def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_collector, mxfp_sensors, monkeypatch,
-                                                                        tmp_path):
+@pytest.mark.parametrize("power_source", ["hwmon", "metrics_8", "metrics_9", "average"])
+def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_collector, mxfp_sensors,
+                                                                        mxfp_gpu_metrics_table, monkeypatch, tmp_path,
+                                                                        power_source):
     import hashlib
     import sys
     import tarfile
     import textwrap
+    from pathlib import Path
 
-    # Exercise the real subprocess, telemetry, validation, and packaging paths
-    # with an external CPU workload and a profiler producing a fixture bundle.
+    failed_input = tmp_path / "input failed during warmup"
+    hwmon = mxfp_sensors.device / "hwmon/hwmon42"
+    if power_source.startswith("metrics_"):
+        (mxfp_sensors.device / "gpu_metrics").write_bytes(
+            mxfp_gpu_metrics_table(watts=425, revision=int(power_source[-1])))
+        expected_source, expected_power = "gpu_metrics_curr_socket_power_w", 425
+    elif power_source == "average":
+        (hwmon / "power1_average").write_text("375000000\n")
+        expected_source, expected_power = "hwmon42_power1_average_w", 375
+    else:
+        expected_source, expected_power = "hwmon42_power1_input_w", 400
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if power_source != "hwmon" and path == hwmon / "power1_input" and failed_input.exists():
+            raise OSError(0, "Error")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+
+    # Run the collector's actual phase/warmup logic in external CPU processes.
+    # GPU launches, benchmark timing, and decoded profiler output are fixtures.
     worker = tmp_path / "fixture worker.py"
     worker.write_text(
         textwrap.dedent('''\
-        import hashlib, json, sys, time
+        import importlib.util, json, sys, time
         from pathlib import Path
+        from types import SimpleNamespace
         spec_path = Path(sys.argv[sys.argv.index('--profile_workload') + 1])
         spec = json.loads(spec_path.read_text())
         root = spec_path.parent
-        start = time.monotonic_ns()
-        time.sleep(0.05)
-        end = time.monotonic_ns()
-        phase = dict(name='measure' if spec['mode'] == 'power' else 'selected_dispatch',
-                     start=dict(monotonic_ns=start), end=dict(monotonic_ns=end))
-        report = dict(phases=[phase], benchmark_samples=[dict(ms=0.2)], median_ms=0.2,
-                      median_tflops=5000, code_sha256=dict(amdgcn=hashlib.sha256(b'assembly').hexdigest()))
-        (root / 'workload.json').write_text(json.dumps(report))
-        (root / 'kernel.amdgcn').write_text('assembly')
+        module_spec = importlib.util.spec_from_file_location('collector', sys.argv[1])
+        collector = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(collector)
+        collector.device_info = lambda: dict(arch='gfx1250', bdf=spec['device_bdf'])
+        sys.modules['torch'] = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None))
+        driver = SimpleNamespace(get_empty_cache_for_benchmark=lambda: None, clear_cache=lambda _: None)
+        kernel_name = sys.argv[2]
+        launch_count = 0
+
+        def launch():
+            global launch_count
+            launch_count += 1
+            return SimpleNamespace(name=kernel_name, metadata=SimpleNamespace(_asdict=lambda: {}),
+                                   asm=dict(amdgcn='fixture assembly ' + kernel_name, hsaco=b'fixture code'))
+
+        def do_bench(fn, warmup, rep):
+            assert warmup == 30 and rep == spec['benchmark_ms'] == 256
+            Path(sys.argv[3]).touch()
+            fn()
+            time.sleep(0.025)
+            return 0.2
+
+        sys.modules['triton'] = SimpleNamespace(runtime=SimpleNamespace(driver=SimpleNamespace(active=driver)),
+                                               testing=SimpleNamespace(do_bench=do_bench))
+        collector.profile_workload(launch, spec_path)
+        (root / 'launch_count.json').write_text(json.dumps(launch_count))
     '''))
     profiler = tmp_path / "fixture profiler"
     profiler.write_text(
@@ -726,13 +906,30 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         subprocess.run(sys.argv[sys.argv.index('--') + 1:], check=True)
         root = Path(sys.argv[sys.argv.index('-d') + 1])
         kernel = sys.argv[sys.argv.index('--kernel-include-regex') + 1]
-        with sqlite3.connect(root / 'fixture_results.db') as db:
-            db.execute('CREATE TABLE fixture (value INTEGER)')
-        (root / 'fixture_shader_engine_0_9.att').write_bytes(b'fixture trace')
+        selected, = json.loads(sys.argv[sys.argv.index('--kernel-iteration-range') + 1])
+        spec_path = Path(sys.argv[sys.argv.index('--profile_workload') + 1])
+        count = json.loads((spec_path.parent / 'launch_count.json').read_text())
+        report = json.loads((spec_path.parent / 'workload.json').read_text())
+        assert count == report['selected_matching_dispatch'] == selected == 1025
+        dispatch_id = 2 * selected
+        # Match rocprofv3's default: the database alone, without kernel CSVs.
+        formats = ['rocpd']
+        if '--output-format' in sys.argv:
+            formats = []
+            for value in sys.argv[sys.argv.index('--output-format') + 1:]:
+                if value.startswith('-'):
+                    break
+                formats.append(value)
+        if 'rocpd' in formats:
+            with sqlite3.connect(root / 'fixture_results.db') as db:
+                db.execute('CREATE TABLE fixture (value INTEGER)')
+        (root / f'fixture_shader_engine_0_{dispatch_id}.att').write_bytes(b'fixture trace')
         (root / 'fixture_gfx1250_code_object_id_1.out').write_bytes(b'fixture code')
-        (root / 'stats_ui_output_agent_0_dispatch_9.csv').write_text('field\\nvalue\\n')
-        (root / 'fixture_kernel_trace.csv').write_text('Dispatch_Id,Kernel_Name\\n9,' + kernel + '\\n')
-        ui = root / 'ui_output_agent_0_dispatch_9'
+        (root / f'stats_ui_output_agent_0_dispatch_{dispatch_id}.csv').write_text('field\\nvalue\\n')
+        rows = ''.join(f'{2*i+1},cache_clear\\n{2*i+2},{kernel}\\n' for i in range(selected))
+        if 'csv' in formats:
+            (root / 'fixture_kernel_trace.csv').write_text('Dispatch_Id,Kernel_Name\\n' + rows)
+        ui = root / f'ui_output_agent_0_dispatch_{dispatch_id}'
         ui.mkdir()
         for name in ('code.json', 'filenames.json', 'occupancy.json', 'wstates0.json', 'se0_sm0_sl0_wv0.json'):
             (ui / name).write_text(json.dumps({'fixture': True}))
@@ -746,11 +943,17 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         "--output",
         str(root), "--profiler",
         str(profiler), "--decoder-dir",
-        str(decoder), "--sample-ms", "2", "--package", "--kernels", "persistent"
+        str(decoder), "--sample-ms", "2", "--package", "--warmup-seconds", "0.075", "--duration-seconds", "0.075"
     ])
-    cases = mxfp_collector.make_cases(args)[:1]
-    cases[0]["application"] = [sys.executable, str(worker)]
-    monkeypatch.setattr(mxfp_collector, "Sensors", lambda bdf: mxfp_sensors)
+    cases = mxfp_collector.make_cases(args)
+    assert len(cases) == 4
+    for case in cases:
+        case["application"] = [
+            sys.executable,
+            str(worker), mxfp_collector.__file__, mxfp_collector.KERNEL_NAMES[case["kernel"]],
+            str(failed_input)
+        ]
+    monkeypatch.setattr(mxfp_collector, "Sensors", lambda bdf: sensors)
 
     def record(command, **kwargs):
         output = dict(bdf="0000:66:00.0", arch="gfx1250") if "--device-info" in command else {}
@@ -760,15 +963,29 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
     mxfp_collector.collect(args, cases)
     manifest = json.loads((root / "manifest.json").read_text())
     assert manifest["status"] == "complete"
-    case = manifest["cases"][0]
-    assert case["runs"]["power"]["telemetry"][0]["metrics"]["power_w"]["mean"] == 400
-    assert case["runs"]["att"]["validation"]["valid"]
-    assert case["runs"]["att"]["dispatch"]["kernel_trace_row"]["dispatch_id"] == "9"
+    assert manifest["power_sensor_priority"] == sensors.power_candidates
+    assert len(manifest["cases"]) == 4
+    for case in manifest["cases"]:
+        measured = next(p for p in case["runs"]["power"]["telemetry"] if p["name"] == "measure")
+        assert measured["metrics"]["power_w"]["mean"] == expected_power
+        assert measured["power_sources"] == {expected_source: measured["samples"]}
+        assert measured["samples"] >= 2
+        workload = case["runs"]["power"]["workload"]
+        assert [p["name"] for p in workload["phases"]] == ["compile", "warmup", "measure"]
+        assert len(workload["benchmark_samples"]) >= 2
+        assert workload["median_ms"] == 0.2
+        assert case["runs"]["att"]["validation"]["valid"]
+        assert case["runs"]["att"]["dispatch"]["kernel_trace_row"]["dispatch_id"] == "2050"
+        assert case["runs"]["att"]["dispatch"]["matching_dispatch"] == 1025
+        if power_source != "hwmon":
+            diagnostics = json.loads((Path(case["root"]) / "power/telemetry_diagnostics.json").read_text())
+            assert diagnostics["sensor_errors"]["hwmon42_power1_input_w: [Errno 0] Error"] > 0
     assert (root / "summary.csv").is_file()
+    assert expected_source in (root / "summary.csv").read_text()
     archive = root.with_name(root.name + ".tar.gz")
     packaged = json.loads(root.with_name(root.name + ".package.json").read_text())
     assert packaged["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     with tarfile.open(archive) as bundle:
         names = bundle.getnames()
-    assert any(name.endswith("/power/telemetry.csv") for name in names)
-    assert any(name.endswith("/att/trace/fixture_shader_engine_0_9.att") for name in names)
+    assert sum(name.endswith("/power/telemetry.csv") for name in names) == 4
+    assert sum(name.endswith("/att/trace/fixture_shader_engine_0_2050.att") for name in names) == 4

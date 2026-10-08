@@ -241,6 +241,11 @@ def _collect_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any
         "--att-library-path",
         capability["decoder_directory"],
         "--kernel-trace",
+        # Keep both dispatch verification and the results database independent
+        # of the profiler version's default output format.
+        "--output-format",
+        "csv",
+        "rocpd",
     ]
     if args.activity > 0:
         command.extend(("--att-activity", str(args.activity)))
