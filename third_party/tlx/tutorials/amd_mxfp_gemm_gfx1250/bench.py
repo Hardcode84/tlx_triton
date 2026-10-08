@@ -195,7 +195,7 @@ def _command(args, case, dtype_b):
     return command
 
 
-def main():
+def parse_benchmark_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", action="append", type=_parse_case, help="repeatable M,N,K or MxNxK override")
     parser.add_argument("-M", type=int)
@@ -266,7 +266,7 @@ def main():
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if sum((args.warp_pipeline, args.register_pipeline, args.operand_pipeline, args.streamed_operands)) > 1:
         parser.error(
             "select only one of --warp-pipeline, --register-pipeline, --operand-pipeline, and --streamed-operands")
@@ -407,6 +407,11 @@ def main():
                     or k // run_args.block_k < run_args.num_buffers):
                 parser.error("cases must contain full M/N/K tiles and at least --num-buffers K tiles")
 
+    return args, cases, variants
+
+
+def main():
+    args, cases, variants = parse_benchmark_args()
     results = []
     runs = [(case, variant, dtype_b, run_args) for case in cases for variant, dtype_b, run_args in variants]
     for index, (case, variant, dtype_b, run_args) in enumerate(runs, 1):

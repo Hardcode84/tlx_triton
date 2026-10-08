@@ -23,6 +23,8 @@ The sweep in ``bench.py`` benchmarks MXFP8 x MXFP8 and MXFP8 x MXFP4 at
 8192x8192x8192 and 8192x8192x4096 by default, using persistent 256x256x128
 tiles, three input buffers, output staging, and partial TDM fusion.
 """
+from collections.abc import Callable
+
 import torch
 
 import triton
@@ -2369,7 +2371,7 @@ def mxgemm_tdm_pipelined(
     TDM_FUSION: str = "none",
     TDM_SPLIT: bool = False,
     GROUP_SIZE_M: int = 8,
-    BENCHMARK: str | None = None,
+    BENCHMARK: str | Callable | None = None,
     BENCHMARK_NUM_ITERS: int = 32,
     PERSISTENT: bool = False,
     NUM_PROGRAMS: int | None = None,
@@ -2391,6 +2393,10 @@ def mxgemm_tdm_pipelined(
     STREAMED_OPERANDS: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
+
+    ``BENCHMARK`` also accepts a callback receiving the allocation-free launch
+    function. The hardware trace collector uses it for controlled warmup and
+    dispatch selection while retaining this API's input and launch validation.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -2631,7 +2637,9 @@ def mxgemm_tdm_pipelined(
             waves_per_eu=1,
         )
 
-    if BENCHMARK == "graph":
+    if callable(BENCHMARK):
+        BENCHMARK(run_kernel)
+    elif BENCHMARK == "graph":
         ms = triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)
         print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
     elif BENCHMARK == "eager":
@@ -2830,6 +2838,7 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark_num_iters", type=int, default=32,
                         help="timing repetition budget in milliseconds (not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--profile_workload", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.sched_mode_2 and not args.persistent:
         parser.error("--sched_mode_2 requires --persistent")
@@ -2859,6 +2868,10 @@ if __name__ == "__main__":
     b_scale_d = b_scale_input.cuda()
 
     benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
+    if args.profile_workload:
+        from functools import partial
+        from collect_traces import profile_workload
+        benchmark = partial(profile_workload, spec_path=args.profile_workload)
     mxgemm_tdm_pipelined(
         a_d,
         b_d,
