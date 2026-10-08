@@ -110,6 +110,20 @@ are read without changing device settings. Existing GPU visibility is
 preserved; `--gpu INDEX_OR_UUID` explicitly selects a physical ROCr device.
 The sampler uses the PCI address reported by HIP to select its sensors.
 
+Before benchmarking, collection checks profiler initialization in the same
+Python environment as the workload and verifies that HIP and ROCr still load
+from the same paths. Profiler discovery prefers the installation containing
+the workload's HIP library. Explicit `--profiler` and `--decoder-dir` choices
+must be usable; they do not silently fall back to another installation.
+The `preflight/` directory retains the initialization log, loaded library
+paths, and dynamic-loader diagnostics, including when initialization aborts.
+To check this setup without running the benchmarks:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --preflight-only --output /tmp/mxfp-profiler-check
+```
+
 Power sampling prefers `gpu_metrics` socket power in watts, supporting table
 versions 1.4 through 1.9. If that reading is unavailable, each sample tries hwmon
 `power1_input`, then `power1_average`. Unavailable readings remain missing.

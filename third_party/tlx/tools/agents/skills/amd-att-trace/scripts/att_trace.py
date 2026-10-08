@@ -44,13 +44,16 @@ def _unique_paths(paths: Iterable[Path]) -> list[Path]:
     return result
 
 
-def _profiler_candidates(override: str | None = None) -> list[Path]:
+def _profiler_candidates(override: str | None = None, runtime_library: str | None = None) -> list[Path]:
     raw: list[Path] = []
     if override:
-        raw.append(Path(override))
+        return _unique_paths([Path(override)])
     for variable in ("AMD_ROCPROFV3", "TLX_ROCPROFV3"):
         if os.environ.get(variable):
             raw.append(Path(os.environ[variable]))
+    if runtime_library:
+        # HIP may come from a Python ROCm SDK package instead of /opt/rocm.
+        raw.append(Path(runtime_library).resolve().parent.parent / "bin" / "rocprofv3")
     raw.extend(Path(path) for path in glob.glob("/usr/local/fbcode/platform*/lib/rocm-dev/bin/rocprofv3"))
     bundled = Path(sys.base_prefix) / "lib" / "rocm-dev" / "bin" / "rocprofv3"
     raw.append(bundled)
@@ -72,12 +75,14 @@ def _help_text(profiler: Path) -> str:
         )
     except (OSError, subprocess.SubprocessError):
         return ""
+    if completed.returncode != 0:
+        return ""
     return completed.stdout + completed.stderr
 
 
-def find_profiler(override: str | None = None) -> tuple[Path, str]:
+def find_profiler(override: str | None = None, runtime_library: str | None = None) -> tuple[Path, str]:
     failures: list[str] = []
-    for candidate in _profiler_candidates(override):
+    for candidate in _profiler_candidates(override, runtime_library):
         if not os.access(candidate, os.X_OK):
             failures.append(f"{candidate}: not executable")
             continue
@@ -91,7 +96,7 @@ def find_profiler(override: str | None = None) -> tuple[Path, str]:
 def _decoder_candidates(profiler: Path, override: str | None = None) -> list[Path]:
     raw: list[Path] = []
     if override:
-        raw.append(Path(override))
+        return _unique_paths([Path(override)])
     explicit = os.environ.get("ROCPROF_ATT_LIBRARY_PATH")
     if explicit:
         raw.extend(Path(entry) for entry in explicit.split(":") if entry)
@@ -115,8 +120,9 @@ def find_decoder(profiler: Path, override: str | None = None) -> tuple[Path, lis
     raise AttError("no ATT decoder found in " + ", ".join(str(path) for path in searched))
 
 
-def probe(profiler_override: str | None, decoder_override: str | None) -> dict[str, Any]:
-    profiler, help_text = find_profiler(profiler_override)
+def probe(profiler_override: str | None, decoder_override: str | None,
+          runtime_library: str | None = None) -> dict[str, Any]:
+    profiler, help_text = find_profiler(profiler_override, runtime_library)
     decoder_dir, decoder_files = find_decoder(profiler, decoder_override)
     return {
         "profiler": str(profiler),
@@ -125,6 +131,16 @@ def probe(profiler_override: str | None, decoder_override: str | None) -> dict[s
         "supports_rocm_root": "--rocm-root" in help_text,
         "supports_att": True,
     }
+
+
+def runtime_check_command(capability: dict[str, Any], application: list[str], output: Path) -> list[str]:
+    """Initialize profiling with the target runtime; no kernel capture is expected."""
+    args = argparse.Namespace(profiler=capability["profiler"], decoder_dir=capability["decoder_directory"],
+                              output=output, name="preflight", activity=0, target_cu=0,
+                              shader_engine_mask="0x1", simd_select="0xF", serialize_all=False,
+                              kernel_regex="^__att_runtime_preflight__$", dispatch=1, application=application)
+    command, _ = _collect_command(args)
+    return command
 
 
 def _sha256(path: Path) -> str:
