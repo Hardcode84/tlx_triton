@@ -117,6 +117,13 @@ the workload's HIP library. Explicit `--profiler` and `--decoder-dir` choices
 must be usable; they do not silently fall back to another installation.
 The `preflight/` directory retains the initialization log, loaded library
 paths, and dynamic-loader diagnostics, including when initialization aborts.
+
+For ROCm Python wheels built with TheRock, install the matching `rocm[devel]`
+package and run `python3 -m rocm_sdk init`. Discovery prefers this expanded
+SDK when its HIP library is linked to the workload's loaded HIP. The devel
+tree supplies the unversioned AQLProfile library name that ROCr may require
+and that can be absent from the core wheel.
+
 To check this setup without running the benchmarks:
 
 ```bash
