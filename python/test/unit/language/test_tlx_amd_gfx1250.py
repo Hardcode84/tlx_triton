@@ -648,7 +648,7 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
 )
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
                                       NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
-                                      FIRST_USE_PREFETCH=False):
+                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -677,7 +677,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
                     REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
                     CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
-                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH))
+                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
@@ -690,6 +690,16 @@ def test_mxgemm_first_use_prefetch_ring_phase(k_iters, prefetch, cluster_size):
     # short K, ring wrap, and cluster/tile transitions for the new read order.
     test_mxgemm_persistent_ring_phase(k_iters, 3, prefetch, "float8_e4m3", 128, True, 4, False, False, cluster_size,
                                       False, FIRST_USE_PREFETCH=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size):
+    # Signed inputs exercise the empty steady loop, odd paired-loop remainder,
+    # ring wrap, uneven tile assignments, and clustered tile transitions.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
+                                      STREAMED_OPERANDS=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

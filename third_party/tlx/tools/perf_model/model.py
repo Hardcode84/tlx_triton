@@ -37,7 +37,7 @@ def number(expr, parameters, stack=()):
                     raise Unknown(node.id)
                 if node.id in stack:
                     raise ValueError(f"cyclic parameter expression: {' -> '.join(stack + (node.id,))}")
-                return number(parameters[node.id], parameters, stack + (node.id,))
+                return number(parameters[node.id], parameters, stack + (node.id, ))
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
                 value = visit(node.operand)
                 return -value if isinstance(node.op, ast.USub) else value
@@ -198,6 +198,39 @@ class Edge:
     reason: str = "dependency"
 
 
+class Arbiter:
+    """Work-conserving arbitration among eligible class heads.
+
+    A weight counts grants, not bytes or occupied cycles. Empty or blocked
+    classes surrender their remaining quantum. FIFO order within a class is
+    supplied by the caller from dependency-ready dates, not criticality.
+    """
+
+    def __init__(self, policy, classes):
+        self.policy = policy
+        self.classes = classes
+        self.cursor = 0
+        self.remaining = classes[0][1]
+
+    def choose(self, heads):
+        start = self.cursor if self.policy == "round-robin" else 0
+        for offset in range(len(self.classes)):
+            index = (start + offset) % len(self.classes)
+            kind, weight = self.classes[index]
+            if kind in heads:
+                remaining = self.remaining if index == self.cursor else weight
+                return heads[kind], index, remaining
+        return None
+
+    def grant(self, choice):
+        _, index, remaining = choice
+        if self.policy == "round-robin":
+            self.cursor, self.remaining = index, remaining - 1
+            if not self.remaining:
+                self.cursor = (index + 1) % len(self.classes)
+                self.remaining = self.classes[self.cursor][1]
+
+
 class Model:
 
     def __init__(self, data, bindings=None, overrides=None):
@@ -233,7 +266,7 @@ class Model:
         self.raw_ops = {op["id"]: op for op in self.data["operations"]}
         if len(self.raw_ops) != len(data["operations"]):
             raise ValueError("duplicate operation id")
-        self.resources = data["resources"]
+        self.resources = self.data["resources"]
         windows = self.data.get("coexecution", {})
         if not isinstance(windows, dict) or any(
                 not isinstance(pattern, list) or any(not isinstance(slot, list) or any(not isinstance(kind, str)
@@ -285,6 +318,37 @@ class Model:
                 raise ValueError(f"invalid dependency between phases: {edge}")
         self.order = self.topological_order()
         self.validate_requests()
+        self.arbitration = {}
+        self.arbitrated_ops = {}
+        for resource, spec in self.resources.items():
+            if "arbitration" not in spec:
+                continue
+            arb = spec["arbitration"]
+            classes = arb.get("classes", [])
+            if arb.get("policy") not in ("round-robin", "priority") or not classes:
+                raise ValueError(f"invalid arbitration policy/classes for {resource}")
+            kinds = [entry["kind"] for entry in classes]
+            if len(set(kinds)) != len(kinds) or any(not isinstance(kind, str) for kind in kinds):
+                raise ValueError(f"arbitration classes must have unique names: {resource}")
+            for entry in classes:
+                try:
+                    weight = self.value(entry.get("weight", 1))
+                except Unknown:
+                    continue
+                if weight < 1 or int(weight) != weight:
+                    raise ValueError("arbitration weights must be positive integer grant counts")
+            members = []
+            for name, op in self.raw_ops.items():
+                uses = [u for u in op.get("uses", []) if u["resource"] == resource]
+                if not uses or op.get("kind", "other") not in kinds:
+                    continue
+                if name in self.arbitrated_ops or len(uses) != 1 or self.value(uses[0].get("offset", 0)) != 0:
+                    raise ValueError("arbitrated operations need one arbitration resource at offset zero")
+                self.arbitrated_ops[name] = resource
+                members.append(name)
+            if set(kinds) - {self.raw_ops[name].get("kind", "other") for name in members}:
+                raise ValueError(f"arbitration class has no operations on {resource}")
+            self.arbitration[resource] = copy.deepcopy(arb)
         for resource in data.get("compute_resources", []):
             if resource not in self.resources:
                 raise ValueError(f"unknown compute resource: {resource}")
@@ -310,6 +374,8 @@ class Model:
             if wait["id"] in names:
                 raise ValueError(f"duplicate wait: {wait['id']}")
             names.add(wait["id"])
+            if set(wait.get("compute_resources", [])) - set(self.data.get("compute_resources", [])):
+                raise ValueError("wait compute_resources must name declared compute resources")
             if not wait["completions"]:
                 raise ValueError(f"empty wait completion set: {wait['id']}")
             for point, role in [(wait["arrival"], "arrival")] + [(p, "completion") for p in wait["completions"]]:
@@ -342,6 +408,8 @@ class Model:
             if request["id"] in names:
                 raise ValueError(f"duplicate request: {request['id']}")
             names.add(request["id"])
+            if type(request.get("aggregate", False)) is not bool:
+                raise ValueError(f"request aggregate must be a boolean: {request['id']}")
             chain = [request["issue"], *request.get("stages", []), request["complete"]]
             if any(name not in self.raw_ops for name in chain):
                 raise ValueError(f"unknown request endpoint: {request['id']}")
@@ -667,7 +735,8 @@ class Model:
                         for _ in range(min(256, len(names))):
                             if node in seen:
                                 cycle = path[seen[node]:]
-                                weight = sum(e.delay * period.denominator - e.distance * period.numerator for e in cycle)
+                                weight = sum(e.delay * period.denominator - e.distance * period.numerator
+                                             for e in cycle)
                                 if weight > 0:
                                     return cycle
                                 break
@@ -747,6 +816,7 @@ class Model:
                       parameter_metadata=self.parameter_metadata, calibration=self.calibration,
                       observations=self.observations, clock=self.data.get("clock", "unspecified ticks"),
                       workload=self.data.get("workload", {}), code=self.data.get("code", {}))
+        result["arbitration"] = self.arbitration
         result["residency"] = self.residency()
         known_bound = max([0] + [r["cycles"] for r in rows if "cycles" in r])
         try:
@@ -779,8 +849,8 @@ class Model:
         ]
         result["unresolved_queues"] = dict(self.unresolved_queues)
         fits = [row["fits"] for row in result.get("storage", {}).values()]
-        result["storage_feasible"] = (False if False in fits else None
-                                      if "storage" not in result or None in fits else True)
+        result["storage_feasible"] = (False
+                                      if False in fits else None if "storage" not in result or None in fits else True)
         result["unresolved"] = sorted(unresolved)
         result["period_lower_bound"] = known_bound
         result["integer_period_lower_bound"] = ticks(known_bound)
@@ -859,6 +929,8 @@ class Model:
 
     def check_periodic_template(self, starts, length, period, capacities, ops, edges):
         """Check a complete cyclic template, including resource/window wrap."""
+        if self.arbitration:
+            return None
         if type(length) is not int or length < 1 or type(period) is not int or period < 1:
             raise ValueError("a periodic template needs a positive integer length and period")
         expected = {(name, j) for name, op in ops.items() if op.phase == "loop" for j in range(length)}
@@ -893,13 +965,14 @@ class Model:
         utilization = {r: sum(cal.values()) / (capacities[r] * period) for r, cal in calendar.items()}
         compute = self.data.get("compute_resources", [])
         origin = min(starts.values())
-        return dict(iterations=length, cycles=period, cycles_per_iteration=period / length,
-                    resource_utilization=utilization,
-                    compute_utilization=sum(utilization[r] * capacities[r] for r in compute) / sum(
-                        capacities[r] for r in compute) if compute else None,
-                    verified_infinite_wrap=True,
-                    template=[dict(op=name, iteration=j, start=start - origin)
-                              for (name, j), start in sorted(starts.items(), key=lambda item: item[1])])
+        return dict(
+            iterations=length, cycles=period, cycles_per_iteration=period / length, resource_utilization=utilization,
+            compute_utilization=sum(utilization[r] * capacities[r]
+                                    for r in compute) / sum(capacities[r] for r in compute) if compute else None,
+            verified_infinite_wrap=True, template=[
+                dict(op=name, iteration=j, start=start - origin)
+                for (name, j), start in sorted(starts.items(), key=lambda item: item[1])
+            ])
 
     def periodic_witness(self, placed, capacities, ops, edges, iterations, warmup):
         """Certify an observed repeat or an explicitly retimed cyclic template.
@@ -908,6 +981,11 @@ class Model:
         as proof. Retimed templates preserve each operation's relative start
         within the sampled block, then search a bounded set of repeat periods.
         """
+        # A feasible resource/dependency template does not certify a stateful
+        # arbiter's grants across the wrap. Keep that result finite until the
+        # arbiter state and work-conserving choices are checked periodically.
+        if self.arbitration:
+            return None
         names = [name for name, op in ops.items() if op.phase == "loop"]
         name_set = set(names)
         if not names:
@@ -928,8 +1006,9 @@ class Model:
                 witness.update(method="observed repeat", source_iterations=[warmup, warmup + length])
                 return witness
         cyclic_edges = [e for e in edges if e.source in name_set and e.target in name_set]
-        resource_bound = max([0] + [sum(u.work for name in names for u in ops[name].uses if u.resource == r) / c
-                                    for r, c in capacities.items()])
+        resource_bound = max([0] + [
+            sum(u.work for name in names for u in ops[name].uses if u.resource == r) / c for r, c in capacities.items()
+        ])
         best = None
         # Search a few interior blocks, not every possible modulo schedule.
         # Larger periods may work even if this bounded search finds no witness.
@@ -944,8 +1023,10 @@ class Model:
                     for j in range(length):
                         quotient, remainder = divmod(j - edge.distance, length)
                         if quotient < 0:
-                            minimum = max(minimum, math.ceil((starts[edge.source, remainder] + edge.delay -
-                                                              starts[edge.target, j]) / -quotient))
+                            minimum = max(
+                                minimum,
+                                math.ceil(
+                                    (starts[edge.source, remainder] + edge.delay - starts[edge.target, j]) / -quotient))
                 limit = minimum + 256
                 if best:
                     limit = min(limit, math.ceil(best["cycles_per_iteration"] * length))
@@ -957,7 +1038,8 @@ class Model:
                         break
         return best
 
-    def schedule(self, iterations=16, warmup=4, max_cycles=1000000, policy="critical-path", target_period=None):
+    def schedule(self, iterations=16, warmup=4, max_cycles=1000000, policy="critical-path", target_period=None,
+                 analysis_windows=None):
         if self.unresolved_queues:
             raise Unknown("unfilled queue capacities: " + ", ".join(self.unresolved_queues.values()))
         capacities, ops, edges = self.resolve()
@@ -1031,8 +1113,14 @@ class Model:
         deadlines = dict.fromkeys(keys, math.inf)
         if policy == "deadline":
             compute_resources = set(self.data.get("compute_resources", []))
-            service = {r: sum(u.work / capacities[r] for op in original_ops.values() if op.phase == "loop"
-                              for u in op.uses if u.resource == r) for r in compute_resources}
+            service = {
+                r:
+                sum(u.work / capacities[r]
+                    for op in original_ops.values()
+                    if op.phase == "loop"
+                    for u in op.uses if u.resource == r)
+                for r in compute_resources
+            }
             target_period = target_period or max(service.values(), default=1)
             if target_period <= 0:
                 raise ValueError("target period must be positive")
@@ -1067,6 +1155,22 @@ class Model:
         issued = defaultdict(lambda: defaultdict(list))
         placed = {}
         current = 0
+        arbiters = {
+            resource:
+            Arbiter(spec["policy"], [(entry["kind"], int(self.value(entry.get("weight", 1))))
+                                     for entry in spec["classes"]])
+            for resource, spec in self.arbitration.items()
+        }
+        order_index = {name: index for index, name in enumerate(self.order)}
+        grants = defaultdict(list)
+        blocked = defaultdict(lambda: defaultdict(list))
+
+        def record_block(key, reason):
+            spans = blocked[key][reason]
+            if spans and spans[-1][1] >= current:
+                spans[-1][1] = max(spans[-1][1], current + 1)
+            else:
+                spans.append([current, current + 1])
 
         def issue_ticks(op, time):
             return [
@@ -1074,12 +1178,13 @@ class Model:
                 for t in range(time + u.offset, time + u.offset + u.duration)
             ]
 
-        def available(op, time):
+        def blockers(op, time):
+            reasons = set()
             for start, pattern in active[op.domain]:
                 for t in issue_ticks(op, time):
                     offset = t - start
                     if 0 <= offset < len(pattern) and op.kind not in pattern[offset] and "*" not in pattern[offset]:
-                        return False
+                        reasons.add(f"issue-window:{op.domain}")
             if op.kind in windows and op.window_domain is not None:
                 pattern = windows[op.kind]
                 if op.domain is not None and issue_ticks(op, time) != [time]:
@@ -1087,12 +1192,26 @@ class Model:
                 for offset, allowed in enumerate(pattern):
                     if any(kind not in allowed and "*" not in allowed
                            for _, kind in issued[op.window_domain][time + offset]):
-                        return False
+                        reasons.add(f"issue-window:{op.window_domain}")
             extra = defaultdict(float)
             for use in op.uses:
                 for tick in range(time + use.offset, time + use.offset + use.duration):
                     extra[use.resource, tick] += use.rate
-            return all(calendar[r][t] + rate <= capacities[r] + 1e-8 for (r, t), rate in extra.items())
+            reasons.update(f"resource:{r}" for (r, t), rate in extra.items()
+                           if calendar[r][t] + rate > capacities[r] + 1e-8)
+            return reasons
+
+        def arbitrate(resource, candidates):
+            heads = {}
+            for candidate in candidates:
+                if candidate not in ready or self.arbitrated_ops.get(candidate[0]) != resource:
+                    continue
+                kind = ops[candidate[0]].kind
+                key = (ready[candidate], candidate[1], order_index[candidate[0]])
+                if kind not in heads or key < heads[kind][0]:
+                    heads[kind] = (key, candidate)
+            eligible = {kind: key for kind, (_, key) in heads.items() if not blockers(ops[key[0]], current)}
+            return arbiters[resource].choose(eligible)
 
         while ready:
             current = max(current, min(ready.values()))
@@ -1103,9 +1222,27 @@ class Model:
             progress = False
             for key in candidates:
                 op = ops[key[0]]
-                if not available(op, current):
+                reasons = blockers(op, current)
+                if reasons:
+                    for reason in reasons:
+                        record_block(key, reason)
                     continue
+                resource = self.arbitrated_ops.get(key[0])
+                if resource is not None:
+                    choice = arbitrate(resource, candidates)
+                    if choice is None or key != choice[0]:
+                        record_block(key, f"arbitration:{resource}")
+                        continue
+                    arbiters[resource].grant(choice)
+                    grants[resource].append(dict(op=key[0], iteration=key[1], kind=op.kind, start=current))
                 placed[key] = current
+                # A failed attempt followed by a grant in the same tick did
+                # not spend a clock blocked (e.g. the second pooled port).
+                for spans in blocked.get(key, {}).values():
+                    if spans and spans[-1][1] > current:
+                        spans[-1][1] = current
+                        if spans[-1][0] == current:
+                            spans.pop()
                 for t in issue_ticks(op, current):
                     issued[op.domain][t].append((key, op.kind))
                 del ready[key]
@@ -1165,21 +1302,45 @@ class Model:
                       finite_resource_lower_bound=finite_resource_bound,
                       finite_lower_bound=max(finite_dependency_bound, finite_resource_bound))
         result["phase_windows"] = {
-            phase: [min(e["start"] for e in events if e["phase"] == phase),
-                    max(e["end"] for e in events if e["phase"] == phase)]
-            for phase, members in phases.items() if members
+            phase: [
+                min(e["start"]
+                    for e in events
+                    if e["phase"] == phase),
+                max(e["end"]
+                    for e in events
+                    if e["phase"] == phase)
+            ]
+            for phase, members in phases.items()
+            if members
         }
-        result["compute_service_ticks"] = sum(use["work"] for e in events for use in e["reservations"]
+        result["compute_service_ticks"] = sum(use["work"]
+                                              for e in events
+                                              for use in e["reservations"]
                                               if use["resource"] in compute)
         if compute:
-            result["dispatch_compute_utilization"] = result["compute_service_ticks"] / (
-                result["makespan"] * sum(capacities[r] for r in compute))
+            result["dispatch_compute_utilization"] = result["compute_service_ticks"] / (result["makespan"] *
+                                                                                        sum(capacities[r]
+                                                                                            for r in compute))
         result["queue_occupancy"] = self.queue_occupancy(placed, original_ops, iterations)
+        result["admissions"] = self.admission_diagnostics(placed, original_ops, expanded_edges, iterations)
+        result["scheduling_blocks"] = [
+            dict(op=name, iteration=i, reasons={reason: spans
+                                                for reason, spans in reasons.items()
+                                                if spans})
+            for (name, i), reasons in blocked.items()
+            if any(reasons.values())
+        ]
+        result["arbitration"] = {
+            resource: dict(spec, grants=grants[resource], quantum="one admitted operation, independent of its bytes")
+            for resource, spec in self.arbitration.items()
+        }
         result["waits"], coverage = self.wait_diagnostics(placed, original_ops, iterations)
         result["requests"] = self.request_diagnostics(placed, original_ops, iterations, coverage, calendar)
         result["buffer_lifetimes"] = self.buffer_lifetimes(placed, original_ops, iterations)
         result["issue_windows"] = self.issue_windows(events, capacities)
         result["periodic_witness"] = self.periodic_witness(placed, capacities, original_ops, edges, iterations, warmup)
+        if self.arbitration:
+            result["periodic_witness_limit"] = "stateful arbitration is checked only in the finite schedule"
         if len(anchors) == iterations and iterations - warmup > warmup:
             lo, hi = anchors[warmup], anchors[iterations - warmup - 1]
             if hi > lo:
@@ -1195,6 +1356,15 @@ class Model:
                     interior_resource_utilization=utilization,
                     interior_compute_utilization=sum(utilization[r] * capacities[r]
                                                      for r in compute) / sum(capacities[r] for r in compute))
+        selected_windows = dict(dispatch=[0, result["makespan"]], **result["phase_windows"])
+        if "interior_window" in result:
+            selected_windows["interior"] = result["interior_window"]
+        for name, span in (analysis_windows or {}).items():
+            if name in selected_windows:
+                raise ValueError(f"analysis window name is reserved: {name}")
+            selected_windows[name] = span
+        result["windows"] = self.schedule_windows(result, capacities, placed, original_ops, iterations,
+                                                  selected_windows, calendar)
         return result
 
     @staticmethod
@@ -1240,9 +1410,9 @@ class Model:
                 start = placed[wait["target"], i]
                 assert start >= ready
                 row = dict(wait=wait["id"], iteration=i, role=wait.get("role", "completion join"), arrival=arrival[1],
-                           ready=ready, start=start, end=start + ops[wait["target"]].latency,
-                           completion_wait_ticks=ready - arrival[1], scheduling_delay_ticks=start - ready,
-                           covered_requests=len(complete),
+                           compute_resources=wait.get("compute_resources", []), ready=ready, start=start,
+                           end=start + ops[wait["target"]].latency, completion_wait_ticks=ready - arrival[1],
+                           scheduling_delay_ticks=start - ready, covered_requests=len(complete),
                            last_completions=[dict(op=name, iteration=j) for name, j, t in complete if t == ready])
                 rows.append(row)
                 for name, j, _ in complete:
@@ -1251,12 +1421,21 @@ class Model:
 
     def request_diagnostics(self, placed, ops, iterations, coverage, calendar):
         rows = []
+        direct_delays = {}
+        for edge in self.raw_edges:
+            if not edge.get("distance", 0):
+                pair = (edge["source"], edge["target"])
+                delay = ticks(self.value(edge["delay"])) if "delay" in edge else ops[edge["source"]].latency
+                direct_delays[pair] = max(direct_delays.get(pair, 0), delay)
         for request in self.requests:
             issue, complete = request["issue"], request["complete"]
             route = list(dict.fromkeys([issue, *request.get("stages", []), complete]))
+            pairs = list(zip(route, route[1:]))
+            route_complete = not request.get("aggregate", False) and all(pair in direct_delays for pair in pairs)
             for i in (range(iterations) if ops[issue].phase == "loop" else [-1]):
                 begin, end = placed[issue, i], placed[complete, i] + ops[complete].latency
-                route_waits = [max(0, placed[b, i] - placed[a, i] - ops[a].latency) for a, b in zip(route, route[1:])]
+                route_queue = (sum(max(0, placed[b, i] - placed[a, i] - direct_delays[a, b])
+                                   for a, b in pairs) if route_complete else None)
                 consumer_times = []
                 for raw in request.get("consumers", []):
                     point = self.endpoint(raw)
@@ -1267,10 +1446,11 @@ class Model:
                 waits = coverage.get((complete, i), [])
                 first_wait = min(waits, key=lambda w: w["arrival"]) if waits else None
                 row = dict(
-                    request=request["id"], iteration=i, kind=request.get("kind", "memory"),
+                    request=request["id"], iteration=i, phase=ops[issue].phase, kind=request.get("kind", "memory"),
                     scope=request.get("scope", "unspecified"), issue=begin, complete=end,
                     bytes=self.value(request["bytes"]) if "bytes" in request else None, latency=end - begin,
-                    route_queue_ticks=sum(route_waits), stages=[
+                    route_queue_ticks=route_queue, route_complete=route_complete,
+                    aggregate=request.get("aggregate", False), stages=[
                         dict(op=name, start=placed[name, i], end=placed[name, i] + ops[name].latency) for name in route
                     ], first_consumer_start=min(consumer_times) if consumer_times else None,
                     first_covering_wait=first_wait["wait"] if first_wait else None,
@@ -1294,12 +1474,14 @@ class Model:
         return dict(
             events=rows, by_kind={
                 kind:
-                dict(latency=self.distribution([r["latency"]
-                                                for r in rows
-                                                if r["kind"] == kind]),
-                     route_queue_ticks=self.distribution([r["route_queue_ticks"]
-                                                          for r in rows
-                                                          if r["kind"] == kind]))
+                dict(
+                    latency=self.distribution([r["latency"]
+                                               for r in rows
+                                               if r["kind"] == kind]), route_queue_ticks=self.distribution([
+                                                   r["route_queue_ticks"]
+                                                   for r in rows
+                                                   if r["kind"] == kind and r["route_queue_ticks"] is not None
+                                               ]))
                 for kind in sorted({r["kind"]
                                     for r in rows})
             })
@@ -1357,23 +1539,161 @@ class Model:
             for domain, timeline in allowed.items()
         ]
 
-    def queue_occupancy(self, placed, ops, iterations):
+    def admission_diagnostics(self, placed, ops, edges, iterations):
+        """Separate circular-credit readiness from subsequent issue delay.
+
+        The frontier includes other dependencies and admission ordering. These
+        are local delays in the supplied schedule, not a counterfactual run
+        with a queue removed. Multiple pools can block the same acquisition.
+        """
+        frontiers = defaultdict(int)
+        credit_ready = defaultdict(lambda: defaultdict(int))
+        for source, target, delay, reason in edges:
+            time = placed[source] + delay
+            if reason.startswith("queue-reuse:"):
+                name = reason.removeprefix("queue-reuse:")
+                credit_ready[target][name] = max(credit_ready[target][name], time)
+            else:
+                frontiers[target] = max(frontiers[target], time)
+        rows = []
+        for queue in self.queues:
+            for index, entry in enumerate(queue["entries"]):
+                name = entry["acquire"]
+                for iteration in (range(iterations) if ops[name].phase == "loop" else [-1]):
+                    key = name, iteration
+                    arrival = frontiers[key]
+                    ready = max(arrival, credit_ready[key].get(queue["id"], 0))
+                    all_ready = max([arrival, *credit_ready[key].values()])
+                    admitted = placed[key]
+                    assert admitted >= all_ready
+                    rows.append(
+                        dict(queue=queue["id"], entry=index, op=name, iteration=iteration, arrival=arrival,
+                             credit_ready=ready, admitted=admitted, credit_wait_ticks=ready - arrival,
+                             scheduling_delay_ticks=admitted - all_ready))
+        return rows
+
+    def schedule_windows(self, schedule, capacities, placed, ops, iterations, windows, calendar):
+        """Compare pressure, loaded latency and idle overlap over one clock window."""
+        compute = self.data.get("compute_resources", [])
+        op_scope = defaultdict(set)
+        for request in self.requests:
+            if "compute_resource" in request:
+                names = [request["issue"], request["complete"], *request.get("stages", [])]
+                names += [self.endpoint(p)["op"] for p in request.get("consumers", [])]
+                for name in names:
+                    op_scope[name].add(request["compute_resource"])
+        for wait in self.waits:
+            op_scope[wait["target"]].update(wait.get("compute_resources", []))
+        intervals = defaultdict(lambda: defaultdict(list))
+        for wait in schedule["waits"]:
+            for resource in wait["compute_resources"]:
+                intervals[resource]["completion-wait:" + wait["role"]].append((wait["arrival"], wait["ready"]))
+        for admission in schedule["admissions"]:
+            for resource in op_scope[admission["op"]]:
+                intervals[resource]["credit:" + admission["queue"]].append(
+                    (admission["arrival"], admission["credit_ready"]))
+        for row in schedule["scheduling_blocks"]:
+            for resource in op_scope[row["op"]]:
+                for reason, spans in row["reasons"].items():
+                    intervals[resource][reason].extend(spans)
+
+        result = {}
+        for name, span in windows.items():
+            if (not isinstance(span, (list, tuple)) or len(span) != 2 or any(type(t) is not int for t in span)
+                    or not 0 <= span[0] <= span[1] <= schedule["makespan"]):
+                raise ValueError(f"invalid analysis window: {name}={span}")
+            lo, hi = span
+            if lo == hi:
+                continue
+
+            def union(spans):
+                merged = []
+                for start, end in sorted((max(lo, a), min(hi, b)) for a, b in spans if a < hi and b > lo):
+                    if start >= end:
+                        continue
+                    if merged and start <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], end)
+                    else:
+                        merged.append([start, end])
+                return merged
+
+            def length(spans):
+                return sum(b - a for a, b in union(spans))
+
+            matrix = {}
+            for resource in compute:
+
+                def idle_overlap(spans):
+                    return sum(
+                        max(0, capacities[resource] - calendar[resource].get(t, 0))
+                        for a, b in union(spans)
+                        for t in range(a, b))
+
+                service = sum(calendar[resource].get(t, 0) for t in range(lo, hi))
+                idle = capacities[resource] * (hi - lo) - service
+                overlap = {reason: idle_overlap(spans) for reason, spans in intervals[resource].items()}
+                total = idle_overlap([span for spans in intervals[resource].values() for span in spans])
+                matrix[resource] = dict(service_ticks=service, idle_ticks=idle,
+                                        idle_overlap_by_reason={k: v
+                                                                for k, v in overlap.items()
+                                                                if v}, idle_overlap_union_ticks=total,
+                                        unclassified_idle_ticks=max(0, idle - total))
+            requests = [r for r in schedule["requests"]["events"] if lo < r["complete"] <= hi]
+            queues = self.queue_occupancy(placed, ops, iterations, (lo, hi))
+            by_queue = defaultdict(list)
+            for row in schedule["admissions"]:
+                by_queue[row["queue"]].append(row)
+            for queue in queues:
+                admissions = by_queue[queue["queue"]]
+                queue["credit_wait_ticks"] = length([(row["arrival"], row["credit_ready"]) for row in admissions])
+                queue["credit_wait_event_ticks"] = sum(
+                    max(0,
+                        min(hi, row["credit_ready"]) - max(lo, row["arrival"])) for row in admissions)
+            numerator = sum(row["service_ticks"] for row in matrix.values())
+            denominator = (hi - lo) * sum(capacities[r] for r in compute)
+            result[name] = dict(
+                window=[lo, hi], matrix_resources=matrix, service_ticks=numerator, available_resource_ticks=denominator,
+                service_fraction=numerator / denominator if denominator else None, queues=queues, requests={
+                    kind:
+                    dict(
+                        latency=self.distribution([r["latency"]
+                                                   for r in requests
+                                                   if r["kind"] == kind]), route_queue_ticks=self.distribution([
+                                                       r["route_queue_ticks"]
+                                                       for r in requests
+                                                       if r["kind"] == kind and r["route_queue_ticks"] is not None
+                                                   ]))
+                    for kind in schedule["requests"]["by_kind"]
+                },
+                interpretation="service/occupancy use [start,end); latency samples complete in (start,end] and retain "
+                "their full lifetime. Idle overlaps are not causal attribution; categories may overlap.")
+        return result
+
+    def queue_occupancy(self, placed, ops, iterations, window=None):
         """Independently validate finite credit occupancy from the witness."""
         rows = []
         for queue in self.queues:
             changes, lifetimes, retirements = defaultdict(float), [], []
+            acquired = released = 0
+            lo, hi = window if window is not None else (0, math.inf)
             for index, entry in enumerate(queue["entries"]):
                 phase = ops[entry["acquire"]].phase
-                delay = ticks(self.value(entry["release_delay"])) if "release_delay" in entry else ops[entry["release"]].latency
+                delay = ticks(self.value(
+                    entry["release_delay"])) if "release_delay" in entry else ops[entry["release"]].latency
                 for iteration in (range(iterations) if phase == "loop" else [-1]):
                     begin = placed[entry["acquire"], iteration]
                     end = placed[entry["release"], iteration] + delay
                     if end < begin:
                         raise AssertionError("queue releases credits before their acquisition")
                     units = self.value(entry.get("units", 1))
-                    changes[begin] += units
-                    changes[end] -= units
-                    lifetimes.append(end - begin)
+                    acquired += lo <= begin < hi
+                    released += lo < end <= hi
+                    if begin < hi and end > lo:
+                        changes[max(lo, begin)] += units
+                        changes[min(hi, end)] -= units
+                        lifetimes.append(end - begin)
+                    elif window is None:
+                        lifetimes.append(end - begin)
                     retirements.append((iteration, index, end))
             if queue.get("ordered_retirement", False):
                 ends = [end for _, _, end in sorted(retirements)]
@@ -1392,9 +1712,12 @@ class Model:
                     raise AssertionError(f"queue {queue['id']} exceeds its credit capacity")
             rows.append(
                 dict(queue=queue["id"], capacity=capacity, peak_credits=peak, scope=queue.get("scope", "unspecified"),
-                     unit=queue.get("unit", "credits"), credit_ticks=area, saturated_ticks=saturated,
-                     ordered_retirement=queue.get("ordered_retirement", False), minimum_lifetime=min(lifetimes),
-                     maximum_lifetime=max(lifetimes), mean_lifetime=sum(lifetimes) / len(lifetimes)))
+                     unit=queue.get("unit",
+                                    "credits"), credit_ticks=area, saturated_ticks=saturated, acquisitions=acquired,
+                     releases=released, ordered_retirement=queue.get("ordered_retirement", False),
+                     minimum_lifetime=min(lifetimes) if lifetimes else None,
+                     maximum_lifetime=max(lifetimes) if lifetimes else None,
+                     mean_lifetime=sum(lifetimes) / len(lifetimes) if lifetimes else None))
         return rows
 
 
@@ -1458,13 +1781,26 @@ def print_summary(report):
         print(f"Finite-dispatch lower bound: {schedule['finite_lower_bound']:.3f} ticks")
         for kind, measurements in schedule["requests"]["by_kind"].items():
             latency, queued = measurements["latency"], measurements["route_queue_ticks"]
+            queued_text = (f"{queued['mean']:.2f} ticks"
+                           if queued["count"] else "unavailable (aggregate or incomplete route)")
             print(f"{kind} requests: {latency['count']}, scheduled latency min/mean/max "
                   f"{latency['minimum']}/{latency['mean']:.2f}/{latency['maximum']} ticks; "
-                  f"mean queueing between stages {queued['mean']:.2f} ticks")
+                  f"mean queueing between stages {queued_text}")
         if schedule["waits"]:
             print(
                 f"Longest declared completion wait: {max(w['completion_wait_ticks'] for w in schedule['waits'])} ticks "
                 "(wait intervals can overlap)")
+        interior = schedule["windows"].get("interior")
+        if interior is not None and interior["service_fraction"] is not None:
+            print(f"Interior window {interior['window']}: {100 * interior['service_fraction']:.3f}% compute service")
+            for kind, measurements in interior["requests"].items():
+                latency = measurements["latency"]
+                if latency["count"]:
+                    print(f"  {kind}: {latency['count']} completions, mean loaded latency {latency['mean']:.2f} ticks")
+            for queue in sorted(interior["queues"], key=lambda q: -q["credit_wait_ticks"])[:3]:
+                if queue["credit_wait_ticks"]:
+                    print(f"  {queue['queue']}: {queue['credit_wait_ticks']} credit-wait ticks, "
+                          f"{queue['saturated_ticks']} full ticks (overlapping measurements)")
         witness = schedule["periodic_witness"]
         if witness:
             print(f"Verified repeating schedule: {witness['cycles']} ticks / {witness['iterations']} iterations "
@@ -1473,6 +1809,8 @@ def print_summary(report):
                 print(f"Compute utilization in that schedule: {100 * witness['compute_utilization']:.3f}%")
         else:
             print("No repeating schedule certified; finite-window measurements are in the JSON report.")
+            if "periodic_witness_limit" in schedule:
+                print("  " + schedule["periodic_witness_limit"])
 
 
 def print_sweep(reports, dimensions):
@@ -1505,6 +1843,8 @@ def main():
     parser.add_argument("--max-cycles", type=int, default=1000000)
     parser.add_argument("--policy", choices=("critical-path", "deadline"), default="critical-path",
                         help="list-scheduling priority; deadline uses ideal compute dates, not hard timing constraints")
+    parser.add_argument("--window", action="append", default=[], metavar="NAME=START:END",
+                        help="additional clock window for pressure and latency diagnostics; requires --schedule")
     parser.add_argument("--json", type=Path, help="write the report, including every scheduled operation")
     parser.add_argument("--print-json", action="store_true", help="print report metadata instead of the compact table")
     parser.add_argument("--plot", type=Path, help="write a resource timeline (requires matplotlib and --schedule)")
@@ -1515,6 +1855,14 @@ def main():
         for item in args.set:
             key, value = item.split("=", 1)
             overrides[key] = float(value)
+        analysis_windows = {}
+        for item in args.window:
+            key, value = item.split("=", 1)
+            if not key or key in analysis_windows:
+                raise ValueError("analysis window names must be nonempty and unique")
+            analysis_windows[key] = [int(v) for v in value.split(":")]
+        if analysis_windows and not args.schedule:
+            raise ValueError("--window requires --schedule")
         if args.target_period is not None and args.target_period <= 0:
             raise ValueError("target-period must be positive")
         data = json.loads(args.model.read_text())
@@ -1532,11 +1880,13 @@ def main():
             report["model_sha256"] = model_hash
             report["tool_sha256"] = tool_hash
             report["bindings_file"] = str(args.bindings) if args.bindings else None
-            report["bindings_sha256"] = hashlib.sha256(args.bindings.read_bytes()).hexdigest() if args.bindings else None
+            report["bindings_sha256"] = hashlib.sha256(
+                args.bindings.read_bytes()).hexdigest() if args.bindings else None
             report["overrides"] = {**overrides, **dict(values)}
             if args.schedule:
                 report["schedule"] = model.schedule(args.iterations, args.warmup, args.max_cycles, args.policy,
-                                                    args.target_period or report["period_lower_bound"])
+                                                    args.target_period or report["period_lower_bound"],
+                                                    analysis_windows)
             reports.append(report)
         report = reports[0] if not dimensions else {"scenarios": reports}
         if args.plot:
