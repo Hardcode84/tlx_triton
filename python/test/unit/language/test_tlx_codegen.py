@@ -5597,8 +5597,12 @@ def test_gfx1250_mxgemm_operand_pipeline_rejects_partial_tiles(m, n, k, block_k,
                                            OUTPUT_STAGING=True)
 
 
-def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, **constants):
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, streamed_operands=False,
+                                       **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
+    if streamed_operands:
+        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_streamed import (
+            mxgemm_tdm_streamed_kernel as kernel, )
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
                      b_scale="*u8")
     # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
@@ -5617,6 +5621,92 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
     return triton_compile(
         src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=num_warps, waves_per_eu=num_warps // 4,
                                                                   ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, streamed_operands=True,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4)
+    asm = compiled.asm["amdgcn"]
+    assert "v_perm" not in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 8
+    assert compiled.metadata.shared <= 320 * 1024
+
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    instructions = [line.strip().split(";")[0].rstrip() for line in body if re.match(r"\s+[vsdt]\w+", line)]
+    # Two K128 steps rotate register ownership. Scales are packed into four
+    # wide reads per step, with no byte permutations, exchanges, or spills.
+    assert sum(inst.startswith("v_wmma") for inst in instructions) == 128
+    assert sum(inst.startswith("ds_load") for inst in instructions) == 136
+    assert all(inst.startswith("ds_load_b128") for inst in instructions if inst.startswith("ds_load"))
+    refills = [i for i, inst in enumerate(instructions) if inst.startswith("tensor_load_to_lds")]
+    assert len(refills) == 4
+    # Launch both fused descriptors before waiting for the next readable
+    # stage; an early wait would delay new requests behind an older transfer.
+    for payload, scale in zip(refills[::2], refills[1::2]):
+        assert not any(inst.startswith("s_wait_tensorcnt") for inst in instructions[payload:scale])
+        assert next(inst for inst in instructions[scale:] if inst.startswith("s_wait_tensorcnt")) == \
+            "s_wait_tensorcnt 0x4"
+    # The first two rows provide sixteen independent WMMAs after the final
+    # operand reads and before each data refill's LDS reuse boundary.
+    for refill in refills[::2]:
+        preceding = instructions[refill:] + instructions[:refill]
+        matrix = 0
+        for inst in reversed(preceding):
+            if inst.startswith("ds_load"):
+                break
+            matrix += inst.startswith("v_wmma")
+        assert matrix >= 16, "late LDS reads lost their independent matrix-work window"
+    # The outer register-carry join must not force a full completion wait at
+    # the inner loop's first consumer. Full waits belong after the head.
+    for i, inst in enumerate(instructions):
+        if inst != "s_wait_dscnt 0x0":
+            continue
+        matrix = 0
+        for previous in reversed(instructions[i:] + instructions[:i]):
+            if previous.startswith("ds_load"):
+                break
+            matrix += previous.startswith("v_wmma")
+        assert matrix >= 16, "full LDS wait moved ahead of the independent matrix-work window"
+
+
+@pytest.mark.parametrize("changes", [
+    {"PERSISTENT": False},
+    {"OUTPUT_STAGING": False},
+    {"CROSS_TILE_PREFETCH": False},
+    {"OUTPUT_TAIL_REUSE": True},
+    {"FIRST_USE_PREFETCH": True},
+    {"NUM_BUFFERS": 4},
+    {"BLOCK_K": 256},
+    {"NUM_WARPS": 8},
+    {"DTYPE_B": "e5m2"},
+    {"WITH_A_SCALE": False},
+    {"TDM_FUSION": "4way"},
+    {"TDM_SPLIT": True},
+    {"L2_PREFETCH_DISTANCE": 1},
+])
+def test_gfx1250_mxgemm_streamed_operands_rejects_incompatible_config(changes):
+    config = dict(PERSISTENT=True, OUTPUT_STAGING=True, STREAMED_OPERANDS=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                  NUM_BUFFERS=3, NUM_WARPS=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, WITH_A_SCALE=True,
+                  SCALE_PRESHUFFLE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial")
+    config.update(changes)
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="STREAMED_OPERANDS requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k,num_warps", [

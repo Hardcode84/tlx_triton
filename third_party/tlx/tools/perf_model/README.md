@@ -54,6 +54,12 @@ permit overlap. A shared array adds TDM writes and DS reads; an LDS return link
 counts only traffic going to registers. Do not charge TDM traffic to that
 return link simply because both operations touch LDS.
 
+Byte bandwidth and port occupancy are separate constraints. A short request
+still occupies a port for its rounded service duration. For example, two
+256-byte ports need two clocks to accept three independent 128-byte requests,
+even though their combined byte bandwidth could carry all three in one clock.
+The MXFP graph reserves both bytes and whole ports for every array access.
+
 An edge from `u` to `v`, with delay `L` and iteration distance `d`, means:
 
 ```text
@@ -90,6 +96,24 @@ The width of an instruction's wait-count field does not establish any of
 those capacities. An unfilled queue capacity leaves bounds partial and
 prevents scheduling; it never becomes an unlimited pool.
 
+Queue release must reflect downstream blocking. For a scheduler entry held
+until an array accepts the request, use the array operation's **start**, rather
+than the end of a fixed scheduler delay or the final register return:
+
+```json
+{
+  "id": "scheduler_entries",
+  "capacity": "scheduler_depth",
+  "unit": "requests",
+  "entries": [{"acquire": "scheduler", "release": "array", "release_delay": 0}]
+}
+```
+
+The acquisition-to-release dependency still includes the scheduler's own
+latency. Array contention extends the entry's residence and delays later
+admissions. A separate instruction-completion queue can retain its credits
+until the result returns. These two lifetimes must not be collapsed.
+
 For minimum lifetimes `L_j`, credit demands `q_j`, and queue capacity `Q`:
 
 ```text
@@ -102,6 +126,40 @@ them; a necessary depth is not a sufficient depth. Reports include minimum
 buffer leads, queue lifetime bounds, and independently checked finite peak
 credit occupancy. Finite reports also include credit-ticks, time at capacity,
 and the minimum slack between buffer retirement and its next overwrite.
+
+The `admissions` report separates the issue frontier, credit readiness, and
+actual admission. A full queue does not necessarily block any admission:
+independent computation may run while that queue is occupied. Conversely,
+ordered circular credit allocation can wait for a particular credit before
+the entire pool is full. `credit_wait_ticks` measures the union of those local
+readiness delays; `credit_wait_event_ticks` retains their summed multiplicity.
+Neither is an automatic attribution of compute idle time.
+
+A resource can specify explicit arbitration for selected operation classes:
+
+```json
+"arbitration": {
+  "policy": "round-robin",
+  "classes": [{"kind": "lds_array", "weight": 2},
+              {"kind": "tdm_array", "weight": 1}]
+}
+```
+
+Weights count admitted operations, independent of byte size or service time.
+Each class preserves FIFO order by dependency-ready time, iteration, and graph
+order. The arbiter skips unavailable class heads and gives up their remaining
+quantum, so an empty class does not idle an otherwise available resource.
+`priority` instead uses the supplied class order. Arbitration applies only to
+the named classes on that resource, at offset zero; other work continues to
+follow the selected list-scheduling policy. The graph must choose whether an
+operation represents an instruction, clause, or packet; the tool cannot infer
+the hardware's arbitration granularity from a byte count.
+
+Arbitrated schedules are finite witnesses. The periodic checker does not yet
+verify arbitration state and work-conserving choices across the wrap, so it
+does not certify them as sustainable repeating schedules. Resource and
+recurrence lower bounds remain optimistic. Graphs without explicit arbitration
+retain their existing periodic certification.
 
 Increasing prefetch distance has two deadlines. The final required read must
 complete before consumption, and all reads of a recycled LDS slot must finish
@@ -196,6 +254,23 @@ do not change operation latencies. A loaded latency distribution is useful
 for checking a scheduled route, but inserting its mean into a component
 delay would count the modeled contention again.
 
+Schedule reports include common clock windows for the dispatch, each serial
+phase, and the sampled interior. `--window NAME=START:END` adds a window to a
+scheduled report. Each window reports matrix service, queue occupancy, credit
+readiness delays, and latency by request kind. Occupancy includes entries
+acquired before the window; its lifetime statistics retain the full lifetimes
+of entries overlapping the window. Latency samples complete in `(start,end]`
+and retain their full latency even when issued earlier. An empty sample has
+unknown mean latency, not zero.
+
+Declared waits can name `compute_resources`. Requests already identify their
+compute resource. The report intersects their completion waits, credit delays,
+resource conflicts, and arbitration delays with compute idle intervals. It
+reports both per-reason overlap and their union, leaving other idle time
+unclassified. These are overlaps within the chosen schedule, not independent
+causal stall counts. Summing them, or replacing them with full-dispatch queue
+totals, can give the wrong diagnosis.
+
 The MXFP graph retains individual stage values and converts their clock domains:
 
 ```text
@@ -248,6 +323,40 @@ It reserves every stage at a fixed offset from issue; future contention can
 therefore delay the issue itself. It cannot reproduce internal queueing in
 the same way. Both modes are abstract arbitration scenarios. Output transport
 still uses fixed reservations and runs after the loop in this generator.
+
+`--stage-queues` additionally holds each DS scheduler entry through array
+admission and adds a finite TDM return FIFO before array service. Supply
+`tdm_copy_fifo_depth` in packets at the selected packet size. Its capacity,
+scope, and release endpoint are explicit scenario inputs; a FIFO entry count
+does not establish its byte or descriptor capacity. Also supply
+`tdm_copy_fifo_cycles`: the portion of the intrinsic `tcp_output_cycles` delay
+spent holding an entry. The remainder precedes FIFO admission; the entry then
+stays occupied until array service starts, including any downstream queueing.
+Use whole shader ticks between zero and `tcp_output_cycles` to move the
+admission point without changing total intrinsic route latency. Pipe latency
+alone does not establish FIFO residence. Without this option,
+internal waiting rooms remain unbounded while the existing transaction and
+instruction-completion credit limits still apply.
+
+`--array-arbitration round-robin` applies weighted arbitration to LDS and TDM
+input array stages, with `array_lds_weight` and `array_tdm_weight` controlling
+grants per quantum. `tdm-priority` and `lds-priority` select strict priority
+scenarios. The default `scheduler` leaves the choice to the list scheduler.
+These options describe arbitration assumptions; they do not identify a
+device's exact policy. Logical TDM command latency and constituent packet
+latencies appear as separate request kinds and must not be averaged together.
+
+```bash
+python3 third_party/tlx/tools/perf_model/mxfp.py \
+  --block-k 128 --data-slots 3 --scale-slots 3 \
+  --stage-queues --array-arbitration round-robin \
+  -o /tmp/queued-mxfp.json
+
+python3 third_party/tlx/tools/perf_model/model.py /tmp/queued-mxfp.json \
+  --bindings third_party/tlx/tools/perf_model/hypothetical.json \
+  --schedule --policy deadline --iterations 8 --warmup 2 \
+  --json /tmp/queued-mxfp-report.json
+```
 
 ```bash
 python3 third_party/tlx/tools/perf_model/mxfp.py \
@@ -446,8 +555,13 @@ operation starts, optionally with an iteration `distance` and a `delay`.
 `source_release` names an endpoint on the route, with delay defaulting to
 that operation's latency. Request reports include issue, source release,
 completion, consumer, first covering wait, and queueing between stages.
-`route_queue_ticks` is scheduled stage delay; it is not an independently
-measured hardware counter.
+`route_queue_ticks` measures gaps beyond the declared direct dependency delays,
+which default to source completion. It is not an independently measured
+hardware counter. It is unknown for omitted intermediate stages and for
+`aggregate: true` requests, such as a command joining several packet routes:
+their end-to-end latency remains available, but missing transport service
+must not be labeled queueing. The `route_complete` field distinguishes these
+cases; unknown queueing samples are excluded from the corresponding means.
 
 A wait's `arrival` and `completions` can be operation names or
 `{op, distance, delay}` endpoints. Distance looks backward from the wait

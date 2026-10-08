@@ -9,6 +9,18 @@
     "fabric_period_ps": 1250,
     "memory_period_ps": 1000,
     "ds_decode_native": 8,
+    "tdm_copy_fifo_depth": {
+      "value": 4,
+      "unit": "returned packets / CU",
+      "kind": "hypothetical",
+      "source": "invented capacity; packet size and downstream release are separate scenario assumptions"
+    },
+    "tdm_copy_fifo_cycles": {
+      "value": 1,
+      "unit": "shader cycles",
+      "kind": "hypothetical",
+      "source": "invented part of tcp_output_cycles spent holding a FIFO entry before array service"
+    },
     "lds_outstanding": {
       "value": 32,
       "unit": "instructions / wave",

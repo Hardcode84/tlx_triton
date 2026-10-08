@@ -145,6 +145,32 @@ def test_shared_array_delays_an_already_issued_request():
     assert read["route_queue_ticks"] == 7
 
 
+@pytest.mark.parametrize("stages,aggregate,queued", [([], False, None), (["array"], True, None), (["array"], False, 0)])
+def test_request_queueing_requires_a_complete_nonaggregate_route(stages, aggregate, queued):
+    graph = completion_credit_graph()
+    graph["requests"][0].update(stages=stages, aggregate=aggregate)
+    schedule = Model(graph).schedule(iterations=1, warmup=0)
+    read = schedule["requests"]["events"][0]
+    assert read["latency"] == 20
+    assert read["route_queue_ticks"] == queued
+    assert read["route_complete"] == (queued is not None)
+    for requests in (schedule["requests"]["by_kind"], schedule["windows"]["dispatch"]["requests"]):
+        assert requests["lds"]["latency"]["mean"] == 20
+        assert requests["lds"]["route_queue_ticks"]["mean"] == queued
+        assert requests["lds"]["route_queue_ticks"]["count"] == (queued is not None)
+
+
+def test_request_dependency_delay_is_transport_not_queueing():
+    graph = dict(resources={}, operations=[dict(id="issue", latency=2),
+                                           dict(id="done", latency=1)],
+                 dependencies=[dict(source="issue", target="done", delay=delay) for delay in (4, 9, 6)],
+                 requests=[dict(id="read", issue="issue", complete="done")])
+    schedule = Model(graph).schedule(iterations=1, warmup=0)
+    read = schedule["requests"]["events"][0]
+    assert read["latency"] == 10
+    assert read["route_queue_ticks"] == 0
+
+
 def test_first_covering_wait_can_precede_the_real_consumer():
     graph = dict(
         resources=dict(matrix=dict(capacity=1)),
@@ -317,9 +343,8 @@ def test_partition_placement_preserves_transport_and_compute_work():
     for key in ("wmma_instructions", "unique_input_bytes", "lds_payload_read_bytes", "lds_scale_read_bytes",
                 "lds_instructions"):
         assert first["workload"][key] == second["workload"][key]
-    assert [op for op in first["operations"] if op["phase"] == "epilogue"] == [
-        op for op in second["operations"] if op["phase"] == "epilogue"
-    ]
+    assert [op for op in first["operations"]
+            if op["phase"] == "epilogue"] == [op for op in second["operations"] if op["phase"] == "epilogue"]
     profile = json.loads((HERE / "hypothetical.json").read_text())
     assert Model(first, profile).bounds()["compute_service_cycles"] == Model(second,
                                                                              profile).bounds()["compute_service_cycles"]
@@ -358,3 +383,173 @@ def test_a_shorter_wait_does_not_imply_less_total_idle():
         "tensor"]
     assert new["resources"]["simd"]["exposed_union_ticks"] == old["resources"]["simd"]["exposed_union_ticks"]
     assert new["service_fraction"] == old["service_fraction"]
+
+
+def test_stage_credit_is_held_while_downstream_service_is_blocked():
+    graph = dict(
+        resources=dict(array=dict(capacity=1)),
+        operations=[dict(id="busy", uses=[dict(resource="array", work=10)]),
+                    dict(id="decode", latency=1)] +
+        [
+            op for i in range(2)
+            for op in (dict(id=f"stage{i}", latency=1), dict(id=f"array{i}", uses=[dict(resource="array", work=4)]))
+        ],
+        dependencies=[
+            edge for i in range(2)
+            for edge in (dict(source="decode", target=f"stage{i}"), dict(source=f"stage{i}", target=f"array{i}"))
+        ],
+        queues=[
+            dict(id="stage", capacity=1,
+                 entries=[dict(acquire=f"stage{i}", release=f"array{i}", release_delay=0) for i in range(2)])
+        ],
+    )
+    schedule = Model(graph).schedule(iterations=1, warmup=0)
+    assert event(schedule, "stage0")["start"] == 1
+    assert event(schedule, "array0")["start"] == 10
+    assert event(schedule, "stage1")["start"] == 10
+    assert event(schedule, "stage1")["start"] < event(schedule, "array0")["end"]
+    queue = schedule["queue_occupancy"][0]
+    assert queue["maximum_lifetime"] == 9
+    assert queue["credit_ticks"] == 13
+    assert schedule["admissions"][1]["credit_wait_ticks"] == 9
+
+
+@pytest.mark.parametrize("independent_work,wait_ticks", [(4, 16), (24, 0)])
+def test_loaded_latency_and_full_queue_do_not_imply_exposed_wait(independent_work, wait_ticks):
+    graph = completion_credit_graph()
+    graph["operations"] += [
+        dict(id="independent", uses=[dict(resource="matrix", work=independent_work)]),
+        dict(id="arrival"),
+        dict(id="gate")
+    ]
+    graph["dependencies"] += [dict(source="independent", target="arrival"), dict(source="gate", target="mma")]
+    graph["requests"][0]["compute_resource"] = "matrix"
+    graph["waits"] = [
+        dict(id="input", arrival="arrival", target="gate", completions=["done"], compute_resources=["matrix"])
+    ]
+    schedule = Model(graph).schedule(iterations=1, warmup=0, analysis_windows=dict(early=[0, 8], late=[16, 21]))
+    dispatch = schedule["windows"]["dispatch"]
+    queue = dispatch["queues"][0]
+    assert queue["saturated_ticks"] == 20
+    assert queue["credit_wait_ticks"] == 0  # No second admission is waiting.
+    assert dispatch["requests"]["lds"]["latency"]["mean"] == 20
+    assert schedule["waits"][0]["completion_wait_ticks"] == wait_ticks
+    assert dispatch["matrix_resources"]["matrix"]["idle_overlap_union_ticks"] == wait_ticks
+    early, late = schedule["windows"]["early"], schedule["windows"]["late"]
+    assert early["requests"]["lds"]["latency"]["mean"] is None
+    assert late["requests"]["lds"]["latency"]["mean"] == 20  # Keep pre-window time in the sample.
+    assert late["queues"][0]["credit_ticks"] == 4
+    assert late["queues"][0]["acquisitions"] == 0
+    assert late["queues"][0]["releases"] == 1
+    if not wait_ticks:
+        assert dispatch["service_fraction"] == 1
+
+
+def arbitration_graph(policy="round-robin", capacity=1):
+    return dict(
+        resources=dict(array=dict(
+            capacity=capacity, arbitration=dict(policy=policy, classes=[
+                dict(kind="read", weight=2), dict(kind="copy", weight=1)
+            ]))),
+        operations=[dict(id=f"read{i}", kind="read", uses=[dict(resource="array", work=1, rate=1)]) for i in range(5)] +
+        [dict(id=f"copy{i}", kind="copy", uses=[dict(resource="array", work=3, rate=1)]) for i in range(2)],
+    )
+
+
+def test_weighted_arbitration_counts_grants_and_preserves_class_fifo():
+    model = Model(arbitration_graph())
+    schedule = model.schedule(iterations=1, warmup=0)
+    grants = schedule["arbitration"]["array"]["grants"]
+    assert [(row["op"], row["start"]) for row in grants] == [("read0", 0), ("read1", 1), ("copy0", 2), ("read2", 5),
+                                                             ("read3", 6), ("copy1", 7), ("read4", 10)]
+    assert schedule["makespan"] == 11
+    assert schedule["periodic_witness"] is None
+    assert "stateful arbitration" in schedule["periodic_witness_limit"]
+
+
+def test_arbitration_skips_unready_classes_without_idling_the_port():
+    graph = arbitration_graph()
+    graph["operations"].append(dict(id="late", latency=4))
+    graph["dependencies"] = [dict(source="late", target=f"copy{i}") for i in range(2)]
+    schedule = Model(graph).schedule(iterations=1, warmup=0)
+    grants = schedule["arbitration"]["array"]["grants"]
+    assert [(row["op"], row["start"]) for row in grants[:5]] == [("read0", 0), ("read1", 1), ("read2", 2), ("read3", 3),
+                                                                 ("copy0", 4)]
+    assert schedule["makespan"] == 11
+
+
+def test_priority_arbitration_and_pooled_grants_do_not_count_zero_time_attempts():
+    schedule = Model(arbitration_graph("priority", capacity=2)).schedule(iterations=1, warmup=0)
+    grants = schedule["arbitration"]["array"]["grants"]
+    assert [row["op"] for row in grants[:5]] == [f"read{i}" for i in range(5)]
+    assert [row["start"] for row in grants[:4]] == [0, 0, 1, 1]
+    for blocked in schedule["scheduling_blocks"]:
+        started = event(schedule, blocked["op"])["start"]
+        for spans in blocked["reasons"].values():
+            assert all(begin < end <= started for begin, end in spans)
+
+
+@pytest.mark.parametrize("weight", [0, -1, 1.5])
+def test_arbitration_rejects_invalid_grant_weights(weight):
+    graph = arbitration_graph()
+    graph["resources"]["array"]["arbitration"]["classes"][0]["weight"] = weight
+    with pytest.raises(ValueError, match="positive integer"):
+        Model(graph)
+
+
+def test_mxfp_stage_queues_preserve_work_and_require_an_explicit_capacity():
+    graph = make_model(tile_m=64, tile_n=64, block_k=128, stage_queues=True, array_arbitration="round-robin")
+    original = make_model(tile_m=64, tile_n=64, block_k=128)
+    for key in ("wmma_instructions", "unique_input_bytes", "lds_instructions", "array_bytes_per_period"):
+        assert graph["workload"][key] == original["workload"][key]
+    profile = json.loads((HERE / "hypothetical.json").read_text())
+    model = Model(graph, profile)
+    schedule = model.schedule(iterations=4, warmup=1, policy="deadline")
+    assert schedule["verified"]
+    assert schedule["windows"]["interior"]["service_fraction"] <= 1
+    stages = {q["queue"]: q for q in schedule["queue_occupancy"]}
+    assert stages["tdm_copy_fifo"]["peak_credits"] <= 4
+    for group in (0, 1):
+        assert stages[f"ds_stage{group}"]["maximum_lifetime"] >= profile["parameters"]["ds_scheduler_native"]
+    del profile["parameters"]["tdm_copy_fifo_depth"]
+    model = Model(graph, profile)
+    assert "tdm_copy_fifo" in model.bounds()["unresolved_queues"]
+    with pytest.raises(Unknown, match="queue capacities"):
+        model.schedule(iterations=4, warmup=1)
+
+
+def test_mxfp_fifo_residence_is_independent_of_total_return_latency():
+    graph = make_model(tile_m=64, tile_n=64, block_k=128, stage_queues=True)
+    request = next(r for r in graph["requests"] if r["id"] == "input_A_0")
+    route = {request["issue"], *request["stages"], request["complete"]}
+    fifo = next(q for q in graph["queues"] if q["id"] == "tdm_copy_fifo")
+    isolated = dict(parameters=graph["parameters"], resources=graph["resources"],
+                    operations=[op for op in graph["operations"] if op["id"] in route],
+                    dependencies=[e for e in graph["dependencies"] if e["source"] in route and e["target"] in route],
+                    queues=[dict(fifo, entries=[e for e in fifo["entries"]
+                                                if e["acquire"] in route])], requests=[dict(request, consumers=[])])
+    profile = json.loads((HERE / "hypothetical.json").read_text())
+    latencies = []
+    for residence in (0, 8):
+        schedule = Model(isolated, profile, dict(tdm_copy_fifo_cycles=residence)).schedule(iterations=1, warmup=0)
+        read = schedule["requests"]["events"][0]
+        latencies.append(read["latency"])
+        assert read["route_queue_ticks"] == 0
+        assert schedule["queue_occupancy"][0]["maximum_lifetime"] == residence
+    assert latencies[0] == latencies[1]
+    with pytest.raises(ValueError, match="time cannot be negative"):
+        Model(isolated, profile, dict(tdm_copy_fifo_cycles=9)).schedule(iterations=1, warmup=0)
+
+
+def test_short_array_requests_still_occupy_whole_ports():
+    graph = make_model(tile_m=64, tile_n=64, block_k=128, packet_bytes=128)
+    graph = dict(parameters=graph["parameters"],
+                 resources={name: graph["resources"][name]
+                            for name in ("array_pool", "array_ports")},
+                 operations=[op for op in graph["operations"] if op["kind"] == "tdm_array"][:3])
+    profile = json.loads((HERE / "hypothetical.json").read_text())
+    schedule = Model(graph, profile).schedule(iterations=1, warmup=0)
+    # Two 256-byte ports cannot serve three independent 128-byte requests
+    # in one clock, even though their combined byte capacity would suffice.
+    assert [e["start"] for e in schedule["events"]] == [0, 0, 1]
+    assert schedule["makespan"] == 2

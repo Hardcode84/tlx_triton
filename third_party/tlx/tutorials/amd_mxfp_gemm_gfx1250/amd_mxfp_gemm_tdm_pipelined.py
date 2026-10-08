@@ -2388,6 +2388,7 @@ def mxgemm_tdm_pipelined(
     OPERAND_PIPELINE: bool = False,
     OUTPUT_TAIL_REUSE: bool = False,
     FIRST_USE_PREFETCH: bool = False,
+    STREAMED_OPERANDS: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -2410,6 +2411,12 @@ def mxgemm_tdm_pipelined(
     registers across two K steps in C00/C10/C01/C11 order. It requires
     persistent E4M3 x E4M3, three BK128 buffers, four waves, partial fusion,
     and dedicated FP32 output staging. It is an explicit scheduling experiment.
+    ``STREAMED_OPERANDS`` uses native 32x32 accumulator fragments, one rolling
+    A register set with two spare fragments, and two B sets. Two initial rows
+    execute by column to cover late operand reads before LDS reuse. Next-tile
+    operands remain in registers through output stores. It requires persistent
+    E4M3 x E4M3, three BK128 buffers, four waves, partial fusion, cross-tile
+    prefetch, and dedicated FP32 output staging.
     BK256 reuses the A ring for output and requires ``CROSS_TILE_PREFETCH=False``; it
     supports two input buffers for A8W8 and two or three for A8W4.
     ``REGISTER_PIPELINE`` selects the A8W8 256x256x256, two-buffer, four-wave
@@ -2458,6 +2465,20 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    persistent_kernel = mxgemm_tdm_persistent_kernel
+    if STREAMED_OPERANDS:
+        if not (PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and WITH_A_SCALE and NUM_WARPS == 4 and
+                (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS == 3 and DTYPE_A == DTYPE_B == "e4m3"
+                and TRANSPOSE_B and SCALE_PRESHUFFLE and TDM_FUSION == "partial" and not TDM_SPLIT
+                and SCHEDULE == "sliceMNK" and L2_PREFETCH_DISTANCE == -1 and not REGISTER_PIPELINE
+                and not WARP_PIPELINE and not OPERAND_PIPELINE and not OUTPUT_TAIL_REUSE and not FIRST_USE_PREFETCH):
+            raise ValueError("STREAMED_OPERANDS requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
+                             "four warps, transposed B, preshuffled scales, partial unsplit TDM, sliceMNK, "
+                             "cross-tile prefetch, dedicated output staging, and no L2 prefetch")
+        if __package__:
+            from .amd_mxfp_gemm_streamed import mxgemm_tdm_streamed_kernel as persistent_kernel
+        else:
+            from amd_mxfp_gemm_streamed import mxgemm_tdm_streamed_kernel as persistent_kernel
     if OPERAND_PIPELINE:
         valid_ring = (BLOCK_K, NUM_BUFFERS) in ((128, 4), (256, 2))
         valid_prefetch = L2_PREFETCH_DISTANCE == -1 or (BLOCK_K == 256 and L2_PREFETCH_DISTANCE in (1, 2))
@@ -2564,7 +2585,7 @@ def mxgemm_tdm_pipelined(
                                                     c.stride(0), a_scale.stride(0), **warp_layouts,
                                                     GROUP_M=GROUP_SIZE_M, num_warps=8, waves_per_eu=2)
         if PERSISTENT:
-            return mxgemm_tdm_persistent_kernel[(NUM_PROGRAMS, )](
+            return persistent_kernel[(NUM_PROGRAMS, )](
                 a, b, c, a_scale_arg, b_scale, M, N, K, a.stride(0), b.stride(0), c.stride(0), a_scale_arg.stride(0),
                 b_scale.stride(0), DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, WITH_A_SCALE=WITH_A_SCALE, TDM_FUSION=TDM_FUSION,
@@ -2670,6 +2691,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         raise ValueError("OUTPUT_TAIL_REUSE requires persistence")
     if cfg.get("FIRST_USE_PREFETCH", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("FIRST_USE_PREFETCH requires persistence")
+    if cfg.get("STREAMED_OPERANDS", False) and not cfg.get("PERSISTENT", False):
+        raise ValueError("STREAMED_OPERANDS requires persistence")
     if cfg.get("OUTPUT_STAGING", False) and not (cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False)
                                                  or cfg.get("OPERAND_PIPELINE", False)):
         raise ValueError("output staging requires persistence")
@@ -2707,8 +2730,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                       True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL", 1),
             NUM_WARPS=cfg["num_warps"], REGISTER_PIPELINE=cfg.get("REGISTER_PIPELINE", False), OPERAND_PIPELINE=cfg.get(
                 "OPERAND_PIPELINE",
-                False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE",
-                                                  False), FIRST_USE_PREFETCH=cfg.get("FIRST_USE_PREFETCH", False))
+                False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
+                    "FIRST_USE_PREFETCH", False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -2788,6 +2811,8 @@ if __name__ == "__main__":
                         help="reuse the retired third A/B stage for persistent E4M3 BK128 output")
     parser.add_argument("--first_use_prefetch", action="store_true",
                         help="test first-use operand prefetch with persistent E4M3 BK128 and three buffers")
+    parser.add_argument("--streamed_operands", action="store_true",
+                        help="test native operand fragments with persistent E4M3 BK128 and three buffers")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)
@@ -2875,4 +2900,5 @@ if __name__ == "__main__":
         OPERAND_PIPELINE=args.operand_pipeline,
         OUTPUT_TAIL_REUSE=args.output_tail_reuse,
         FIRST_USE_PREFETCH=args.first_use_prefetch,
+        STREAMED_OPERANDS=args.streamed_operands,
     )
