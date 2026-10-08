@@ -130,6 +130,19 @@ The streamed schedule supports A8W8. Use `--warmup-seconds`,
 collection lengths and sampling. These diagnostic runs do not perform
 numerical correctness checks.
 
+If power validation fails, inspect the saved capture without rerunning the
+workload or accessing the device:
+
+```bash
+python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --inspect /tmp/mxfp-hardware-01
+```
+
+The report includes total and valid readings, sensor errors, read-batch
+durations, and counts both inside and overlapping each workload phase.
+Collection also saves `telemetry_diagnostics.json` and
+`telemetry_summary.json` before reporting insufficient power samples.
+
 Use `--first-use-prefetch` to test the model-derived operand schedule:
 
 ```bash

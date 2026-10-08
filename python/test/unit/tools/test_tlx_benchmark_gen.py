@@ -521,8 +521,86 @@ def test_mxfp_trace_missing_power_is_a_failure(mxfp_collector, mxfp_sensors, tmp
         dict(phases=[dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300))]))
     (tmp_path / "telemetry.jsonl").write_text("".join(
         json.dumps(dict(monotonic_ns=150, read_end_monotonic_ns=160, power_w=value)) + "\n" for value in values))
-    with pytest.raises(mxfp_collector.CollectionError, match="fewer than two valid power"):
+    with pytest.raises(mxfp_collector.CollectionError, match="fewer than two valid power") as error:
         mxfp_collector.phase_summary(tmp_path, mxfp_sensors)
+    summary = json.loads((tmp_path / "telemetry_summary.json").read_text())[0]
+    diagnostics = json.loads((tmp_path / "telemetry_diagnostics.json").read_text())
+    assert summary["samples"] == diagnostics["phases"][0]["complete_read_batches"] == len(values)
+    assert diagnostics["phases"][0]["valid_power_samples"] == sum(value is not None for value in values)
+    assert str(tmp_path / "telemetry_diagnostics.json") in str(error.value)
+
+
+@pytest.mark.parametrize("readings,complete,overlap,errors", [
+    ([(90, 110, 400), (280, 320, 410)], 0, 2, {}),
+    ([(120, 130, None), (140, 150, None)], 2, 2, {"power: Input/output error": 2}),
+    ([(0, 10, 400), (310, 320, 410)], 0, 0, {}),
+    ([], 0, 0, {}),
+])
+def test_mxfp_trace_diagnostics_distinguish_sensor_errors_and_phase_coverage(mxfp_collector, tmp_path, readings,
+                                                                             complete, overlap, errors):
+    workload = dict(phases=[
+        dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300)),
+        dict(name="unfinished", start=dict(monotonic_ns=400))
+    ])
+    samples = [
+        dict(monotonic_ns=begin, read_end_monotonic_ns=end, power_w=power,
+             errors={"power": "Input/output error"} if power is None else {}) for begin, end, power in readings
+    ]
+    report = mxfp_collector.telemetry_diagnostics(tmp_path, workload, samples)
+    assert report["sample_count"] == len(readings)
+    assert report["samples_with_power"] == sum(power is not None for _, _, power in readings)
+    assert report["sensor_errors"] == errors
+    measure = report["phases"][0]
+    assert measure["duration_seconds"] == pytest.approx(200 / 1e9)
+    assert measure["complete_read_batches"] == complete
+    assert measure["valid_power_samples"] == 0
+    assert measure["overlapping_read_batches"] == overlap
+    assert measure["overlapping_power_samples"] == (0 if errors else overlap)
+    assert report["phases"][1] == dict(name="unfinished", status="unfinished")
+    if readings:
+        assert report["first_read_monotonic_ns"] == readings[0][0]
+        assert report["last_read_monotonic_ns"] == readings[-1][1]
+        assert report["read_duration_ms"]["max"] == pytest.approx(max(end - begin for begin, end, _ in readings) / 1e6)
+    else:
+        assert report["first_read_monotonic_ns"] is None
+        assert report["last_read_monotonic_ns"] is None
+        assert report["read_duration_ms"] is None
+
+
+@pytest.mark.parametrize("inspect_stage", [False, True])
+def test_mxfp_trace_inspection_preserves_existing_capture_without_device_access(mxfp_collector, monkeypatch, tmp_path,
+                                                                                capsys, inspect_stage):
+    stage = tmp_path / "case/power"
+    stage.mkdir(parents=True)
+    # Original captures predate telemetry_diagnostics.json and must remain readable.
+    mxfp_collector.write_json(
+        stage / "workload.json",
+        dict(phases=[dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300))]))
+    sample = dict(monotonic_ns=150, read_end_monotonic_ns=160, power_w=None,
+                  errors={"hwmon42_power1_input_w": "Input/output error"})
+    (stage / "telemetry.jsonl").write_text(json.dumps(sample) + "\n")
+
+    def snapshot():
+        return {
+            str(path.relative_to(tmp_path)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("inspection must not probe a device, load a profiler, or start a workload")
+
+    for name in ("device_info", "command_record", "load_att_helper", "make_cases", "Sensors", "collect"):
+        monkeypatch.setattr(mxfp_collector, name, unexpected_probe)
+    assert mxfp_collector.main(["--inspect", str(stage if inspect_stage else tmp_path)]) == 0
+    report, = json.loads(capsys.readouterr().out)
+    assert report["directory"] == str(stage)
+    assert report["sensor_errors"] == {"hwmon42_power1_input_w: Input/output error": 1}
+    assert report["phases"][0]["complete_read_batches"] == 1
+    assert report["phases"][0]["valid_power_samples"] == 0
+    assert snapshot() == before
 
 
 def test_mxfp_trace_existing_output_is_preserved(mxfp_collector, monkeypatch, tmp_path):
