@@ -693,13 +693,13 @@ def test_mxgemm_first_use_prefetch_ring_phase(k_iters, prefetch, cluster_size):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("num_buffers,k_iters", [(3, k) for k in (3, 4, 5, 9)] + [(4, k) for k in (4, 5, 6, 7, 9)])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size):
+def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size, num_buffers):
     # Signed inputs exercise the empty steady loop, odd paired-loop remainder,
     # ring wrap, uneven tile assignments, and clustered tile transitions.
-    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
-                                      STREAMED_OPERANDS=True)
+    test_mxgemm_persistent_ring_phase(k_iters, num_buffers, True, "float8_e4m3", 128, True, 4, False, False,
+                                      cluster_size, False, STREAMED_OPERANDS=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
