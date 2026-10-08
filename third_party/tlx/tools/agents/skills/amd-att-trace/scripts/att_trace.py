@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 from typing import Any, Iterable, Sequence
 
 DECODER_NAMES = (
@@ -353,22 +354,31 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
-def package_bundle(root: Path, archive: Path | None) -> dict[str, Any]:
+def package_bundle(root: Path, archive: Path | None, *, require_att: bool = True) -> dict[str, Any]:
     root = root.resolve()
-    validation = validate_bundle(root)
-    destination = (archive.expanduser().resolve() if archive is not None else root.with_name(root.name + ".tar.gz"))
+    if not root.is_dir():
+        raise AttError(f"collection root is not a directory: {root}")
+    validation = validate_bundle(root) if require_att else None
+    destination = archive.expanduser() if archive is not None else root.with_name(root.name + ".tar.gz")
+    destination = destination.parent.resolve() / destination.name
     if destination == root or root in destination.parents:
         raise AttError(f"archive must be outside trace root: {destination}")
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         raise AttError(f"refusing to overwrite archive: {destination}")
-    with tarfile.open(destination, "w:gz") as output:
-        output.add(root, arcname=root.name)
-    return {
-        "archive": str(destination),
-        "bytes": destination.stat().st_size,
-        "sha256": _sha256(destination),
-        "validation": validation,
-    }
+    # Publish only a complete archive. A failed write/checksum leaves the
+    # capture intact, and an archive created concurrently is never replaced.
+    with tempfile.TemporaryDirectory(prefix=f".{destination.name}-", dir=destination.parent) as staging:
+        temporary = Path(staging) / "capture.tar.gz"
+        with tarfile.open(temporary, "w:gz") as output:
+            output.add(root, arcname=root.name)
+        result = {
+            "archive": str(destination),
+            "bytes": temporary.stat().st_size,
+            "sha256": _sha256(temporary),
+            "validation": validation,
+        }
+        os.link(temporary, destination)
+    return result
 
 
 def _select_ui(root: Path, requested: str | None) -> Path:

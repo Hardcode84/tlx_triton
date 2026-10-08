@@ -741,10 +741,13 @@ def test_mxfp_trace_inspection_preserves_existing_capture_without_device_access(
     assert snapshot() == before
 
 
-def test_mxfp_trace_existing_output_is_preserved(mxfp_collector, monkeypatch, tmp_path):
-    previous = tmp_path / "previous.att"
+@pytest.mark.parametrize("existing", ["directory", "archive"])
+def test_mxfp_trace_existing_output_is_preserved(mxfp_collector, monkeypatch, tmp_path, existing):
+    root = tmp_path / "capture"
+    previous = root / "previous.att" if existing == "directory" else tmp_path / "capture.tar.gz"
+    previous.parent.mkdir(exist_ok=True)
     previous.write_bytes(b"previous trace")
-    args = mxfp_collector.parser().parse_args(["--output", str(tmp_path)])
+    args = mxfp_collector.parser().parse_args(["--output", str(root)])
 
     def unexpected_probe(*args, **kwargs):
         pytest.fail("should reject existing output before probing or starting a workload")
@@ -825,11 +828,14 @@ def test_mxfp_trace_timeout_reaps_child(mxfp_collector, mxfp_sensors, tmp_path):
     assert "end" in json.loads((tmp_path / "process.json").read_text())
 
 
-@pytest.mark.parametrize("power_source,mode", [("hwmon", "collect"), ("metrics_8", "collect"), ("metrics_9", "collect"),
-                                               ("average", "collect"), ("hwmon", "failure"), ("hwmon", "preflight")])
+@pytest.mark.parametrize("power_source,mode", [("hwmon", "collect"), ("metrics_8", "collect"),
+                                               ("metrics_9", "explicit_package"), ("average", "collect"),
+                                               ("hwmon", "failure"), ("hwmon", "preflight"), ("hwmon", "no_package"),
+                                               ("hwmon", "no_att"), ("hwmon", "archive_failure"),
+                                               ("hwmon", "archive_suffix")])
 def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_collector, mxfp_sensors,
                                                                         mxfp_gpu_metrics_table, monkeypatch, tmp_path,
-                                                                        power_source, mode):
+                                                                        capsys, power_source, mode):
     import hashlib
     import sys
     import tarfile
@@ -948,12 +954,15 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
     decoder.mkdir()
     (decoder / "librocprof-trace-decoder.so").touch()
     root = tmp_path / "collection with spaces"
+    archive = root.with_name(root.name + ".tar.gz")
+    mode_options = dict(preflight=["--preflight-only"], no_package=["--no-package"], no_att=["--no-att"],
+                        explicit_package=["--package"])
     args = mxfp_collector.parser().parse_args([
         "--output",
-        str(root), "--profiler",
+        str(archive if mode == "archive_suffix" else root), "--profiler",
         str(profiler), "--decoder-dir",
-        str(decoder), "--sample-ms", "2", "--preflight-only" if mode == "preflight" else "--package",
-        "--warmup-seconds", "0.075", "--duration-seconds", "0.075"
+        str(decoder), "--sample-ms", "2", *mode_options.get(mode, []), "--warmup-seconds", "0.075",
+        "--duration-seconds", "0.075"
     ])
     cases = mxfp_collector.make_cases(args)
     assert len(cases) == 4
@@ -981,15 +990,45 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         assert not list(root.rglob("workload_spec.json"))
         assert not root.with_name(root.name + ".tar.gz").exists()
         return
+    if mode == "archive_failure":
+
+        def failed_write(*args, **kwargs):
+            raise OSError("archive disk full")
+
+        monkeypatch.setattr(tarfile.TarFile, "add", failed_write)
+        with pytest.raises(OSError, match="archive disk full"):
+            mxfp_collector.collect(args, cases)
+        assert json.loads((root / "manifest.json").read_text())["status"] == "complete"
+        assert len(list(root.rglob("*.att"))) == 4
+        assert not archive.exists()
+        assert not list(tmp_path.glob(".collection with spaces.tar.gz-*"))
+        assert "capture retained" in capsys.readouterr().err
+        return
     mxfp_collector.collect(args, cases)
-    manifest = json.loads((root / "manifest.json").read_text())
     if mode == "preflight":
+        manifest = json.loads((root / "manifest.json").read_text())
         assert manifest["status"] == "preflight_complete" and manifest["cases"] == []
         assert manifest["preflight"]["status"] == "complete"
         assert not list(root.rglob("workload_spec.json"))
+        assert not archive.exists()
         return
+    if mode == "no_package":
+        assert root.is_dir() and not archive.exists()
+        names = [str(path.relative_to(root)) for path in root.rglob("*")]
+    else:
+        assert not root.exists()
+        assert list(tmp_path.glob("collection with spaces*")) == [archive]
+        assert f"SHA-256: {hashlib.sha256(archive.read_bytes()).hexdigest()}" in capsys.readouterr().out
+        with tarfile.open(archive) as bundle:
+            names = bundle.getnames()
+            bundle.extractall(tmp_path / "unpacked", filter="data")
+        root = tmp_path / "unpacked" / root.name
+        if args.att:
+            assert mxfp_collector.load_att_helper().validate_bundle(root)["valid"]
+    manifest = json.loads((root / "manifest.json").read_text())
     assert manifest["status"] == "complete"
-    assert manifest["preflight"]["status"] == "complete"
+    if args.att:
+        assert manifest["preflight"]["status"] == "complete"
     assert manifest["power_sensor_priority"] == sensors.power_candidates
     assert len(manifest["cases"]) == 4
     for case in manifest["cases"]:
@@ -1001,21 +1040,17 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
         assert [p["name"] for p in workload["phases"]] == ["compile", "warmup", "measure"]
         assert len(workload["benchmark_samples"]) >= 2
         assert workload["median_ms"] == 0.2
-        assert case["runs"]["att"]["validation"]["valid"]
-        assert case["runs"]["att"]["dispatch"]["kernel_trace_row"]["dispatch_id"] == "2050"
-        assert case["runs"]["att"]["dispatch"]["matching_dispatch"] == 1025
+        if args.att:
+            assert case["runs"]["att"]["validation"]["valid"]
+            assert case["runs"]["att"]["dispatch"]["kernel_trace_row"]["dispatch_id"] == "2050"
+            assert case["runs"]["att"]["dispatch"]["matching_dispatch"] == 1025
         if power_source != "hwmon":
-            diagnostics = json.loads((Path(case["root"]) / "power/telemetry_diagnostics.json").read_text())
+            diagnostics = json.loads((root / Path(case["root"]).name / "power/telemetry_diagnostics.json").read_text())
             assert diagnostics["sensor_errors"]["hwmon42_power1_input_w: [Errno 0] Error"] > 0
     assert (root / "summary.csv").is_file()
     assert expected_source in (root / "summary.csv").read_text()
-    archive = root.with_name(root.name + ".tar.gz")
-    packaged = json.loads(root.with_name(root.name + ".package.json").read_text())
-    assert packaged["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
-    with tarfile.open(archive) as bundle:
-        names = bundle.getnames()
     assert sum(name.endswith("/power/telemetry.csv") for name in names) == 4
-    assert sum(name.endswith("/att/trace/fixture_shader_engine_0_2050.att") for name in names) == 4
+    assert sum(name.endswith("/att/trace/fixture_shader_engine_0_2050.att") for name in names) == (4 if args.att else 0)
 
 
 def test_mxfp_trace_profiler_prefers_workload_runtime(mxfp_collector, monkeypatch, tmp_path):

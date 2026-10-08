@@ -64,7 +64,7 @@ run the collector on an idle gfx1250 device in the same Python environment:
 
 ```bash
 gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
-  --output /tmp/mxfp-hardware-01 --package
+  --output /tmp/mxfp-hardware-01.tar.gz
 ```
 
 This compares both schedules at M=N=8192 and K=8192/4096, placing each
@@ -91,15 +91,37 @@ succeeds only after validating the raw trace, code objects, decoded UI files,
 and results database. The compiled assembly must also match between the
 timing and ATT processes.
 
-The output contains `summary.csv` with timing and measured device power;
+Successful collection produces one `.tar.gz` archive; `--output` accepts
+either its full name or a path with `.tar.gz` omitted. The archive contains
+`summary.csv` with timing and measured device power;
 `manifest.json` with device identity, configuration, versions, and commands;
 and a source snapshot. Each case has `power/` and `att/` directories with
 `telemetry.csv`, `telemetry.jsonl`, `telemetry_summary.json`, `workload.json`,
 logs, generated assembly, and the compiled code object. The viewer bundle is
 under `att/trace/`. Available AMD SMI snapshots retain per-domain clocks and
-throttle counters before and after each process. `--package` archives the
-whole collection and prints its SHA-256 digest. Existing non-empty output
-directories and archives are rejected.
+throttle counters before and after each process. The collector prints the
+archive's SHA-256 digest and removes the work directory only after the
+archive is complete. `--no-package` keeps an unpacked directory instead.
+Preflight-only checks and failed collection or packaging attempts retain
+their directories for diagnosis. Existing non-empty output directories and
+archives are rejected before benchmarking.
+
+Unpack a completed capture for inspection:
+
+```bash
+tar -xzf /tmp/mxfp-hardware-01.tar.gz -C /tmp
+```
+
+Package an existing capture without accessing the GPU:
+
+```bash
+python3 third_party/tlx/tools/agents/skills/amd-att-trace/scripts/att_trace.py \
+  package /tmp/mxfp-existing-capture
+```
+
+The standalone packaging command validates the ATT bundle, creates a sibling
+`.tar.gz` archive, and retains the original directory. Use it when a capture
+was collected with `--no-package` or an older collector.
 
 Power describes the repeated benchmark workload, including its cache clears
 and host launch gaps. The summary averages the valid samples wholly inside
