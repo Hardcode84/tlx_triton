@@ -27,9 +27,9 @@ runs by default:
 
 Both use E8M0 scales, FP32 output, 256x256 M/N tiles, three buffers, partial TDM
 fusion, persistent scheduling, and output staging. MX8xMX8 uses BK128 with
-cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch disabled so
-output can reuse the A ring. The summary and CSV identify each variant and
-its configuration.
+cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch disabled by
+default and reuses the A ring for output. The summary and CSV identify each
+variant and its configuration.
 
 Both variants default to 256 persistent programs (capped by tile count),
 group-M 8, no XCD remapping, and four-workgroup multicast with a cluster
@@ -58,6 +58,78 @@ python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
+
+Two independent A8W4 options test startup and persistent tile handoff:
+
+- `--compact-k-tail` uses one loop body for the final three K256 stages,
+  reducing the static code footprint. It selects E4M3 x E2M1 with three
+  buffers, four waves, partial fusion, and staged FP32 output.
+- `--variant mx8xmx4 --cross-tile-prefetch` starts each next-tile A/B load
+  after the C transfer using its input slot retires. The three C slots use
+  the same physical stride as A, so each can be retired independently.
+  The last C uses retire in slot order 1, 2, 0; counted waits leave younger
+  input transfers in flight while the remaining C transfers complete.
+
+Compare the baseline, each option separately, and their combination:
+
+```bash
+mxfp_bench=third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --csv a8w4-baseline.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --compact-k-tail --csv a8w4-compact.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --cross-tile-prefetch --csv a8w4-handoff.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --compact-k-tail --cross-tile-prefetch --csv a8w4-both.csv
+```
+
+Both options retain FP32 output and the input packing. The standalone tail
+flag is `--compact_k_tail`; the Python API and `matmul` configuration use
+`COMPACT_K_TAIL=True`. The summary and CSV record both options. They remain
+opt-in until repeated hardware comparisons establish a benefit.
+
+For A8W4, `--output-tail-reuse --cross-tile-prefetch` keeps the next tile's
+first A/B stage prefetched and uses the other two A stages as separate
+128x128 FP32 C slots. Indexing A before aliasing preserves its physical ring
+pitch while allowing C's own row padding. The four output transfers still
+use `ds_store_b128` to fill LDS.
+
+The first two C fills do not wait for incoming A/B transfers. The next two
+wait only before reusing a C slot, and both stores remain in flight across
+the tile boundary. The next tile executes its first 48 WMMAs per wave before
+retiring the first C slot and refilling input stage 1. A second counted wait
+retires the other C slot while stage 1's A/B transfers remain in flight, then
+issues stage 2. The ordinary K loop handles this entry without duplicating
+its compute body. Final kernel completion still drains outstanding stores.
+
+Compare this opt-in schedule with the baseline at both default K lengths:
+
+```bash
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --csv a8w4-baseline.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --cross-tile-prefetch \
+  --output-tail-reuse --csv a8w4-c-staging.csv
+```
+
+Use three buffers, four waves, partial fusion, and staged FP32 output.
+This variant cannot be combined with `--compact-k-tail`. The standalone
+flag is `--output_tail_reuse`; the Python configuration uses
+`OUTPUT_TAIL_REUSE=True` with `CROSS_TILE_PREFETCH=True`.
+
+To distinguish startup from a cost paid on every output tile, vary K and
+M/N independently. At 256 programs, square M/N sizes 4096, 8192, and 16384
+give one, four, and sixteen tiles per program. Increasing M/N at fixed K
+amortizes a one-time startup cost but retains the per-tile output work.
+Increasing K at fixed M/N amortizes the per-tile handoff and epilogue too.
+For example, apply the same option combinations to this sweep:
+
+```bash
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --num-programs 256 \
+  --case 4096,4096,8192 --case 8192,8192,8192 --case 16384,16384,8192 \
+  --case 8192,8192,4096 --case 8192,8192,16384 --csv a8w4-scaling.csv
+```
+
+Interleave repeated baseline and candidate runs using the same timing mode.
+Eager timing clears the cache before measured launches; switching to graph
+timing changes both launch behavior and cache conditions. For an A8W4 trace,
+pass `--kernels persistent -- --variant mx8xmx4` to the collector below;
+append the same candidate flags after `--`.
 
 To collect hardware evidence for the persistent and streamed A8W8 schedules,
 run the collector on an idle gfx1250 device in the same Python environment:

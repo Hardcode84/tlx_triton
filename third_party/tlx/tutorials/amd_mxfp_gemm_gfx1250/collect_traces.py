@@ -514,8 +514,8 @@ def make_cases(args):
     if not any(arg.split("=")[0] in ("--variant", "--dtype-b") for arg in forwarded):
         forwarded = ["--variant", "mx8xmx8", *forwarded]
     kernel_options = {
-        "--streamed-operands", "--first-use-prefetch", "--output-tail-reuse", "--warp-pipeline", "--operand-pipeline",
-        "--register-pipeline", "--no-persistent"
+        "--streamed-operands", "--first-use-prefetch", "--warp-pipeline", "--operand-pipeline", "--register-pipeline",
+        "--no-persistent"
     }
     if any(arg.split("=")[0] in kernel_options for arg in forwarded):
         raise CollectionError("select the profiled schedule using --kernels before --")
