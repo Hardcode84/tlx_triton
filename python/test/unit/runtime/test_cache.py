@@ -19,6 +19,24 @@ from triton._internal_testing import is_hip, is_cpu
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
 
 
+def test_ast_source_hash_distinguishes_optional_constexpr_positions():
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(out, FIRST: tl.constexpr = False, SECOND: tl.constexpr = False):
+        tl.store(out, 1 if FIRST else (2 if SECOND else 0))
+
+    def source(constants):
+        return ASTSource(kernel, signature={"out": "*i32"}, constexprs=constants)
+
+    # Both sources supply one True and omit the other argument's default,
+    # but they select different stores. A cache hit must distinguish them.
+    assert source({"FIRST": True}).hash() != source({"SECOND": True}).hash()
+    assert source({(1, ): True}).hash() == source({"FIRST": True}).hash()
+    assert source({"FIRST": True, "SECOND": False}).hash() == source({"SECOND": False, "FIRST": True}).hash()
+    assert source({(1, 0): True}).hash() != source({(1, 1): True}).hash()
+
+
 def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
     env = os.environ.copy()
     env.update({

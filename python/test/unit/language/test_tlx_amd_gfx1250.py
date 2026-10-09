@@ -673,11 +673,17 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
                      id=f"tail-reuse-k{k}-cluster{cluster}")
         for cluster, ks in ((1, (3, 4, 5, 6)), (4, (3, 6, 9)))
         for k in ks
+    ] + [
+        pytest.param(k, 3, "float4", 256, True, 4, False, False, cluster, False,
+                     id=f"a8w4-output-k{k}-cluster{cluster}")
+        for cluster, ks in ((1, (3, 4, 5, 6)), (4, (3, 6, 9)))
+        for k in ks
     ],
 )
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
                                       NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
-                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False):
+                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
+                                      COMPACT_K_TAIL=False, TDM_FUSION="partial"):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -702,13 +708,41 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         _gfx1250_mxfp.pack_scale(b_scale).cuda(),
         config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
                     DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
+                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
                     CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
                     REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
                     CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
                     FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS,
-                    ASYNC_OUTPUT=ASYNC_OUTPUT))
+                    ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters,cluster_size", [(3, 1), (4, 1), (5, 1), (6, 1), (3, 4), (4, 4), (5, 4), (9, 4)])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_mxgemm_compact_k_tail_ring_phase(k_iters, cluster_size, prefetch):
+    # Cover an empty steady loop, all three ring phases, uneven tile counts,
+    # and cluster transitions with and without C/input transfer overlap.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, prefetch, "float4", 256, True, 4, False, False, cluster_size, False,
+                                      COMPACT_K_TAIL=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("fusion,cluster_size", [("4way", 1), ("4way", 4), ("2way", 4), ("none", 1)])
+def test_mxgemm_output_overlap_wait_counts(fusion, cluster_size):
+    # Fused and separate loads leave different numbers of younger transfers
+    # pending while the same three C slots retire and become input storage.
+    test_mxgemm_persistent_ring_phase(5, 3, True, "float4", 256, True, 4, False, False, cluster_size, False,
+                                      TDM_FUSION=fusion)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_a8w4_c_staging_ring_phase(k_iters, cluster_size):
+    # Keep next-tile K=0 live while C occupies the other two A stages.
+    # Cover all ring phases, an empty steady loop, and final-store retirement.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, cluster_size, True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -775,6 +809,8 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     ({"BLOCK_M": 256}, "full tiles"),
     ({"SCALE_PRESHUFFLE": False}, "preshuffled scales"),
     ({"TDM_SPLIT": True}, "unsplit descriptors"),
+    ({"COMPACT_K_TAIL": True}, "COMPACT_K_TAIL requires"),
+    ({"BLOCK_M": 256, "BLOCK_N": 256, "OUTPUT_STAGING": True}, "BK256 cross-tile output staging"),
 ])
 def test_mxgemm_persistent_invalid_config(config, match):
     # Validation happens before any GPU allocation or launch.

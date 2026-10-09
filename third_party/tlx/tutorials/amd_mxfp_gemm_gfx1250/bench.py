@@ -3,7 +3,10 @@
 Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
 output, persistent 256x256 M/N tiles, three input buffers, output staging, and
 partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
-BK256 with cross-tile prefetch disabled so output can reuse the A ring.
+BK256 with cross-tile prefetch disabled by default. Use --variant mx8xmx4
+--cross-tile-prefetch to start refilling each A/B stage as its C slot retires.
+Use --compact-k-tail to test one loop body for A8W4's final three K256 stages.
+It selects MX8xMX4 and can be combined with --cross-tile-prefetch.
 Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
 multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
 Use --first-use-prefetch to test the MX8xMX8 three-buffer schedule with B1 local
@@ -26,6 +29,12 @@ pending. This also supports the four-buffer --output-tail-reuse configuration.
 Use --output-tail-reuse to keep two next-tile input stages prefetched while
 the retired third A/B stage holds FP32 output. This selects MX8xMX8 with three
 BK128 buffers and removes the separate output allocation.
+For MX8xMX4, add --variant mx8xmx4 --cross-tile-prefetch --output-tail-reuse.
+This keeps next-tile K=0 prefetched and uses the other two A stages for 128x128
+FP32 C quadrants. The first two fills leave incoming A/B in flight, and the
+last two stores overlap the next tile's first 48 WMMAs. Counted waits then
+retire each C slot separately before its input refill. Do not combine this
+variant with --compact-k-tail.
 With four waves, MX8xMX8 also supports four input buffers: --num-buffers 4
 uses smaller output staging chunks and an explicit LDS/WMMA prefetch schedule.
 Use --num-warps 8 to test two waves per SIMD on persistent 256x256 tiles;
@@ -185,6 +194,8 @@ def _command(args, case, dtype_b):
         command.append("--output_tail_reuse")
     if args.first_use_prefetch:
         command.append("--first_use_prefetch")
+    if args.compact_k_tail:
+        command.append("--compact_k_tail")
     if args.streamed_operands:
         command.append("--streamed_operands")
     if args.async_output:
@@ -253,17 +264,20 @@ def parse_benchmark_args(argv=None):
                         help="stage persistent FP32 output for TDM stores; BK256 reuses input storage")
     parser.add_argument(
         "--output-tail-reuse", action="store_true",
-        help="reuse input LDS for output with E4M3 BK128: three persistent buffers or "
-        "four streamed buffers; selects MX8xMX8")
+        help="reuse input LDS for output: E4M3 BK128 with three persistent/four streamed buffers "
+        "(selects MX8xMX8), or explicit --variant mx8xmx4 with BK256 and --cross-tile-prefetch")
     parser.add_argument("--first-use-prefetch", action="store_true",
                         help="test first-use prefetch with persistent E4M3 BK128 and three buffers; selects MX8xMX8")
+    parser.add_argument("--compact-k-tail", action="store_true",
+                        help="test one loop body for A8W4's final three K256 stages; selects MX8xMX4")
     parser.add_argument(
         "--streamed-operands", action="store_true",
         help="test native fragments with persistent E4M3 BK128 and three or four buffers; selects MX8xMX8")
     parser.add_argument("--async-output", action="store_true",
                         help="use direct LDS-to-global C stores with independent waits; requires --streamed-operands")
-    parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
-                        help="default: enabled for the register pipeline and BK128; disabled for BK256 output reuse")
+    parser.add_argument(
+        "--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
+        help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
     parser.add_argument("--num-programs", type=int, default=256,
                         help="persistent program count, capped by tile count (default: 256)")
     parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none",
@@ -312,6 +326,8 @@ def parse_benchmark_args(argv=None):
     else:
         default_variants = ("mx8xmx8", ) if (args.warp_pipeline or args.operand_pipeline or args.output_tail_reuse
                                              or args.first_use_prefetch or args.streamed_operands) else VARIANT_DTYPES_B
+        if args.compact_k_tail:
+            default_variants = ("mx8xmx4", )
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
     if args.num_programs is not None and args.num_programs <= 0:
         parser.error("--num-programs must be positive")
@@ -342,6 +358,14 @@ def parse_benchmark_args(argv=None):
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
+        if run_args.compact_k_tail and not (
+                run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial" and
+            (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 256) and run_args.num_buffers == 3
+                and run_args.num_warps == 4 and run_args.dtype_a == "float8_e4m3" and dtype_b == "float4"
+                and not (run_args.register_pipeline or run_args.warp_pipeline or run_args.operand_pipeline
+                         or run_args.streamed_operands or run_args.output_tail_reuse or run_args.first_use_prefetch)):
+            parser.error("--compact-k-tail requires persistent E4M3 x FP4, 256x256x256 tiles, three buffers, "
+                         "four warps, partial TDM fusion, and output staging")
         if run_args.streamed_operands and not (run_args.persistent and run_args.output_staging
                                                and run_args.cross_tile_prefetch and run_args.tdm_fusion == "partial"
                                                and run_args.num_warps == 4 and run_args.num_buffers in (3, 4) and
@@ -361,14 +385,19 @@ def parse_benchmark_args(argv=None):
                 and not run_args.register_pipeline and not run_args.warp_pipeline and not run_args.operand_pipeline):
             parser.error("--first-use-prefetch requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
                          "four warps, partial TDM fusion, and dedicated output staging")
-        if run_args.output_tail_reuse and not (
-                run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial"
-                and run_args.num_warps == 4 and run_args.num_buffers == (4 if run_args.streamed_operands else 3) and
-            (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
-                and run_args.dtype_a == dtype_b == "float8_e4m3" and not run_args.register_pipeline
-                and not run_args.warp_pipeline and not run_args.operand_pipeline):
-            parser.error("--output-tail-reuse requires persistent E4M3 x E4M3, 256x256x128 tiles, "
-                         "three buffers (four with --streamed-operands), "
+        a8w4_output_tail = ((run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 256)
+                            and run_args.dtype_a == "float8_e4m3" and dtype_b == "float4" and run_args.num_buffers == 3
+                            and run_args.cross_tile_prefetch and not run_args.streamed_operands)
+        a8w8_output_tail = ((run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
+                            and run_args.dtype_a == dtype_b == "float8_e4m3"
+                            and run_args.num_buffers == (4 if run_args.streamed_operands else 3))
+        if run_args.output_tail_reuse and not (run_args.persistent and run_args.output_staging
+                                               and run_args.tdm_fusion == "partial" and run_args.num_warps == 4 and
+                                               (a8w8_output_tail or a8w4_output_tail) and not run_args.register_pipeline
+                                               and not run_args.warp_pipeline and not run_args.operand_pipeline):
+            parser.error("--output-tail-reuse requires persistent E4M3 x E4M3 with 256x256x128 tiles "
+                         "and three buffers (four with --streamed-operands), or E4M3 x FP4 with "
+                         "256x256x256 tiles, three buffers, and --cross-tile-prefetch; "
                          "four warps, partial TDM fusion, and output staging")
         if run_args.l2_prefetch_distance < -1:
             parser.error("--l2-prefetch-distance must be at least -1")
@@ -401,8 +430,10 @@ def parse_benchmark_args(argv=None):
             parser.error("--register-pipeline requires A8W8, persistent 256x256x256 tiles, two buffers, "
                          "four warps, partial TDM fusion, and output staging; select --variant mx8xmx8")
         if run_args.output_staging:
-            if run_args.block_k == 256 and run_args.cross_tile_prefetch and not run_args.register_pipeline:
-                parser.error("BK256 output staging reuses the A ring and requires --no-cross-tile-prefetch")
+            if (run_args.block_k == 256 and run_args.cross_tile_prefetch and not run_args.register_pipeline
+                    and not (dtype_b == "float4" and run_args.num_buffers == 3 and run_args.num_warps == 4)):
+                parser.error("BK256 cross-tile output staging requires three buffers, FP4 B, and four warps; "
+                             "use --no-cross-tile-prefetch otherwise")
             max_buffers = 4 if run_args.block_k == 128 else (3 if dtype_b == "float4" else 2)
             if run_args.num_buffers > max_buffers:
                 parser.error(
@@ -470,9 +501,9 @@ def main():
             tdm_split=run_args.tdm_split, l2_prefetch_distance=run_args.l2_prefetch_distance,
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
-            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
-            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            compact_k_tail=run_args.compact_k_tail, streamed_operands=run_args.streamed_operands,
+            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
+            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
@@ -495,6 +526,7 @@ def main():
             f"register_pipeline={run_args.register_pipeline}, "
             f"output_tail_reuse={run_args.output_tail_reuse}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
+            f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
             f"async_output={run_args.async_output}, "
             f"l2_prefetch_distance={run_args.l2_prefetch_distance}, "

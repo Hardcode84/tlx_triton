@@ -6004,6 +6004,71 @@ def test_gfx1250_mxgemm_output_tail_reuse_rejects_incompatible_config(changes):
         _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
 
 
+@pytest.mark.parametrize("k", [768, 1024, 1280, 4096, 8192])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("uneven_tiles", [False, True])
+def test_gfx1250_mxgemm_a8w4_c_staging_preserves_overlap(k, cluster_size, uneven_tiles, capfd):
+    m, n, programs = (8192, 8192, 256)
+    if uneven_tiles:
+        m, n, programs = (1280, 512, 3) if cluster_size == 1 else (2048, 1024, 16)
+    compiled = _compile_gfx1250_mxgemm_persistent("e2m1", 3, 256, K=k, CROSS_TILE_PREFETCH=True, OUTPUT_TAIL_REUSE=True,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4, M=m, N=n,
+                                                  NUM_PROGRAMS=programs)
+    assert "illegal VGPR to SGPR copy" not in capfd.readouterr().err
+    asm, ttgir = compiled.asm["amdgcn"], compiled.asm["ttgir"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert "ttg.convert_layout" not in ttgir, "entry/loop layout mismatch introduced an LDS exchange"
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+
+    aliases = re.findall(
+        r"ttg.memdesc_reinterpret (%\w+) \{tlx.storage_alias_view\} : "
+        r"!ttg.memdesc<256x256xf8E4M3FN, (#\w+),.*? -> !ttg.memdesc<1x128x128xf32, (#\w+),", ttgir)
+    assert len(aliases) == 2, "C quadrants must use two independently retired A stages"
+    assert aliases[0][0] != aliases[1][0]
+    for source, a_layout, c_layout in aliases:
+        assert re.search(re.escape(source) + r" = ttg.memdesc_index .*?!ttg.memdesc<3x256x256xf8E4M3FN", ttgir)
+        assert re.search(re.escape(a_layout) + r" = #ttg.padded_shared<\[256:\+16\]", ttgir)
+        assert re.search(re.escape(c_layout) + r" = #ttg.padded_shared<\[128:\+4\]", ttgir)
+
+    lines = asm.splitlines()
+    stores = [i for i, line in enumerate(lines) if "tensor_store_from_lds" in line]
+    assert len(stores) == 4
+    last_matrix = max(i for i in range(stores[0]) if "v_wmma" in lines[i])
+    assert not any("s_wait_tensorcnt" in line for line in lines[last_matrix + 1:stores[1]])
+    for previous, current in zip(stores[1:], stores[2:]):
+        region = lines[previous + 1:current]
+        wait = next(i for i, line in enumerate(region) if re.search(r"s_wait_tensorcnt\s+(?:0x0*1|1)\b", line))
+        write = next(i for i, line in enumerate(region) if "ds_store_" in line)
+        assert wait < write, "C's previous reader must retire before slot reuse"
+    # Follow branch targets: the first tile's initial wait and the final drain
+    # are allowed, but a continuing tile must reach C-slot retirement after
+    # executing the first halves of C00/C01/C10. Textual order alone can count
+    # matrix instructions from an unrelated block or a previous K iteration.
+    labels = {line.split(":", 1)[0]: i for i, line in enumerate(lines) if line.startswith(".LBB")}
+    pending, visited, first_waits = [(stores[-1] + 1, 0)], set(), set()
+    while pending:
+        i, matrix = pending.pop()
+        if (i, matrix) in visited or i >= len(lines):
+            continue
+        visited.add((i, matrix))
+        line = lines[i].strip()
+        if wait := re.match(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)\b", line):
+            first_waits.add((int(wait[1], 0), matrix))
+            continue
+        if line.startswith("s_endpgm"):
+            continue
+        matrix = min(128, matrix + int(line.startswith("v_wmma")))
+        if branch := re.match(r"(s_branch|s_cbranch_\w+)\s+(\.LBB\w+)", line):
+            pending.append((labels[branch[2]], matrix))
+            if branch[1] == "s_branch":
+                continue
+        pending.append((i + 1, matrix))
+    assert (1, 48) in first_waits, f"C-slot retirement cannot overlap the next tile's entry: {first_waits}"
+    assert sum("v_wmma" in line for line in lines) <= 512, "tile entry duplicated the K compute body"
+    assert re.search(r"\.sgpr_spill_count:\s+0\b", asm), "one-time refill descriptors stayed live in the K loop"
+
+
 @pytest.mark.parametrize("k", [512, 768, 4096, 8192])
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("sched_mode_2", [False, True])
@@ -6086,7 +6151,38 @@ def test_gfx1250_mxgemm_register_pipeline_rejects_incompatible_config(changes):
         _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, **config)
 
 
-@pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 3, True, "CROSS_TILE_PREFETCH=False"),
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("compact", [False, True])
+def test_gfx1250_mxgemm_a8w4_handoff_preserves_slot_stride(k, compact):
+    compiled = _compile_gfx1250_mxgemm_persistent("e2m1", 3, 256, K=k, CROSS_TILE_PREFETCH=True, COMPACT_K_TAIL=compact,
+                                                  CLUSTER_SIZE=4, CLUSTER_BARRIER_INTERVAL=4)
+    ttgir, asm = compiled.asm["ttgir"], compiled.asm["amdgcn"]
+    alias = re.search(
+        r"ttg.memdesc_reinterpret %\w+ \{tlx.storage_alias_view\} : "
+        r"!ttg.memdesc<3x256x256xf8E4M3FN, (#\w+),.*? -> !ttg.memdesc<3x128x128xf32, (#\w+),", ttgir)
+    assert alias, "C must reuse the three A slots: " + "\n".join(
+        line for line in ttgir.splitlines() if "local_alloc" in line or "memdesc_reinterpret" in line)
+    paddings = {
+        name: (int(interval), int(padding))
+        for name, interval, padding in re.findall(r"(#\w+) = #ttg.padded_shared<\[(\d+):\+(\d+)\]", ttgir)
+    }
+    strides = []
+    for layout, elements, width in ((alias[1], 256 * 256, 1), (alias[2], 128 * 128, 4)):
+        interval, padding = paddings[layout]
+        strides.append((elements + elements // interval * padding) * width)
+    # Functional simulation can retire stores too quickly to expose an alias
+    # race. Retiring C slot i must free exactly A slot i, including padding.
+    assert strides[0] == strides[1], "C-slot retirement does not protect the corresponding A-slot refill"
+    assert compiled.metadata.shared <= 320 * 1024
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 4
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    if compact:
+        native_mma = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4\s", asm, re.MULTILINE)
+        assert len(native_mma) <= 256, "duplicated A8W4 compute bodies in the compact tail"
+
+
+@pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 2, True, "CROSS_TILE_PREFETCH=False"),
                                                             ("e4m3", 3, False, "2 buffers")])
 def test_gfx1250_mxgemm_persistent_output_reuse_rejects_conflict(dtype_b, buffers, prefetch, error):
     a = torch.empty((256, 1024), dtype=torch.float8_e4m3fn, device="meta")
