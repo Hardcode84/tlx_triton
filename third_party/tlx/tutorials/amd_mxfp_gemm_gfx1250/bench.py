@@ -35,6 +35,9 @@ FP32 C quadrants. The first two fills leave incoming A/B in flight, and the
 last two stores overlap the next tile's first 48 WMMAs. Counted waits then
 retire each C slot separately before its input refill. Do not combine this
 variant with --compact-k-tail.
+Add --handoff-schedule b-prefetch to load B1/B2 and their scales in the old
+tile's tail, or --handoff-schedule staggered to also place matrix work between
+the next tile's A refills. Both require the MX8xMX4 output-tail-reuse options.
 With four waves, MX8xMX8 also supports four input buffers: --num-buffers 4
 uses smaller output staging chunks and an explicit LDS/WMMA prefetch schedule.
 Use --num-warps 8 to test two waves per SIMD on persistent 256x256 tiles;
@@ -196,6 +199,8 @@ def _command(args, case, dtype_b):
         command.append("--first_use_prefetch")
     if args.compact_k_tail:
         command.append("--compact_k_tail")
+    if args.handoff_schedule != "current":
+        command.extend(["--handoff_schedule", args.handoff_schedule])
     if args.streamed_operands:
         command.append("--streamed_operands")
     if args.async_output:
@@ -298,6 +303,8 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
+    parser.add_argument("--handoff-schedule", choices=("current", "b-prefetch", "staggered"), default="current",
+                        help="A8W4 output-tail-reuse experiment: early B loads or staggered A refills")
     args = parser.parse_args(argv)
     if args.async_output and not args.streamed_operands:
         parser.error("--async-output requires --streamed-operands")
@@ -391,6 +398,10 @@ def parse_benchmark_args(argv=None):
         a8w8_output_tail = ((run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128)
                             and run_args.dtype_a == dtype_b == "float8_e4m3"
                             and run_args.num_buffers == (4 if run_args.streamed_operands else 3))
+        if run_args.handoff_schedule != "current" and not (a8w4_output_tail and run_args.output_tail_reuse
+                                                           and not run_args.compact_k_tail):
+            parser.error("--handoff-schedule requires --variant mx8xmx4 --cross-tile-prefetch "
+                         "--output-tail-reuse without --compact-k-tail")
         if run_args.output_tail_reuse and not (run_args.persistent and run_args.output_staging
                                                and run_args.tdm_fusion == "partial" and run_args.num_warps == 4 and
                                                (a8w8_output_tail or a8w4_output_tail) and not run_args.register_pipeline
@@ -501,9 +512,10 @@ def main():
             tdm_split=run_args.tdm_split, l2_prefetch_distance=run_args.l2_prefetch_distance,
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
-            compact_k_tail=run_args.compact_k_tail, streamed_operands=run_args.streamed_operands,
-            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
-            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
+            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
+            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
+            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
@@ -525,6 +537,7 @@ def main():
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
             f"register_pipeline={run_args.register_pipeline}, "
             f"output_tail_reuse={run_args.output_tail_reuse}, "
+            f"handoff_schedule={run_args.handoff_schedule}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
