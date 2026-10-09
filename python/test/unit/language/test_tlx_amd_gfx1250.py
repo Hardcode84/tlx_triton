@@ -683,7 +683,7 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
                                       NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
                                       FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
-                                      COMPACT_K_TAIL=False, TDM_FUSION="partial"):
+                                      COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current"):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -713,7 +713,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
                     CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
                     FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS,
-                    ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL))
+                    ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL, HANDOFF_SCHEDULE=HANDOFF_SCHEDULE))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
@@ -737,12 +737,14 @@ def test_mxgemm_output_overlap_wait_counts(fusion, cluster_size):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9])
-@pytest.mark.parametrize("cluster_size", [1, 4])
-def test_mxgemm_a8w4_c_staging_ring_phase(k_iters, cluster_size):
+@pytest.mark.parametrize("k_iters,cluster_size",
+                         [(k, cluster) for cluster in (1, 4) for k in (3, 4, 5, 6, 9)] + [(16, 4), (32, 4)])
+@pytest.mark.parametrize("handoff_schedule", ["current", "b-prefetch", "staggered"])
+def test_mxgemm_a8w4_c_staging_ring_phase(k_iters, cluster_size, handoff_schedule):
     # Keep next-tile K=0 live while C occupies the other two A stages.
     # Cover all ring phases, an empty steady loop, and final-store retirement.
-    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, cluster_size, True)
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, cluster_size, True,
+                                      HANDOFF_SCHEDULE=handoff_schedule)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -810,6 +812,8 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     ({"SCALE_PRESHUFFLE": False}, "preshuffled scales"),
     ({"TDM_SPLIT": True}, "unsplit descriptors"),
     ({"COMPACT_K_TAIL": True}, "COMPACT_K_TAIL requires"),
+    ({"HANDOFF_SCHEDULE": "invalid"}, "HANDOFF_SCHEDULE must be"),
+    ({"HANDOFF_SCHEDULE": "b-prefetch"}, "HANDOFF_SCHEDULE requires"),
     ({"BLOCK_M": 256, "BLOCK_N": 256, "OUTPUT_STAGING": True}, "BK256 cross-tile output staging"),
 ])
 def test_mxgemm_persistent_invalid_config(config, match):
