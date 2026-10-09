@@ -2391,12 +2391,16 @@ def mxgemm_tdm_pipelined(
     OUTPUT_TAIL_REUSE: bool = False,
     FIRST_USE_PREFETCH: bool = False,
     STREAMED_OPERANDS: bool = False,
+    ASYNC_OUTPUT: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
     ``BENCHMARK`` also accepts a callback receiving the allocation-free launch
     function. The hardware trace collector uses it for controlled warmup and
     dispatch selection while retaining this API's input and launch validation.
+
+    ``ASYNC_OUTPUT`` requires ``STREAMED_OPERANDS`` and stores staged FP32 C
+    directly from LDS, with completion tracked independently of TDM inputs.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -2478,6 +2482,8 @@ def mxgemm_tdm_pipelined(
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
     persistent_kernel = mxgemm_tdm_persistent_kernel
+    if ASYNC_OUTPUT and not STREAMED_OPERANDS:
+        raise ValueError("ASYNC_OUTPUT requires STREAMED_OPERANDS")
     if STREAMED_OPERANDS:
         if not (PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and WITH_A_SCALE and NUM_WARPS == 4 and
                 (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and NUM_BUFFERS in (3, 4)
@@ -2594,6 +2600,8 @@ def mxgemm_tdm_pipelined(
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
 
+    streamed_options = {"ASYNC_OUTPUT": ASYNC_OUTPUT} if STREAMED_OPERANDS else {}
+
     def run_kernel():
         if WARP_PIPELINE:
             return mxfp8_warp_pipeline_kernel[grid](a, b, c, a_scale, b_scale, M, N, K, a.stride(0), b.stride(0),
@@ -2609,7 +2617,7 @@ def mxgemm_tdm_pipelined(
                 FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
-                ctas_per_cga=(CLUSTER_SIZE, 1, 1))
+                ctas_per_cga=(CLUSTER_SIZE, 1, 1), **streamed_options)
         kernel = mxgemm_tdm_operand_pipeline_kernel if OPERAND_PIPELINE else mxgemm_tdm_pipelined_kernel
         return kernel[grid](
             a,
@@ -2710,6 +2718,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         raise ValueError("FIRST_USE_PREFETCH requires persistence")
     if cfg.get("STREAMED_OPERANDS", False) and not cfg.get("PERSISTENT", False):
         raise ValueError("STREAMED_OPERANDS requires persistence")
+    if cfg.get("ASYNC_OUTPUT", False) and not cfg.get("STREAMED_OPERANDS", False):
+        raise ValueError("ASYNC_OUTPUT requires STREAMED_OPERANDS")
     if cfg.get("OUTPUT_STAGING", False) and not (cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False)
                                                  or cfg.get("OPERAND_PIPELINE", False)):
         raise ValueError("output staging requires persistence")
@@ -2748,7 +2758,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
             NUM_WARPS=cfg["num_warps"], REGISTER_PIPELINE=cfg.get("REGISTER_PIPELINE", False), OPERAND_PIPELINE=cfg.get(
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
-                    "FIRST_USE_PREFETCH", False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False))
+                    "FIRST_USE_PREFETCH",
+                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS",
+                                                      False), ASYNC_OUTPUT=cfg.get("ASYNC_OUTPUT", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -2830,6 +2842,8 @@ if __name__ == "__main__":
                         help="test first-use operand prefetch with persistent E4M3 BK128 and three buffers")
     parser.add_argument("--streamed_operands", action="store_true",
                         help="test native operand fragments with persistent E4M3 BK128 and three or four buffers")
+    parser.add_argument("--async_output", action="store_true",
+                        help="use direct LDS-to-global C stores with independent waits; requires --streamed_operands")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)
@@ -2923,4 +2937,5 @@ if __name__ == "__main__":
         OUTPUT_TAIL_REUSE=args.output_tail_reuse,
         FIRST_USE_PREFETCH=args.first_use_prefetch,
         STREAMED_OPERANDS=args.streamed_operands,
+        ASYNC_OUTPUT=args.async_output,
     )

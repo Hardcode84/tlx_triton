@@ -1709,3 +1709,30 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
 // CHECK:           }
 // CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
 // CHECK:             %[[VAL_1:.*]] = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.padded_shared<[128:+8] {order = [0], shape = [1024]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32,
+                   "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+  // The destination is operand 1; operand 0 is the LDS source. Preserve the
+  // mask, vector-contiguity hint, and completion token when materializing it.
+  // CHECK-LABEL: tt.func @async_store_destination(
+  // CHECK-SAME: %[[BASE:.*]]: !tt.ptr<f32>
+  // CHECK-SAME: %[[OFFSET:.*]]: i32, %[[SRC:.*]]: !ttg.memdesc<1024xf32, #shared, #smem, mutable>, %[[MASK:.*]]: tensor<1024xi1, #blocked>
+  tt.func @async_store_destination(%base: !tt.ptr<f32> {tt.pointer_range = 32 : i32}, %offset: i32,
+      %src: !ttg.memdesc<1024xf32, #shared, #smem, mutable>, %mask: tensor<1024xi1, #blocked>) -> !ttg.async.token {
+    %r = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %p = tt.addptr %base, %offset : !tt.ptr<f32>, i32
+    %ps = tt.splat %p : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    %dst = tt.addptr %ps, %r : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    // CHECK: %[[PTRS:.*]] = tt.splat %[[BASE]] : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    // CHECK: %[[DST:.*]] = tt.addptr %[[PTRS]], %{{.*}} : tensor<1024x!tt.ptr<f32>, #blocked>, tensor<1024xi32, #blocked>
+    // CHECK: %[[TOKEN:.*]] = amdg.async_copy_local_to_global %[[SRC]], %[[DST]] mask %[[MASK]] {{.*}}contiguity = 4 : i32
+    %token = amdg.async_copy_local_to_global %src, %dst mask %mask {contiguity = 4 : i32} : !ttg.memdesc<1024xf32, #shared, #smem, mutable> -> tensor<1024x!tt.ptr<f32>, #blocked>
+    // CHECK: tt.return %[[TOKEN]] : !ttg.async.token
+    tt.return %token : !ttg.async.token
+  }
+}

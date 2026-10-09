@@ -20,6 +20,9 @@ slots instead of 64x128: sixteen FP32 output transfers per tile instead of eight
 Add --output-tail-reuse to that four-buffer streamed configuration to restore
 two 64x128 panels and eight transfers. One panel reuses the first next-tile A
 stage after its operands reach registers; the other has dedicated storage.
+Add --async-output to --streamed-operands to store FP32 C directly from LDS
+with b128 async stores. Output-buffer waits then leave next-tile TDM transfers
+pending. This also supports the four-buffer --output-tail-reuse configuration.
 Use --output-tail-reuse to keep two next-tile input stages prefetched while
 the retired third A/B stage holds FP32 output. This selects MX8xMX8 with three
 BK128 buffers and removes the separate output allocation.
@@ -184,6 +187,8 @@ def _command(args, case, dtype_b):
         command.append("--first_use_prefetch")
     if args.streamed_operands:
         command.append("--streamed_operands")
+    if args.async_output:
+        command.append("--async_output")
     if args.register_pipeline:
         command.append("--register_pipeline")
     if args.warp_pipeline:
@@ -255,6 +260,8 @@ def parse_benchmark_args(argv=None):
     parser.add_argument(
         "--streamed-operands", action="store_true",
         help="test native fragments with persistent E4M3 BK128 and three or four buffers; selects MX8xMX8")
+    parser.add_argument("--async-output", action="store_true",
+                        help="use direct LDS-to-global C stores with independent waits; requires --streamed-operands")
     parser.add_argument("--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
                         help="default: enabled for the register pipeline and BK128; disabled for BK256 output reuse")
     parser.add_argument("--num-programs", type=int, default=256,
@@ -278,6 +285,8 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
     args = parser.parse_args(argv)
+    if args.async_output and not args.streamed_operands:
+        parser.error("--async-output requires --streamed-operands")
     if sum((args.warp_pipeline, args.register_pipeline, args.operand_pipeline, args.streamed_operands)) > 1:
         parser.error(
             "select only one of --warp-pipeline, --register-pipeline, --operand-pipeline, and --streamed-operands")
@@ -454,21 +463,21 @@ def main():
         if status == "ok" and args.benchmark_mode != "none" and ms is None:
             status = "missing timing"
         kernel_name = _kernel_name(run_args)
-        config = dict(kernel=kernel_name, block_m=run_args.block_m, block_n=run_args.block_n, block_k=run_args.block_k,
-                      num_buffers=run_args.num_buffers,
-                      scale_buffers=3 if run_args.warp_pipeline else run_args.num_buffers, num_warps=run_args.num_warps,
-                      group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion, tdm_split=run_args.tdm_split,
-                      l2_prefetch_distance=run_args.l2_prefetch_distance, output_staging=run_args.output_staging,
-                      register_pipeline=run_args.register_pipeline, output_tail_reuse=run_args.output_tail_reuse,
-                      first_use_prefetch=run_args.first_use_prefetch, streamed_operands=run_args.streamed_operands,
-                      sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-                      xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
-                      cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
-                      cluster_barrier_interval=run_args.cluster_barrier_interval,
-                      cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
-                      requested_programs=run_args.num_programs if run_args.persistent else None,
-                      benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
-                      seed=run_args.seed)
+        config = dict(
+            kernel=kernel_name, block_m=run_args.block_m, block_n=run_args.block_n, block_k=run_args.block_k,
+            num_buffers=run_args.num_buffers, scale_buffers=3 if run_args.warp_pipeline else run_args.num_buffers,
+            num_warps=run_args.num_warps, group_m=run_args.group_m, tdm_fusion=run_args.tdm_fusion,
+            tdm_split=run_args.tdm_split, l2_prefetch_distance=run_args.l2_prefetch_distance,
+            output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
+            output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
+            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
+            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
+            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
+            cluster_barrier_interval=run_args.cluster_barrier_interval,
+            cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
+            requested_programs=run_args.num_programs if run_args.persistent else None,
+            benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
                  tflops=tflops, status=status, **config, command=shlex.join(command)))
@@ -487,6 +496,7 @@ def main():
             f"output_tail_reuse={run_args.output_tail_reuse}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"streamed_operands={run_args.streamed_operands}, "
+            f"async_output={run_args.async_output}, "
             f"l2_prefetch_distance={run_args.l2_prefetch_distance}, "
             f"sched_mode_2={run_args.sched_mode_2}, "
             f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "

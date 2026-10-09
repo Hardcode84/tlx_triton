@@ -20,6 +20,8 @@ With four buffers, --output-tail-reuse restores two 64x128 output slots by
 reusing the first next-tile A stage after its operands reach registers. Its
 last output store completes before the next refill; the final store from
 the dedicated slot can continue during the next tile's computation.
+Add --async-output to use direct b128 LDS-to-global stores for C. Output
+completion then uses a separate counter from next-tile TDM input transfers.
 """
 
 import triton
@@ -247,6 +249,7 @@ def mxgemm_tdm_streamed_kernel(
     REGISTER_PIPELINE: tl.constexpr = False,
     OUTPUT_TAIL_REUSE: tl.constexpr = False,
     FIRST_USE_PREFETCH: tl.constexpr = False,
+    ASYNC_OUTPUT: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and (NUM_BUFFERS == 3 or NUM_BUFFERS == 4))
     tl.static_assert(DTYPE_A == "e4m3" and DTYPE_B == "e4m3" and WITH_A_SCALE and TDM_FUSION == "partial")
@@ -274,6 +277,9 @@ def mxgemm_tdm_streamed_kernel(
         c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
         ca = tlx.local_alloc((64, 128), tl.float32, NUM_BUFFERS, layout=c_layout, reuse=ab)
         cb = tlx.local_alloc((64, 128), tl.float32, 1, layout=c_layout)
+    elif ASYNC_OUTPUT:
+        c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, C_COLS], [1, 0])
+        cb = tlx.local_alloc((64, C_COLS), tl.float32, 2, layout=c_layout)
     else:
         cb = tlx.local_alloc((64, C_COLS), tl.float32, 2)
     num_m, num_n = M // 256, N // 256
@@ -328,18 +334,28 @@ def mxgemm_tdm_streamed_kernel(
                                             load_k, NUM_BUFFERS, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
                                             XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL)
         tlx.amd_sched_barrier()
-        cd = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [64, C_COLS])
+        if ASYNC_OUTPUT:
+            # TDM waits in the K loop do not retire the preceding tile's C
+            # copies. Drain those only when its output slots are needed again.
+            tlx.async_load_wait_group(0)
+            output_layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, C_COLS // 32, 4)),
+                                                     stride=((4, C_COLS, 4 * C_COLS), (1, 32, 16 * C_COLS)))
+            rm, rn = tl.arange(0, 64), tl.arange(0, C_COLS)
+        else:
+            cd = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [64, C_COLS])
         if OUTPUT_TAIL_REUSE:
             # The final step acquired all next-tile K=0 operands in registers.
             # Retire every wave's LDS reads before changing that A slot to C.
             tlx.workgroup_barrier()
             output_a = tlx.local_view(ca, slot)
-        # A previous tile leaves at most two output stores pending. The first
-        # NUM_BUFFERS-1 K-step waits retire them. K contains at least one full
-        # input ring, so both output slots are free again here.
+        # For TDM output, the first NUM_BUFFERS-1 K-step waits retire the
+        # previous tile's stores. Direct output was retired separately above.
         for part in tl.static_range(4 * C_PARTS_PER_ROW):
             if part >= 2:
-                tlx.async_amd_descriptor_wait(1)
+                if ASYNC_OUTPUT:
+                    tlx.async_load_wait_group(1)
+                else:
+                    tlx.async_amd_descriptor_wait(1)
             if OUTPUT_TAIL_REUSE:
                 if part % 2 == 0:
                     view = output_a
@@ -351,14 +367,30 @@ def mxgemm_tdm_streamed_kernel(
                 for c in tl.static_range(C_COLS // 32):
                     value = acc[((part // C_PARTS_PER_ROW) * 2 + r) * 8 + (part % C_PARTS_PER_ROW) * (C_COLS // 32) + c]
                     tlx.local_store(tlx.local_slice(view, [r * 32, c * 32], [32, 32]), value)
-            tlx.async_amd_descriptor_store(
-                cd, view, [off_m + (part // C_PARTS_PER_ROW) * 64, off_n + (part % C_PARTS_PER_ROW) * C_COLS])
+            out_m = off_m + (part // C_PARTS_PER_ROW) * 64
+            out_n = off_n + (part % C_PARTS_PER_ROW) * C_COLS
+            if ASYNC_OUTPUT:
+                # Keep the uniform panel base separate from the per-lane
+                # offsets instead of rebuilding a full address for each copy.
+                c_base = (c_ptr.to(tl.uint64) + (out_m.to(tl.uint64) * stride_cm + out_n.to(tl.uint64)) * 4).to(
+                    tl.pointer_type(tl.float32))
+                c_base = tl.multiple_of(c_base, 16)
+                ptrs = c_base + (rm[:, None] * stride_cm + rn[None, :]).to(tl.uint32)
+                token = tlx.async_amd_store(tlx.require_layout(ptrs, output_layout), view)
+                tlx.async_load_commit_group([token])
+            else:
+                tlx.async_amd_descriptor_store(cd, view, [out_m, out_n])
         if OUTPUT_TAIL_REUSE:
             # The penultimate store uses the A alias; the final store uses cb.
             # Keep only the latter outstanding before the next K=0 refill.
-            tlx.async_amd_descriptor_wait(1)
+            if ASYNC_OUTPUT:
+                tlx.async_load_wait_group(1)
+            else:
+                tlx.async_amd_descriptor_wait(1)
         phase = (phase + k_iters) % NUM_BUFFERS
         tile = next_tile
     tlx.async_amd_descriptor_wait(0)
+    if ASYNC_OUTPUT:
+        tlx.async_load_wait_group(0)
     if CLUSTER_SIZE > 1 and CLUSTER_BARRIER_INTERVAL > 0:
         tlx.cluster_barrier()
