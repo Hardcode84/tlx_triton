@@ -4979,6 +4979,32 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     assert ttgir.count("clamp_bounds") == 2
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_async_amd_store_preserves_vector_layout_gfx1250(masked):
+
+    @triton.jit
+    def kernel(dst, valid_rows, MASKED: tl.constexpr):
+        shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
+        layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 4, 4)), stride=((4, 128, 512), (1, 32, 2048)))
+        buf = tlx.local_view(tlx.local_alloc((64, 128), tl.float32, 1, layout=shared), 0)
+        r, c = tl.arange(0, 64), tl.arange(0, 128)
+        tlx.local_store(buf, (r[:, None] * 128 + c[None, :]).to(tl.float32))
+        ptrs = tlx.require_layout(dst + r[:, None] * 128 + c[None, :], layout)
+        mask = r[:, None] < valid_rows if MASKED else None
+        copy = tlx.async_amd_store(ptrs, buf, mask=mask)
+        group = tlx.async_load_commit_group([copy])
+        tlx.async_load_wait_group(0, [group])
+
+    src = ASTSource(kernel, signature={"dst": "*fp32", "valid_rows": "i32"}, constexprs={"MASKED": masked},
+                    attrs={(0, ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]})
+    compiled = triton_compile(src, target=GFX1250, options=dict(num_warps=4))
+    assert "amdg.async_copy_local_to_global" in compiled.asm["ttgir"]
+    assert re.findall(r"\bglobal_store_async_from_lds_\w+", compiled.asm["amdgcn"]) == \
+        ["global_store_async_from_lds_b128"] * 16
+    assert "s_wait_asynccnt 0x0" in compiled.asm["amdgcn"]
+    assert "s_wait_tensorcnt" not in compiled.asm["amdgcn"]
+
+
 def test_update_tensor_descriptor_store_compiles_gfx1250(device):
     compiled = compile_for_gfx1250(
         _update_tensor_descriptor_store_kernel,
@@ -5626,27 +5652,44 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
 @pytest.mark.parametrize("k", [4096, 8192])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("num_buffers,output_tail_reuse", [(3, False), (4, False), (4, True)])
-def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size, num_buffers, output_tail_reuse):
+@pytest.mark.parametrize("async_output", [False, True])
+def test_gfx1250_mxgemm_streamed_operands_preserves_overlap(k, cluster_size, num_buffers, output_tail_reuse,
+                                                            async_output):
     compiled = _compile_gfx1250_mxgemm_persistent("e4m3", num_buffers, 128, K=k, streamed_operands=True,
                                                   CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4,
-                                                  OUTPUT_TAIL_REUSE=output_tail_reuse)
+                                                  OUTPUT_TAIL_REUSE=output_tail_reuse, ASYNC_OUTPUT=async_output)
     asm = compiled.asm["amdgcn"]
     assert "v_perm" not in asm
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
     assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
-    assert asm.count("tensor_store_from_lds") == (8 if num_buffers == 3 or output_tail_reuse else 16)
+    panels = 8 if num_buffers == 3 or output_tail_reuse else 16
+    stores_per_panel = 128 // panels
+    if async_output:
+        assert re.findall(r"\bglobal_store_async_from_lds_\w+", asm) == ["global_store_async_from_lds_b128"] * 128
+        assert "tensor_store_from_lds" not in asm
+    else:
+        assert asm.count("tensor_store_from_lds") == panels
     assert compiled.metadata.shared <= 320 * 1024
 
     lines = asm.splitlines()
     labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    store_op = "global_store_async_from_lds" if async_output else "tensor_store_from_lds"
+    last_store = max(i for i, line in enumerate(lines) if store_op in line)
+    if async_output:
+        first_store = next(i for i, line in enumerate(lines) if store_op in line)
+        stores = lines[first_store:last_store + 1]
+        assert any(f"s_wait_asynccnt {stores_per_panel:#x}" in line for line in stores)
+        assert not any("s_wait_tensorcnt" in line for line in stores), "C-slot reuse drained next-tile TDM input"
+        assert any("s_wait_asynccnt 0x0" in line for line in lines[last_store:]), "missing final C completion"
     if output_tail_reuse:
         # The final store uses dedicated LDS. Retire the preceding aliased
         # store before tile reentry while allowing that final transfer to run.
-        last_store = max(i for i, line in enumerate(lines) if "tensor_store_from_lds" in line)
         next_label = min(i for i in labels.values() if i > last_store)
         output_tail = [line.strip() for line in lines[last_store + 1:next_label]]
-        assert "s_wait_tensorcnt 0x1" in output_tail
-        assert "s_wait_tensorcnt 0x0" not in output_tail
+        counter = "asynccnt" if async_output else "tensorcnt"
+        remaining = stores_per_panel if async_output else 1
+        assert f"s_wait_{counter} {remaining:#x}" in output_tail
+        assert f"s_wait_{counter} 0x0" not in output_tail
     loops = []
     for i, line in enumerate(lines):
         branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
@@ -5721,6 +5764,14 @@ def test_gfx1250_mxgemm_streamed_operands_rejects_incompatible_config(changes):
     scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
     with pytest.raises(ValueError, match="STREAMED_OPERANDS requires"):
         _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, **config)
+
+
+def test_gfx1250_mxgemm_async_output_requires_streamed_operands():
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="ASYNC_OUTPUT requires STREAMED_OPERANDS"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, scale, scale, ASYNC_OUTPUT=True, TRANSPOSE_B=True, DTYPE_A="e4m3",
+                                           DTYPE_B="e4m3")
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k,num_warps", [

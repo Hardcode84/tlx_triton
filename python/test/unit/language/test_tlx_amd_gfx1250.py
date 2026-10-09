@@ -271,6 +271,35 @@ def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
     torch.testing.assert_close(x, y)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("valid_rows", [0, 61, 64])
+def test_async_amd_store_masked_reuse_gfx1250(device, valid_rows):
+
+    @triton.jit
+    def kernel(src, dst, valid_rows):
+        shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
+        layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 4, 4)), stride=((4, 128, 512), (1, 32, 2048)))
+        desc = tl.make_tensor_descriptor(src, [64, 128], [128, 1], [64, 128])
+        buf = tlx.local_view(tlx.local_alloc((64, 128), tl.float32, 1, layout=shared), 0)
+        tlx.async_amd_descriptor_load(desc, buf, [0, 0])
+        tlx.async_amd_descriptor_wait(0)
+        values = tlx.local_load(buf)
+        r, c = tl.arange(0, 64), tl.arange(0, 128)
+        for part in tl.static_range(3):
+            tlx.local_store(buf, values + part)
+            ptrs = tlx.require_layout(dst + part * 64 * 128 + r[:, None] * 128 + c[None, :], layout)
+            copy = tlx.async_amd_store(ptrs, buf, mask=r[:, None] < valid_rows)
+            group = tlx.async_load_commit_group([copy])
+            tlx.async_load_wait_group(0, [group])
+
+    src = torch.randn((64, 128), device=device, dtype=torch.float32)
+    dst = torch.full((3, 64, 128), float("nan"), device=device, dtype=torch.float32)
+    kernel[(1, )](src, dst, valid_rows, num_warps=4)
+    expected = src[None, :valid_rows, :] + torch.arange(3, device=device)[:, None, None]
+    torch.testing.assert_close(dst[:, :valid_rows], expected, atol=0, rtol=0)
+    assert torch.isnan(dst[:, valid_rows:]).all()
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 def test_local_reshape_correctness_gfx1250(device):
     """End-to-end: local_reshape reinterprets a flat LDS buffer as a 2D tile."""
@@ -648,7 +677,7 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
 )
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
                                       NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
-                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False):
+                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -677,7 +706,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
                     REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
                     CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
-                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS))
+                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS,
+                    ASYNC_OUTPUT=ASYNC_OUTPUT))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
@@ -697,11 +727,13 @@ def test_mxgemm_first_use_prefetch_ring_phase(k_iters, prefetch, cluster_size):
                          [(3, k, False)
                           for k in (3, 4, 5, 9)] + [(4, k, reuse) for reuse in (False, True) for k in (4, 5, 6, 7, 9)])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size, num_buffers, output_tail_reuse):
+@pytest.mark.parametrize("async_output", [False, True])
+def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size, num_buffers, output_tail_reuse, async_output):
     # Signed inputs exercise the empty steady loop, odd paired-loop remainder,
     # ring wrap, uneven tile assignments, and clustered tile transitions.
     test_mxgemm_persistent_ring_phase(k_iters, num_buffers, True, "float8_e4m3", 128, True, 4, False, False,
-                                      cluster_size, output_tail_reuse, STREAMED_OPERANDS=True)
+                                      cluster_size, output_tail_reuse, STREAMED_OPERANDS=True,
+                                      ASYNC_OUTPUT=async_output)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

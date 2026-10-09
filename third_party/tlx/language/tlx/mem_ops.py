@@ -1034,8 +1034,9 @@ def async_load_commit_group(
     _semantic=None,
 ) -> tlx.async_token:
     """
-    Commits all prior initiated but uncommitted async_load ops an async group.
-    Each token represents a tracked async load operation.
+    Commits all prior uncommitted async copies into an async group.
+    On gfx1250 this includes both ``async_load`` and ``async_amd_store``.
+    Each token represents a tracked async copy operation.
     """
     handles = [t.handle for t in tokens]
     return tlx.async_token(_semantic.builder.create_async_commit_group(handles))
@@ -1049,6 +1050,8 @@ def async_load_wait_group(
 ) -> tlx.async_token:
     """
     Wait for completion of prior asynchronous copy operations.
+    On gfx1250 this includes both ``async_load`` and ``async_amd_store``,
+    independently of TDM descriptor operations.
     Each token represents a tracked async commit group operation.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
@@ -2125,6 +2128,48 @@ def async_descriptor_store(
         }
         reduce_kind = reduce_kind_map[store_reduce]
         _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle, evict)
+
+
+@tl.builtin
+def async_amd_store(
+    dst: tl.tensor,
+    src: tlx.buffered_tensor,
+    mask: Optional[tl.tensor] = None,
+    cache_modifier: str = "",
+    eviction_policy: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """Copy shared memory directly to global memory asynchronously on gfx1250.
+
+    ``dst`` is a tensor of pointers with the same shape and element type as
+    the unbuffered shared-memory view ``src``. Its register layout controls
+    which lanes perform the copies and their vector width. ``mask``, if
+    provided, must be boolean and broadcastable to that shape.
+
+    Commit copies with ``async_load_commit_group`` and wait with
+    ``async_load_wait_group`` before reusing the source or consuming the
+    output. These copies share completion tracking with ``async_load``;
+    ``async_amd_descriptor_wait`` only waits for TDM and cannot retire them.
+    """
+    if not dst.type.is_block() or not dst.dtype.is_ptr():
+        raise ValueError("async_amd_store requires a tensor of destination pointers")
+    if src.type.num != 0:
+        raise ValueError("async_amd_store requires a single buffer view; use local_view")
+    if dst.dtype.element_ty != src.type.element_ty:
+        raise ValueError("async_amd_store requires matching source and destination element types")
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        if mask.dtype != tl.int1:
+            raise ValueError("async_amd_store requires a boolean mask")
+        dst, mask = _semantic.broadcast_impl_value(dst, mask)
+    if dst.type.shape != src.type.shape:
+        raise ValueError("async_amd_store requires matching source and destination shapes")
+    cache = _semantic._str_to_store_cache_modifier(cache_modifier)
+    eviction = _semantic._str_to_eviction_policy(eviction_policy)
+    return tlx.async_token(
+        _semantic.builder.create_async_amd_store(src.handle, dst.handle, mask.handle if mask is not None else None,
+                                                 cache, eviction))
 
 
 @tl.builtin

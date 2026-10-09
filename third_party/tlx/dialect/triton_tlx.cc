@@ -1535,6 +1535,17 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value src, Value dst, Value size) -> void {
              self.create<ttng::AsyncStoreOp>(src, dst, size);
            })
+      .def(
+          "create_async_amd_store",
+          [](TritonOpBuilder &self, Value src, Value dst,
+             std::optional<Value> mask, CacheModifier cacheModifier,
+             EvictionPolicy evictionPolicy) -> mlir::Value {
+            return self.create<amdgpu::AsyncCopyLocalToGlobalOp>(
+                src, dst, mask.value_or(Value()), cacheModifier,
+                evictionPolicy);
+          },
+          py::arg("src"), py::arg("dst"), py::arg("mask").none(),
+          py::arg("cacheModifier"), py::arg("evictionPolicy"))
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);

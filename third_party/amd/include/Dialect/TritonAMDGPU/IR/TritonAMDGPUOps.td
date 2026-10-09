@@ -944,7 +944,8 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 def AsyncCopyLocalToGlobalOp
     : TT_AMDGPU_Op<
           "async_copy_local_to_global",
-          [DeclareOpInterfaceMethods<PredicatedOpInterface>,
+          [SameLoadStoreOperandsEncoding,
+           DeclareOpInterfaceMethods<PredicatedOpInterface>,
            OptionalTypesMatchWith<"infer mask type from dst type", "dst",
                                   "mask", "getI1SameShape($_self)">,
 ]> {

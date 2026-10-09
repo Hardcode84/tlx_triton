@@ -126,6 +126,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::tlx::DumpLayoutOp, triton::gpu::WarpVoteOp,
       triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
       triton::amdgpu::BufferLoadToLocalOp,
+      triton::amdgpu::AsyncCopyLocalToGlobalOp,
       triton::amdgpu::RematerializedRangeOp,
       triton::amdgpu::RegisterClassAnchorOp>([&](Operation *op) -> bool {
     // make sure every RankedTensorType operand has encoding
