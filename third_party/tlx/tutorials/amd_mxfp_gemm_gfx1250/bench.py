@@ -38,6 +38,11 @@ variant with --compact-k-tail.
 Add --handoff-schedule b-prefetch to load B1/B2 and their scales in the old
 tile's tail, or --handoff-schedule staggered to also place matrix work between
 the next tile's A refills. Both require the MX8xMX4 output-tail-reuse options.
+Use --handoff-schedule ab-reuse to stage three C quadrants across the later
+A/B ring stages, preload K1 before the final C store, and delay the K2 refill
+until 80 WMMAs of the next tile (48 with a three-stage K length).
+Add --handoff-tdm-fusion 4way to fuse A, B, and their scales in each ab-reuse
+handoff refill. Ordinary K refills retain partial fusion.
 With four waves, MX8xMX8 also supports four input buffers: --num-buffers 4
 uses smaller output staging chunks and an explicit LDS/WMMA prefetch schedule.
 Use --num-warps 8 to test two waves per SIMD on persistent 256x256 tiles;
@@ -201,6 +206,8 @@ def _command(args, case, dtype_b):
         command.append("--compact_k_tail")
     if args.handoff_schedule != "current":
         command.extend(["--handoff_schedule", args.handoff_schedule])
+    if args.handoff_tdm_fusion != "partial":
+        command.extend(["--handoff_tdm_fusion", args.handoff_tdm_fusion])
     if args.streamed_operands:
         command.append("--streamed_operands")
     if args.async_output:
@@ -303,8 +310,11 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
     parser.add_argument("--dry-run", action="store_true", help="print commands without importing GPU libraries")
-    parser.add_argument("--handoff-schedule", choices=("current", "b-prefetch", "staggered"), default="current",
-                        help="A8W4 output-tail-reuse experiment: early B loads or staggered A refills")
+    parser.add_argument("--handoff-schedule", choices=("current", "b-prefetch", "staggered", "ab-reuse"),
+                        default="current",
+                        help="A8W4 output-tail-reuse experiment: early B loads, staggered A refills, or A/B C staging")
+    parser.add_argument("--handoff-tdm-fusion", choices=("partial", "4way"), default="partial",
+                        help="fusion for ab-reuse handoff refills (default: partial)")
     args = parser.parse_args(argv)
     if args.async_output and not args.streamed_operands:
         parser.error("--async-output requires --streamed-operands")
@@ -402,6 +412,8 @@ def parse_benchmark_args(argv=None):
                                                            and not run_args.compact_k_tail):
             parser.error("--handoff-schedule requires --variant mx8xmx4 --cross-tile-prefetch "
                          "--output-tail-reuse without --compact-k-tail")
+        if run_args.handoff_tdm_fusion != "partial" and run_args.handoff_schedule != "ab-reuse":
+            parser.error("--handoff-tdm-fusion requires --handoff-schedule ab-reuse")
         if run_args.output_tail_reuse and not (run_args.persistent and run_args.output_staging
                                                and run_args.tdm_fusion == "partial" and run_args.num_warps == 4 and
                                                (a8w8_output_tail or a8w4_output_tail) and not run_args.register_pipeline
@@ -513,9 +525,9 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
-            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
-            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
+            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
+            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
@@ -538,6 +550,7 @@ def main():
             f"register_pipeline={run_args.register_pipeline}, "
             f"output_tail_reuse={run_args.output_tail_reuse}, "
             f"handoff_schedule={run_args.handoff_schedule}, "
+            f"handoff_tdm_fusion={run_args.handoff_tdm_fusion}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
