@@ -1,9 +1,10 @@
 """Benchmark persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
-Both variants run at 8192x8192x8192 and 8192x8192x4096 by default, with FP32
-output, persistent 256x256 M/N tiles, three input buffers, output staging, and
-partial TDM fusion. MX8xMX8 uses BK128 with cross-tile prefetch; MX8xMX4 uses
-BK256 with cross-tile prefetch disabled by default. Use --variant mx8xmx4
+Both variants run at 8192x8192x8192, 8192x8192x4096, 16384x16384x16384, and
+32768x32768x32768 by default, with FP32 output, persistent 256x256 M/N tiles,
+three input buffers, output staging, and partial TDM fusion. MX8xMX8 uses
+BK128 with cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch
+disabled by default. Use --variant mx8xmx4
 --cross-tile-prefetch to start refilling each A/B stage as its C slot retires.
 Use --compact-k-tail to test one loop body for A8W4's final three K256 stages.
 It selects MX8xMX4 and can be combined with --cross-tile-prefetch.
@@ -105,7 +106,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_CASES = ((8192, 8192, 8192), (8192, 8192, 4096))
+DEFAULT_CASES = ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
 VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
