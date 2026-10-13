@@ -11,6 +11,13 @@ import triton.language as tl
 from triton._internal_testing import is_cuda, is_hip
 
 
+@pytest.mark.parametrize("shape", [(), (1, ), (0, ), (3, 5), (2, 3, 5, 7), (1, 1, 512, 128), (2, 0, 3), (2, 3, 0)])
+def test_mock_tensor_contiguous_strides(shape):
+    tensor = torch.empty(shape, device="meta")
+    mock = triton.runtime.jit.MockTensor(tensor.dtype, shape)
+    assert mock.stride() == tensor.stride()
+
+
 def test_metadata() -> None:
 
     used_hook = False
