@@ -277,23 +277,13 @@ SmallVector<int32_t> LocalMemOpTile::getLaneAddr(ArrayRef<int32_t> lane) const {
 SmallVector<int32_t> getLaneTile(const LocalMemOpTile &tile,
                                  ArrayRef<int32_t> lane, int32_t vecSize,
                                  int32_t bitwidth, int32_t numBanks) {
+  // Explicit instruction phases survive projection of vector bases.
+  if (!tile.laneAddr.empty())
+    return tile.getLaneAddr(lane);
   auto log2Vec = llvm::Log2_32(std::max<int32_t>(1, (vecSize * bitwidth) / 32));
   auto log2Bank = llvm::Log2_32(numBanks);
   auto log2Phase = std::max<int32_t>(0, log2Vec + lane.size() - log2Bank);
-  SmallVector<int32_t> res;
-  if (!tile.laneAddr.empty()) {
-    // The laneAddr field explicitly defines the lane basis indices for
-    // load/store instructions with non-sequential lane IDs within a single
-    // phase, like ds_read_b128.
-    res = tile.getLaneAddr(lane);
-  } else {
-    // If laneAddr is empty, we fall back to the standard assumption for
-    // regular loads/stores: lane IDs are sequential within a single phase.
-    res = to_vector(lane.drop_back(log2Phase));
-  }
-  assert(res.size() == lane.size() - log2Phase &&
-         "Both paths should return the expected number of elements");
-  return res;
+  return to_vector(lane.drop_back(log2Phase));
 }
 
 std::pair<int, int>
