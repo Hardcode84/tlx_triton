@@ -996,12 +996,13 @@ def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_col
     archive = root.with_name(root.name + ".tar.gz")
     mode_options = dict(preflight=["--preflight-only"], no_package=["--no-package"], no_att=["--no-att"],
                         explicit_package=["--package"])
+    # Keep packaging coverage fixed as the default benchmark sweep grows.
     args = mxfp_collector.parser().parse_args([
         "--output",
         str(archive if mode == "archive_suffix" else root), "--profiler",
         str(profiler), "--decoder-dir",
         str(decoder), "--sample-ms", "2", *mode_options.get(mode, []), "--warmup-seconds", "0.075",
-        "--duration-seconds", "0.075"
+        "--duration-seconds", "0.075", "--", "--case", "8192,8192,8192", "--case", "8192,8192,4096"
     ])
     cases = mxfp_collector.make_cases(args)
     assert len(cases) == 4
