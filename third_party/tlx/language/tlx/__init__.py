@@ -7,6 +7,8 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    amd_cluster_arrive,
+    amd_cluster_wait,
     cond_barrier,
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
@@ -248,6 +250,8 @@ __all__ = [
     "prefetch",
     # barriers
     "cluster_barrier",
+    "amd_cluster_arrive",
+    "amd_cluster_wait",
     "cond_barrier",
     "workgroup_barrier",
     "alloc_barriers",

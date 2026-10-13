@@ -33,6 +33,32 @@ def cluster_barrier(_semantic=None):
 
 
 @tl.builtin
+def amd_cluster_arrive(_semantic=None):
+    """Signal the AMD cluster barrier without waiting.
+
+    This does not synchronize the workgroup or fence its memory accesses.
+    Pair each arrival with :func:`amd_cluster_wait` before another arrival.
+    All threads and all CTAs in the cluster must execute the same sequence.
+    Independent computation can execute between arrival and wait.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_arrive is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_arrive()
+
+
+@tl.builtin
+def amd_cluster_wait(_semantic=None):
+    """Wait for the preceding :func:`amd_cluster_arrive` on AMD.
+
+    This does not replace workgroup synchronization or memory completion
+    waits. Use :func:`cluster_barrier` for a full cluster synchronization.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_wait is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_wait()
+
+
+@tl.builtin
 def cond_barrier(pred: tl.tensor, _semantic=None):
     """
     Conditionally execute a workgroup barrier (AMD only).
