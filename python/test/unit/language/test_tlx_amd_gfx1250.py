@@ -684,7 +684,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
                                       FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
                                       COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
-                                      HANDOFF_TDM_FUSION="partial"):
+                                      HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
+                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -706,17 +707,42 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         a.cuda(),
         b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
-        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
-                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
-                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=4, num_warps=NUM_WARPS, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
-                    FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, STREAMED_OPERANDS=STREAMED_OPERANDS,
-                    ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL, HANDOFF_SCHEDULE=HANDOFF_SCHEDULE,
-                    HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION))
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
+            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
+            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
+            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("dtype_b,block_k", [("float8_e4m3", 128), ("float4", 256)])
+@pytest.mark.parametrize("schedule", ["2x2", "split", "early", "combined"])
+def test_mxgemm_cluster_and_output_schedule_ring_phase(k_iters, dtype_b, block_k, schedule):
+    # Signed inputs, varying scales, both short/steady K, and every three-slot
+    # ring phase. The unclustered case also has uneven output tile assignments.
+    cluster = 1 if schedule == "early" else 4
+    test_mxgemm_persistent_ring_phase(k_iters, 3, block_k == 128, dtype_b, block_k, True, 4, False, False, cluster,
+                                      False, CLUSTER_LAYOUT="2x2" if schedule in ("2x2", "combined") else "linear",
+                                      SPLIT_CLUSTER_BARRIER=schedule in ("split", "combined"), EARLY_C_STORES=schedule
+                                      in ("early", "combined"), CLUSTER_BARRIER_INTERVAL=1 if k_iters == 5 else 4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("fusion", ["partial", "4way"])
+def test_mxgemm_early_c_stores_ab_reuse_ring_phase(k_iters, fusion):
+    # Preserve next K0, stage C in the later A/B slots, and acquire K1 while
+    # the final C store is live. Include the mixed fused/partial wait ledger.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, 4, True,
+                                      HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION=fusion, CLUSTER_LAYOUT="2x2",
+                                      SPLIT_CLUSTER_BARRIER=True, EARLY_C_STORES=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -821,6 +847,10 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     ({"HANDOFF_SCHEDULE": "b-prefetch"}, "HANDOFF_SCHEDULE requires"),
     ({"HANDOFF_TDM_FUSION": "invalid"}, "HANDOFF_TDM_FUSION must be"),
     ({"HANDOFF_TDM_FUSION": "4way"}, "HANDOFF_TDM_FUSION requires"),
+    ({"CLUSTER_LAYOUT": "invalid"}, "CLUSTER_LAYOUT must be"),
+    ({"CLUSTER_LAYOUT": "2x2"}, "CLUSTER_LAYOUT=2x2 requires CLUSTER_SIZE=4"),
+    ({"EARLY_C_STORES": True}, "EARLY_C_STORES require"),
+    ({"SPLIT_CLUSTER_BARRIER": True}, "SPLIT_CLUSTER_BARRIER and EARLY_C_STORES require"),
     ({"BLOCK_M": 256, "BLOCK_N": 256, "OUTPUT_STAGING": True}, "BK256 cross-tile output staging"),
 ])
 def test_mxgemm_persistent_invalid_config(config, match):
@@ -835,6 +865,50 @@ def test_mxgemm_persistent_invalid_config(config, match):
         b = b.T.contiguous()
     with pytest.raises(ValueError, match=match):
         _gfx1250_mxfp.matmul(a, b, scales, scales, config=cfg)
+
+
+@triton.jit
+def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
+                           GROUP_M: tl.constexpr, REMAP: tl.constexpr):
+    pid = tl.program_id(0)
+    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, "2x2")
+    for step in range(NUM_M * NUM_N // PROGRAMS):
+        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, "2x2")
+        tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
+        tile += PROGRAMS
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("num_m,num_n,programs", [(16, 8, 32), (12, 8, 32), (16, 8, 64), (12, 16, 64)])
+@pytest.mark.parametrize("group_m", [4, 8])
+@pytest.mark.parametrize("remap", [0, 2])
+def test_mxgemm_cluster_2x2_tile_coverage(num_m, num_n, programs, group_m, remap):
+    # Check the mapping separately from GEMM, including a short final M group.
+    # Whole-cluster remapping must preserve the physical multicast rank bits.
+    # Sixty-four programs exercise a full remap chunk; 32 cover its remainder.
+    output = torch.empty(num_m * num_n, dtype=torch.int32, device="cuda")
+    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, group_m, remap, num_warps=4,
+                                         ctas_per_cga=(4, 1, 1))
+    ids = output.cpu().reshape(-1, 4)
+    torch.testing.assert_close(ids.flatten().sort().values, torch.arange(num_m * num_n, dtype=torch.int32))
+    rows, cols = ids // num_n, ids % num_n
+    assert torch.equal(rows[:, 0], rows[:, 2]) and torch.equal(rows[:, 1], rows[:, 3])
+    assert torch.equal(cols[:, 0], cols[:, 1]) and torch.equal(cols[:, 2], cols[:, 3])
+    assert torch.equal(rows[:, 1], rows[:, 0] + 1)
+    assert torch.equal(cols[:, 2], cols[:, 0] + 1)
+
+
+def test_mxgemm_bench_cluster_and_output_options():
+    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
+
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
+    assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
+    for _, dtype_b, args in variants:
+        cmd = bench._command(args, shapes[0], dtype_b)
+        assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
+        assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
+        assert cmd[cmd.index("--xcd_remap") + 1] == "none"
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -1189,10 +1263,14 @@ def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid
 
 
 @triton.jit
-def _amd_independent_cluster_ids(output):
+def _amd_independent_cluster_ids(output, SPLIT: tl.constexpr = False):
     pid = tl.program_id(0)
     rank = tlx.cluster_cta_rank()
-    tlx.cluster_barrier()
+    if SPLIT:
+        tlx.amd_cluster_arrive()
+        tlx.amd_cluster_wait()
+    else:
+        tlx.cluster_barrier()
     tl.store(output + pid, pid * 16 + rank)
 
 
@@ -1204,20 +1282,21 @@ def _amd_independent_cluster_ids(output):
     ("gfx950", None),
     ("gfx950", 1),
 ])
-def test_amd_cluster_barrier_compiles(arch, cluster_size):
+@pytest.mark.parametrize("split", [False, True])
+def test_amd_cluster_barrier_compiles(arch, cluster_size, split):
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
     options = dict(num_warps=4)
     if cluster_size is not None:
         options["ctas_per_cga"] = (cluster_size, 1, 1)
-    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"})
+    source = ASTSource(_amd_independent_cluster_ids, signature={"output": "*i32"}, constexprs={"SPLIT": split})
     compiled = triton.compile(source, target=GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64), options=options)
     ttgir = compiled.asm["ttgir"]
-    assert "ttg.barrier local" in ttgir
+    assert ("ttg.barrier local" in ttgir) == (not split)
     assert "amdg.cluster_barrier_arrive" in ttgir
     assert "amdg.cluster_barrier_wait" in ttgir
-    assert "s_barrier" in compiled.asm["amdgcn"]
+    assert ("s_barrier" in compiled.asm["amdgcn"]) == (not split or (cluster_size is not None and cluster_size > 1))
     multi_cta = cluster_size is not None and cluster_size > 1
     assert ("s_barrier_signal -3" in compiled.asm["amdgcn"]) == multi_cta
     assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta

@@ -1076,6 +1076,14 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<amdgpu::ClusterBarrierArriveOp>();
              self.create<amdgpu::ClusterBarrierWaitOp>();
            })
+      .def("create_amd_cluster_arrive",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierArriveOp>();
+           })
+      .def("create_amd_cluster_wait",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
       .def("create_amd_cluster_cta_rank",
            [](TritonOpBuilder &self) -> Value {
              return self.create<ROCDL::ClusterWorkgroupIdXOp>(

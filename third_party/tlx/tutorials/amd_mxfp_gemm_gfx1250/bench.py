@@ -8,7 +8,13 @@ BK256 with cross-tile prefetch disabled by default. Use --variant mx8xmx4
 Use --compact-k-tail to test one loop body for A8W4's final three K256 stages.
 It selects MX8xMX4 and can be combined with --cross-tile-prefetch.
 Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
-multicast with a cluster barrier every four input K blocks. SCHED_MODE[2] is off.
+multicast in a 2x2 tile layout, with a cluster barrier every four input K blocks.
+MX8xMX4 also enables split cluster barriers and early C stores. These two
+options are disabled by default for MX8xMX8 and output-tail reuse. Other
+operand schedules do not support these options. SCHED_MODE[2] is off.
+Use --cluster-layout linear --no-split-cluster-barrier --no-early-c-stores
+to compare with the previous defaults. Clusters smaller than four workgroups
+and --streamed-operands use a linear layout by default.
 Use --first-use-prefetch to test the MX8xMX8 three-buffer schedule with B1 local
 to each K step, operand registers rotating across two K steps, and four-read
 LDS groups during C01. It retains dedicated FP32 output staging.
@@ -114,6 +120,14 @@ def _parse_case(value):
     return dims
 
 
+def _supports_cluster_output_options(args, dtype_b):
+    return (args.persistent and args.output_staging and args.num_warps == 4 and args.num_buffers == 3
+            and args.block_m == args.block_n == 256 and args.dtype_a == "float8_e4m3" and args.tdm_fusion == "partial"
+            and ((args.block_k == 128 and dtype_b == "float8_e4m3") or (args.block_k == 256 and dtype_b == "float4"))
+            and not (args.register_pipeline or args.first_use_prefetch or args.compact_k_tail or args.streamed_operands
+                     or args.warp_pipeline or args.operand_pipeline))
+
+
 def _variant_args(args, dtype_b):
     resolved = argparse.Namespace(**vars(args))
     if resolved.block_k is None:
@@ -128,6 +142,13 @@ def _variant_args(args, dtype_b):
     if resolved.cross_tile_prefetch is None:
         resolved.cross_tile_prefetch = not resolved.operand_pipeline and (
             resolved.register_pipeline or not (resolved.output_staging and resolved.block_k == 256))
+    default_output_schedule = (dtype_b == "float4" and _supports_cluster_output_options(resolved, dtype_b)
+                               and not resolved.output_tail_reuse)
+    if resolved.split_cluster_barrier is None:
+        resolved.split_cluster_barrier = (default_output_schedule and resolved.cluster_size > 1
+                                          and resolved.cluster_barrier_interval > 0)
+    if resolved.early_c_stores is None:
+        resolved.early_c_stores = default_output_schedule
     return resolved
 
 
@@ -208,6 +229,12 @@ def _command(args, case, dtype_b):
         command.extend(["--handoff_schedule", args.handoff_schedule])
     if args.handoff_tdm_fusion != "partial":
         command.extend(["--handoff_tdm_fusion", args.handoff_tdm_fusion])
+    if args.cluster_layout != "linear":
+        command.extend(["--cluster_layout", args.cluster_layout])
+    if args.split_cluster_barrier:
+        command.append("--split_cluster_barrier")
+    if args.early_c_stores:
+        command.append("--early_c_stores")
     if args.streamed_operands:
         command.append("--streamed_operands")
     if args.async_output:
@@ -298,6 +325,18 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--xcd-chunk", type=int, default=2)
     parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=None,
                         help="workgroups per cluster (default: 4, or 1 with --warp-pipeline/--operand-pipeline)")
+    parser.add_argument(
+        "--cluster-layout", choices=("linear", "2x2"), default=None,
+        help="tile arrangement within each cluster (default: 2x2 for four workgroups without --streamed-operands, "
+        "linear otherwise); 2x2 shares A and B without XCD remapping")
+    parser.add_argument(
+        "--split-cluster-barrier", action=argparse.BooleanOptionalAction, default=None,
+        help="overlap periodic cluster rendezvous with steady-loop matrix work "
+        "(default: enabled for the MX8xMX4 output schedule when cluster barriers are active)")
+    parser.add_argument(
+        "--early-c-stores", action=argparse.BooleanOptionalAction, default=None,
+        help="interleave final quadrant dots and staged FP32 output stores "
+        "(default: enabled for the MX8xMX4 output schedule)")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument(
@@ -327,6 +366,8 @@ def parse_benchmark_args(argv=None):
         args.num_warps = 8 if args.warp_pipeline else 4
     if args.cluster_size is None:
         args.cluster_size = 1 if args.warp_pipeline or args.operand_pipeline else 4
+    if args.cluster_layout is None:
+        args.cluster_layout = "2x2" if args.cluster_size == 4 and not args.streamed_operands else "linear"
 
     dims = (args.M, args.N, args.K)
     if any(dim is not None for dim in dims):
@@ -363,6 +404,8 @@ def parse_benchmark_args(argv=None):
         parser.error("--num-xcds and --xcd-chunk must be positive")
     if args.cluster_barrier_interval < 0:
         parser.error("--cluster-barrier-interval must be nonnegative")
+    if args.cluster_layout == "2x2" and (args.cluster_size != 4 or args.streamed_operands):
+        parser.error("--cluster-layout 2x2 requires --cluster-size 4 without --streamed-operands")
     if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
         parser.error("XCD remapping and clustering require --persistent")
     if args.cluster_size > 1:
@@ -375,6 +418,16 @@ def parse_benchmark_args(argv=None):
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
+        if run_args.split_cluster_barrier and (run_args.cluster_size == 1 or run_args.cluster_barrier_interval == 0 or
+                                               (run_args.output_tail_reuse
+                                                and run_args.handoff_schedule != "ab-reuse")):
+            parser.error("--split-cluster-barrier requires clustering, a positive barrier interval, "
+                         "and --handoff-schedule ab-reuse when using --output-tail-reuse")
+        if (run_args.split_cluster_barrier
+                or run_args.early_c_stores) and not _supports_cluster_output_options(run_args, dtype_b):
+            parser.error("--split-cluster-barrier and --early-c-stores require persistent E4M3 x E4M3 BK128 or "
+                         "E4M3 x FP4 BK256, 256x256 tiles, three buffers, four warps, partial TDM fusion, "
+                         "and output staging without an alternative operand schedule")
         if run_args.compact_k_tail and not (
                 run_args.persistent and run_args.output_staging and run_args.tdm_fusion == "partial" and
             (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 256) and run_args.num_buffers == 3
@@ -529,7 +582,8 @@ def main():
             async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
             num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
-            cluster_barrier_interval=run_args.cluster_barrier_interval,
+            cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
+            split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
             requested_programs=run_args.num_programs if run_args.persistent else None,
             benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
@@ -561,6 +615,8 @@ def main():
             f"cluster_size={run_args.cluster_size}, "
             f"cluster_multicast={run_args.cluster_multicast if run_args.cluster_size > 1 else False}, "
             f"cluster_barrier_interval={run_args.cluster_barrier_interval}, "
+            f"cluster_layout={run_args.cluster_layout}, split_cluster_barrier={run_args.split_cluster_barrier}, "
+            f"early_c_stores={run_args.early_c_stores}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
