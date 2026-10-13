@@ -35,6 +35,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
 
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -42,6 +43,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -1216,6 +1218,37 @@ void init_triton_ir(py::module_ &m) {
   py::class_<scf::ConditionOp, OpState>(m, "ConditionOp");
 
   py::class_<Operation>(m, "operation")
+      .def(
+          "reencode_blocked_load",
+          [](Operation &self, std::vector<unsigned> sizePerThread) {
+            if (!isa<LoadOp, triton::amdgpu::BufferLoadOp>(self))
+              throw py::value_error("expected a blocking load");
+            auto type = dyn_cast<RankedTensorType>(self.getResult(0).getType());
+            if (!type)
+              throw py::value_error("expected a ranked tensor result");
+            auto encoding =
+                dyn_cast<ttg::BlockedEncodingAttr>(type.getEncoding());
+            if (!encoding || sizePerThread.size() != type.getRank())
+              throw py::value_error(
+                  "expected blocked encoding of matching rank");
+            for (unsigned size : sizePerThread)
+              if (!llvm::isPowerOf2_32(size))
+                throw py::value_error("size per thread must be a power of two");
+            Attribute next = ttg::BlockedEncodingAttr::get(
+                self.getContext(), type.getShape(), sizePerThread,
+                encoding.getOrder(), product(encoding.getWarpsPerCTA()),
+                product(encoding.getThreadsPerWarp()), encoding.getCGALayout());
+            Operation *result = convertDistributedOpEncoding(next, &self);
+            if (auto load = dyn_cast<triton::amdgpu::BufferLoadOp>(result)) {
+              auto nextType = cast<RankedTensorType>(load.getType());
+              unsigned contiguous =
+                  ttg::getContigPerThread(nextType)[encoding.getOrder()[0]];
+              // Retiling changes the maximum packet owned by one thread.
+              load.setContiguity(std::min(load.getContiguity(), contiguous));
+            }
+            return result;
+          },
+          ret::reference)
       .def("get_name",
            [](Operation &self) {
              llvm::StringRef opName = self.getName().getStringRef();
