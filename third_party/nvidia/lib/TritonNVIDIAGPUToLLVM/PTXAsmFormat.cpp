@@ -150,15 +150,9 @@ std::string PTXBuilder::dump() const {
 PTXInstrExecution &PTXInstrCommon::call(ArrayRef<Operand *> oprs,
                                         bool onlyAttachMLIRArgs) {
   if (onlyAttachMLIRArgs) {
-    // Nearly impossible to make the $0,$1 in two PTX code snippets to point to
-    // the same MLIR values in onlyAttachMLIRArgs mode.
-
-    // Facebook begin. Comment out the following code to avoid compilation error
-    // in CLC TLX query_cancel. assert(builder->executions.empty() &&
-    //        "builder can only hold a single execution when onlyAttachMIIRArgs
-    //        " "is true.");
-    // builder->reorderArgArchive(oprs);
-    // Facebook end.
+    assert(builder->executions.empty() &&
+           "raw PTX requires a single execution with explicit operand order");
+    builder->reorderArgArchive(oprs);
   }
 
   builder->executions.emplace_back(

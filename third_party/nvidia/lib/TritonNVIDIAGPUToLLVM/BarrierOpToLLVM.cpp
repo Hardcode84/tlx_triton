@@ -670,8 +670,8 @@ struct CLCQueryCancelOpConversion
     auto queryOp = *builder.create<>(ptx);
 
     SmallVector<PTXBuilder::Operand *, 4> operands = {
-        builder.newOperand("=r", true), builder.newOperand("=r", true),
-        builder.newOperand("=r", true),
+        builder.newOperand("=r"), builder.newOperand("=r"),
+        builder.newOperand("=r"),
         builder.newOperand(adaptor.getClcResAlloc(), "r")};
     queryOp(operands, /*onlyAttachMLIRArgs=*/true);
 

@@ -582,7 +582,7 @@ struct FpToFpOpConversion
       // Emit PTX inline assembly for stochastic rounding
       PTXBuilder builder;
       auto &ptxOp = *builder.create(ptxAsm);
-      auto res = builder.newOperand("=r", "r");
+      auto res = builder.newOperand("=r");
       SmallVector<PTXBuilder::Operand *> operands;
       operands.push_back(res);
       for (Value v : srcPack) {
