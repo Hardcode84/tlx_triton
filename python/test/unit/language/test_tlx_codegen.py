@@ -5642,11 +5642,97 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
                   NUM_PROGRAMS=256, CROSS_TILE_PREFETCH=block_k == 128, OUTPUT_STAGING=True, SCHED_MODE_2=False,
                   XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
                   CLUSTER_BARRIER_INTERVAL=1, REGISTER_PIPELINE=False)
+    config.update(HANDOFF_SCHEDULE="current", HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear")
     config.update(constants)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     return triton_compile(
         src, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=num_warps, waves_per_eu=num_warps // 4,
                                                                   ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+
+
+@pytest.mark.parametrize("k", [384, 4096, 8192])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_wave_specialized_handoff_separates_queues(k, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4,
+                                                  CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                                  WAVE_SPECIALIZED_HANDOFF=True)
+    ttgir, llir, asm = (compiled.asm[kind] for kind in ("ttgir", "llir", "amdgcn"))
+    assert "warp_used_hints = array<i32: 1, 2>" in ttgir
+    stores = [line for line in ttgir.splitlines() if "amdg.async_tdm_copy_local_to_global" in line]
+    assert len(stores) == 8
+    assert all("warp_used_hint = 12 : i32" in line for line in stores)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 256
+
+    # A single role decision selects the complete epilogue. Both straight-line
+    # bodies fill their native accumulator fragments and rendezvous in the
+    # same order: eight fill barriers and six slot-reuse barriers. The output
+    # body alone issues stores/waits; no per-panel role branch is needed.
+    kernel_ir = llir.split("\n}", 1)[0]
+    pieces = re.split(r"^([-\w.]+):.*$", kernel_ir, flags=re.MULTILINE)
+    blocks = dict(zip(pieces[1::2], pieces[2::2]))
+    output_blocks = [block for block in blocks.values() if "@llvm.amdgcn.tensor.store.from.lds" in block]
+    assert len(output_blocks) == 1
+    output_block = output_blocks[0]
+    assert output_block.count("@llvm.amdgcn.tensor.store.from.lds") == 8
+    role_blocks = {label: block for label, block in blocks.items() if block.count("@llvm.amdgcn.s.barrier") == 14}
+    assert len(role_blocks) == 2 and output_block in role_blocks.values()
+    branches = re.findall(r"br i1 [^,\n]+, label %([-\w.]+), label %([-\w.]+)", kernel_ir)
+    assert sum({left, right} == set(role_blocks) for left, right in branches) == 1
+    for block in role_blocks.values():
+        assert not re.search(r"\bbr i1\b", block)
+        assert sum(int(width) for width in re.findall(r"\bstore <(\d+) x float>", block)) == 512
+    input_block = next(block for block in role_blocks.values() if block != output_block)
+    assert "s_wait_tensorcnt" not in input_block
+    assert output_block.count('asm sideeffect "s_wait_tensorcnt 1') == 6
+    assert "s_wait_tensorcnt" not in output_block.split("@llvm.amdgcn.tensor.store.from.lds", 1)[0]
+    assert "s_wait_tensorcnt" not in output_block.rsplit("@llvm.amdgcn.tensor.store.from.lds", 1)[1]
+    # Initial and later tiles share an unconditional entry wait. Its count
+    # acquires input stage 0 without retiring the output role's last two stores.
+    entry_blocks = [
+        block for block in blocks.values() if 'asm sideeffect "s_wait_tensorcnt 4"' in block and " = phi " in block
+    ]
+    assert len(entry_blocks) == 1
+    # Reusing six panels waits only on the output queue. The first two fills
+    # have no wait and the last two stores remain pending across tile entry.
+    output = asm[asm.index("tensor_store_from_lds"):asm.rindex("tensor_store_from_lds")]
+    assert not re.search(r"\bs_cbranch_", output)
+    assert re.findall(r"\bs_wait_tensorcnt\s+(\w+)", output) == ["1"] * 6
+    assert asm.count("tensor_store_from_lds") == 8
+    # Descriptor setup must precede each fill-completion barrier. Stores can
+    # issue immediately on its release, without another address/role sequence.
+    instructions = [line.strip() for line in asm.splitlines() if re.match(r"\s+[a-z]\w+ ", line)]
+    for i, instruction in enumerate(instructions):
+        if instruction.startswith("tensor_store_from_lds"):
+            assert instructions[i - 1].startswith("s_barrier_wait ")
+        if re.fullmatch(r"s_wait_tensorcnt (?:0x)?0*1", instruction):
+            # A dummy asm-result move after completion delays all C writers.
+            assert instructions[i + 1].startswith("s_barrier_signal ")
+    assert "s_wait_tensorcnt 0x0" in asm[asm.rindex("tensor_store_from_lds"):]
+    assert 'constraints = "=s,n"' not in ttgir
+
+
+@pytest.mark.parametrize("changes", [
+    {"DTYPE_B": "e2m1", "BLOCK_K": 256},
+    {"NUM_WARPS": 8},
+    {"NUM_BUFFERS": 4},
+    {"OUTPUT_STAGING": False},
+    {"CROSS_TILE_PREFETCH": False},
+    {"OUTPUT_TAIL_REUSE": True},
+    {"EARLY_C_STORES": True},
+    {"FIRST_USE_PREFETCH": True},
+])
+def test_gfx1250_mxgemm_wave_specialized_handoff_rejects_incompatible_config(changes):
+    config = dict(PERSISTENT=True, WAVE_SPECIALIZED_HANDOFF=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=3,
+                  DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, TDM_FUSION="partial", OUTPUT_STAGING=True)
+    config.update(changes)
+    a = torch.empty((256, 512), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((256, 256 if config["DTYPE_B"] == "e2m1" else 512), dtype=torch.uint8, device="meta")
+    scale = torch.empty((2, 2048), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="WAVE_SPECIALIZED_HANDOFF requires"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, **config)
 
 
 @pytest.mark.parametrize("k", [4096, 8192])

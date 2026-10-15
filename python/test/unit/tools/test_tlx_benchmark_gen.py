@@ -448,18 +448,28 @@ def mxfp_sensors(mxfp_collector, tmp_path):
 
 def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
     cases = mxfp_collector.make_cases(mxfp_collector.parser().parse_args([]))
-    assert [(case["kernel"], case["shape"][2]) for case in cases] == [("persistent", 8192), ("streamed_operands", 8192),
-                                                                      ("persistent", 4096), ("streamed_operands", 4096)]
+    assert [(case["kernel"], case["shape"]) for case in cases
+            ] == [(kernel, shape)
+                  for shape in ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
+                  for kernel in ("persistent", "streamed_operands")]
     baseline, streamed = cases[:2]
-    assert streamed["application"] == baseline["application"][:baseline["application"].index("--num_programs")] + [
+    assert baseline["config"]["cluster_layout"] == "2x2"
+    assert streamed["config"]["cluster_layout"] == "linear"
+    # The streamed schedule does not support 2x2 clusters. Other options
+    # match the persistent benchmark defaults for each shape.
+    application = baseline["application"].copy()
+    layout = application.index("--cluster_layout")
+    del application[layout:layout + 2]
+    assert streamed["application"] == application[:application.index("--num_programs")] + [
         "--streamed_operands"
-    ] + baseline["application"][baseline["application"].index("--num_programs"):]
+    ] + application[application.index("--num_programs"):]
     for case in cases:
         config = case["config"]
         assert config["benchmark_num_iters"] == 256
         assert (config["block_m"], config["block_n"], config["block_k"]) == (256, 256, 128)
         assert config["num_programs"] == 256
         assert config["cluster_size"] == config["cluster_barrier_interval"] == 4
+        assert not config["wave_specialized_handoff"]
 
 
 def test_mxfp_trace_device_selection_avoids_double_visibility(mxfp_collector, monkeypatch):

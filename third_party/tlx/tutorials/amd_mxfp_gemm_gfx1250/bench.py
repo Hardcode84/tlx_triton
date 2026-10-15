@@ -19,6 +19,10 @@ and --streamed-operands use a linear layout by default.
 Use --first-use-prefetch to test the MX8xMX8 three-buffer schedule with B1 local
 to each K step, operand registers rotating across two K steps, and four-read
 LDS groups during C01. It retains dedicated FP32 output staging.
+Use --wave-specialized-handoff to issue next-tile A/B and scales from waves
+0/1, and C transfers from waves 2/3. All four waves compute and fill C; output
+reuse waits leave the input queue pending. This selects MX8xMX8 and requires
+the three-buffer BK128 schedule with dedicated C slots.
 Use --streamed-operands to test native 32x32 accumulator fragments with one
 rolling A set, three spare A fragments, and two B sets. The final three rows cover
 operand reads before LDS reuse; refills precede two initial rows that cover
@@ -226,6 +230,8 @@ def _command(args, case, dtype_b):
         command.append("--first_use_prefetch")
     if args.compact_k_tail:
         command.append("--compact_k_tail")
+    if args.wave_specialized_handoff:
+        command.append("--wave_specialized_handoff")
     if args.handoff_schedule != "current":
         command.extend(["--handoff_schedule", args.handoff_schedule])
     if args.handoff_tdm_fusion != "partial":
@@ -315,6 +321,8 @@ def parse_benchmark_args(argv=None):
         help="test native fragments with persistent E4M3 BK128 and three or four buffers; selects MX8xMX8")
     parser.add_argument("--async-output", action="store_true",
                         help="use direct LDS-to-global C stores with independent waits; requires --streamed-operands")
+    parser.add_argument("--wave-specialized-handoff", action="store_true",
+                        help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
     parser.add_argument(
         "--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
         help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
@@ -384,7 +392,8 @@ def parse_benchmark_args(argv=None):
         variants = [(variant, args.dtype_b)]
     else:
         default_variants = ("mx8xmx8", ) if (args.warp_pipeline or args.operand_pipeline or args.output_tail_reuse
-                                             or args.first_use_prefetch or args.streamed_operands) else VARIANT_DTYPES_B
+                                             or args.first_use_prefetch or args.streamed_operands
+                                             or args.wave_specialized_handoff) else VARIANT_DTYPES_B
         if args.compact_k_tail:
             default_variants = ("mx8xmx4", )
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
@@ -419,6 +428,17 @@ def parse_benchmark_args(argv=None):
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
     variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
     for _, dtype_b, run_args in variants:
+        if run_args.wave_specialized_handoff and not (
+                run_args.persistent and run_args.output_staging and run_args.cross_tile_prefetch and
+            (run_args.block_m, run_args.block_n, run_args.block_k) == (256, 256, 128) and run_args.num_buffers == 3
+                and run_args.num_warps == 4 and run_args.tdm_fusion == "partial"
+                and run_args.dtype_a == dtype_b == "float8_e4m3"
+                and not (run_args.register_pipeline or run_args.warp_pipeline or run_args.operand_pipeline
+                         or run_args.streamed_operands or run_args.output_tail_reuse or run_args.first_use_prefetch
+                         or run_args.split_cluster_barrier or run_args.early_c_stores)):
+            parser.error("--wave-specialized-handoff requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
+                         "four warps, partial fusion, dedicated output staging, and cross-tile prefetch "
+                         "without other schedule variants")
         if run_args.split_cluster_barrier and (run_args.cluster_size == 1 or run_args.cluster_barrier_interval == 0 or
                                                (run_args.output_tail_reuse
                                                 and run_args.handoff_schedule != "ab-reuse")):
@@ -578,10 +598,11 @@ def main():
             tdm_split=run_args.tdm_split, l2_prefetch_distance=run_args.l2_prefetch_distance,
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
-            handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
-            handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
-            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
-            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            wave_specialized_handoff=run_args.wave_specialized_handoff, handoff_schedule=run_args.handoff_schedule,
+            compact_k_tail=run_args.compact_k_tail, handoff_tdm_fusion=run_args.handoff_tdm_fusion,
+            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
+            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
+            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
@@ -607,6 +628,7 @@ def main():
             f"handoff_schedule={run_args.handoff_schedule}, "
             f"handoff_tdm_fusion={run_args.handoff_tdm_fusion}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
+            f"wave_specialized_handoff={run_args.wave_specialized_handoff}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
             f"async_output={run_args.async_output}, "

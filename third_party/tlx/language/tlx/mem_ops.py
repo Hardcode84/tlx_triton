@@ -1894,6 +1894,7 @@ def async_amd_descriptor_store(
     source: tlx.buffered_tensor,
     offsets: Optional[list[tl.tensor]] = None,
     clamp_bounds: tl.constexpr = True,
+    warp_used_hint: tl.constexpr = None,
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
@@ -1904,6 +1905,11 @@ def async_amd_descriptor_store(
     ``offsets=None`` stores through an already positioned descriptor. When
     offsets are supplied, the convenience update clamps remaining bounds by
     default; set ``clamp_bounds=False`` for position-only advancement.
+
+    ``warp_used_hint`` selects the waves carrying the store descriptors, with
+    the same bitmask rules as :func:`async_amd_descriptor_load`. Selected waves
+    cover the whole source tile. Other waves still issue null descriptors;
+    wave-uniform control flow is needed to suppress those instructions.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -1939,11 +1945,18 @@ def async_amd_descriptor_store(
             None,
             clamp_bounds,
         )
-    _semantic.builder.create_async_tdm_copy_local_to_global(
+    token_handle = _semantic.builder.create_async_tdm_copy_local_to_global(
         positioned_desc,
         source.handle,
         None,
     )
+    warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+    if warp_used_hint is not None:
+        if not isinstance(warp_used_hint, int) or isinstance(warp_used_hint, bool) or warp_used_hint <= 0:
+            raise ValueError("warp_used_hint must be a positive integer bitmask")
+        if warp_used_hint >= 1 << _semantic.builder.options.num_warps:
+            raise ValueError("warp_used_hint sets bits beyond num_warps")
+        token_handle.set_attr("warp_used_hint", _semantic.builder.get_int32_attr(warp_used_hint))
 
 
 @tl.builtin
