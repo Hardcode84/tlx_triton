@@ -1540,14 +1540,18 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
         cacheMod, triton::EvictionPolicy::NORMAL, /*isLoad*/ false, targetInfo);
 
+    std::optional<uint32_t> warpUsedHint;
+    if (auto hint = op.getWarpUsedHintAttr())
+      warpUsedHint = static_cast<uint32_t>(hint.getInt());
+
     // Placeholder: the copy inherits pred from the descriptor.
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
         padInterval, padAmount, offset, srcPtrs, pred,
         /*multicastMask=*/{}, elementType, barrierPtr,
-        /*isLoad=*/false, sharedLayout, encoding, ctaId, auxBits,
-        /*warpUsedHint=*/std::nullopt, /*isPureForm=*/true);
+        /*isLoad=*/false, sharedLayout, encoding, ctaId, auxBits, warpUsedHint,
+        /*isPureForm=*/true);
 
     rewriter.eraseOp(op);
     return success();

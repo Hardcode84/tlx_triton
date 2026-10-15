@@ -1244,8 +1244,8 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, Value src,
-             std::optional<Value> barrier) {
-            self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
+             std::optional<Value> barrier) -> Value {
+            return self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                 desc, src, barrier.value_or(Value()));
           },
           py::arg("desc"), py::arg("src"), py::arg("barrier").none())

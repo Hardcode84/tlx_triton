@@ -108,6 +108,7 @@ def _async_amd_desc_store_kernel(
     y_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    STORE_WAVES: tl.constexpr = None,
 ):
     desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
     desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
@@ -120,7 +121,10 @@ def _async_amd_desc_store_kernel(
     tlx.async_amd_descriptor_wait(pendings=0)
     data = tlx.local_load(load_view)
     tlx.local_store(store_view, data)
-    tlx.async_amd_descriptor_store(desc_out, store_view, [0, 0])
+    if STORE_WAVES is not None:
+        tlx.workgroup_barrier()
+    if STORE_WAVES is None or ((STORE_WAVES >> tlx.assume_uniform(tlx.thread_id(0) // 32)) & 1) != 0:
+        tlx.async_amd_descriptor_store(desc_out, store_view, [0, 0], warp_used_hint=STORE_WAVES)
     tlx.async_amd_descriptor_wait(pendings=0)
 
 
@@ -263,11 +267,12 @@ def test_update_tensor_descriptor_roundtrip_gfx1250(device):
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
-def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
+@pytest.mark.parametrize("store_waves", [None, 0b1100, 0b1010, 0b1000])
+def test_async_amd_desc_store_correctness_gfx1250(device, M, N, store_waves):
     """TDM load → store round-trip produces correct results on gfx1250."""
     x = torch.randn(M, N, dtype=torch.float16, device=device)
     y = torch.zeros_like(x)
-    _async_amd_desc_store_kernel[(1, )](x, y, M=M, N=N)
+    _async_amd_desc_store_kernel[(1, )](x, y, M=M, N=N, STORE_WAVES=store_waves)
     torch.testing.assert_close(x, y)
 
 
@@ -685,7 +690,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
                                       COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
                                       HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
-                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4):
+                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
+                                      WAVE_SPECIALIZED_HANDOFF=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -707,17 +713,31 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         a.cuda(),
         b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
-            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
-            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
-            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
-            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
-            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES))
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
+        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
+                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
+                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
+                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+                    OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+                    STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+                    HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION,
+                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
+                    EARLY_C_STORES=EARLY_C_STORES, WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 4), (4, 0), (4, 1), (4, 2), (4, 4)])
+def test_mxgemm_wave_specialized_handoff_ring_phase(k_iters, cluster_size, barrier_interval):
+    # Exercise different input/output counter histories, every ring phase,
+    # an empty steady loop, uneven tile counts, and final output retirement.
+    # LDS release must also work with no, periodic, and every-stage cluster sync.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
+                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      CLUSTER_BARRIER_INTERVAL=barrier_interval, WAVE_SPECIALIZED_HANDOFF=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

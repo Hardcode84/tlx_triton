@@ -1908,6 +1908,17 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
+  if (auto warpUsedHintAttr = getWarpUsedHintAttr()) {
+    uint32_t hint = static_cast<uint32_t>(warpUsedHintAttr.getInt());
+    if (auto numWarps = gpu::maybeLookupNumWarps(getOperation())) {
+      if (failed(validateWarpUsedHint(getOperation(), hint, *numWarps)))
+        return failure();
+    }
+    if (failed(verifyPartitionedHintFitsSingleInstruction(getOperation(),
+                                                          smemTy, hint)))
+      return failure();
+  }
+
   auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
   auto partitionedEnc = llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(enc);
   if (partitionedEnc &&
