@@ -155,19 +155,40 @@ python3 bench.py --case 16,4096,4096,4096 --kernel list --cluster-size 1
 the summary/CSV with a `kernel` column. With `--cluster-size 1`, use
 `--no-cross-tile-prefetch` for alias-C or `--auto-config` for tile selection.
 
-Compare automatic wave specialization with the baseline:
+Compare automatic wave specialization with the baseline and an experimental
+instruction-prefetch variant:
 
 ```bash
 python3 bench.py --case 2,1024,1024,512 --num-programs 16 \
   --wave-specialization all --check --csv wave_specialization.csv
 python3 bench.py --wave-specialization on
+python3 bench.py --wave-specialization prefetch --instruction-prefetch-bytes 8192
 ```
 
-`--wave-specialization off|on|all` defaults to `off`. `all` runs each shape/kernel
-combination with specialization disabled and enabled, in separate processes.
-The summary and CSV identify the mode. The standalone kernel script accepts
-`--wave_specialization off|on`. The packed/list host wrappers expose
-`enable_wave_specialization=False`.
+`--wave-specialization off|on|prefetch|all` defaults to `off`. `all` runs each
+shape/kernel combination in all three modes, in separate processes. The summary
+and CSV identify the mode; CSV also records `instruction_prefetch_bytes` (zero
+unless the prefetch mode is selected). The standalone kernel script accepts
+`--wave_specialization off|on|prefetch` and `--instruction_prefetch_bytes`.
+The packed/list host wrappers expose `enable_wave_specialization=False` and
+`instruction_prefetch_bytes=0`.
+
+The prefetch variant enables wave specialization and inserts side-effecting
+`s_prefetch_inst` inline assembly before the original loops. Its addresses
+are relative to the kernel symbol, so both specialized copies target the same
+code range. The assembly materializes the kernel address using `s_getpc_b64`
+and a label difference, using one temporary SGPR pair. It requests 8 KiB by
+default, starting at kernel offset 32,640,
+the limit of gfx1250's launch instruction prefetch. This is the window used to
+investigate the roughly 39 KiB specialized grouped GEMM body. Each instruction
+requests at most 4 KiB; the byte count must be a positive multiple of 128.
+
+This is a manual performance experiment: the requested window is not derived
+from the compiled function size. Check the generated code and adjust the byte
+count when changing schedules or compiler versions; the default does not promise
+coverage of every specialized kernel. Keep requests within mapped code memory.
+Inlining the prefetch into the source can also affect code layout, so its timings
+need a fresh comparison with the other two modes.
 
 ## Cluster multicast
 

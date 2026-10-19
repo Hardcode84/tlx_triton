@@ -1072,6 +1072,35 @@ def _grouped_gemm_tdm_impl(
     # tlx.async_amd_descriptor_wait(0)
 
 
+@triton.constexpr_function
+def _instruction_prefetch_asm(kernel, size):
+    # The PC-relative prefetch instruction only accepts a numeric offset in
+    # the assembler. Materialize the kernel address using a relocatable label
+    # difference instead. LLVM gives each inline-asm instance a unique label.
+    return ("s_getpc_b64 $0\n.Lprefetch_pc${:uid}:\n"
+            f"s_add_nc_u64 $0, $0, {kernel} - .Lprefetch_pc${{:uid}}\n") + "\n".join(
+                f"s_prefetch_inst $0, {32640 + offset}, null, {min(size - offset, 4096) // 128 - 1}"
+                for offset in range(0, size, 4096))
+
+
+@triton.jit
+def _prefetch_instruction_tail(KERNEL: tl.constexpr, BYTES: tl.constexpr):
+    # Experimental fixed window beyond gfx1250's 255 * 128-byte launch
+    # prefetch. Symbol-relative targets remain correct when wave specialization
+    # clones this asm into both versions. Each wave executes it once, before
+    # entering the original loops. This is not an automatic code-size policy.
+    tl.static_assert(BYTES >= 0 and BYTES % 128 == 0, "prefetch bytes must be a nonnegative multiple of 128")
+    if BYTES > 0:
+        tl.inline_asm_elementwise(
+            _instruction_prefetch_asm(KERNEL, BYTES),
+            constraints="=&s",
+            args=[],
+            dtype=tl.uint64,
+            is_pure=False,
+            pack=1,
+        )
+
+
 @triton.jit
 def grouped_gemm_tdm_kernel(
     a_packed,
@@ -1099,8 +1128,10 @@ def grouped_gemm_tdm_kernel(
     XCD_CHUNK: tl.constexpr,
     CLUSTER_SIZE: tl.constexpr = 1,
     CLUSTER_MULTICAST: tl.constexpr = True,
+    INSTRUCTION_PREFETCH_BYTES: tl.constexpr = 0,
 ):
     """Original packed entry point; the pointer-table path is compiled out."""
+    _prefetch_instruction_tail("grouped_gemm_tdm_kernel", INSTRUCTION_PREFETCH_BYTES)
     _grouped_gemm_tdm_impl(
         a_packed,
         b_t,
@@ -1155,6 +1186,7 @@ def grouped_gemm_tdm_list_kernel(
     CLUSTER_SIZE: tl.constexpr = 1,
     CLUSTER_MULTICAST: tl.constexpr = True,
     ALLOW_MN_TAILS: tl.constexpr = True,
+    INSTRUCTION_PREFETCH_BYTES: tl.constexpr = 0,
 ):
     """Ragged-M GEMM over independently allocated A/B/C matrices.
 
@@ -1169,6 +1201,7 @@ def grouped_gemm_tdm_list_kernel(
     cover full tiles and ldc is divisible by 8; clustering requires this mode.
     No offsets, descriptor buffers, or matrix repacking are required.
     """
+    _prefetch_instruction_tail("grouped_gemm_tdm_list_kernel", INSTRUCTION_PREFETCH_BYTES)
     N = tl.load(group_gemm_sizes + 1)
     _grouped_gemm_tdm_impl(
         group_a_ptrs,
@@ -1244,6 +1277,7 @@ def grouped_gemm_tdm(
     cluster_size: int = 1,
     cluster_multicast: bool = True,
     enable_wave_specialization: bool = False,
+    instruction_prefetch_bytes: int = 0,
 ) -> torch.Tensor:
     """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
 
@@ -1365,6 +1399,7 @@ def grouped_gemm_tdm(
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
+            INSTRUCTION_PREFETCH_BYTES=instruction_prefetch_bytes,
             enable_wave_specialization=enable_wave_specialization,
             num_warps=4,
             waves_per_eu=1,
@@ -1469,6 +1504,7 @@ def grouped_gemm_tdm_list(
     cluster_size: int = 1,
     cluster_multicast: bool = True,
     enable_wave_specialization: bool = False,
+    instruction_prefetch_bytes: int = 0,
 ) -> list[torch.Tensor]:
     """Compute FP16 A[g] @ B[g] using the optimized TDM list kernel.
 
@@ -1552,6 +1588,7 @@ def grouped_gemm_tdm_list(
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
             ALLOW_MN_TAILS=allow_mn_tails,
+            INSTRUCTION_PREFETCH_BYTES=instruction_prefetch_bytes,
             enable_wave_specialization=enable_wave_specialization,
             num_warps=4,
             waves_per_eu=1,
@@ -2210,12 +2247,16 @@ if __name__ == "__main__":
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
-    parser.add_argument("--wave_specialization", choices=("off", "on"), default="off",
-                        help="enable automatic wave specialization")
+    parser.add_argument("--wave_specialization", choices=("off", "on", "prefetch"), default="off",
+                        help="automatic wave specialization, optionally with experimental instruction prefetch")
+    parser.add_argument("--instruction_prefetch_bytes", type=int, default=8192,
+                        help="bytes beyond launch prefetch to fetch in prefetch mode (multiple of 128; default: 8192)")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.instruction_prefetch_bytes <= 0 or args.instruction_prefetch_bytes % 128:
+        parser.error("--instruction_prefetch_bytes must be a positive multiple of 128")
 
     m_list = [int(x) for x in args.m_list.split(",") if x]
     if not m_list:
@@ -2258,6 +2299,7 @@ if __name__ == "__main__":
         cluster_size=args.cluster_size,
         cluster_multicast=args.cluster_multicast,
         enable_wave_specialization=args.wave_specialization != "off",
+        instruction_prefetch_bytes=args.instruction_prefetch_bytes if args.wave_specialization == "prefetch" else 0,
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )

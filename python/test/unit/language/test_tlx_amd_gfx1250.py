@@ -834,7 +834,8 @@ def test_wave_specialization_grouped_gemm_fused(interface, groups, k, programs, 
 
     monkeypatch.setattr(HIPBackend, "make_llir", staticmethod(capture))
     kernels = []
-    for enabled in (False, True):
+    for enabled, prefetch_bytes in ((False, 0), (True, 0), (True, 8192)):
+        constants["INSTRUCTION_PREFETCH_BYTES"] = prefetch_bytes
         source = ASTSource(kernel, signature={k: v
                                               for k, v in signature.items()
                                               if k not in constants}, constexprs=constants, attrs=attrs)
@@ -863,6 +864,7 @@ def test_wave_specialization_grouped_gemm_fused(interface, groups, k, programs, 
         # LLVM may bitcast the four-i32 group into two i64s before selecting.
         llvm_descriptor_selects = re.findall(r"\bselect\b[^\n]*<(?:4 x i32|8 x i32|2 x i64)>", asm["llir"])
         assert bool(llvm_descriptor_selects) != enabled
+        assert ("s_prefetch_inst " in kernels[-1].asm["amdgcn"]) == bool(prefetch_bytes)
     assert len({kernel.metadata.shared for kernel in kernels}) == 1
     assert kernels[0].asm["hsaco"] != kernels[1].asm["hsaco"]
 
@@ -1304,7 +1306,7 @@ def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
         _gfx1250_grouped._require_grouped_gemm_gfx1250(torch.device("cuda"))
 
 
-@pytest.mark.parametrize("mode", [None, "on", "all"])
+@pytest.mark.parametrize("mode", [None, "on", "prefetch", "all"])
 def test_grouped_gemm_interface_defaults_match_bench(monkeypatch, tmp_path, mode):
     import csv
     import sys
@@ -1315,6 +1317,7 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch, tmp_path, mode
     def check_case(args, case, kernel_variant, wave_specialization, index, total):
         command = bench._build_command(args, case, kernel_variant, wave_specialization)
         assert command[command.index("--wave_specialization") + 1] == wave_specialization
+        assert command[command.index("--instruction_prefetch_bytes") + 1] == "8192"
         cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
             _gfx1250_grouped._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k, 256,
             auto_cluster=True)
@@ -1337,7 +1340,9 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch, tmp_path, mode
         assert cfg["ALLOW_MN_TAILS"] is False
         assert cfg["NUM_SM"] == 256
         checked.append(wave_specialization)
-        return bench.BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, 0, None, None)
+        prefetch_bytes = 8192 if wave_specialization == "prefetch" else 0
+        return bench.BenchResult(case, kernel_variant, wave_specialization, prefetch_bytes, case.tensor_gib, 0, None,
+                                 None)
 
     csv_path = tmp_path / "results.csv"
     argv = ["bench.py", "--dry-run", "--csv", str(csv_path)]
@@ -1347,11 +1352,14 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch, tmp_path, mode
     monkeypatch.setattr(bench, "_run_case", check_case)
     monkeypatch.setattr(bench, "_print_summary", lambda results: None)
     assert bench.main() == 0
-    modes = ["off", "on"] if mode == "all" else [mode or "off"]
+    modes = ["off", "on", "prefetch"] if mode == "all" else [mode or "off"]
     assert checked == modes * (2 * len(bench.DEFAULT_CASES))
     with csv_path.open() as stream:
         rows = list(csv.DictReader(stream))
     assert [row["wave_specialization"] for row in rows] == checked
+    assert all(
+        int(row["instruction_prefetch_bytes"]) == (8192 if row["wave_specialization"] == "prefetch" else 0)
+        for row in rows)
 
 
 @pytest.mark.parametrize("ms,n,num_sm,config,expected", [

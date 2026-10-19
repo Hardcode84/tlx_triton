@@ -71,6 +71,7 @@ class BenchResult:
     case: BenchCase
     kernel: str
     wave_specialization: str
+    instruction_prefetch_bytes: int
     tensor_gib: float
     returncode: int
     ms: float | None
@@ -137,6 +138,8 @@ def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: st
         str(args.seed),
         "--wave_specialization",
         wave_specialization,
+        "--instruction_prefetch_bytes",
+        str(args.instruction_prefetch_bytes),
     ]
     if args.num_programs is not None:
         command.extend(["--num_programs", str(args.num_programs)])
@@ -156,12 +159,13 @@ def _build_command(args: argparse.Namespace, case: BenchCase, kernel_variant: st
 def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, wave_specialization: str, index: int,
               total: int) -> BenchResult:
     command = _build_command(args, case, kernel_variant, wave_specialization)
+    prefetch_bytes = args.instruction_prefetch_bytes if wave_specialization == "prefetch" else 0
     print()
     print(f"[{index}/{total}] {kernel_variant} {case.label} wave_specialization={wave_specialization} "
           f" estimated tensors: {case.tensor_gib:.1f} GiB")
     print(f"$ {shlex.join(command)}")
     if args.dry_run:
-        return BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, 0, None, None)
+        return BenchResult(case, kernel_variant, wave_specialization, prefetch_bytes, case.tensor_gib, 0, None, None)
 
     process = subprocess.Popen(
         command,
@@ -180,7 +184,8 @@ def _run_case(args: argparse.Namespace, case: BenchCase, kernel_variant: str, wa
             ms = float(match.group(1))
             tflops = float(match.group(2))
     returncode = process.wait()
-    return BenchResult(case, kernel_variant, wave_specialization, case.tensor_gib, returncode, ms, tflops)
+    return BenchResult(case, kernel_variant, wave_specialization, prefetch_bytes, case.tensor_gib, returncode, ms,
+                       tflops)
 
 
 def _print_summary(results: list[BenchResult]) -> None:
@@ -202,8 +207,8 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(
             output,
-            fieldnames=("kernel", "wave_specialization", "groups", "m_per_group", "n", "k", "tensor_gib", "ms",
-                        "tflops", "status"),
+            fieldnames=("kernel", "wave_specialization", "instruction_prefetch_bytes", "groups", "m_per_group", "n",
+                        "k", "tensor_gib", "ms", "tflops", "status"),
         )
         writer.writeheader()
         for result in results:
@@ -211,6 +216,7 @@ def _write_csv(path: Path, results: list[BenchResult]) -> None:
             writer.writerow({
                 "kernel": result.kernel,
                 "wave_specialization": result.wave_specialization,
+                "instruction_prefetch_bytes": result.instruction_prefetch_bytes,
                 "groups": case.groups,
                 "m_per_group": case.m,
                 "n": case.n,
@@ -253,8 +259,10 @@ def main() -> int:
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
-    parser.add_argument("--wave-specialization", choices=("off", "on", "all"), default="off",
-                        help="run baseline, wave specialization, or both")
+    parser.add_argument("--wave-specialization", choices=("off", "on", "prefetch", "all"), default="off",
+                        help="run baseline, wave specialization, specialization + instruction prefetch, or all three")
+    parser.add_argument("--instruction-prefetch-bytes", type=int, default=8192,
+                        help="bytes beyond launch prefetch to fetch in prefetch mode (multiple of 128; default: 8192)")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
@@ -262,10 +270,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
+    if args.instruction_prefetch_bytes <= 0 or args.instruction_prefetch_bytes % 128:
+        parser.error("--instruction-prefetch-bytes must be a positive multiple of 128")
 
     cases = args.cases or [BenchCase(*case) for case in DEFAULT_CASES]
     kernels = ("packed", "list") if args.kernel == "both" else (args.kernel, )
-    modes = ("off", "on") if args.wave_specialization == "all" else (args.wave_specialization, )
+    modes = ("off", "on", "prefetch") if args.wave_specialization == "all" else (args.wave_specialization, )
     runs = [(case, kernel, mode) for case in cases for kernel in kernels for mode in modes]
     results = []
     for index, (case, kernel, mode) in enumerate(runs, start=1):
