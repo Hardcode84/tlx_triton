@@ -595,6 +595,35 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("DTYPE_B", ["float8_e4m3", "float4"])
+@pytest.mark.parametrize("CLUSTER_SIZE", [1, 4])
+def test_mxgemm_persistent_tiles_per_warp(DTYPE_B, CLUSTER_SIZE):
+    M = N = 1024
+    K = 768
+    torch.manual_seed(7)
+    a = _gfx1250_mxfp._init_data("float8_e4m3", M, K)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+
+    b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
+    a_d = a.cuda()
+    b_d = b_data.T.contiguous().cuda()
+    a_scale_d = _gfx1250_mxfp.pack_scale(a_scale).cuda()
+    b_scale_d = _gfx1250_mxfp.pack_scale(b_scale).cuda()
+    for tiles_per_warp in ((1, 1), (2, 1), (1, 2), (2, 2)):
+        out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_d, b_d, a_scale_d, b_scale_d, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128,
+                                                 TRANSPOSE_B=True, NUM_BUFFERS=3, DTYPE_A="e4m3",
+                                                 DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], SCHEDULE="sliceMNK",
+                                                 TDM_FUSION="partial", GROUP_SIZE_M=4, PERSISTENT=True, NUM_PROGRAMS=16,
+                                                 OUTPUT_STAGING=True, CLUSTER_SIZE=CLUSTER_SIZE,
+                                                 TILES_PER_WARP=tiles_per_warp)
+        torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4,
+                                   msg=f"{DTYPE_B=}, {CLUSTER_SIZE=}, {tiles_per_warp=}")
+
+
 @pytest.mark.parametrize("config,match", [
     ({"TRANSPOSE_B": False}, "transposed B"),
     ({"NUM_PROGRAMS": 0}, "positive integer"),
