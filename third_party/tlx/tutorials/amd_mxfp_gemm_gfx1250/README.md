@@ -56,8 +56,15 @@ Run from the repository root in an environment configured for gfx1250:
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --tiles-per-warp 1 2
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
+
+Use `--tiles-per-warp M N` to compare the gfx1250 WMMA tile groupings from A30.
+The default is `2 2`. Run the same shape and configuration with `1 1`, `2 1`,
+`1 2`, and `2 2`; the selected layout is included in the summary and CSV.
+The standalone tutorial spelling is `--tiles_per_warp M N`, while the Python
+API and `matmul` configuration use `TILES_PER_WARP=(M, N)`.
 
 Two independent A8W4 options test startup and persistent tile handoff:
 

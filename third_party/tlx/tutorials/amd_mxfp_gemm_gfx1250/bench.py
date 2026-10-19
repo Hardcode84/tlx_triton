@@ -95,6 +95,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -BK 256 --num-buffers 2 --no-cross-tile-prefetch
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4 -BK 128
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --tiles-per-warp 1 2
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 
 For a single dispatch per shape/variant, select
@@ -219,6 +220,9 @@ def _command(args, case, dtype_b):
         str(args.cluster_size),
         "--cluster_barrier_interval",
         str(args.cluster_barrier_interval),
+        "--tiles_per_warp",
+        str(args.tiles_per_warp[0]),
+        str(args.tiles_per_warp[1]),
     ]
     if args.persistent:
         command.append("--persistent")
@@ -354,6 +358,8 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
+    parser.add_argument("--tiles-per-warp", nargs=2, type=int, choices=(1, 2), default=(2, 2), metavar=("M", "N"),
+                        help="WMMA tiles per warp in M and N (default: 2 2)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
@@ -608,6 +614,7 @@ def main():
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
             requested_programs=run_args.num_programs if run_args.persistent else None,
+            tiles_per_warp="x".join(map(str, run_args.tiles_per_warp)),
             benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
@@ -641,6 +648,7 @@ def main():
             f"cluster_layout={run_args.cluster_layout}, split_cluster_barrier={run_args.split_cluster_barrier}, "
             f"early_c_stores={run_args.early_c_stores}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
+            f"tiles_per_warp={'x'.join(map(str, run_args.tiles_per_warp))}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
     print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'M':>7} {'N':>7} {'K':>7} "
