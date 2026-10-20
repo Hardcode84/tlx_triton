@@ -283,9 +283,16 @@ def _tdm_load_subtile(
     SUBTILE_LEN: tl.constexpr,
 ):
     slot = consumer % NUM_BUFFERS
-    a_view = tlx.local_slice(a_buf[slot], [0, start], [BLOCK_M, SUBTILE_LEN])
-    b_view = tlx.local_slice(b_buf[slot], [0, start], [BLOCK_N, SUBTILE_LEN])
-    return tlx.local_load(a_view), tlx.local_load(tlx.local_trans(b_view))
+    if len(a_buf.shape) == 3:
+        ctas: tl.constexpr = a_buf.shape[0]
+        a_view = tlx.local_slice(a_buf[slot], [0, 0, start], [ctas, BLOCK_M, SUBTILE_LEN])
+        b_view = tlx.local_slice(b_buf[slot], [0, 0, start], [ctas, BLOCK_N, SUBTILE_LEN])
+        b_view = tlx.local_trans(b_view, (0, 2, 1))
+    else:
+        a_view = tlx.local_slice(a_buf[slot], [0, start], [BLOCK_M, SUBTILE_LEN])
+        b_view = tlx.local_slice(b_buf[slot], [0, start], [BLOCK_N, SUBTILE_LEN])
+        b_view = tlx.local_trans(b_view)
+    return tlx.local_load(a_view), tlx.local_load(b_view)
 
 
 @triton.jit
@@ -320,10 +327,10 @@ def _tdm_issue_loads(
     CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     slot = producer % NUM_BUFFERS
-    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False,
-                                          pred=pred)
-    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False,
-                                          pred=pred)
+    a_offsets = [0, off_m, producer * BLOCK_K] if CLUSTER_SIZE > 1 else [off_m, producer * BLOCK_K]
+    b_offsets = [0, off_n, producer * BLOCK_K] if CLUSTER_SIZE > 1 else [off_n, producer * BLOCK_K]
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=a_offsets, clamp_bounds=False, pred=pred)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, clamp_bounds=False, pred=pred)
     _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
     return producer + 1
 
@@ -343,8 +350,10 @@ def _tdm_issue_loads_unpredicated(
     CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     slot = producer % NUM_BUFFERS
-    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False)
-    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False)
+    a_offsets = [0, off_m, producer * BLOCK_K] if CLUSTER_SIZE > 1 else [off_m, producer * BLOCK_K]
+    b_offsets = [0, off_n, producer * BLOCK_K] if CLUSTER_SIZE > 1 else [off_n, producer * BLOCK_K]
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=a_offsets, clamp_bounds=False)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=b_offsets, clamp_bounds=False)
     _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
     return producer + 1
 
@@ -422,12 +431,20 @@ def _tdm_wait_and_finish_k_block(
 @triton.jit
 def _tdm_c_store_chunk(acc, part: tl.constexpr):
     """Select 32 rows without keeping a second full output tile in registers."""
-    width: tl.constexpr = acc.shape[1]
-    lo, hi = tl.split(tl.reshape(acc, (2, 128, width)).permute(1, 2, 0))
-    half = lo if part < 4 else hi
-    lo2, hi2 = tl.split(tl.reshape(half, (2, 64, width)).permute(1, 2, 0))
-    quarter = lo2 if part % 4 < 2 else hi2
-    lo3, hi3 = tl.split(tl.reshape(quarter, (2, 32, width)).permute(1, 2, 0))
+    width: tl.constexpr = acc.shape[-1]
+    if len(acc.shape) == 3:
+        ctas: tl.constexpr = acc.shape[0]
+        lo, hi = tl.split(tl.reshape(acc, (ctas, 2, 128, width)).permute(0, 2, 3, 1))
+        half = lo if part < 4 else hi
+        lo2, hi2 = tl.split(tl.reshape(half, (ctas, 2, 64, width)).permute(0, 2, 3, 1))
+        quarter = lo2 if part % 4 < 2 else hi2
+        lo3, hi3 = tl.split(tl.reshape(quarter, (ctas, 2, 32, width)).permute(0, 2, 3, 1))
+    else:
+        lo, hi = tl.split(tl.reshape(acc, (2, 128, width)).permute(1, 2, 0))
+        half = lo if part < 4 else hi
+        lo2, hi2 = tl.split(tl.reshape(half, (2, 64, width)).permute(1, 2, 0))
+        quarter = lo2 if part % 4 < 2 else hi2
+        lo3, hi3 = tl.split(tl.reshape(quarter, (2, 32, width)).permute(1, 2, 0))
     return lo3 if part % 2 == 0 else hi3
 
 
@@ -561,7 +578,10 @@ def _grouped_gemm_tdm_impl(
     tl.static_assert(K_ITERS >= NUM_BUFFERS, "K must cover the TDM pipeline")
     tl.static_assert(SUBTILE_LEN == 32, "BLOCK_K must be 128 for the first TDM schedule")
 
-    pid = _remap_grouped_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
+    # num_ctas launches one logical program per cluster. Retain the physical
+    # workgroup numbering used by the persistent scheduler and XCD remapping.
+    physical_pid = tl.program_id(0) * CLUSTER_SIZE + tlx.cluster_cta_rank()
+    pid = _remap_grouped_program_id(physical_pid, NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
     tile_idx = pid
     last_problem_end = 0
     num_n_tiles = tl.cdiv(N, BLOCK_N)
@@ -569,8 +589,12 @@ def _grouped_gemm_tdm_impl(
     a_dtype: tl.constexpr = tl.float16 if POINTER_TABLES else tlx.dtype_of(a_packed)
     b_dtype: tl.constexpr = tl.float16 if POINTER_TABLES else tlx.dtype_of(b_t)
     c_dtype: tl.constexpr = tl.float16 if POINTER_TABLES else tlx.dtype_of(c_packed)
-    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), a_dtype, NUM_BUFFERS)
-    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), b_dtype, NUM_BUFFERS)
+    # Distribute a leading batch axis across CTAs: each CTA owns a complete
+    # matrix tile, with the same LDS footprint and WMMA schedule as size 1.
+    a_shape: tl.constexpr = (CLUSTER_SIZE, BLOCK_M, BLOCK_K) if CLUSTER_SIZE > 1 else (BLOCK_M, BLOCK_K)
+    b_shape: tl.constexpr = (CLUSTER_SIZE, BLOCK_N, BLOCK_K) if CLUSTER_SIZE > 1 else (BLOCK_N, BLOCK_K)
+    a_buf = tlx.local_alloc(a_shape, a_dtype, NUM_BUFFERS)
+    b_buf = tlx.local_alloc(b_shape, b_dtype, NUM_BUFFERS)
     # TLXRewriteLocalAlias only accepts size-mismatched shared aliases when
     # the backing allocation is an integer multiple of the alias.  Reuse A only
     # when that ratio is legal.  Otherwise store C in BLOCK_K-wide chunks that
@@ -580,7 +604,8 @@ def _grouped_gemm_tdm_impl(
     if HYBRID_TILE_PREFETCH:
         # Two 16-KiB output slots fit alongside the input rings. TDM drains
         # one chunk while the other is filled, leaving prefetched A/B intact.
-        c_buf = tlx.local_alloc((32, BLOCK_N), c_dtype, 2)
+        c_shape: tl.constexpr = (CLUSTER_SIZE, 32, BLOCK_N) if CLUSTER_SIZE > 1 else (32, BLOCK_N)
+        c_buf = tlx.local_alloc(c_shape, c_dtype, 2)
     elif C_STAGING_MODE == 1:
         tl.static_assert(USE_FULL_C_TILE, "dedicated C staging currently requires a full C buffer")
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), c_dtype, 1)
@@ -641,26 +666,32 @@ def _grouped_gemm_tdm_impl(
         b_group = _grouped_gemm_matrix_pointer(b_t, g, group_base_b, POINTER_TABLES)
         c_group = _grouped_gemm_matrix_pointer(c_packed, g, group_base_c, POINTER_TABLES)
 
+        # The batch axis expresses CTA ownership. Its global stride is zero
+        # because the per-CTA tile coordinates already select the matrix data.
         a_desc_base = tl.make_tensor_descriptor(
             a_group,
             # The launcher validates exact BLOCK_K coverage. Keeping the K
             # extent static avoids rebuilding dynamic bounds at every TDM issue.
-            shape=[gm, K],
-            strides=[group_stride_am, tl.constexpr(1)],
-            block_shape=[BLOCK_M, BLOCK_K],
+            shape=[CLUSTER_SIZE, gm, K] if CLUSTER_SIZE > 1 else [gm, K],
+            strides=[0, group_stride_am, tl.constexpr(1)] if CLUSTER_SIZE > 1 else [group_stride_am,
+                                                                                    tl.constexpr(1)],
+            block_shape=[CLUSTER_SIZE, BLOCK_M, BLOCK_K] if CLUSTER_SIZE > 1 else [BLOCK_M, BLOCK_K],
         )
         b_desc_base = tl.make_tensor_descriptor(
             b_group,
-            shape=[N, K],
-            strides=[group_stride_bn, tl.constexpr(1)],
-            block_shape=[BLOCK_N, BLOCK_K],
+            shape=[CLUSTER_SIZE, N, K] if CLUSTER_SIZE > 1 else [N, K],
+            strides=[0, group_stride_bn, tl.constexpr(1)] if CLUSTER_SIZE > 1 else [group_stride_bn,
+                                                                                    tl.constexpr(1)],
+            block_shape=[CLUSTER_SIZE, BLOCK_N, BLOCK_K] if CLUSTER_SIZE > 1 else [BLOCK_N, BLOCK_K],
         )
         if USE_FULL_C_TILE:
             c_desc_base = tl.make_tensor_descriptor(
                 c_group,
-                shape=[gm, N],
-                strides=[group_stride_cm, tl.constexpr(1)],
-                block_shape=[32 if HYBRID_TILE_PREFETCH else BLOCK_M, BLOCK_N],
+                shape=[CLUSTER_SIZE, gm, N] if CLUSTER_SIZE > 1 else [gm, N],
+                strides=[0, group_stride_cm, tl.constexpr(1)]
+                if CLUSTER_SIZE > 1 else [group_stride_cm, tl.constexpr(1)],
+                block_shape=[CLUSTER_SIZE, 32, BLOCK_N]
+                if CLUSTER_SIZE > 1 else [32 if HYBRID_TILE_PREFETCH else BLOCK_M, BLOCK_N],
             )
         else:
             c_desc_base = tl.make_tensor_descriptor(
@@ -788,7 +819,8 @@ def _grouped_gemm_tdm_impl(
                 # and the oldest input group before the first LDS read.
                 tlx.async_amd_descriptor_wait(NUM_BUFFERS - 1)
 
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            acc = tl.zeros((CLUSTER_SIZE, BLOCK_M, BLOCK_N) if CLUSTER_SIZE > 1 else (BLOCK_M, BLOCK_N),
+                           dtype=tl.float32)
             epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
             a0, b0 = _tdm_load_subtile(a_buf, b_buf, consumer, 0, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
 
@@ -1000,10 +1032,12 @@ def _grouped_gemm_tdm_impl(
                     c_part = _tdm_c_store_chunk(acc, part)
                     c_part = c_part.to(c_dtype)
                     c_view = c_buf[part % 2]
-                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m + part * 32, off_n],
+                    c_offsets = [0, off_m + part * 32, off_n] if CLUSTER_SIZE > 1 else [off_m + part * 32, off_n]
+                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=c_offsets,
                                                           clamp_bounds=ALLOW_MN_TAILS)
                     tlx.local_store(c_view, c_part)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
+                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0, 0] if CLUSTER_SIZE > 1 else [0, 0],
+                                                   clamp_bounds=False)
                 # The last two output stores overlap the next tile's entry.
                 # Its input waits also retire them before C staging is reused.
             elif OPTIMIZE_CROSS_TILE:
@@ -1338,7 +1372,7 @@ def grouped_gemm_tdm(
                          if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
 
     def run_kernel():
-        return grouped_gemm_tdm_kernel[(num_programs, )](
+        return grouped_gemm_tdm_kernel[(num_programs // cluster_size, )](
             a_packed,
             b_t,
             c_packed,
@@ -1366,7 +1400,7 @@ def grouped_gemm_tdm(
             CLUSTER_MULTICAST=cluster_multicast,
             num_warps=4,
             waves_per_eu=1,
-            ctas_per_cga=(cluster_size, 1, 1),
+            num_ctas=cluster_size,
         )
 
     if benchmark == "graph":
@@ -1526,7 +1560,7 @@ def grouped_gemm_tdm_list(
                          if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
 
     def run_kernel():
-        return grouped_gemm_tdm_list_kernel[(num_programs, )](
+        return grouped_gemm_tdm_list_kernel[(num_programs // cluster_size, )](
             a_ptrs,
             b_ptrs,
             c_ptrs,
@@ -1551,7 +1585,7 @@ def grouped_gemm_tdm_list(
             ALLOW_MN_TAILS=allow_mn_tails,
             num_warps=4,
             waves_per_eu=1,
-            ctas_per_cga=(cluster_size, 1, 1),
+            num_ctas=cluster_size,
         )
 
     with torch.cuda.device(device):
@@ -1741,7 +1775,7 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
         return
     specialize_groups = tuning["CROSS_TILE_PREFETCH"] and tuning["BLOCK_SIZE_M"] == tuning["BLOCK_SIZE_N"] == 256
     with torch.cuda.device(device):
-        grouped_gemm_tdm_list_kernel[(cfg["NUM_SM"], )](
+        grouped_gemm_tdm_list_kernel[(cfg["NUM_SM"] // tuning["CLUSTER_SIZE"], )](
             *tables, tl.constexpr(G) if specialize_groups else G, K=cfg["K"], NUM_PROGRAMS=cfg["NUM_SM"],
             BLOCK_M=tuning["BLOCK_SIZE_M"], BLOCK_N=tuning["BLOCK_SIZE_N"], BLOCK_K=tuning["BLOCK_SIZE_K"],
             GROUP_M=tuning["GROUP_SIZE_M"], NUM_BUFFERS=tuning["NUM_BUFFERS"],
@@ -1749,8 +1783,7 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
             CROSS_TILE_PREFETCH=tuning["CROSS_TILE_PREFETCH"], XCD_REMAP_MODE=tuning["XCD_REMAP_MODE"],
             NUM_XCDS=tuning["NUM_XCDS"], XCD_CHUNK=tuning["XCD_CHUNK"], CLUSTER_SIZE=tuning["CLUSTER_SIZE"],
             CLUSTER_MULTICAST=tuning["CLUSTER_MULTICAST"], ALLOW_MN_TAILS=cfg["ALLOW_MN_TAILS"],
-            num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(tuning["CLUSTER_SIZE"], 1,
-                                                                                              1))
+            num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], num_ctas=tuning["CLUSTER_SIZE"])
 
 
 def grouped_gemm(group_a, group_b):

@@ -475,7 +475,7 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
   auto blockShapePerCTA =
       triton::gpu::getShapePerCTA(CGALayout.getCTASplitNum(), shape);
   int innerDimLength = blockShapePerCTA[order[0]];
-  bool loadTransposed = (order[0] != (1 - opIdx));
+  bool loadTransposed = (order[0] != (shape.size() - 1 - opIdx));
 
   // Fallback: assume padding to match widest load width
   unsigned typeWidthInBit = srcTy.getElementType().getIntOrFloatBitWidth();

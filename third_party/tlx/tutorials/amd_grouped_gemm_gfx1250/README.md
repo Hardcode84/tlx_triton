@@ -162,6 +162,18 @@ two-by-two output region. Cluster barriers protect input-slot reuse.
 `--no-cluster-multicast` retains synchronization but loads inputs independently.
 Program counts refer to physical workgroups.
 
+The kernels launch with upstream-style `num_ctas=cluster_size`; the launch
+grid counts clusters. The host interfaces convert their physical program
+count to `grid=(num_programs // cluster_size,)`. Direct kernel callers must
+use the same grid and pass matching `CLUSTER_SIZE` and `num_ctas` values.
+For example, 16 workgroups in four clusters use `kernel[(4,)](...,
+NUM_PROGRAMS=16, CLUSTER_SIZE=4, num_ctas=4)`.
+
+Inside the kernel, `tl.program_id(0)` identifies the cluster. Its CTA rank
+recovers the physical workgroup ID for persistent scheduling. A leading
+tensor batch axis distributes the matrix tiles across CTAs, keeping a full
+256x256 tile in each CTA.
+
 Clustering requires:
 
 - 256x256x128 tiles, depth 2, `group_m=4`, cross-tile prefetch on, dedicated C

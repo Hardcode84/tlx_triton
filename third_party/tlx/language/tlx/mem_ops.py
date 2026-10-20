@@ -479,21 +479,19 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     elem_type = dtype.to_ir(_semantic.builder)
     if layout is None:
         if storage == tlx.storage_kind.smem:
-            if len(shape) == 1:
+            if len(shape) == 1 or _semantic.builder.options.arch.startswith("gfx"):
                 layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
                 layout._tlx_default = True
-                layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
-                    layout.vectorSize,
-                    layout.perPhase,
-                    layout.maxPhase,
-                    layout.order,
-                    layout.numCTAsPerCGA,
-                    layout.numCTASplit,
-                    layout.numCTAOrder,
-                )
-            elif _semantic.builder.options.arch.startswith("gfx"):
-                layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
-                layout._tlx_default = True
+                if _semantic.builder.options.backend_name == "hip":
+                    # Partition from the most strided dimension, matching the
+                    # default register layout. The buffer-array axis stays local.
+                    remaining_ctas = _semantic.builder.options.num_ctas
+                    for axis, dim in enumerate(unwrapped_shape):
+                        split = min(remaining_ctas, dim)
+                        layout.numCTAsPerCGA[axis] = split
+                        layout.numCTASplit[axis] = split
+                        remaining_ctas //= split
+                    layout.numCTAsPerCGA[-1] *= remaining_ctas
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
                     layout.perPhase,

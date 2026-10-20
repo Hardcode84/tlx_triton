@@ -1053,7 +1053,7 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
   SmallVector<unsigned> order(rank);
   for (unsigned i = 0; i < rank; ++i)
     order[i] = rank - 1 - i;
-  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(buf.getContext(), rank);
+  auto cgaLayout = ttg::getCGALayout(bufType.getEncoding());
 
   Attribute encoding;
   if (allowDotAware) {

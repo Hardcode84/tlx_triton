@@ -588,6 +588,26 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
   }
 }
 
+// -----
+
+// Descriptor-default padding must preserve the batch axis distributed across
+// CTAs. Replacing this with a single-CTA layout invalidates the allocation.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0], CGALayout = [[1, 0, 0]]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$CLUSTER_PADDED:.*]] = #ttg.padded_shared<[256:+8] {{.*}}block = {{\[\[1, 0, 0\]\]}}{{.*}}>
+// PROP-DAG: #[[$CLUSTER_PADDED:.*]] = #ttg.padded_shared<[256:+8] {{.*}}block = {{\[\[1, 0, 0\]\]}}{{.*}}>
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_store_cluster_batch
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<2x32x256xf16, #[[$CLUSTER_PADDED]], #smem, mutable>
+  // PROP-LABEL: @tdm_store_cluster_batch
+  // PROP: ttg.local_alloc : () -> !ttg.memdesc<2x32x256xf16, #[[$CLUSTER_PADDED]], #smem, mutable>
+  tt.func @tdm_store_cluster_batch(%desc: !tt.tensordesc<2x32x256xf16>) {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<2x32x256xf16, #shared, #smem, mutable>
+    amdg.async_tdm_copy_local_to_global %desc from %buf : !ttg.memdesc<2x32x256xf16, #shared, #smem, mutable> -> !tt.tensordesc<2x32x256xf16>
+    tt.return
+  }
+}
+
 //--- invalid.mlir
 
 // Genuine swizzling remains unsupported and is rejected by the TDM verifier.

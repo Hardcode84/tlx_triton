@@ -109,6 +109,13 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
                                    int numWarps,
                                    std::pair<int64_t, int64_t> instrShape) {
   auto rank = shape.size();
+  // A batch split across CTAs can leave only one matrix in each CTA.
+  // Distribute its warps over M/N instead of replicating the whole matrix.
+  if (rank == 3 && shape[0] == 1) {
+    auto warps = planWarps(dotOp, shape.drop_front(), numWarps, instrShape);
+    warps.insert(warps.begin(), 1);
+    return warps;
+  }
   // Case 1: Early exit for batched matmul
   if (rank == 3)
     return {static_cast<unsigned>(numWarps), 1, 1};

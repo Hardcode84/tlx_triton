@@ -516,3 +516,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Each CTA owns one batch member. All four warps must divide that matrix,
+// rather than redundantly computing it on a unit-size per-CTA batch axis.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 32], warpsPerCTA = [1, 1, 4], order = [2, 1, 0], CGALayout = [[1, 0, 0], [2, 0, 0]]}>
+#a = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#b = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+// CHECK-DAG: #[[$BATCH_MMA:.*]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[0, 0, 1\], \[0, 1, 0\]\]}}}, CGALayout = {{\[\[1, 0, 0\], \[2, 0, 0\]\]}}, instrShape = [16, 16, 32]}>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @wmma_batch_one_matrix_per_cta
+  // CHECK: tt.dot {{.*}} -> tensor<4x256x256xf32, #[[$BATCH_MMA]]>
+  tt.func @wmma_batch_one_matrix_per_cta(%a: tensor<4x256x32xf16, #a>,
+                                        %b: tensor<4x32x256xf16, #b>,
+                                        %c: tensor<4x256x256xf32, #blocked>) -> tensor<4x256x256xf32, #blocked> {
+    %d = tt.dot %a, %b, %c : tensor<4x256x32xf16, #a> * tensor<4x32x256xf16, #b> -> tensor<4x256x256xf32, #blocked>
+    tt.return %d : tensor<4x256x256xf32, #blocked>
+  }
+}

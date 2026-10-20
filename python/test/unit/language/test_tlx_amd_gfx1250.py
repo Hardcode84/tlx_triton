@@ -766,6 +766,19 @@ def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, 
     torch.testing.assert_close(output.cpu(), inputs, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("m,n,num_ctas", [(64, 64, 2), (1, 64, 4)])
+def test_tdm_default_layout_multi_cta(m, n, num_ctas):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_async_amd_desc_load_kernel, signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
+                       constexprs={"M": m, "N": n})
+    compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32), options=dict(num_ctas=num_ctas))
+    assert compiled.metadata.num_ctas == num_ctas
+    assert compiled.metadata.global_scratch_size == 0
+    assert "tensor_load_to_lds" in compiled.asm["amdgcn"]
+
+
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
 @pytest.mark.parametrize("interface", ["packed", "list"])
@@ -791,9 +804,9 @@ def test_grouped_gemm_multicast_compiles(cluster_size, multicast, group_size, in
                                           if k not in constants}, constexprs=constants, attrs=attrs)
     assert knobs.runtime.add_stages_inspection_hook is None
     compiled = triton.compile(source, target=GPUTarget("hip", "gfx1250", 32),
-                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1)))
-    assert compiled.metadata.num_ctas == 1
-    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+                              options=dict(num_warps=4, waves_per_eu=1, num_ctas=cluster_size))
+    assert compiled.metadata.num_ctas == cluster_size
+    assert compiled.metadata.ctas_per_cga is None
     assert "call void @llvm.amdgcn.s.setreg(i32 154, i32 1)" in compiled.asm["llir"]
     assert f'"amdgpu-cluster-dims"="{cluster_size},1,1"' in compiled.asm["llir"]
     assert compiled.metadata.global_scratch_size == 0
