@@ -28,6 +28,8 @@ tiles, BK128 for A8W8 and BK256 for A8W4, three input buffers, output staging,
 and partial TDM fusion.
 """
 from collections.abc import Callable
+import statistics
+import time
 
 import torch
 
@@ -3167,6 +3169,22 @@ def _init_data(dtype: str, rows: int, cols: int):
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
+def _mxfp_timed_batches(batch: Callable[[], float], warmup_seconds: float, duration_seconds: float):
+    """Run timing batches for a warmup period, then return the median batch over the measurement period.
+
+    Power-capped devices reach steady clocks only after seconds of load, so a
+    single batch from a cold process overstates the kernel time.
+    """
+    deadline = time.monotonic() + warmup_seconds
+    while time.monotonic() < deadline:
+        batch()
+    samples = []
+    deadline = time.monotonic() + duration_seconds
+    while not samples or time.monotonic() < deadline:
+        samples.append(batch())
+    return statistics.median(samples), len(samples)
+
+
 def mxgemm_tdm_pipelined(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3191,6 +3209,8 @@ def mxgemm_tdm_pipelined(
     GROUP_SIZE_M: int = 8,
     BENCHMARK: str | Callable | None = None,
     BENCHMARK_NUM_ITERS: int = 32,
+    BENCHMARK_WARMUP_SECONDS: float = 0.0,
+    BENCHMARK_DURATION_SECONDS: float = 0.0,
     PERSISTENT: bool = False,
     NUM_PROGRAMS: int | None = None,
     CROSS_TILE_PREFETCH: bool = True,
@@ -3612,12 +3632,14 @@ def mxgemm_tdm_pipelined(
 
     if callable(BENCHMARK):
         BENCHMARK(run_kernel)
-    elif BENCHMARK == "graph":
-        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)
-        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
-    elif BENCHMARK == "eager":
-        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=BENCHMARK_NUM_ITERS)
-        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS")
+    elif BENCHMARK in ("graph", "eager"):
+        if BENCHMARK == "graph":
+            batch = lambda: triton.testing.do_bench_cudagraph(run_kernel, rep=BENCHMARK_NUM_ITERS)  # noqa: E731
+        else:
+            batch = lambda: triton.testing.do_bench(run_kernel, warmup=30, rep=BENCHMARK_NUM_ITERS)  # noqa: E731
+        ms, batches = _mxfp_timed_batches(batch, BENCHMARK_WARMUP_SECONDS, BENCHMARK_DURATION_SECONDS)
+        detail = f" (median of {batches} batches after {BENCHMARK_WARMUP_SECONDS:g} s warmup)" if batches > 1 else ""
+        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS{detail}")
     else:
         run_kernel()
     return c
@@ -3845,6 +3867,10 @@ if __name__ == "__main__":
     parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
                         help="Prefetch distance in K iterations; -1 disables L2 prefetch")
     parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_warmup_seconds", type=float, default=0.0,
+                        help="repeat timing batches for this long before measuring")
+    parser.add_argument("--benchmark_duration_seconds", type=float, default=0.0,
+                        help="report the median timing batch over this period (0: one batch)")
     parser.add_argument("--benchmark_num_iters", type=int, default=32,
                         help="timing repetition budget in milliseconds (not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
@@ -3938,4 +3964,6 @@ if __name__ == "__main__":
         ASYNC_OUTPUT=args.async_output,
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
         OUTPUT_C_SLOTS=args.output_c_slots,
+        BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
+        BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
     )

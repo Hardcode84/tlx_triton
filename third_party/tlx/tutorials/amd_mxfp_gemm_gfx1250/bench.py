@@ -83,9 +83,13 @@ This selects BK256, two input buffers, and four FP32 output panels, retaining
 one prefetched input stage while the other stage holds output.
 Each shape/variant runs in a fresh process using the current
 interpreter and environment. Tensor allocation and compilation are outside the
-tutorial kernel's timed region. The default timing budget is 256 ms, matching
-a standalone run using --benchmark_num_iters 256 (that parameter is a duration,
-not an iteration count). Override it with --benchmark-ms.
+tutorial kernel's timed region. Timing repeats 256 ms batches (--benchmark-ms;
+a duration, not an iteration count): 1 s of warmup batches, then the median
+batch over 2 s (--warmup-seconds, --duration-seconds). On gfx1250 the first
+batch of a fresh process is inflated by a few slow first launches; after it,
+batches settle within about 0.3% of a 10 s warmup. Use --warmup-seconds 0
+--duration-seconds 0 for a single cold batch. The AMD code generator revision
+is printed and recorded so runs with different code generators are not mixed.
 
 Examples::
 
@@ -249,6 +253,10 @@ def _command(args, case, dtype_b):
         args.benchmark_mode,
         "--benchmark_num_iters",
         str(args.benchmark_num_iters),
+        "--benchmark_warmup_seconds",
+        str(args.warmup_seconds),
+        "--benchmark_duration_seconds",
+        str(args.duration_seconds),
         "--seed",
         str(args.seed),
         "--xcd_remap",
@@ -408,6 +416,10 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
+    parser.add_argument("--warmup-seconds", type=float, default=1.0,
+                        help="repeat timing batches for this long before measuring (default: 1)")
+    parser.add_argument("--duration-seconds", type=float, default=2.0,
+                        help="report the median batch over this period; 0 runs one batch (default: 2)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--output-dir", type=Path, help="create a fresh subdirectory for each case's artifacts")
@@ -453,6 +465,8 @@ def parse_benchmark_args(argv=None):
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
     if args.num_programs is not None and args.num_programs <= 0:
         parser.error("--num-programs must be positive")
+    if args.warmup_seconds < 0 or args.duration_seconds < 0:
+        parser.error("--warmup-seconds and --duration-seconds must be nonnegative")
     if args.benchmark_num_iters <= 0:
         parser.error("--benchmark-num-iters must be positive")
     if args.tdm_split and args.persistent:
@@ -626,8 +640,19 @@ def parse_benchmark_args(argv=None):
     return args, cases, variants
 
 
+def _amd_codegen_revision():
+    try:
+        from triton.backends.amd.compiler import get_amd_codegen_revision
+        return get_amd_codegen_revision()
+    except Exception as error:  # Report rather than hide an unusable code generator.
+        return f"unknown ({error})"
+
+
 def main():
     args, cases, variants = parse_benchmark_args()
+    codegen = None if args.dry_run else _amd_codegen_revision()
+    if codegen is not None:
+        print(f"AMD code generator: {codegen}", flush=True)
     results = []
     runs = [(case, variant, dtype_b, run_args) for case in cases for variant, dtype_b, run_args in variants]
     for index, (case, variant, dtype_b, run_args) in enumerate(runs, 1):
@@ -673,7 +698,9 @@ def main():
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
             requested_programs=run_args.num_programs if run_args.persistent else None,
-            benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters, seed=run_args.seed)
+            benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
+            warmup_seconds=run_args.warmup_seconds, duration_seconds=run_args.duration_seconds, seed=run_args.seed,
+            amd_codegen=codegen)
         results.append(
             dict(variant=variant, dtype_a=args.dtype_a, dtype_b=dtype_b, M=case[0], N=case[1], K=case[2], ms=ms,
                  tflops=tflops, status=status, **config, command=shlex.join(command)))
@@ -709,7 +736,9 @@ def main():
             f"early_c_stores={run_args.early_c_stores}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
             f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
-            f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms", flush=True)
+            f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms batches, "
+            f"warmup={run_args.warmup_seconds:g} s, median over {run_args.duration_seconds:g} s, "
+            f"amd_codegen={codegen}", flush=True)
     print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'M':>7} {'N':>7} {'K':>7} "
           f"{'BK':>4} {'ms':>12} {'TFLOPS':>12}  status")
     for row in results:

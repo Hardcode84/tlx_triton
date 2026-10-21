@@ -117,9 +117,25 @@ tail, streamed operands, async output, and wave-specialized handoff default
 off. Handoff scheduling remains `current`, with partial handoff TDM fusion.
 
 The default sweep is both variants at 8192x8192x8192, 8192x8192x4096,
-16384x16384x16384, and 32768x32768x32768: eight runs. Eager timing uses a
-**256 ms budget**, not 256 launches. Keep the timing mode and cache-clearing
-behavior identical across comparisons.
+16384x16384x16384, and 32768x32768x32768: eight runs. Eager timing repeats
+**256 ms batches** (a duration, not 256 launches): 1 s of warmup, then the
+median batch over 2 s. Keep the timing mode and cache-clearing behavior
+identical across comparisons.
+
+A fresh process's first batch is inflated by a few slow first launches. On
+hardware at 8192 cubed, its mean was 0.1875 ms against a median of
+0.1666 ms in the same batch. Later batches settle at 0.167–0.169 ms, then
+drift up about 1% over 12 s under the power cap. Older single-batch `bench.py`
+numbers (about 0.19–0.20 ms at 8192 cubed) are therefore not comparable with
+warmed-up numbers. With the pinned codegen, the current defaults measured
+(2026-10-21; ms, TFLOPS):
+
+| Shape | MX8xMX8 | MX8xMX4 |
+|---|---:|---:|
+| 8192³ | 0.1671 (6580) | 0.1357 (8100) |
+| 8192²×4096 | 0.1014 (5423) | 0.0804 (6837) |
+| 16384³ | 1.3783 (6382) | 1.0334 (8512) |
+| 32768³ | 11.3298 (6211) | 8.6696 (8117) |
 
 ## Latest controlled hardware comparison
 

@@ -39,7 +39,10 @@ group-M 8, no XCD remapping, and four-workgroup multicast with a cluster
 barrier every four input K blocks. This captures the selected hardware
 configuration across both default shapes. Interval 8 was slightly faster
 at K8192, while interval 4 was faster at K4096, so the benchmark uses 4
-for both. The eager timing budget remains 256 ms.
+for both. Eager timing repeats 256 ms batches: 1 s of warmup, then the median
+batch over 2 s (`--warmup-seconds`, `--duration-seconds`). A single batch from
+a fresh process overstates gfx1250 kernel times because of a few slow first
+launches. The summary prints the AMD code generator revision.
 
 The default MX8xMX8 kernel handles its final three K stages in one loop.
 It carries the physical ring slot across the tail and selects the required
