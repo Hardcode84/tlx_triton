@@ -30,6 +30,9 @@ at K=4096, where the larger code costs more than it saves. Use
 --static-slot-unroll or --no-static-slot-unroll to force it for every case.
 --static-slot-unroll requires the three-buffer BK128 staged-output schedule
 and selects MX8xMX8.
+MX8xMX8 also stages FP32 output through three dedicated 64x128 LDS slots
+instead of two, keeping more C stores in flight at each tile transition.
+Use --output-c-slots to choose another count.
 Use --streamed-operands to test native 32x32 accumulator fragments with one
 rolling A set, three spare A fragments, and two B sets. The final three rows cover
 operand reads before LDS reuse; refills precede two initial rows that cover
@@ -158,6 +161,18 @@ def _static_slot_unroll(args, case, dtype_b):
     return _supports_static_slot_unroll(args, dtype_b) and case[2] >= STATIC_SLOT_UNROLL_MIN_K
 
 
+# Three dedicated 64x128 C slots fit beside the three-buffer BK128 input ring
+# and cut A8W8 tile transitions by about 35% on gfx1250.
+DEFAULT_OUTPUT_C_SLOTS = 3
+
+
+def _supports_default_output_c_slots(args, dtype_b):
+    return (args.persistent and args.output_staging and (args.block_m, args.block_n, args.block_k) == (256, 256, 128)
+            and args.num_buffers == 3 and args.num_warps == 4 and args.dtype_a == dtype_b == "float8_e4m3"
+            and not (args.register_pipeline or args.warp_pipeline or args.operand_pipeline or args.streamed_operands
+                     or args.output_tail_reuse or args.first_use_prefetch or args.wave_specialized_handoff))
+
+
 def _variant_args(args, dtype_b):
     resolved = argparse.Namespace(**vars(args))
     if resolved.block_k is None:
@@ -179,6 +194,8 @@ def _variant_args(args, dtype_b):
                                           and resolved.cluster_barrier_interval > 0)
     if resolved.early_c_stores is None:
         resolved.early_c_stores = default_output_schedule
+    if resolved.output_c_slots is None and _supports_default_output_c_slots(resolved, dtype_b):
+        resolved.output_c_slots = DEFAULT_OUTPUT_C_SLOTS
     return resolved
 
 
@@ -259,6 +276,8 @@ def _command(args, case, dtype_b):
         command.append("--wave_specialized_handoff")
     if _static_slot_unroll(args, case, dtype_b):
         command.append("--static_slot_unroll")
+    if args.output_c_slots is not None:
+        command.extend(["--output_c_slots", str(args.output_c_slots)])
     if args.handoff_schedule != "current":
         command.extend(["--handoff_schedule", args.handoff_schedule])
     if args.handoff_tdm_fusion != "partial":
@@ -350,6 +369,10 @@ def parse_benchmark_args(argv=None):
                         help="use direct LDS-to-global C stores with independent waits; requires --streamed-operands")
     parser.add_argument("--wave-specialized-handoff", action="store_true",
                         help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
+    parser.add_argument(
+        "--output-c-slots", type=int, default=None,
+        help=f"dedicated BK128 FP32 output staging slots (default: {DEFAULT_OUTPUT_C_SLOTS} for three-buffer MX8xMX8, "
+        "otherwise 2)")
     parser.add_argument(
         "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
@@ -470,6 +493,13 @@ def parse_benchmark_args(argv=None):
             parser.error("--wave-specialized-handoff requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
                          "four warps, partial fusion, dedicated output staging, and cross-tile prefetch "
                          "without other schedule variants")
+        if run_args.output_c_slots is not None and not (
+                run_args.output_c_slots >= 2 and run_args.persistent and run_args.output_staging
+                and run_args.block_k == 128 and
+                not (run_args.register_pipeline or run_args.warp_pipeline or run_args.operand_pipeline
+                     or run_args.streamed_operands or run_args.output_tail_reuse or run_args.wave_specialized_handoff)):
+            parser.error("--output-c-slots requires at least two slots and persistent BK128 dedicated output staging "
+                         "without other output schedules")
         if run_args.static_slot_unroll and not _supports_static_slot_unroll(run_args, dtype_b):
             parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
@@ -633,8 +663,8 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case,
-                dtype_b), handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
+                run_args, case, dtype_b), output_c_slots=run_args.output_c_slots or 2,
+            handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
             async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
             num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
@@ -665,6 +695,7 @@ def main():
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"wave_specialized_handoff={run_args.wave_specialized_handoff}, "
             f"static_slot_unroll={'auto' if run_args.static_slot_unroll is None else run_args.static_slot_unroll}, "
+            f"output_c_slots={run_args.output_c_slots or 2}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
             f"async_output={run_args.async_output}, "

@@ -32,10 +32,13 @@ override. The opt-in
 `STATIC_SLOT_UNROLL` removes most remaining loop waits. With the pinned
 codegen it gains another 1.2% at 8192 cubed (3.6% in total, 6455 TFLOPS) but
 loses 1.8% at K4096. `bench.py` therefore enables it for MX8xMX8 cases with
-K >= 8192; the kernel and `matmul` default remains off. The 16384- and
-32768-cubed cases have not been measured with it. See
-[Wait reduction experiments](#wait-reduction-experiments) and
-[Hardware A/B](#hardware-ab).
+K >= 8192; the kernel and `matmul` default remains off. That schedule now
+peels each tile's first K step. `bench.py` also stages A8W8 output through
+three C slots instead of two, cutting tile transitions by about 35%. The
+current bench defaults measure 0.16825 ms at 8192 cubed (6535 TFLOPS),
+0.10176 ms at K4096, and 1.38280 ms at 16384 cubed. 32768 cubed has not been
+measured. See [Wait reduction experiments](#wait-reduction-experiments),
+[Hardware A/B](#hardware-ab), and [Tile transition](#tile-transition).
 
 The branch has been rebased and tested locally. After the rebase, only one
 diagnostic hardware profile exists (A8W8 8192 cubed, see
@@ -100,6 +103,8 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Cross-tile prefetch | On | Off |
 | Split cluster barrier | Off | On |
 | Early C stores | Off | On |
+| Static slot unroll | K >= 8192 | Off |
+| Dedicated C slots | 3 | — (C reuses A stages) |
 
 Common launch settings: group-M 8, 256 programs capped by tile count,
 four-workgroup multicast with a 2x2 cluster layout, and a cluster barrier
@@ -421,6 +426,107 @@ smaller because the remaining time is elsewhere:
 
 At K4096 there are half as many steady steps per tile. There, the larger
 `STATIC_SLOT_UNROLL` code costs more than it saves, as AM predicted.
+
+### Tile transition
+
+Hardware ATT, pinned codegen with static slot unroll, 8192 cubed: between the
+last WMMA of one tile and the first of the next, the wave idles for 7.1–9.2k
+cycles (16 ideal K steps) in each of the three transitions. That is about 9%
+of the wave. The A8W8 epilogue writes the 256x256 FP32 tile as eight
+64x128 chunks through two dedicated 32 KB LDS slots. Each chunk takes about
+210 cycles to fill (16 `ds_store_b128` per wave, LDS wait, barrier, TDM store),
+but reusing a slot waits for that slot's previous store:
+
+- The first reuse wait (`s_wait_tensorcnt 1`, 1.9–2.9k cycles) also waits for
+  the next tile's prefetched input stages, because the counter retires in
+  order.
+- Later reuse waits take 1.1–1.5k cycles each. With two slots, at most two
+  32 KB stores are in flight, so the epilogue is bound by store latency
+  rather than fill work.
+- After the last store, about 800 cycles go to zeroing 512 accumulator VGPRs
+  and next-tile setup. The K-tail step that issues the next-tile prefetch
+  takes 1.3–2.1k cycles instead of about 850.
+
+`OUTPUT_C_SLOTS` and `OUTPUT_C_COLS` (kernel constexprs, default 2 and
+automatic) make the dedicated staging configurable. Chunks rotate through the
+slots across quadrants, and each reuse waits for `slots − 1` pending stores.
+Three 64x128 slots use 316,552 bytes of LDS; six 64x64 slots use 319,624.
+The default assembly is unchanged.
+
+AM, pinned codegen and static slot unroll, M=N=K=2048, 16 programs, four
+tiles per program. All outputs passed the CPU check and were bitwise
+identical. "Lost" counts the cycles below plateau WMMA utilization in each of
+the last two transitions, where code is warm:
+
+| Output staging | Dispatch cycles | Warm transitions lost (cycles) |
+|---|---:|---|
+| 2 × 64x128 (current) | 111,542 | 5,637 / 5,473 |
+| 3 × 64x128 | 107,692 (−3.5%) | 4,243 / 4,335 |
+| 4 × 64x64 | 111,894 (+0.3%) | 5,477 / 5,430 |
+| 6 × 64x64 | 108,936 (−2.3%) | 4,554 / 4,428 |
+| `WAVE_SPECIALIZED_HANDOFF` | 114,159 (+2.3%) | 5,382 / 5,114 |
+
+Three 32 KB slots cut warm transitions by about 23% on AM. AM runs only 16
+workgroups, so it does not reproduce all 256 CUs storing at once. Hardware
+timing at 8192 cubed must decide whether store bandwidth, rather than
+latency, limits the gain there.
+
+**Zero-accumulator peel.** `STATIC_SLOT_UNROLL` now peels the first steady
+K step of each tile. That step's dots see the tile's zero accumulators as
+constants, so all 64 of its WMMAs encode C as an inline `0` and the per-tile
+zeroing disappears (`v_dual_mov_b32` 303 → 65, `v_mov_b32` 38 → 2). The
+remaining steps keep `slots[k % 3]`, and the peel replaces one remainder step,
+so static code shrinks from 2,229 to 1,937 instructions with 857 VGPRs.
+Outputs are bitwise identical to the unpeeled schedule; the 12 FFM ring-phase
+cases pass. Same AM setup as above:
+
+| Variant | Dispatch cycles | Warm transitions lost (cycles) |
+|---|---:|---|
+| Static slot unroll (before peel) | 111,542 | 5,637 / 5,473 |
+| + peel | 105,319 (−5.6%) | 4,981 / 4,986 |
+| + peel, 3 × 64x128 C slots | 101,818 (−8.7%) | 4,203 / 4,126 |
+
+Some of the peel's gain is AM's cheaper cold instruction fetch from the
+smaller code. Overlapping accumulator zeroing with C-slot waits would still
+help the non-unrolled path (K < 8192 in `bench.py`). It cannot be combined
+with the peel, because zeros carried across tiles are no longer constants.
+
+With a remainder after the unrolled loop (K = 4096 or 16384), the peeled and
+remainder dots initially selected a different WMMA warp distribution from the
+loop. That inserted 23 `convert_layout` operations and 16 KB of LDS scratch,
+which made three C slots exceed 320 KB. Static-slot steps, and every other
+dot under `STATIC_SLOT_UNROLL`, now use `_mxgemm_native_dot`, the store's
+native layout. No conversions remain at K = 4096, 8192, or 16384; LDS is
+282,760 bytes with two slots and 316,552 with three. The K8192 assembly is
+unchanged from the AM runs, and the default (non-static) assembly is
+unchanged.
+
+**Hardware A/B (2026-10-21).** Remote gfx1250, pinned codegen,
+`collect_traces.py` warmed-up timing: four interleaved rounds, plus the trace
+run at 8192 cubed. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-tt-20261021.tar.gz` (SHA256
+`1fc8281526497d3539908a05b4620a6b0360a15233153827b2a3515db0fd94ad`). All
+variants passed the CPU checks; 8192-cubed outputs were bitwise identical.
+
+| Variant | 8192³ ms (TFLOPS) | 8192²×4096 ms | 16384³ ms |
+|---|---:|---:|---:|
+| Committed static slot unroll (`f8aca875c4`) | 0.17075 (6439) | 0.10365 | 1.38529 |
+| + zero-accumulator peel | 0.17052 (−0.14%) | 0.10365 (±0%) | 1.38772 (+0.18%) |
+| + peel, 3 C slots | **0.16825 (−1.47%, 6535)** | **0.10176 (−1.82%)** | 1.38280 (−0.18%) |
+
+The 8192²×4096 case does not use static slot unroll, so only the C slots
+apply there. ATT at 8192 cubed (one wave, three transitions):
+
+| Variant | Transition gap (cycles) | After last C store | Slot-reuse waits |
+|---|---|---|---|
+| Committed | 6,611 / 7,290 / 7,009 | 791–892 | 1.2–1.7k each |
+| + peel | 6,325 / 6,283 / 6,400 | 411–548 | 1.0–1.5k |
+| + peel, 3 C slots | 4,419 / 4,050 / 4,502 | 452–459 | 0.1–0.8k |
+
+The peel removes about 400 cycles of zeroing per transition, which is below
+whole-kernel noise. The third C slot cuts transitions by about 35%. At 16384
+cubed, with 128 K steps per tile, transitions matter less, and clocks drop to
+about 1.72 GHz under the power cap.
 
 Pre-existing post-rebase breakage found during validation (not fixed):
 

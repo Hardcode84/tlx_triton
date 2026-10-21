@@ -60,6 +60,13 @@ of the loop, removing most ALU dependency waits. Static code grows by about
 a third. On hardware with the pinned AMDGPU codegen it is 1.2% faster at
 8192 cubed but 1.8% slower at K=4096. `bench.py` therefore enables it for
 MX8xMX8 cases with K >= 8192; the kernel and `matmul` default remains off.
+The unrolled schedule also peels each tile's first K step, so its WMMAs take
+the zero accumulator as an inline constant instead of zeroing 512 VGPRs.
+
+`--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
+FP32 output staging slots (kernel default two). `bench.py` uses three for
+three-buffer MX8xMX8, which keeps more C stores in flight at each tile
+transition: 1.5% faster at 8192 cubed and 1.8% faster at K=4096 on hardware.
 See [HANDOFF.md](HANDOFF.md#hardware-ab).
 
 Run from the repository root in an environment configured for gfx1250:

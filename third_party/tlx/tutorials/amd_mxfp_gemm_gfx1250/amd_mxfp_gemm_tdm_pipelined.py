@@ -1575,17 +1575,19 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
                                    BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr,
                                    DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
                                    WITH_A_SCALE: tl.constexpr, GROUPED_PREFETCH: tl.constexpr = False, ARRIVE_K=None,
-                                   CLUSTER_SIZE: tl.constexpr = 1, CLUSTER_BARRIER_INTERVAL: tl.constexpr = 0):
+                                   CLUSTER_SIZE: tl.constexpr = 1, CLUSTER_BARRIER_INTERVAL: tl.constexpr = 0,
+                                   PIN_NATIVE: tl.constexpr = False):
     tl.static_assert(BK == 128)
+    dot: tl.constexpr = _mxgemm_native_dot if PIN_NATIVE else tlx.dot_scaled
     b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
-    c00 = tlx.dot_scaled(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+    c00 = dot(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(101)
     tlx.amd_sched_barrier()
     a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     if ARRIVE_K is not None:
         _mxgemm_cluster_arrive(ARRIVE_K, CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL)
-    c01 = tlx.dot_scaled(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+    c01 = dot(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(102, True)
     tlx.amd_sched_barrier()
@@ -1605,10 +1607,14 @@ def _mxgemm_defer_bottom_k_step(
         REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr):
     # One steady BK128 step of the deferred-bottom schedule. This matches the
     # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
+    # Pin every dot to the output store's native WMMA layout. A peeled step
+    # starts from constant zeros and remainder steps follow the loop; without
+    # pins, layout selection can pick different warp distributions for these
+    # dots and insert accumulator conversions through LDS.
     c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
         c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BM, BN, BK, DA, DB, DTYPE_A, DTYPE_B,
         BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH, ARRIVE_K=i + BUFFERS if SPLIT_CLUSTER_BARRIER else None,
-        CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL)
+        CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=True)
     last_b00, last_sb00 = b00, sb00
     _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, i + BUFFERS,
                             slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
@@ -1618,13 +1624,13 @@ def _mxgemm_defer_bottom_k_step(
     a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
     if not PREFETCH_B_AFTER_C10:
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS)
-    c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+    c10 = _mxgemm_native_dot(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(103, True)
     tlx.amd_sched_barrier()
     if PREFETCH_B_AFTER_C10:
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS)
-    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(104)
     tlx.amd_sched_barrier()
@@ -1768,13 +1774,17 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                 tlx.local_store(view, left if part == 0 else right)
                 _mxgemm_c_tdm_store(desc, view, [0, part * C_COLS], C_TDM_ISSUER)
         else:
-            tl.static_assert(C_ROWS == 64 and C_SLOTS == 2 and (C_COLS == 64 or C_COLS == 128))
-            for part in tl.static_range(2 * (BN // C_COLS)):
+            tl.static_assert(C_ROWS == 64 and C_SLOTS >= 2 and (C_COLS == 64 or C_COLS == 128))
+            PARTS: tl.constexpr = 2 * (BN // C_COLS)
+            for part in tl.static_range(PARTS):
                 # Dedicated slots are free on entry: the current tile's tail
-                # waits retired any previous C stores. Start both chunks while
-                # next-tile inputs remain in flight, then wait only on reuse.
-                if not INITIAL_C_SLOTS_FREE or QUADRANT > 0 or part >= C_SLOTS:
-                    _mxgemm_c_slot_wait(1, C_TDM_ISSUER)
+                # waits retired any previous C stores. Start the first C_SLOTS
+                # chunks while next-tile inputs remain in flight, then wait
+                # only on reuse. Chunks rotate through slots across quadrants.
+                # Chunk QUADRANT * PARTS + part, computed inline so tuple slot
+                # views keep a constant index.
+                if not INITIAL_C_SLOTS_FREE or QUADRANT * PARTS + part >= C_SLOTS:
+                    _mxgemm_c_slot_wait(C_SLOTS - 1, C_TDM_ISSUER)
                 lo, hi = tl.split(tl.reshape(acc, (2, 64, BN)).permute(1, 2, 0))
                 if C_COLS == 128:
                     chunk = lo if part == 0 else hi
@@ -1786,7 +1796,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                     left, right = tl.split(tl.reshape(half, (64, 2, 64)).permute(0, 2, 1))
                     chunk = left if part % 2 == 0 else right
                     row, col = (part // 2) * 64, (part % 2) * 64
-                view = c_buf[part % C_SLOTS]
+                view = c_buf[(QUADRANT * PARTS + part) % C_SLOTS]
                 tlx.local_store(view, chunk)
                 _mxgemm_c_tdm_store(desc, view, [row, col], C_TDM_ISSUER)
     else:
@@ -2028,6 +2038,8 @@ def mxgemm_tdm_persistent_kernel(
     EARLY_C_STORES: tl.constexpr = False,
     WAVE_SPECIALIZED_HANDOFF: tl.constexpr = False,
     STATIC_SLOT_UNROLL: tl.constexpr = False,
+    OUTPUT_C_SLOTS: tl.constexpr = None,
+    OUTPUT_C_COLS: tl.constexpr = None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -2094,7 +2106,9 @@ def mxgemm_tdm_persistent_kernel(
     PEEL_HANDOFF: tl.constexpr = (HANDOFF_SCHEDULE == "staggered" or AB_C_REUSE) and K // BLOCK_K > NUM_BUFFERS
     PEEL_FUSION_TRANSITION: tl.constexpr = (AB_C_REUSE and HANDOFF_TDM_FUSION == "4way"
                                             and K // BLOCK_K > NUM_BUFFERS + 1)
-    dot: tl.constexpr = _mxgemm_native_dot if DEFERRED_C_REFILL else tlx.dot_scaled
+    # Static-slot steps pin their dots to the native output layout, so every
+    # dot in that schedule must use the same pinned layout.
+    dot: tl.constexpr = _mxgemm_native_dot if DEFERRED_C_REFILL or STATIC_SLOT_UNROLL else tlx.dot_scaled
     if OUTPUT_STAGING:
         tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and DA == 1)
         if OUTPUT_REUSE:
@@ -2138,9 +2152,16 @@ def mxgemm_tdm_persistent_kernel(
     bs_buf = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
                              layout=_scale_shared_layout([BLOCK_N // 128, BLOCK_K // 32 * 128]))
     # Two 64x64 output slots leave room for a fourth BK128 input stage.
-    C_COLS: tl.constexpr = 64 if NUM_BUFFERS == 4 else BLOCK_N // 2
+    C_COLS: tl.constexpr = OUTPUT_C_COLS if OUTPUT_C_COLS is not None else (64 if NUM_BUFFERS == 4 else BLOCK_N // 2)
     C_ROWS: tl.constexpr = 128 if OUTPUT_REUSE else 64
-    C_SLOTS: tl.constexpr = NUM_BUFFERS if OUTPUT_REUSE and not DEFERRED_C_REFILL else 2
+    # Dedicated staging defaults to two slots; OUTPUT_C_SLOTS/OUTPUT_C_COLS
+    # (None selects the default) let output stores overlap more deeply.
+    C_SLOTS: tl.constexpr = NUM_BUFFERS if OUTPUT_REUSE and not DEFERRED_C_REFILL else (
+        2 if OUTPUT_C_SLOTS is None else OUTPUT_C_SLOTS)
+    if OUTPUT_C_SLOTS is not None or OUTPUT_C_COLS is not None:
+        tl.static_assert(
+            OUTPUT_STAGING and not (OUTPUT_REUSE or OUTPUT_TAIL_REUSE or REGISTER_PIPELINE or WAVE_SPECIALIZED_HANDOFF),
+            "OUTPUT_C_SLOTS/OUTPUT_C_COLS apply to dedicated output staging slots")
     if DEFERRED_C_REFILL:
         c_buf = None
     elif OUTPUT_TAIL_REUSE:
@@ -2163,7 +2184,7 @@ def mxgemm_tdm_persistent_kernel(
             # Without overlap, all C transfers drain before reloading A.
             c_buf = tlx.local_alloc((128, BLOCK_N // 2), tl.float32, NUM_BUFFERS, reuse=a_buf)
     else:
-        c_buf = tlx.local_alloc((C_ROWS, C_COLS), tl.float32, 2) if OUTPUT_STAGING else None
+        c_buf = tlx.local_alloc((C_ROWS, C_COLS), tl.float32, C_SLOTS) if OUTPUT_STAGING else None
     num_m, num_n = M // BLOCK_M, N // BLOCK_N
     total_tiles = num_m * num_n
     k_iters = K // BLOCK_K
@@ -2529,24 +2550,38 @@ def mxgemm_tdm_persistent_kernel(
                 slot2 = tl.where(slot1 == NUM_BUFFERS - 1, 0, slot1 + 1)
                 slots = (slot, slot1, slot2)
                 STEADY_STEPS: tl.constexpr = K // BLOCK_K - NUM_BUFFERS
-                UNROLLED_END: tl.constexpr = STEADY_STEPS - STEADY_STEPS % NUM_BUFFERS
-                for i in tl.range(0, UNROLLED_END, NUM_BUFFERS):
-                    for j in tl.static_range(NUM_BUFFERS):
-                        c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
-                            c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
-                            as_buf, bs_buf, off_m, off_n, i + j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M,
-                            BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
-                            GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
-                            SPLIT_CLUSTER_BARRIER)
-                for j in tl.static_range(STEADY_STEPS % NUM_BUFFERS):
+                # Peel the first step: its dots see the tile's zero accumulators
+                # as constants, which WMMA encodes as an inline C operand. This
+                # removes the per-tile zeroing of 512 accumulator VGPRs. Step k
+                # uses slots[k % NUM_BUFFERS] throughout.
+                PEEL: tl.constexpr = 1 if STEADY_STEPS > 0 else 0
+                for j in tl.static_range(PEEL):
                     c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                         c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
-                        as_buf, bs_buf, off_m, off_n, UNROLLED_END + j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M,
-                        BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
+                        as_buf, bs_buf, off_m, off_n, j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N,
+                        BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
                         GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
                         XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
                         SPLIT_CLUSTER_BARRIER)
+                REST: tl.constexpr = STEADY_STEPS - PEEL
+                UNROLLED_END: tl.constexpr = PEEL + REST - REST % NUM_BUFFERS
+                for i in tl.range(PEEL, UNROLLED_END, NUM_BUFFERS):
+                    for j in tl.static_range(NUM_BUFFERS):
+                        c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+                            c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
+                            as_buf, bs_buf, off_m, off_n, i + j, slots[(PEEL + j) % NUM_BUFFERS],
+                            slots[(PEEL + j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B,
+                            NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
+                            CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                            REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER)
+                for j in tl.static_range(REST % NUM_BUFFERS):
+                    c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+                        c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
+                        as_buf, bs_buf, off_m, off_n, UNROLLED_END + j, slots[(UNROLLED_END + j) % NUM_BUFFERS],
+                        slots[(UNROLLED_END + j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
+                        DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
+                        CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                        REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER)
                 slot = slots[STEADY_STEPS % NUM_BUFFERS]
             # With STATIC_SLOT_UNROLL the steps above consume the whole range.
             for i in tl.range(
@@ -2562,7 +2597,7 @@ def mxgemm_tdm_persistent_kernel(
                         c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K,
                         DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
                         ARRIVE_K=i + NUM_BUFFERS if SPLIT_CLUSTER_BARRIER else None, CLUSTER_SIZE=CLUSTER_SIZE,
-                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL)
+                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=STATIC_SLOT_UNROLL)
                     last_b00, last_sb00 = b00, sb00
                 elif OUTPUT_REUSE:
                     c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
@@ -2676,7 +2711,8 @@ def mxgemm_tdm_persistent_kernel(
                     else:
                         c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
                             c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
-                            BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH)
+                            BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
+                            PIN_NATIVE=STATIC_SLOT_UNROLL)
                         last_b00, last_sb00 = b00, sb00
                     if DEFERRED_C_REFILL and K // BLOCK_K == NUM_BUFFERS and j == 0 and tile >= NUM_PROGRAMS:
                         # With an empty steady loop, the first tail stage also
@@ -2772,7 +2808,8 @@ def mxgemm_tdm_persistent_kernel(
                         else:
                             c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
                                 c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
-                                BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH)
+                                BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
+                                PIN_NATIVE=STATIC_SLOT_UNROLL)
                         last_b00, last_sb00 = b00, sb00
                     elif OUTPUT_REUSE:
                         c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
@@ -3181,6 +3218,7 @@ def mxgemm_tdm_pipelined(
     EARLY_C_STORES: bool = False,
     WAVE_SPECIALIZED_HANDOFF: bool = False,
     STATIC_SLOT_UNROLL: bool = False,
+    OUTPUT_C_SLOTS: int | None = None,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3202,6 +3240,10 @@ def mxgemm_tdm_pipelined(
     the loop-carried operand copies leave the loop, removing most ALU dependency
     waits; the static code grows by about a third. It requires the three-buffer
     BK128 schedule with dedicated output staging.
+
+    ``OUTPUT_C_SLOTS`` sets the number of dedicated 64-row FP32 output staging
+    slots (default two). More slots keep more C stores in flight during the
+    tile epilogue; three 64x128 slots fit beside the A8W8 BK128 input ring.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3353,6 +3395,12 @@ def mxgemm_tdm_pipelined(
                                             or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH)):
         raise ValueError("STATIC_SLOT_UNROLL requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
+    if OUTPUT_C_SLOTS is not None and not (isinstance(OUTPUT_C_SLOTS, int) and OUTPUT_C_SLOTS >= 2 and PERSISTENT
+                                           and OUTPUT_STAGING and BLOCK_K == 128 and
+                                           not (REGISTER_PIPELINE or WARP_PIPELINE or OPERAND_PIPELINE
+                                                or STREAMED_OPERANDS or OUTPUT_TAIL_REUSE or WAVE_SPECIALIZED_HANDOFF)):
+        raise ValueError("OUTPUT_C_SLOTS requires at least two slots and persistent BK128 dedicated output staging "
+                         "without other output schedules")
     if COMPACT_K_TAIL and not (
             PERSISTENT and OUTPUT_STAGING and WITH_A_SCALE and NUM_WARPS == 4 and NUM_BUFFERS == 3 and
         (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 256) and DTYPE_A == "e4m3" and DTYPE_B == "e2m1"
@@ -3507,6 +3555,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["WAVE_SPECIALIZED_HANDOFF"] = True
     if STATIC_SLOT_UNROLL:
         persistent_options["STATIC_SLOT_UNROLL"] = True
+    if OUTPUT_C_SLOTS is not None:
+        persistent_options["OUTPUT_C_SLOTS"] = OUTPUT_C_SLOTS
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -3678,7 +3728,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
                     False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
-                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False))
+                        "ASYNC_OUTPUT",
+                        False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
+                                                           False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -3764,6 +3816,8 @@ if __name__ == "__main__":
                         help="test one loop body for A8W4's final three K256 stages")
     parser.add_argument("--wave_specialized_handoff", action="store_true",
                         help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
+    parser.add_argument("--output_c_slots", type=int, default=None,
+                        help="dedicated BK128 FP32 output staging slots (default: 2)")
     parser.add_argument("--static_slot_unroll", action="store_true",
                         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots")
     parser.add_argument("--streamed_operands", action="store_true",
@@ -3883,4 +3937,5 @@ if __name__ == "__main__":
         STREAMED_OPERANDS=args.streamed_operands,
         ASYNC_OUTPUT=args.async_output,
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
+        OUTPUT_C_SLOTS=args.output_c_slots,
     )

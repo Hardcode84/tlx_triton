@@ -7214,12 +7214,24 @@ def test_gfx1250_mxgemm_wave_specialized_handoff_separates_queues(k, cluster_siz
 
 
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size):
-    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4,
+@pytest.mark.parametrize("k, output_c_slots", [(8192, None), (4096, None), (4096, 3), (16384, 3)])
+def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size, k, output_c_slots):
+    extra = {} if output_c_slots is None else dict(OUTPUT_C_SLOTS=output_c_slots)
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4,
                                                   CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
-                                                  STATIC_SLOT_UNROLL=True)
+                                                  STATIC_SLOT_UNROLL=True, **extra)
     asm = compiled.asm["amdgcn"]
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    # Peeled, unrolled, and remainder steps share the output's native WMMA
+    # layout: no accumulator conversions, so three C slots fit in LDS.
+    assert "ttg.convert_layout" not in compiled.asm["ttgir"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert asm.count("tensor_store_from_lds") == 8
+    # The peeled first step reads the tile's zero accumulators as WMMA inline
+    # constants instead of zeroing 512 accumulator VGPRs.
+    wmmas = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4 .*$", asm, re.MULTILINE)
+    assert sum(bool(re.search(r"\], 0, ", wmma)) for wmma in wmmas) == 64
     lines = asm.splitlines()
     labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
     bodies = []

@@ -494,16 +494,22 @@ def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
     baseline, streamed = cases[:2]
     assert baseline["config"]["cluster_layout"] == "2x2"
     assert streamed["config"]["cluster_layout"] == "linear"
-    # Only the persistent schedule uses 2x2 clusters, and it unrolls the steady
-    # loop by the ring depth from K=8192. Other options match the persistent
-    # benchmark defaults for each shape.
+    # Only the persistent schedule uses 2x2 clusters and three dedicated C
+    # slots, and it unrolls the steady loop by the ring depth from K=8192.
+    # Other options match the persistent benchmark defaults for each shape.
     for case in cases:
         assert ("--static_slot_unroll" in case["application"]) == (case["kernel"] == "persistent"
                                                                    and case["shape"][2] >= 8192)
+        persistent = case["kernel"] == "persistent"
+        assert ("--output_c_slots" in case["application"]) == persistent
+        assert case["config"]["output_c_slots"] == (3 if persistent else None)
     application = baseline["application"].copy()
     layout = application.index("--cluster_layout")
     del application[layout:layout + 2]
     application.remove("--static_slot_unroll")
+    slots = application.index("--output_c_slots")
+    assert application[slots + 1] == "3"
+    del application[slots:slots + 2]
     assert streamed["application"] == application[:application.index("--num_programs")] + [
         "--streamed_operands"
     ] + application[application.index("--num_programs"):]
