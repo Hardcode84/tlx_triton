@@ -3,6 +3,9 @@
 This directory contains the FP8/FP4 TDM-pipelined GEMM tutorial and a persistent
 MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 
+See [HANDOFF.md](HANDOFF.md) for the performance investigation checkpoint,
+measured results, toolchain caveats, and next validation steps.
+
 - `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
   `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
 - `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
@@ -17,8 +20,8 @@ MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 - [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
   assembly reproduction with FP32 output and a standalone HIP benchmark.
 
-The benchmark runs both variants at M=N=8192 with K=8192 and K=4096, for four
-runs by default:
+The benchmark runs both variants at M=N=8192 with K=8192 and K=4096,
+and at 16384 and 32768 cubed, for eight runs by default:
 
 | Variant | Activations | Weights |
 | --- | --- | --- |
@@ -49,6 +52,15 @@ those inputs remain in flight. Output waits begin with the third chunk,
 when a C slot is reused, and leave the other chunk in flight. The current
 tile's input waits retire any previous tile's C stores before this output
 phase, so there is no need to drain incoming A/B before the first C chunk.
+
+`--static-slot-unroll` (`STATIC_SLOT_UNROLL=True`) unrolls the MX8xMX8
+steady loop by its three-slot ring. Each step then reads a loop-invariant
+slot, so LDS operand addresses and the loop-carried operand copies move out
+of the loop, removing most ALU dependency waits. Static code grows by about
+a third. On hardware with the pinned AMDGPU codegen it is 1.2% faster at
+8192 cubed but 1.8% slower at K=4096. `bench.py` therefore enables it for
+MX8xMX8 cases with K >= 8192; the kernel and `matmul` default remains off.
+See [HANDOFF.md](HANDOFF.md#hardware-ab).
 
 Run from the repository root in an environment configured for gfx1250:
 

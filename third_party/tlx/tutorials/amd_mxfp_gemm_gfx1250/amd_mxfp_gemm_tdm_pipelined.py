@@ -1595,6 +1595,43 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
 
 
 @triton.jit
+def _mxgemm_defer_bottom_k_step(
+        c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m,
+        off_n, i, slot, next_slot, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr,
+        DB: tl.constexpr, DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
+        WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr, LOADS: tl.constexpr, GROUPED_PREFETCH: tl.constexpr,
+        PREFETCH_B_AFTER_C10: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
+        REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr):
+    # One steady BK128 step of the deferred-bottom schedule. This matches the
+    # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
+    c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
+        c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BM, BN, BK, DA, DB, DTYPE_A, DTYPE_B,
+        BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH, ARRIVE_K=i + BUFFERS if SPLIT_CLUSTER_BARRIER else None,
+        CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL)
+    last_b00, last_sb00 = b00, sb00
+    _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, i + BUFFERS,
+                            slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
+                            GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE,
+                            CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER)
+    tlx.async_amd_descriptor_wait((BUFFERS - 1) * LOADS)
+    a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    if not PREFETCH_B_AFTER_C10:
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS)
+    c10 = tlx.dot_scaled(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+    if GROUPED_PREFETCH:
+        _mxgemm_schedule_prefetch(103, True)
+    tlx.amd_sched_barrier()
+    if PREFETCH_B_AFTER_C10:
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS)
+    c11 = tlx.dot_scaled(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+    if GROUPED_PREFETCH:
+        _mxgemm_schedule_prefetch(104)
+    tlx.amd_sched_barrier()
+    return c00, c01, c10, c11, a00, sa00, b00, sb00
+
+
+@triton.jit
 def _mxgemm_native_operand(value, index: tl.constexpr, dtype: tl.constexpr):
     parent: tl.constexpr = tlx.amd_wmma_layout(((0, 2), (2, 0)), ((0, 1), (1, 0)),
                                                instr_shape=(16, 16, 64 if dtype == "e2m1" else 128))
@@ -1990,6 +2027,7 @@ def mxgemm_tdm_persistent_kernel(
     SPLIT_CLUSTER_BARRIER: tl.constexpr = False,
     EARLY_C_STORES: tl.constexpr = False,
     WAVE_SPECIALIZED_HANDOFF: tl.constexpr = False,
+    STATIC_SLOT_UNROLL: tl.constexpr = False,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -2478,7 +2516,42 @@ def mxgemm_tdm_persistent_kernel(
                 c11 = dot(a11, sa11, DTYPE_A, b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
                 slot = next_slot
-            for i in tl.range(2 if PEEL_FUSION_TRANSITION else (1 if PEEL_HANDOFF else 0), steady_end):
+            if STATIC_SLOT_UNROLL:
+                tl.static_assert(
+                    DEFER_BOTTOM and NUM_BUFFERS == 3 and not DEFERRED_C_REFILL and not B_TAIL_PREFETCH
+                    and not PEEL_HANDOFF and not PEEL_FUSION_TRANSITION,
+                    "STATIC_SLOT_UNROLL requires the BK128 staged-output schedule with three buffers")
+                # The ring slot repeats every NUM_BUFFERS steps. Unrolling by the
+                # ring depth keeps each step's slot loop-invariant, so LDS operand
+                # addresses leave the loop. A per-step VALU address add would
+                # otherwise make each ds_load wait for in-flight WMMAs (va_vdst).
+                slot1 = tl.where(slot == NUM_BUFFERS - 1, 0, slot + 1)
+                slot2 = tl.where(slot1 == NUM_BUFFERS - 1, 0, slot1 + 1)
+                slots = (slot, slot1, slot2)
+                STEADY_STEPS: tl.constexpr = K // BLOCK_K - NUM_BUFFERS
+                UNROLLED_END: tl.constexpr = STEADY_STEPS - STEADY_STEPS % NUM_BUFFERS
+                for i in tl.range(0, UNROLLED_END, NUM_BUFFERS):
+                    for j in tl.static_range(NUM_BUFFERS):
+                        c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+                            c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
+                            as_buf, bs_buf, off_m, off_n, i + j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M,
+                            BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
+                            GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+                            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
+                            SPLIT_CLUSTER_BARRIER)
+                for j in tl.static_range(STEADY_STEPS % NUM_BUFFERS):
+                    c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+                        c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
+                        as_buf, bs_buf, off_m, off_n, UNROLLED_END + j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M,
+                        BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
+                        GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+                        XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
+                        SPLIT_CLUSTER_BARRIER)
+                slot = slots[STEADY_STEPS % NUM_BUFFERS]
+            # With STATIC_SLOT_UNROLL the steps above consume the whole range.
+            for i in tl.range(
+                    steady_end if STATIC_SLOT_UNROLL else (2 if PEEL_FUSION_TRANSITION else (1 if PEEL_HANDOFF else 0)),
+                    steady_end):
                 # Carry the physical slot so the hot loop needs only an increment
                 # and wrap, including when K does not divide the ring depth.
                 tl.assume(slot >= 0)
@@ -3107,6 +3180,7 @@ def mxgemm_tdm_pipelined(
     SPLIT_CLUSTER_BARRIER: bool = False,
     EARLY_C_STORES: bool = False,
     WAVE_SPECIALIZED_HANDOFF: bool = False,
+    STATIC_SLOT_UNROLL: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3122,6 +3196,12 @@ def mxgemm_tdm_pipelined(
     compute and fill the dedicated C slots; output reuse waits affect only
     output waves. This requires three BK128 input buffers and cross-tile
     prefetch, without other operand/output schedule variants.
+
+    ``STATIC_SLOT_UNROLL`` unrolls the A8W8 steady K loop by its three-slot
+    ring so every step reads a loop-invariant LDS slot. Operand addresses and
+    the loop-carried operand copies leave the loop, removing most ALU dependency
+    waits; the static code grows by about a third. It requires the three-buffer
+    BK128 schedule with dedicated output staging.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3267,6 +3347,12 @@ def mxgemm_tdm_pipelined(
         raise ValueError("WAVE_SPECIALIZED_HANDOFF requires persistent E4M3 x E4M3, 256x256x128 tiles, "
                          "three buffers, four warps, both scales, partial TDM fusion, dedicated output staging, "
                          "and cross-tile prefetch without other schedule variants")
+    if STATIC_SLOT_UNROLL and not (PERSISTENT and OUTPUT_STAGING and NUM_WARPS == 4 and NUM_BUFFERS == 3 and
+                                   (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 128) and DTYPE_A == DTYPE_B == "e4m3"
+                                   and not (REGISTER_PIPELINE or WARP_PIPELINE or OPERAND_PIPELINE or STREAMED_OPERANDS
+                                            or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH)):
+        raise ValueError("STATIC_SLOT_UNROLL requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
+                         "four warps, and dedicated output staging without other operand schedules")
     if COMPACT_K_TAIL and not (
             PERSISTENT and OUTPUT_STAGING and WITH_A_SCALE and NUM_WARPS == 4 and NUM_BUFFERS == 3 and
         (BLOCK_M, BLOCK_N, BLOCK_K) == (256, 256, 256) and DTYPE_A == "e4m3" and DTYPE_B == "e2m1"
@@ -3419,6 +3505,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["EARLY_C_STORES"] = True
     if WAVE_SPECIALIZED_HANDOFF:
         persistent_options["WAVE_SPECIALIZED_HANDOFF"] = True
+    if STATIC_SLOT_UNROLL:
+        persistent_options["STATIC_SLOT_UNROLL"] = True
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -3589,8 +3677,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
-                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS",
-                                                      False), ASYNC_OUTPUT=cfg.get("ASYNC_OUTPUT", False))
+                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
+                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -3676,6 +3764,8 @@ if __name__ == "__main__":
                         help="test one loop body for A8W4's final three K256 stages")
     parser.add_argument("--wave_specialized_handoff", action="store_true",
                         help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
+    parser.add_argument("--static_slot_unroll", action="store_true",
+                        help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots")
     parser.add_argument("--streamed_operands", action="store_true",
                         help="test native operand fragments with persistent E4M3 BK128 and three or four buffers")
     parser.add_argument("--async_output", action="store_true",
@@ -3792,4 +3882,5 @@ if __name__ == "__main__":
         WAVE_SPECIALIZED_HANDOFF=args.wave_specialized_handoff,
         STREAMED_OPERANDS=args.streamed_operands,
         ASYNC_OUTPUT=args.async_output,
+        STATIC_SLOT_UNROLL=args.static_slot_unroll,
     )

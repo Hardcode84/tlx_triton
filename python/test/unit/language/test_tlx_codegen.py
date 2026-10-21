@@ -7213,6 +7213,31 @@ def test_gfx1250_mxgemm_wave_specialized_handoff_separates_queues(k, cluster_siz
     assert 'constraints = "=s,n"' not in ttgir
 
 
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, CLUSTER_SIZE=cluster_size, CLUSTER_BARRIER_INTERVAL=4,
+                                                  CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                                  STATIC_SLOT_UNROLL=True)
+    asm = compiled.asm["amdgcn"]
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    bodies = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            bodies.append("\n".join(lines[labels[branch[1]]:i]))
+    # One iteration covers every ring slot. Each step's next-stage operands are
+    # loaded straight into the registers the following step reads, so the
+    # steady loop carries no operand register copies. Cluster rendezvous adds a
+    # second back edge around the same body; check the innermost one.
+    steady = [body for body in bodies if body.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 3 * 64]
+    assert steady
+    body = min(steady, key=len)
+    assert body.count("tensor_load_to_lds") == 3 * 2
+    assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+
+
 @pytest.mark.parametrize("changes", [
     {"DTYPE_B": "e2m1", "BLOCK_K": 256},
     {"NUM_WARPS": 8},

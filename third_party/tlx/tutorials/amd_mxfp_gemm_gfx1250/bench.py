@@ -23,6 +23,13 @@ Use --wave-specialized-handoff to issue next-tile A/B and scales from waves
 0/1, and C transfers from waves 2/3. All four waves compute and fill C; output
 reuse waits leave the input queue pending. This selects MX8xMX8 and requires
 the three-buffer BK128 schedule with dedicated C slots.
+MX8xMX8 unrolls its steady K loop by the three-slot ring for cases with
+K >= 8192 (static slot unroll), so LDS operand addresses and loop-carried
+operand copies leave the loop. On hardware this is faster at K=8192 and slower
+at K=4096, where the larger code costs more than it saves. Use
+--static-slot-unroll or --no-static-slot-unroll to force it for every case.
+--static-slot-unroll requires the three-buffer BK128 staged-output schedule
+and selects MX8xMX8.
 Use --streamed-operands to test native 32x32 accumulator fragments with one
 rolling A set, three spare A fragments, and two B sets. The final three rows cover
 operand reads before LDS reuse; refills precede two initial rows that cover
@@ -133,6 +140,24 @@ def _supports_cluster_output_options(args, dtype_b):
                      or args.warp_pipeline or args.operand_pipeline))
 
 
+# Static slot unroll pays off once the steady loop dominates the larger code's
+# tile-transition cost: +1.2% at K=8192, -1.8% at K=4096 on gfx1250.
+STATIC_SLOT_UNROLL_MIN_K = 8192
+
+
+def _supports_static_slot_unroll(args, dtype_b):
+    return (args.persistent and args.output_staging and (args.block_m, args.block_n, args.block_k) == (256, 256, 128)
+            and args.num_buffers == 3 and args.num_warps == 4 and args.dtype_a == dtype_b == "float8_e4m3"
+            and not (args.register_pipeline or args.warp_pipeline or args.operand_pipeline or args.streamed_operands
+                     or args.output_tail_reuse or args.first_use_prefetch))
+
+
+def _static_slot_unroll(args, case, dtype_b):
+    if args.static_slot_unroll is not None:
+        return args.static_slot_unroll
+    return _supports_static_slot_unroll(args, dtype_b) and case[2] >= STATIC_SLOT_UNROLL_MIN_K
+
+
 def _variant_args(args, dtype_b):
     resolved = argparse.Namespace(**vars(args))
     if resolved.block_k is None:
@@ -232,6 +257,8 @@ def _command(args, case, dtype_b):
         command.append("--compact_k_tail")
     if args.wave_specialized_handoff:
         command.append("--wave_specialized_handoff")
+    if _static_slot_unroll(args, case, dtype_b):
+        command.append("--static_slot_unroll")
     if args.handoff_schedule != "current":
         command.extend(["--handoff_schedule", args.handoff_schedule])
     if args.handoff_tdm_fusion != "partial":
@@ -324,6 +351,10 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--wave-specialized-handoff", action="store_true",
                         help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
     parser.add_argument(
+        "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
+        help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
+        f"(default: MX8xMX8 cases with K >= {STATIC_SLOT_UNROLL_MIN_K})")
+    parser.add_argument(
         "--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
         help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
     parser.add_argument("--num-programs", type=int, default=256,
@@ -391,9 +422,9 @@ def parse_benchmark_args(argv=None):
         variant = "mx8xmx4" if args.dtype_b == "float4" else "mx8xmx8"
         variants = [(variant, args.dtype_b)]
     else:
-        default_variants = ("mx8xmx8", ) if (args.warp_pipeline or args.operand_pipeline or args.output_tail_reuse
-                                             or args.first_use_prefetch or args.streamed_operands
-                                             or args.wave_specialized_handoff) else VARIANT_DTYPES_B
+        default_variants = ("mx8xmx8", ) if (
+            args.warp_pipeline or args.operand_pipeline or args.output_tail_reuse or args.first_use_prefetch
+            or args.streamed_operands or args.wave_specialized_handoff or args.static_slot_unroll) else VARIANT_DTYPES_B
         if args.compact_k_tail:
             default_variants = ("mx8xmx4", )
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
@@ -439,6 +470,9 @@ def parse_benchmark_args(argv=None):
             parser.error("--wave-specialized-handoff requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
                          "four warps, partial fusion, dedicated output staging, and cross-tile prefetch "
                          "without other schedule variants")
+        if run_args.static_slot_unroll and not _supports_static_slot_unroll(run_args, dtype_b):
+            parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
+                         "four warps, and dedicated output staging without other operand schedules")
         if run_args.split_cluster_barrier and (run_args.cluster_size == 1 or run_args.cluster_barrier_interval == 0 or
                                                (run_args.output_tail_reuse
                                                 and run_args.handoff_schedule != "ab-reuse")):
@@ -598,11 +632,12 @@ def main():
             tdm_split=run_args.tdm_split, l2_prefetch_distance=run_args.l2_prefetch_distance,
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
-            wave_specialized_handoff=run_args.wave_specialized_handoff, handoff_schedule=run_args.handoff_schedule,
-            compact_k_tail=run_args.compact_k_tail, handoff_tdm_fusion=run_args.handoff_tdm_fusion,
-            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
-            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+            wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
+                run_args, case,
+                dtype_b), handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
+            handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
+            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
+            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
@@ -629,6 +664,7 @@ def main():
             f"handoff_tdm_fusion={run_args.handoff_tdm_fusion}, "
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"wave_specialized_handoff={run_args.wave_specialized_handoff}, "
+            f"static_slot_unroll={'auto' if run_args.static_slot_unroll is None else run_args.static_slot_unroll}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
             f"async_output={run_args.async_output}, "
