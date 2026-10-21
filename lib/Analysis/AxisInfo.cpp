@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Matchers.h"
+#include "triton/Analysis/IntegerRange.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -659,22 +660,15 @@ private:
   }
 };
 
-static bool isNonNegativeDividend(Value value) {
-  APInt constant;
-  if (matchPattern(value, m_ConstantInt(&constant)))
-    return !constant.isNegative();
-  if (auto range = value.getDefiningOp<MakeRangeOp>())
-    return range.getStartAttr().getInt() >= 0;
-  // Axis facts alone do not constrain the sign of group bases.
-  return false;
-}
-
 template <typename OpTy>
 class DivOpAxisInfoVisitor final : public BinaryOpVisitorImpl<OpTy> {
 public:
-  using BinaryOpVisitorImpl<OpTy>::BinaryOpVisitorImpl;
+  explicit DivOpAxisInfoVisitor(const DenseSet<Operation *> &nonNegative)
+      : nonNegative(nonNegative) {}
 
 private:
+  const DenseSet<Operation *> &nonNegative;
+
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
     // lhs / 1 = lhs
@@ -692,7 +686,7 @@ private:
     auto shape = resTy.getShape();
     // Signed truncation breaks constant groups at negative multiples.
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::DivUIOp>;
-    if ((isUnsigned || isNonNegativeDividend(op.getLhs())) &&
+    if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -728,9 +722,12 @@ private:
 template <typename OpTy>
 class RemOpAxisInfoVisitor final : public BinaryOpVisitorImpl<OpTy> {
 public:
-  using BinaryOpVisitorImpl<OpTy>::BinaryOpVisitorImpl;
+  explicit RemOpAxisInfoVisitor(const DenseSet<Operation *> &nonNegative)
+      : nonNegative(nonNegative) {}
 
 private:
+  const DenseSet<Operation *> &nonNegative;
+
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
     auto resTy = dyn_cast<RankedTensorType>(op.getType());
@@ -740,7 +737,7 @@ private:
     int64_t contiguity = 1;
     // Signed remainder jumps after a negative multiple: [0, -3, -2, -1].
     constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
-    if ((isUnsigned || isNonNegativeDividend(op.getLhs())) &&
+    if ((isUnsigned || nonNegative.contains(op)) &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
@@ -750,14 +747,14 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    if (getContiguity(op, lhs, rhs, dim) > 1)
-      return gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
-    // Unit contiguity requires divisibility of every element.
-    int64_t lhsDivisibility =
-        lhs.getContiguity(dim) == 1 ? lhs.getDivisibility(dim) : 1;
-    int64_t rhsDivisibility =
-        rhs.getContiguity(dim) == 1 ? rhs.getDivisibility(dim) : 1;
-    return gcd(lhsDivisibility, rhsDivisibility);
+    int64_t contiguity = getContiguity(op, lhs, rhs, dim);
+    int64_t divisibility =
+        gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
+    // Splitting an input group creates bases at result-contiguity offsets.
+    if (lhs.getContiguity(dim) > contiguity ||
+        rhs.getContiguity(dim) > contiguity)
+      divisibility = gcd(divisibility, contiguity);
+    return divisibility;
   };
 };
 
@@ -1249,10 +1246,14 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   AddSubOpAxisInfoVisitor<arith::AddIOp>,
                   AddSubOpAxisInfoVisitor<arith::SubIOp>>();
   visitors.append<MulIOpAxisInfoVisitor>();
-  visitors.append<DivOpAxisInfoVisitor<arith::DivSIOp>,
-                  DivOpAxisInfoVisitor<arith::DivUIOp>>();
-  visitors.append<RemOpAxisInfoVisitor<arith::RemSIOp>,
-                  RemOpAxisInfoVisitor<arith::RemUIOp>>();
+  visitors.append(std::make_unique<DivOpAxisInfoVisitor<arith::DivSIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<DivOpAxisInfoVisitor<arith::DivUIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<RemOpAxisInfoVisitor<arith::RemSIOp>>(
+      nonNegativeDividends));
+  visitors.append(std::make_unique<RemOpAxisInfoVisitor<arith::RemUIOp>>(
+      nonNegativeDividends));
   visitors.append<BroadcastOpAxisInfoVisitor>();
   visitors.append<SplatOpAxisInfoVisitor>();
   visitors.append<ExpandDimsOpAxisInfoVisitor>();
@@ -1270,6 +1271,12 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   MaxMinOpAxisInfoVisitor<arith::MinUIOp>>();
   visitors.append<LoadOpAxisInfoVisitor>();
   visitors.append<TransOpAxisInfoVisitor>();
+}
+
+LogicalResult AxisInfoAnalysis::initialize(Operation *top) {
+  if (failed(collectNonNegativeDividends(top, nonNegativeDividends)))
+    return top->emitError("signed div/rem range analysis failed");
+  return SparseForwardDataFlowAnalysis::initialize(top);
 }
 
 void AxisInfoAnalysis::setToEntryState(dataflow::Lattice<AxisInfo> *lattice) {
