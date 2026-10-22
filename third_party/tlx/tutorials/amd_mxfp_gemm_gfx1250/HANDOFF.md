@@ -103,13 +103,14 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Cross-tile prefetch | On | Off |
 | Split cluster barrier | Off | On |
 | Early C stores | Off | On |
-| Static slot unroll | K >= 8192 | Off |
-| Dedicated C slots | 3 | — (C reuses A stages) |
+| Static slot unroll | K = 8192 (three-stage ring) | Off |
+| Input ring | 3 stages; 4 stages, 2 C slots for K >= 16384 | 3 stages |
+| Dedicated C slots | 3 (K < 16384) | — (C reuses A stages) |
 | Scales-first K loop (without static unroll) | On | — (BK256 path) |
 
 Common launch settings: group-M 8, 256 programs capped by tile count,
-four-workgroup multicast with a 2x2 cluster layout, and a cluster barrier
-every four input K blocks. XCD remapping and SCHED_MODE[2] are disabled;
+16-workgroup multicast with a 4x4 cluster layout, and a cluster barrier
+every eight input K blocks. XCD remapping and SCHED_MODE[2] are disabled;
 L2 prefetch distance is -1. Optional cluster rendezvous promotes multicast
 matching; it must not be confused with required LDS reuse synchronization.
 
@@ -128,15 +129,16 @@ hardware at 8192 cubed, its mean was 0.1875 ms against a median of
 0.1666 ms in the same batch. Later batches settle at 0.167–0.169 ms, then
 drift up about 1% over 12 s under the power cap. Older single-batch `bench.py`
 numbers (about 0.19–0.20 ms at 8192 cubed) are therefore not comparable with
-warmed-up numbers. With the pinned codegen, the current defaults measured
-(2026-10-21; ms, TFLOPS):
+warmed-up numbers. With the pinned codegen, the current defaults (4x4
+clusters) measured, against the previous 2x2 configuration in the same
+session (2026-10-22; ms, TFLOPS):
 
-| Shape | MX8xMX8 | MX8xMX4 |
-|---|---:|---:|
-| 8192³ | 0.1671 (6580) | 0.1357 (8100) |
-| 8192²×4096 | 0.1014 (5423) | 0.0804 (6837) |
-| 16384³ | 1.3783 (6382) | 1.0334 (8512) |
-| 32768³ | 11.3298 (6211) | 8.6696 (8117) |
+| Shape | MX8xMX8 | MX8xMX8 2x2 | MX8xMX4 | MX8xMX4 2x2 |
+|---|---:|---:|---:|---:|
+| 8192³ | 0.1559 (7051) | 0.1707 (6440) | 0.1287 (8541) | 0.1330 (8265) |
+| 8192²×4096 | 0.0849 (6478) | 0.0884 (6216) | 0.0733 (7500) | 0.0758 (7252) |
+| 16384³ | 1.2080 (7282) | 1.3805 (6372) | 0.9742 (9029) | 1.0230 (8598) |
+| 32768³ | 9.7577 (7212) | 11.2131 (6276) | 7.7148 (9121) | 8.1754 (8607) |
 
 ## Latest controlled hardware comparison
 
@@ -780,6 +782,48 @@ Conclusions:
   as on `HEAD`.
 - Static unroll at K=4096 is now −0.5% (it was +1.8% before the peel and
   third C slot), small enough that `bench.py` keeps the K ≥ 8192 threshold.
+
+**Larger multicast clusters (2026-10-22): adopted.** Grid layouts `RxC`
+(`CLUSTER_SIZE=R*C` up to 16) generalize the 2x2 cluster. Rank r covers M
+tile r % R and N tile r // R. A is multicast to the C ranks with equal
+r % R, B to the R consecutive ranks with equal r // R, and clusters tile
+each M group as R x C blocks. The default 2x2 assembly is unchanged. FFM
+passes 27 new ring-phase cases (4x2, 2x4, 4x4; A8W8 three- and four-stage,
+A8W4), and all hardware outputs at 8192 were bitwise identical. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-cluster-20261022.tar.gz` (SHA256
+`9075c860aa0d0bd98bfea84d116aa45981915e99f1fb92e4c6ac02488ae50632`).
+
+Unique A/B input per CU per K step: 2x2 32 KB, 4x2/2x4 24 KB, 4x4 16 KB,
+8x2/2x8 20 KB. A8W8 hardware A/B, medians of three interleaved rounds, change
+against the 2x2 default in the same run:
+
+| Variant | 8192³ | 8192²×4096 | 16384³ | 32768³ |
+|---|---:|---:|---:|---:|
+| 4x2 | −2.4% | −3.4% | −5.0% | — |
+| 2x4 | −2.9% | −1.7% | −1.6% | — |
+| 4x4, interval 4 | −4.8 to −7.5% | −4.1 to −4.7% | −7.3 to −7.6% | −4.5% |
+| 4x4, interval 8 | −5.8 to −8.5% | −4.4 to −4.9% | −7.3 to −7.6% | −0.8% |
+| 4x4, interval 2 | −4.0% | −3.1% | −7.9% | — |
+| 4x4, `GROUP_SIZE_M=4` | −4.9% | −4.3% | −6.8% | — |
+| 4x4, split cluster barrier | −0.8% | −4.5% | −2.5% | — |
+| 8x2 | +12.7% | +6.6% | +28.4% | — |
+| 2x8 | +18.5% | +9.0% | +35.0% | — |
+| 2x2, four-stage ring | +2.6% | +5.8% | −1.0% | — |
+| 4x4, four-stage ring | −5.0 to −7.6% | −2.1 to −3.1% | −11.5% | −11.8% |
+| 4x4, four-stage ring, interval 8 | −8.1% | −3.6% | −12.4% | **−12.4%** |
+| 4x4, four-stage ring, interval 16 | −8.3% | −3.4% | **−13.0%** | −11.6% |
+
+A8W4 via `bench.py` (two rounds each), 2x2 → 4x4 interval 8: 8192³
+0.1329 → 0.1286 ms, 8192²×4096 0.0759 → 0.0735 ms, 16384³ 1.022 → 0.973 ms,
+32768³ 8.163 → 7.692 ms (−3.2, −3.2, −4.8, −5.8%; 9150 TFLOPS at 32768³).
+
+Halving the unique bytes per CU is the largest win since the static unroll,
+which confirms that input delivery limits the full device. Square sharing
+matters: 8x2 and 2x8 move nearly as few bytes as 4x4 but are much slower.
+A deeper ring pays off only once multicast is wide (2x2 + 4 stages loses at
+K ≤ 8192), and from K=16384 the 4x4 four-stage ring adds 4–5%. `bench.py`
+now defaults to 4x4 clusters with interval 8 for both variants, and to the
+four-stage A8W8 ring (two C slots, dynamic slots) for K ≥ 16384.
 
 Pre-existing post-rebase breakage found during validation (not fixed):
 

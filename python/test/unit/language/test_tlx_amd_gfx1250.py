@@ -789,6 +789,25 @@ def test_mxgemm_early_c_stores_ab_reuse_ring_phase(k_iters, fusion):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [4, 5, 9])
+@pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4"])
+@pytest.mark.parametrize("schedule", ["a8w8", "a8w8-4buf", "a8w4"])
+def test_mxgemm_grid_cluster_ring_phase(k_iters, layout, schedule):
+    # Grid clusters multicast A to the C CTAs of a row and B to the R CTAs of
+    # a column. Use each operand's bench schedules: A8W8 with the static slot
+    # unroll and three C slots or with a four-stage ring, and A8W4 with split
+    # barriers and early C stores.
+    rows, cols = map(int, layout.split("x"))
+    a8w8 = schedule != "a8w4"
+    static = schedule == "a8w8"
+    test_mxgemm_persistent_ring_phase(k_iters, 4 if schedule == "a8w8-4buf" else 3, a8w8,
+                                      "float8_e4m3" if a8w8 else "float4", 128 if a8w8 else 256, True, 4, False, False,
+                                      rows * cols, False, CLUSTER_LAYOUT=layout, STATIC_SLOT_UNROLL=static,
+                                      OUTPUT_C_SLOTS=3 if static else None, SPLIT_CLUSTER_BARRIER=not a8w8,
+                                      EARLY_C_STORES=not a8w8)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("k_iters,cluster_size", [(3, 1), (4, 1), (5, 1), (6, 1), (3, 4), (4, 4), (5, 4), (9, 4)])
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_mxgemm_compact_k_tail_ring_phase(k_iters, cluster_size, prefetch):
@@ -892,6 +911,7 @@ def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_P
     ({"HANDOFF_TDM_FUSION": "4way"}, "HANDOFF_TDM_FUSION requires"),
     ({"CLUSTER_LAYOUT": "invalid"}, "CLUSTER_LAYOUT must be"),
     ({"CLUSTER_LAYOUT": "2x2"}, "CLUSTER_LAYOUT=2x2 requires CLUSTER_SIZE=4"),
+    ({"CLUSTER_LAYOUT": "4x4"}, "CLUSTER_LAYOUT=4x4 requires CLUSTER_SIZE=16"),
     ({"EARLY_C_STORES": True}, "EARLY_C_STORES require"),
     ({"SPLIT_CLUSTER_BARRIER": True}, "SPLIT_CLUSTER_BARRIER and EARLY_C_STORES require"),
     ({"BLOCK_M": 256, "BLOCK_N": 256, "OUTPUT_STAGING": True}, "BK256 cross-tile output staging"),
@@ -912,11 +932,11 @@ def test_mxgemm_persistent_invalid_config(config, match):
 
 @triton.jit
 def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
-                           GROUP_M: tl.constexpr, REMAP: tl.constexpr):
+                           GROUP_M: tl.constexpr, REMAP: tl.constexpr, LAYOUT: tl.constexpr = "2x2"):
     pid = tl.program_id(0)
-    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, "2x2")
+    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
     for step in range(NUM_M * NUM_N // PROGRAMS):
-        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, "2x2")
+        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
         tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
         tile += PROGRAMS
 
@@ -941,17 +961,53 @@ def test_mxgemm_cluster_2x2_tile_coverage(num_m, num_n, programs, group_m, remap
     assert torch.equal(cols[:, 2], cols[:, 0] + 1)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4", "8x2", "2x8"])
+@pytest.mark.parametrize("num_m,num_n,programs", [(16, 16, 32), (8, 16, 64), (16, 8, 128)])
+def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs):
+    # Every tile is covered once, and rank r of each R x C cluster covers M
+    # tile r % R and N tile r // R of one aligned block, matching the A
+    # (equal r % R) and B (equal r // R) multicast masks.
+    rows_per, cols_per = map(int, layout.split("x"))
+    size = rows_per * cols_per
+    output = torch.empty(num_m * num_n, dtype=torch.int32, device="cuda")
+    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, 8, 0, layout, num_warps=4,
+                                         ctas_per_cga=(size, 1, 1))
+    ids = output.cpu().reshape(-1, size)
+    torch.testing.assert_close(ids.flatten().sort().values, torch.arange(num_m * num_n, dtype=torch.int32))
+    rows, cols = ids // num_n, ids % num_n
+    rank = torch.arange(size)
+    assert torch.equal(rows - rows[:, :1], (rank % rows_per).expand_as(rows))
+    assert torch.equal(cols - cols[:, :1], (rank // rows_per).expand_as(cols))
+    assert torch.equal(rows[:, 0] % rows_per, torch.zeros_like(rows[:, 0]))
+    assert torch.equal(cols[:, 0] % cols_per, torch.zeros_like(cols[:, 0]))
+
+
 def test_mxgemm_bench_cluster_and_output_options():
     from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
 
     _, shapes, variants = bench.parse_benchmark_args(
-        ["--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
+        ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
     assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
     for _, dtype_b, args in variants:
         cmd = bench._command(args, shapes[0], dtype_b)
         assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
         assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
+    # Defaults: 4x4 clusters with an eight-block barrier interval for both
+    # variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
+    _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
+    for variant, dtype_b, args in variants:
+        for shape in shapes:
+            cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)
+            assert cmd[cmd.index("--cluster_layout") + 1] == "4x4"
+            assert cmd[cmd.index("--cluster_size") + 1] == "16"
+            assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
+            four_stage = variant == "mx8xmx8" and shape[2] >= 16384
+            assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
+            assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
+            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and shape[2] == 8192)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

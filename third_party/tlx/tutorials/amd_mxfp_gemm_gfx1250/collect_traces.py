@@ -526,7 +526,8 @@ def make_cases(args):
         if parsed.benchmark_mode != "eager" or parsed.csv or parsed.output_dir or parsed.dry_run:
             raise CollectionError("collection requires eager timing; use the collector's output and dry-run options")
         for shape in shapes:
-            for variant, dtype_b, config in variants:
+            for variant, dtype_b, variant_config in variants:
+                config = bench._case_args(variant_config, shape)
                 cases.append(
                     dict(kernel=kernel, variant=variant, shape=shape, config=vars(config),
                          application=bench._command(config, shape, dtype_b)))

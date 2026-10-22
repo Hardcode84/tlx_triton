@@ -8,14 +8,16 @@ disabled by default. Use --variant mx8xmx4
 --cross-tile-prefetch to start refilling each A/B stage as its C slot retires.
 Use --compact-k-tail to test one loop body for A8W4's final three K256 stages.
 It selects MX8xMX4 and can be combined with --cross-tile-prefetch.
-Both use 256 persistent programs, group-M 8, no XCD remapping, and four-workgroup
-multicast in a 2x2 tile layout, with a cluster barrier every four input K blocks.
+Both use 256 persistent programs, group-M 8, no XCD remapping, and 16-workgroup
+multicast in a 4x4 tile layout (each A and B tile shared by four workgroups),
+with a cluster barrier every eight input K blocks. MX8xMX8 uses a four-stage
+input ring with two C slots for K >= 16384, and three stages otherwise.
 MX8xMX4 also enables split cluster barriers and early C stores. These two
 options are disabled by default for MX8xMX8 and output-tail reuse. Other
 operand schedules do not support these options. SCHED_MODE[2] is off.
-Use --cluster-layout linear --no-split-cluster-barrier --no-early-c-stores
-to compare with the previous defaults. Clusters smaller than four workgroups
-and --streamed-operands use a linear layout by default.
+Use --cluster-size 4 --cluster-layout 2x2 --cluster-barrier-interval 4 for the
+previous four-workgroup clusters, and --num-buffers 3 to keep three stages.
+Other cluster sizes and --streamed-operands use a linear layout by default.
 Use --first-use-prefetch to test the MX8xMX8 three-buffer schedule with B1 local
 to each K step, operand registers rotating across two K steps, and four-read
 LDS groups during C01. It retains dedicated FP32 output staging.
@@ -154,6 +156,11 @@ def _supports_cluster_output_options(args, dtype_b):
 # Static slot unroll pays off once the steady loop dominates the larger code's
 # tile-transition cost: +1.2% at K=8192, -1.8% at K=4096 on gfx1250.
 STATIC_SLOT_UNROLL_MIN_K = 8192
+# Grid cluster layouts: R M tiles by C N tiles per cluster of R*C workgroups.
+GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 4), "8x2": (8, 2), "2x8": (2, 8)}
+# With 4x4 multicast, a four-stage MX8xMX8 ring (two C slots, dynamic slots)
+# beats three stages from K=16384 (-4 to -5% on gfx1250) but not at K<=8192.
+FOUR_BUFFER_MIN_K = 16384
 
 
 def _supports_static_slot_unroll(args, dtype_b):
@@ -202,8 +209,23 @@ def _variant_args(args, dtype_b):
                                           and resolved.cluster_barrier_interval > 0)
     if resolved.early_c_stores is None:
         resolved.early_c_stores = default_output_schedule
+    # Choose the MX8xMX8 ring depth per case unless the ring, C slots, or the
+    # three-stage static unroll were requested explicitly.
+    resolved.auto_ring_depth = (args.num_buffers is None and args.output_c_slots is None
+                                and args.static_slot_unroll is not True
+                                and _supports_default_output_c_slots(resolved, dtype_b))
     if resolved.output_c_slots is None and _supports_default_output_c_slots(resolved, dtype_b):
         resolved.output_c_slots = DEFAULT_OUTPUT_C_SLOTS
+    return resolved
+
+
+def _case_args(args, case):
+    if not (args.auto_ring_depth and case[2] >= FOUR_BUFFER_MIN_K):
+        return args
+    resolved = argparse.Namespace(**vars(args))
+    resolved.num_buffers = 4
+    resolved.output_c_slots = None
+    resolved.static_slot_unroll = False
     return resolved
 
 
@@ -402,12 +424,14 @@ def parse_benchmark_args(argv=None):
                         help="persistent program remapping (default: none)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
-    parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4), default=None,
-                        help="workgroups per cluster (default: 4, or 1 with --warp-pipeline/--operand-pipeline)")
     parser.add_argument(
-        "--cluster-layout", choices=("linear", "2x2"), default=None,
-        help="tile arrangement within each cluster (default: 2x2 for four workgroups without --streamed-operands, "
-        "linear otherwise); 2x2 shares A and B without XCD remapping")
+        "--cluster-size", type=int, choices=(1, 2, 4, 8, 16), default=None,
+        help="workgroups per cluster (default: 16, 4 with --streamed-operands, or 1 with "
+        "--warp-pipeline/--operand-pipeline)")
+    parser.add_argument(
+        "--cluster-layout", choices=("linear", ) + tuple(GRID_CLUSTER_LAYOUTS), default=None,
+        help="tile arrangement within each cluster (default: 4x4 for 16 workgroups and 2x2 for four, without "
+        "--streamed-operands; linear otherwise); RxC layouts share A across C and B across R workgroups")
     parser.add_argument(
         "--split-cluster-barrier", action=argparse.BooleanOptionalAction, default=None,
         help="overlap periodic cluster rendezvous with steady-loop matrix work "
@@ -419,8 +443,9 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument(
-        "--cluster-barrier-interval", type=int, default=4,
-        help="align cluster requests every N input K blocks (default: 4); 0 disables all cluster barriers")
+        "--cluster-barrier-interval", type=int, default=None,
+        help="align cluster requests every N input K blocks (default: 8 for 4x4, otherwise 4); 0 disables all "
+        "cluster barriers")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
@@ -448,9 +473,12 @@ def parse_benchmark_args(argv=None):
     if args.num_warps is None:
         args.num_warps = 8 if args.warp_pipeline else 4
     if args.cluster_size is None:
-        args.cluster_size = 1 if args.warp_pipeline or args.operand_pipeline else 4
+        args.cluster_size = 1 if args.warp_pipeline or args.operand_pipeline else (4 if args.streamed_operands else 16)
     if args.cluster_layout is None:
-        args.cluster_layout = "2x2" if args.cluster_size == 4 and not args.streamed_operands else "linear"
+        default_layouts = {4: "2x2", 16: "4x4"}
+        args.cluster_layout = ("linear" if args.streamed_operands else default_layouts.get(args.cluster_size, "linear"))
+    if args.cluster_barrier_interval is None:
+        args.cluster_barrier_interval = 8 if args.cluster_layout == "4x4" else 4
 
     dims = (args.M, args.N, args.K)
     if any(dim is not None for dim in dims):
@@ -490,8 +518,15 @@ def parse_benchmark_args(argv=None):
         parser.error("--num-xcds and --xcd-chunk must be positive")
     if args.cluster_barrier_interval < 0:
         parser.error("--cluster-barrier-interval must be nonnegative")
-    if args.cluster_layout == "2x2" and (args.cluster_size != 4 or args.streamed_operands):
-        parser.error("--cluster-layout 2x2 requires --cluster-size 4 without --streamed-operands")
+    if args.cluster_layout in GRID_CLUSTER_LAYOUTS:
+        rows, cols = GRID_CLUSTER_LAYOUTS[args.cluster_layout]
+        if args.cluster_size != rows * cols or args.streamed_operands:
+            parser.error(f"--cluster-layout {args.cluster_layout} requires --cluster-size {rows * cols} "
+                         "without --streamed-operands")
+        if args.group_m % rows:
+            parser.error(f"--cluster-layout {args.cluster_layout} requires --group-m divisible by {rows}")
+        if args.cluster_layout != "2x2" and args.xcd_remap != "none":
+            parser.error(f"--cluster-layout {args.cluster_layout} requires --xcd-remap none")
     if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
         parser.error("XCD remapping and clustering require --persistent")
     if args.cluster_size > 1:
@@ -635,8 +670,10 @@ def parse_benchmark_args(argv=None):
             if run_args.warp_pipeline and (k < 1024 or k % 512):
                 parser.error("--warp-pipeline requires K >= 1024 divisible by 512")
             if run_args.cluster_size > 1:
-                if m % (run_args.group_m * run_args.block_m) or n % (2 * run_args.block_n):
-                    parser.error("clustering requires full M groups and an even number of N tiles")
+                cols = GRID_CLUSTER_LAYOUTS.get(run_args.cluster_layout, (1, 2))[1]
+                if m % (run_args.group_m * run_args.block_m) or n % (max(2, cols) * run_args.block_n):
+                    parser.error("clustering requires full M groups and N tiles divisible by the cluster columns "
+                                 "(at least two)")
                 tiles = (m // run_args.block_m) * (n // run_args.block_n)
                 programs = min(run_args.num_programs, tiles) if run_args.num_programs is not None else None
                 if programs is not None and (programs <= 0 or programs % 16 or tiles % programs):
@@ -664,6 +701,7 @@ def main():
     results = []
     runs = [(case, variant, dtype_b, run_args) for case in cases for variant, dtype_b, run_args in variants]
     for index, (case, variant, dtype_b, run_args) in enumerate(runs, 1):
+        run_args = _case_args(run_args, case)
         label = "x".join(map(str, case))
         command = _command(run_args, case, dtype_b)
         print(f"\n[{index}/{len(runs)}] {variant} {label} ({args.dtype_a} x {dtype_b})", flush=True)
@@ -721,7 +759,9 @@ def main():
         print(
             f"\nConfiguration ({variant}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
-            f"buffers={run_args.num_buffers}, warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
+            f"buffers={run_args.num_buffers}"
+            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K})' if run_args.auto_ring_depth else ''}, "
+            f"warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"scale_buffers={3 if run_args.warp_pipeline else run_args.num_buffers}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
             f"register_pipeline={run_args.register_pipeline}, "

@@ -492,17 +492,22 @@ def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
                   for shape in ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
                   for kernel in ("persistent", "streamed_operands")]
     baseline, streamed = cases[:2]
-    assert baseline["config"]["cluster_layout"] == "2x2"
+    assert baseline["config"]["cluster_layout"] == "4x4"
     assert streamed["config"]["cluster_layout"] == "linear"
-    # Only the persistent schedule uses 2x2 clusters and three dedicated C
-    # slots, and it unrolls the steady loop by the ring depth from K=8192.
-    # Other options match the persistent benchmark defaults for each shape.
+    # Only the persistent schedule uses 4x4 clusters. It unrolls the steady
+    # loop by a three-stage ring with three dedicated C slots at K=8192, keeps
+    # three stages with dynamic slots at K=4096, and switches to a four-stage
+    # ring with two C slots from K=16384. Other options match the persistent
+    # benchmark defaults for each shape.
     for case in cases:
-        assert ("--static_slot_unroll" in case["application"]) == (case["kernel"] == "persistent"
-                                                                   and case["shape"][2] >= 8192)
         persistent = case["kernel"] == "persistent"
-        assert ("--output_c_slots" in case["application"]) == persistent
-        assert case["config"]["output_c_slots"] == (3 if persistent else None)
+        k = case["shape"][2]
+        four_stage = persistent and k >= 16384
+        assert ("--static_slot_unroll" in case["application"]) == (persistent and k == 8192)
+        assert ("--output_c_slots" in case["application"]) == (persistent and not four_stage)
+        assert case["config"]["output_c_slots"] == (3 if persistent and not four_stage else None)
+        application = case["application"]
+        assert application[application.index("--num_buffers") + 1] == ("4" if four_stage else "3")
     application = baseline["application"].copy()
     layout = application.index("--cluster_layout")
     del application[layout:layout + 2]
@@ -510,6 +515,8 @@ def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
     slots = application.index("--output_c_slots")
     assert application[slots + 1] == "3"
     del application[slots:slots + 2]
+    application[application.index("--cluster_size") + 1] = "4"
+    application[application.index("--cluster_barrier_interval") + 1] = "4"
     assert streamed["application"] == application[:application.index("--num_programs")] + [
         "--streamed_operands"
     ] + application[application.index("--num_programs"):]
@@ -518,7 +525,8 @@ def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
         assert config["benchmark_num_iters"] == 256
         assert (config["block_m"], config["block_n"], config["block_k"]) == (256, 256, 128)
         assert config["num_programs"] == 256
-        assert config["cluster_size"] == config["cluster_barrier_interval"] == 4
+        expected_cluster = (16, 8) if case["kernel"] == "persistent" else (4, 4)
+        assert (config["cluster_size"], config["cluster_barrier_interval"]) == expected_cluster
         assert not config["wave_specialized_handoff"]
 
 

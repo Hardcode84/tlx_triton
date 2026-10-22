@@ -35,11 +35,13 @@ default and reuses the A ring for output. The summary and CSV identify each
 variant and its configuration.
 
 Both variants default to 256 persistent programs (capped by tile count),
-group-M 8, no XCD remapping, and four-workgroup multicast with a cluster
-barrier every four input K blocks. This captures the selected hardware
-configuration across both default shapes. Interval 8 was slightly faster
-at K8192, while interval 4 was faster at K4096, so the benchmark uses 4
-for both. Eager timing repeats 256 ms batches: 1 s of warmup, then the median
+group-M 8, no XCD remapping, and 16-workgroup multicast in a 4x4 tile layout
+with a cluster barrier every eight input K blocks: each A tile is shared by
+the four workgroups of its cluster row and each B tile by the four of its
+column, halving the unique input each CU loads per K step compared with the
+previous 2x2 clusters. MX8xMX8 also switches to a four-stage input ring with
+two C slots for K >= 16384. On gfx1250 this is 3-6% faster than 2x2 clusters
+for MX8xMX4 and 5-12% faster for MX8xMX8. Eager timing repeats 256 ms batches: 1 s of warmup, then the median
 batch over 2 s (`--warmup-seconds`, `--duration-seconds`). A single batch from
 a fresh process overstates gfx1250 kernel times because of a few slow first
 launches. The summary prints the AMD code generator revision.
@@ -434,9 +436,12 @@ using `--num-xcds` (default 8) and `--xcd-chunk` (default 2). Remapping defaults
 to `none`. Balanced mode assigns each logical XCD a contiguous range; chunked
 mode groups small runs of tiles and leaves an incomplete final chunk unchanged.
 
-Use `--cluster-size 2|4` with `--xcd-remap none|chunked` to multicast inputs
-across independent workgroups. The benchmark defaults to cluster size 4;
-use `--cluster-size 1` to disable clustering. Data and their
+Use `--cluster-size 2|4|8|16` with `--xcd-remap none|chunked` to multicast
+inputs across independent workgroups. The benchmark defaults to cluster size
+16 with `--cluster-layout 4x4`; use `--cluster-size 1` to disable clustering.
+Grid layouts `RxC` (`2x2`, `4x2`, `2x4`, `4x4`, `8x2`, `2x8`) place R M tiles by
+C N tiles in a cluster of R*C workgroups and require no XCD remapping (except
+`2x2`), a group-M divisible by R, and N tiles divisible by C. Data and their
 E8M0 scales use the same recipient masks. Without remapping, a cluster shares
 B and its scales across consecutive M tiles, for either `--group-m 4` or
 `--group-m 8`. With chunked remapping, a two-workgroup cluster shares B and

@@ -230,6 +230,8 @@ def _mxgemm_issue_loads(
         rank = tlx.cluster_cta_rank()
         if CLUSTER_LAYOUT == "2x2" or (XCD_REMAP_MODE == 2 and CLUSTER_SIZE == 4 and GROUP_SIZE_M == 4):
             a_mask, b_mask = 5 << (rank & 1), 3 << (rank & 2)
+        elif CLUSTER_LAYOUT != "linear":
+            a_mask, b_mask = _mxgemm_grid_masks(rank, CLUSTER_LAYOUT)
         else:
             # Without remapping, consecutive cluster CTAs cover consecutive
             # M tiles at the same N, so only B and its scales are shared.
@@ -1323,6 +1325,38 @@ def _mxgemm_remap_program_id(pid, NUM_PROGRAMS: tl.constexpr, XCD_REMAP_MODE: tl
         return (local_pid // XCD_CHUNK) * NUM_XCDS * XCD_CHUNK + xcd * XCD_CHUNK + local_pid % XCD_CHUNK
 
 
+# Grid cluster layouts "RxC" place R M tiles by C N tiles in one cluster. Rank r
+# covers M tile r % R and N tile r // R; A is shared by the C ranks with equal
+# r % R, B by the R consecutive ranks with equal r // R.
+_MXGEMM_GRID_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 4), "8x2": (8, 2), "2x8": (2, 8)}
+
+
+@triton.jit
+def _mxgemm_grid_rows(CLUSTER_LAYOUT: tl.constexpr):
+    R: tl.constexpr = (2 if CLUSTER_LAYOUT == "2x2" or CLUSTER_LAYOUT == "2x4" or CLUSTER_LAYOUT == "2x8" else
+                       (4 if CLUSTER_LAYOUT == "4x2" or CLUSTER_LAYOUT == "4x4" else
+                        (8 if CLUSTER_LAYOUT == "8x2" else 1)))
+    return R
+
+
+@triton.jit
+def _mxgemm_grid_cols(CLUSTER_LAYOUT: tl.constexpr):
+    C: tl.constexpr = (2 if CLUSTER_LAYOUT == "2x2" or CLUSTER_LAYOUT == "4x2" or CLUSTER_LAYOUT == "8x2" else
+                       (4 if CLUSTER_LAYOUT == "2x4" or CLUSTER_LAYOUT == "4x4" else
+                        (8 if CLUSTER_LAYOUT == "2x8" else 1)))
+    return C
+
+
+@triton.jit
+def _mxgemm_grid_masks(rank, CLUSTER_LAYOUT: tl.constexpr):
+    R: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT)
+    C: tl.constexpr = _mxgemm_grid_cols(CLUSTER_LAYOUT)
+    # Bits R*c for every column c: a geometric series in 2^R.
+    A_PATTERN: tl.constexpr = ((1 << (R * C)) - 1) // ((1 << R) - 1)
+    B_PATTERN: tl.constexpr = (1 << R) - 1
+    return A_PATTERN << (rank % R), B_PATTERN << (R * (rank // R))
+
+
 @triton.jit
 def _mxgemm_cluster_program_id(pid, NUM_PROGRAMS: tl.constexpr, XCD_REMAP_MODE: tl.constexpr, NUM_XCDS: tl.constexpr,
                                XCD_CHUNK: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr = "linear"):
@@ -1330,6 +1364,9 @@ def _mxgemm_cluster_program_id(pid, NUM_PROGRAMS: tl.constexpr, XCD_REMAP_MODE: 
         # Remap whole clusters: physical rank bit 0 selects M, bit 1 selects N.
         # This keeps multicast partners together for every persistent stride.
         return 4 * _mxgemm_remap_program_id(pid // 4, NUM_PROGRAMS // 4, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK) + pid % 4
+    if CLUSTER_LAYOUT != "linear":
+        S: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT) * _mxgemm_grid_cols(CLUSTER_LAYOUT)
+        return S * _mxgemm_remap_program_id(pid // S, NUM_PROGRAMS // S, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK) + pid % S
     return _mxgemm_remap_program_id(pid, NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
 
 
@@ -1348,6 +1385,14 @@ def _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M: tl.constexpr, BM: tl.const
         pair = local // 4
         return (first_m + 2 * (pair % (group_m // 2)) + local % 2) * BM, (2 * (pair //
                                                                                (group_m // 2)) + local // 2 % 2) * BN
+    if CLUSTER_LAYOUT != "linear":
+        # Clusters tile each complete M group as R x C blocks, M first.
+        R: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT)
+        C: tl.constexpr = _mxgemm_grid_cols(CLUSTER_LAYOUT)
+        cluster = local // (R * C)
+        rank = local % (R * C)
+        return (first_m + R * (cluster % (GROUP_M // R)) + rank % R) * BM, (C * (cluster //
+                                                                                 (GROUP_M // R)) + rank // R) * BN
     return (first_m + local % group_m) * BM, (local // group_m) * BN
 
 
@@ -1452,6 +1497,9 @@ def _mxgemm_handoff_load_operand(desc, scale_desc, base, scale_base, buf, scale_
         if CLUSTER_LAYOUT == "2x2" or (XCD_REMAP_MODE == 2 and CLUSTER_SIZE == 4 and GROUP_SIZE_M == 4):
             rank = tlx.cluster_cta_rank()
             mask = (3 << (rank & 2)) if IS_B else (5 << (rank & 1))
+        elif CLUSTER_LAYOUT != "linear":
+            a_mask, b_mask = _mxgemm_grid_masks(tlx.cluster_cta_rank(), CLUSTER_LAYOUT)
+            mask = b_mask if IS_B else a_mask
         else:
             mask = ((1 << CLUSTER_SIZE) - 1) if IS_B else 0
         masks = [mask, mask]
@@ -2051,10 +2099,14 @@ def mxgemm_tdm_persistent_kernel(
         tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
-    tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4)
+    tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4 or CLUSTER_SIZE == 8
+                     or CLUSTER_SIZE == 16)
     tl.static_assert(CLUSTER_BARRIER_INTERVAL >= 0)
-    tl.static_assert(CLUSTER_LAYOUT == "linear" or CLUSTER_LAYOUT == "2x2")
-    tl.static_assert(CLUSTER_LAYOUT != "2x2" or CLUSTER_SIZE == 4)
+    tl.static_assert(CLUSTER_LAYOUT == "linear"
+                     or (_mxgemm_grid_rows(CLUSTER_LAYOUT) > 1
+                         and _mxgemm_grid_rows(CLUSTER_LAYOUT) * _mxgemm_grid_cols(CLUSTER_LAYOUT) == CLUSTER_SIZE))
+    tl.static_assert(CLUSTER_LAYOUT == "linear" or GROUP_SIZE_M % _mxgemm_grid_rows(CLUSTER_LAYOUT) == 0)
+    tl.static_assert(CLUSTER_LAYOUT == "linear" or CLUSTER_LAYOUT == "2x2" or XCD_REMAP_MODE == 0)
     if SPLIT_CLUSTER_BARRIER or EARLY_C_STORES:
         tl.static_assert(OUTPUT_STAGING and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 3)
         tl.static_assert(tlx.num_warps() == 4 and DTYPE_A == "e4m3" and WITH_A_SCALE)
@@ -3147,20 +3199,26 @@ def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_
         raise ValueError("XCD_REMAP must be none, balanced, or chunked")
     if num_xcds <= 0 or xcd_chunk <= 0:
         raise ValueError("NUM_XCDS and XCD_CHUNK must be positive")
-    if cluster_size not in (1, 2, 4):
-        raise ValueError("CLUSTER_SIZE must be 1, 2, or 4")
-    if cluster_layout not in ("linear", "2x2"):
-        raise ValueError("CLUSTER_LAYOUT must be linear or 2x2")
-    if cluster_layout == "2x2" and cluster_size != 4:
-        raise ValueError("CLUSTER_LAYOUT=2x2 requires CLUSTER_SIZE=4")
+    if cluster_size not in (1, 2, 4, 8, 16):
+        raise ValueError("CLUSTER_SIZE must be 1, 2, 4, 8, or 16")
+    if cluster_layout != "linear" and cluster_layout not in _MXGEMM_GRID_LAYOUTS:
+        raise ValueError(f"CLUSTER_LAYOUT must be linear or one of {', '.join(_MXGEMM_GRID_LAYOUTS)}")
+    grid_rows, grid_cols = _MXGEMM_GRID_LAYOUTS.get(cluster_layout, (1, 1))
+    if cluster_layout != "linear" and grid_rows * grid_cols != cluster_size:
+        raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires CLUSTER_SIZE={grid_rows * grid_cols}")
+    if cluster_layout not in ("linear", "2x2") and xcd_remap != "none":
+        raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires XCD_REMAP=none")
     if not persistent and (xcd_remap != "none" or cluster_size > 1):
         raise ValueError("XCD remapping and clustering require persistence")
     if cluster_size == 1:
         return
     if xcd_remap != "none" and (xcd_remap, num_xcds, xcd_chunk) != ("chunked", 8, 2):
         raise ValueError("clustering requires XCD_REMAP=none or chunked with NUM_XCDS=8 and XCD_CHUNK=2")
-    if group_m not in (4, 8) or M % (group_m * block_m) or N % (2 * block_n):
-        raise ValueError("clustering requires GROUP_SIZE_M=4 or 8, full M groups, and an even number of N tiles")
+    if group_m not in (4, 8) or M % (group_m * block_m) or N % (max(2, grid_cols) * block_n):
+        raise ValueError("clustering requires GROUP_SIZE_M=4 or 8, full M groups, and an even number of N tiles "
+                         "(a multiple of the cluster columns for grid layouts)")
+    if group_m % grid_rows:
+        raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires GROUP_SIZE_M divisible by {grid_rows}")
     if not with_a_scale or fusion not in ("partial", "2way", "4way"):
         raise ValueError("clustering requires A scales and partial, 2way, or 4way TDM fusion")
     # Every cluster member must execute the same number of persistent tiles,
@@ -3362,7 +3420,10 @@ def mxgemm_tdm_pipelined(
     total tile count so cluster members take identical loop boundaries.
     ``CLUSTER_LAYOUT="2x2"`` maps each four-CTA cluster to two M tiles and
     two N tiles, sharing both operands and their scales. It works without XCD
-    remapping; when remapping is enabled, it permutes whole clusters.
+    remapping; when remapping is enabled, it permutes whole clusters. The grid
+    layouts ``"4x2"``, ``"2x4"``, ``"4x4"``, ``"8x2"``, and ``"2x8"`` generalize it
+    to R M tiles by C N tiles (``CLUSTER_SIZE=R*C``, no XCD remapping): each A
+    tile is multicast to C CTAs and each B tile to R CTAs.
     ``SPLIT_CLUSTER_BARRIER`` signals the periodic cluster rendezvous before
     independent matrix work and waits immediately before the steady refill.
     It preserves local LDS protection and requires a nonzero barrier interval.
@@ -3871,9 +3932,9 @@ if __name__ == "__main__":
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
-    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4), default=1)
-    parser.add_argument("--cluster_layout", choices=("linear", "2x2"), default="linear",
-                        help="map four-CTA clusters to two M and two N tiles with 2x2")
+    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4, 8, 16), default=1)
+    parser.add_argument("--cluster_layout", choices=("linear", ) + tuple(_MXGEMM_GRID_LAYOUTS), default="linear",
+                        help="map clusters to R M tiles by C N tiles with RxC (2x2 for four CTAs)")
     parser.add_argument("--split_cluster_barrier", action="store_true",
                         help="overlap periodic cluster rendezvous with independent steady-loop matrix work")
     parser.add_argument("--early_c_stores", action="store_true",
