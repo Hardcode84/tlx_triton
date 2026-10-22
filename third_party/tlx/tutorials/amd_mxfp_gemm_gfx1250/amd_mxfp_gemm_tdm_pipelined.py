@@ -1578,15 +1578,16 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
                                    DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
                                    WITH_A_SCALE: tl.constexpr, GROUPED_PREFETCH: tl.constexpr = False, ARRIVE_K=None,
                                    CLUSTER_SIZE: tl.constexpr = 1, CLUSTER_BARRIER_INTERVAL: tl.constexpr = 0,
-                                   PIN_NATIVE: tl.constexpr = False):
+                                   PIN_NATIVE: tl.constexpr = False, SCALES_FIRST: tl.constexpr = False):
     tl.static_assert(BK == 128)
     dot: tl.constexpr = _mxgemm_native_dot if PIN_NATIVE else tlx.dot_scaled
-    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
+    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS, PREFETCH_SCALES=SCALES_FIRST)
     c00 = dot(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(101)
     tlx.amd_sched_barrier()
-    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE)
+    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
+                                     PREFETCH_SCALES=SCALES_FIRST)
     if ARRIVE_K is not None:
         _mxgemm_cluster_arrive(ARRIVE_K, CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL)
     c01 = dot(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
@@ -2042,6 +2043,7 @@ def mxgemm_tdm_persistent_kernel(
     STATIC_SLOT_UNROLL: tl.constexpr = False,
     OUTPUT_C_SLOTS: tl.constexpr = None,
     OUTPUT_C_COLS: tl.constexpr = None,
+    DYNAMIC_SCALES_FIRST: tl.constexpr = True,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -2129,6 +2131,14 @@ def mxgemm_tdm_persistent_kernel(
     GROUPED_PREFETCH: tl.constexpr = DEFER_BOTTOM and (NUM_BUFFERS == 4
                                                        or tlx.num_warps() == 8) and DA == 1 and DB == 1 and WITH_A_SCALE
     PREFETCH_B_AFTER_C10: tl.constexpr = GROUPED_PREFETCH or (DEFER_BOTTOM and tlx.num_warps() == 8)
+    # In the three-buffer dynamic-slot deferred-bottom loop, read each
+    # operand's scale before its payload. The next quadrant's first WMMA then
+    # waits only for its own operands instead of draining every outstanding
+    # LDS read. On gfx1250 hardware this speeds up K < 8192 A8W8 cases by
+    # 0.4-1.9% but slows the unrolled static loop (8192^3: +4.6%), which keeps
+    # the payload-first order.
+    STEP_SCALES_FIRST: tl.constexpr = (DYNAMIC_SCALES_FIRST and DEFER_BOTTOM and NUM_BUFFERS == 3
+                                       and not STATIC_SLOT_UNROLL)
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE)
         LOADS: tl.constexpr = 1
@@ -2599,7 +2609,8 @@ def mxgemm_tdm_persistent_kernel(
                         c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K,
                         DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
                         ARRIVE_K=i + NUM_BUFFERS if SPLIT_CLUSTER_BARRIER else None, CLUSTER_SIZE=CLUSTER_SIZE,
-                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=STATIC_SLOT_UNROLL)
+                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=STATIC_SLOT_UNROLL,
+                        SCALES_FIRST=STEP_SCALES_FIRST)
                     last_b00, last_sb00 = b00, sb00
                 elif OUTPUT_REUSE:
                     c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
@@ -2654,9 +2665,10 @@ def mxgemm_tdm_persistent_kernel(
                 else:
                     tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
                 a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
-                                                 WITH_A_SCALE)
+                                                 WITH_A_SCALE, PREFETCH_SCALES=STEP_SCALES_FIRST)
                 if not PREFETCH_B_AFTER_C10:
-                    b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+                    b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS,
+                                                     PREFETCH_SCALES=STEP_SCALES_FIRST)
                 if OUTPUT_REUSE:
                     if DB == 2 and tlx.num_warps() == 4:
                         c11 = dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
@@ -2678,7 +2690,7 @@ def mxgemm_tdm_persistent_kernel(
                         # C10 is the last user of old B0. Prefetching here permits
                         # register reuse and gives every quadrant one incoming operand.
                         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB,
-                                                         NUM_BUFFERS)
+                                                         NUM_BUFFERS, PREFETCH_SCALES=STEP_SCALES_FIRST)
                     c11 = dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
                     if GROUPED_PREFETCH:
                         _mxgemm_schedule_prefetch(104)
@@ -3239,6 +3251,7 @@ def mxgemm_tdm_pipelined(
     WAVE_SPECIALIZED_HANDOFF: bool = False,
     STATIC_SLOT_UNROLL: bool = False,
     OUTPUT_C_SLOTS: int | None = None,
+    DYNAMIC_SCALES_FIRST: bool = True,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3264,6 +3277,11 @@ def mxgemm_tdm_pipelined(
     ``OUTPUT_C_SLOTS`` sets the number of dedicated 64-row FP32 output staging
     slots (default two). More slots keep more C stores in flight during the
     tile epilogue; three 64x128 slots fit beside the A8W8 BK128 input ring.
+
+    ``DYNAMIC_SCALES_FIRST`` (default on) makes the three-buffer A8W8 K loop
+    without static slot unroll read each operand's scale before its payload,
+    so each quadrant waits only for its own LDS reads. The static loop keeps
+    the payload-first order, which is faster there.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3577,6 +3595,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["STATIC_SLOT_UNROLL"] = True
     if OUTPUT_C_SLOTS is not None:
         persistent_options["OUTPUT_C_SLOTS"] = OUTPUT_C_SLOTS
+    if not DYNAMIC_SCALES_FIRST:
+        persistent_options["DYNAMIC_SCALES_FIRST"] = False
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -3750,9 +3770,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
                     False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
-                        "ASYNC_OUTPUT",
-                        False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
-                                                           False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"))
+                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False),
+            OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST", True))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -3842,6 +3861,8 @@ if __name__ == "__main__":
                         help="dedicated BK128 FP32 output staging slots (default: 2)")
     parser.add_argument("--static_slot_unroll", action="store_true",
                         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots")
+    parser.add_argument("--no_dynamic_scales_first", action="store_true",
+                        help="read payloads before scales in the A8W8 K loop without static slot unroll")
     parser.add_argument("--streamed_operands", action="store_true",
                         help="test native operand fragments with persistent E4M3 BK128 and three or four buffers")
     parser.add_argument("--async_output", action="store_true",
@@ -3964,6 +3985,7 @@ if __name__ == "__main__":
         ASYNC_OUTPUT=args.async_output,
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
         OUTPUT_C_SLOTS=args.output_c_slots,
+        DYNAMIC_SCALES_FIRST=not args.no_dynamic_scales_first,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
     )

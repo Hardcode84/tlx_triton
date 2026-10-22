@@ -105,6 +105,7 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Early C stores | Off | On |
 | Static slot unroll | K >= 8192 | Off |
 | Dedicated C slots | 3 | — (C reuses A stages) |
+| Scales-first K loop (without static unroll) | On | — (BK256 path) |
 
 Common launch settings: group-M 8, 256 programs capped by tile count,
 four-workgroup multicast with a 2x2 cluster layout, and a cluster barrier
@@ -543,6 +544,242 @@ The peel removes about 400 cycles of zeroing per transition, which is below
 whole-kernel noise. The third C slot cuts transitions by about 35%. At 16384
 cubed, with 128 K steps per tile, transitions matter less, and clocks drop to
 about 1.72 GHz under the power cap.
+
+### Next A8W8 bottleneck (after `156c70871f`)
+
+Source: the hardware ATT of the committed configuration at 8192 cubed
+(`mxfp-hw-tt-20261021`, variant `peel-s3`; one wave, 278,722 cycles, WMMA
+utilization 0.47).
+
+| Phase | Cycles | Share |
+|---|---:|---:|
+| Steady K steps (60 per tile) | 232,970 | 83.6% |
+| … above the 512-cycle WMMA floor | 110,090 | 39.5% |
+| K tail (3 steps per tile, ~1.2k each) | 15,073 | 5.4% |
+| Tile transitions | 12,971 | 4.7% |
+| Prologue | 10,009 | 3.6% |
+| Final epilogue | 4,730 | 1.7% |
+
+Steady steps: median 836 cycles, mean 971. They split into two kinds:
+
+- **Late input (about 226 cycles per step on average, 23% of steady time).**
+  The slowest 10% of steps average 1,794 cycles. In them, the traced wave
+  waits 1–2k cycles at the workgroup rendezvous after the TDM refill
+  (`s_barrier_wait` at 0x2e34/0x35f8/0x3da4), while its own tensor wait is
+  short: a sibling wave is waiting for late TDM input. Slow steps cluster at
+  k mod 4 = 3 (12 of the slowest 24) and at tile starts. Cluster rendezvous
+  steps (k mod 4 = 1) add another ~50 cycles per step on average. The likely
+  cause is multicast coupling and memory latency spikes not covered by the
+  three-stage ring. AM cannot reproduce 256 CUs, so this needs a hardware
+  sweep of cluster barrier interval, split cluster barrier, multicast, and
+  cluster size.
+- **Built-in overhead (fast half: 755 cycles, 243 above the floor).** Mostly
+  `s_wait_dscnt 0x0` drains (~84 cycles at each of three sites). The
+  next-stage burst of 19 `ds_load_b128` is followed by only 16 WMMAs before
+  its consumer, plus two rendezvous per step.
+
+AM experiment, M=N=K=2048, 16 programs, deliberately incorrect variants that
+reuse operands from registers instead of reading LDS (temporary code, not
+committed). Steady step from plateau WMMA utilization:
+
+| Variant | Steady step (cycles) |
+|---|---:|
+| Committed configuration | 826 |
+| B reused (half the LDS operand reads) | 762 (−8%) |
+| A reused | 764 (−7.5%) |
+| No operand LDS reads | 666 (−19%) |
+
+LDS operand traffic (~132 KB per CU per step with the 2x2 wave layout) costs
+about half of the excess, but halving it saves only 8%. The step is not
+purely LDS-bandwidth bound. Without any LDS reads, about 150 cycles remain
+for the two workgroup rendezvous, TDM issue and waits, and the periodic
+cluster rendezvous. Candidates, in order of measured size: make input
+delivery robust to cross-CTA skew (hardware sweep above), give the
+next-stage operand burst more matrix work to hide behind, and merge the
+release and acquire rendezvous of each step.
+
+**Cluster and multicast sweep (hardware, 2026-10-21).** Committed
+`37b13785a6` defaults (static slot unroll with peel, three C slots), pinned
+codegen, warmed-up `bench.py` timing. Medians of three interleaved rounds.
+All variants passed the CPU checks, with bitwise-identical 8192-cubed
+outputs. Archive: `/home/ibutygin/tlx/perf-data/mxfp-hw-sweep-20261021.tar.gz`
+(SHA256 `5df288d27a8b4dc2a2161dec82fe41922c39dd2cc74658b2d93a72315bab3fdd`).
+
+| Variant | 8192³ | 8192²×4096 | 16384³ |
+|---|---:|---:|---:|
+| Default: 4-CTA 2x2, multicast, interval 4 | 0.16709 ms | 0.10142 ms | 1.37282 ms |
+| Interval 1 | +0.6% | +3.9% | −0.8% |
+| Interval 2 | +0.4% | +0.4% | −0.7% |
+| Interval 8 | +4.6% | +2.5% | +2.5% |
+| Interval 16 | +13.3% | +11.9% | +13.7% |
+| No cluster rendezvous (interval 0) | +70.7% | +43.0% | +82.4% |
+| Split cluster barrier | +8.6% | +4.8% | +4.8% |
+| Multicast off | +21.9% | +12.4% | +22.5% |
+| 2-CTA linear cluster | +8.7% | +3.9% | +10.1% |
+| No cluster | +22.8% | +10.9% | +23.7% |
+
+The default stays best except for a possible 0.7% gain at 16384 cubed with
+interval 2, within that case's spread. Every move toward less sharing or
+less alignment costs 4–80%. So the late-input stalls are not caused by too
+much synchronization. Input delivery is limited by the memory system: with
+2x2 multicast each CU still needs 32 KB of unique input per K step, about
+18 TB/s across 256 CUs at the measured step rate (36 TB/s without
+multicast). The next lever is fewer bytes per FLOP from L2: larger multicast
+groups (eight or sixteen CTAs; the tutorial supports at most four) or larger
+per-CTA tiles. Within one CTA, the remaining costs are LDS operand traffic
+and per-step rendezvous, as measured on AM above.
+
+**L2 prefetch (2026-10-22): no gain, reverted.** The experiment issued
+`tlx.amd_descriptor_prefetch_tensor` for A, B and both scales of stage
+`k + d` in every persistent K step, skipped past the tile's last stage.
+`dedup` let only the cluster ranks that own a multicast A (or B) tile
+prefetch it, and `speculative` set the speculative hint. With `d = 0`, the
+instructions match the committed kernel. Every variant was slower on
+hardware, so the source was restored to `HEAD`. The patch, harnesses, logs
+and AM results are in
+`/home/ibutygin/tlx/perf-data/mxfp-hw-l2pf-20261022.tar.gz` (SHA256
+`eb8dfbe05e2729bb3d9a98e73fcb45a1fc2dccce0cc7cadf7e6788c24e801b7d`).
+
+Lowering: each tile is spread over lanes in 256-byte chunks, one
+`global_prefetch_b8 ... scope:SCOPE_SE` per lane. That is about 128 L2
+requests per 32 KB tile, one instruction per wave per tile, plus about 20
+VALU per step for the addresses. Non-speculative prefetches carry
+`th:TH_LOAD_NT`.
+
+Correctness pitfall: do not pass `pred=` to prefetches through these tile
+descriptors. A masked prefetch is still issued, redirected to the last
+element of the descriptor view. The kernel's tile descriptors come from
+`update_tensor_descriptor(..., add_offsets=[off_m, 0], clamp_bounds=False)`,
+which moves the base but keeps the full `[M, K]` bounds. So that element lies
+up to `off_m` rows past the allocation. Non-speculative prefetches faulted
+there intermittently (`hipErrorIllegalAddress` for d=2, 8 and 4n, depending
+on what memory happened to be mapped). Speculative prefetches never faulted.
+Branching on the block-uniform predicate (`if pa:`) fixed it. The lowering is
+consistent with the descriptor semantics; the descriptor view was too large.
+
+Hardware, committed defaults plus prefetch, median of three interleaved
+`bench.py`-style rounds. Every 8192-sized output was bitwise identical to
+d=0:
+
+| Variant | 8192³ | 8192²×4096 | 16384³ |
+|---|---:|---:|---:|
+| No prefetch | 0.16453 ms | 0.08992 ms | 1.38391 ms |
+| d=1, dedup | +23.5% | +20.4% | +24.8% |
+| d=2, dedup | +23.2% | +19.6% | +23.6% |
+| d=4, dedup | +22.4% | +18.3% | +22.4% |
+| d=8, dedup | +20.7% | +15.5% | +21.4% |
+| d=2, no dedup | +24.2% | +21.3% | +22.0% |
+| d=4, no dedup | +22.3% | +19.7% | +20.1% |
+| d=2, dedup, speculative | +23.2% | +19.6% | +23.6% |
+| d=4, dedup, speculative | +22.4% | +18.4% | +22.5% |
+
+L2 counters (rocprofv3, one dispatch):
+
+| Shape, variant | GL2C_REQ | GL2C_MISS |
+|---|---:|---:|
+| 8192³, none | 17.5M | 1.95M (11%) |
+| 8192³, d=2 dedup | 35.4M | 1.94M |
+| 8192³, d=4 no dedup | 47.9M | 1.93M |
+| 16384³, none | 136.5M | 24.7M (18%) |
+| 16384³, d=2 dedup | 293.4M | 25.6M |
+| 16384³, d=4 no dedup | 394.8M | 24.8M |
+
+Prefetch doubles or triples L2 requests but does not reduce L2 misses. The
+misses are the compulsory per-XCD fills, and a prefetch can only move them
+earlier. The three-stage ring already overlaps their latency. The extra
+requests then compete with TDM on the input path that limits the kernel, at
+about 20% for every distance and hint. Dedup barely helps because rank 0
+still prefetches both A and B, and the multicast rendezvous waits for the
+slowest rank. A balanced split (one tile per rank) might halve the loss but
+cannot turn it into a gain while misses stay flat. AM (2048 cubed, where
+everything hits in L2) showed the same direction: 26–30% more dispatch
+cycles. The AM dedup runs used `pred=`, so the skipped ranks still issued
+redirected prefetches.
+
+**Next-tile loads after the C store (2026-10-22): slower, reverted.** With
+cross-tile prefetch, the K tail issues the next tile's three input stages
+before the epilogue. The tensor counter retires in order, so the fourth C
+chunk's slot wait also waits for those nine input loads. The alternative was
+`CROSS_TILE_PREFETCH=False`, which issues the next-tile TDM loads after the
+C stores. It was tested alone and with an L2 prefetch of the next tile's
+three stages at the start of the K tail (`NEXT_TILE_L2_PREFETCH`). That
+prefetch used the full-tensor descriptors and uniform branches, one tile per
+cluster rank. All variants passed FFM at 2048 cubed, and hardware outputs at
+8192 were bitwise identical. Patch and logs:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-ntl2-20261022.tar.gz` (SHA256
+`c0421b893f235ba682fbc0aafe0da6a6329757a441de77d37f7e82fea53dc202`).
+
+| Variant | AM 2048³ cycles | HW 8192³ | HW 8192²×4096 | HW 16384³ |
+|---|---:|---:|---:|---:|
+| Cross-tile prefetch (default) | 101,818 | 0.16404 ms | 0.09129 ms | 1.38177 ms |
+| Loads after C stores | +6.2% | +1.57% | +2.91% | +0.95% |
+| + next-tile L2 prefetch | +8.2% | +1.29% | +2.79% | +1.19% |
+
+On AM, warm transitions lose 6.1–6.3k cycles instead of 4.1–4.2k: the next
+tile's first step waits for the full TDM latency, about 2k cycles. With three
+C slots, the ATT slot-reuse waits that include input loads are only
+0.1–0.8k cycles, so decoupling can save less than the exposed latency costs.
+The L2 prefetch recovers at most 0.3%, because most input already hits in
+L2. A hybrid (cross-tile TDM for stage 0 only) would be bounded by the same
+≤0.8k-cycle wait, under 1% at 8192 cubed.
+
+**K-step schedule and barrier placement (2026-10-22).** Each steady A8W8
+step per wave runs four 16-WMMA quadrants and issues 64 `ds_load_b128`:
+
+1. c00 reads `b01` (this slot).
+2. c01 reads `a10` (this slot).
+3. Release barrier, TDM refill of this slot, `s_wait_tensorcnt` for the
+   next stage, acquire barrier.
+4. c10 and c11 read `a00`/`b00` of the next slot, in a 34-load burst.
+
+Both barriers are split (signal, about five WMMAs, wait), so on fast steps
+they are cheap. Each operand group ends with its scale load, and the next
+quadrant's first WMMA needs that scale, so every operand wait was
+`s_wait_dscnt 0x0`. Both barriers come from Membar. Because the three ring
+slots are selected at runtime, Membar cannot tell them apart, so it also
+places a barrier after every TDM refill and before the next LDS read.
+
+Variants, all bitwise identical to the baseline on hardware and passing
+FFM where barriers changed. Hardware is the median of three interleaved
+`bench.py`-style rounds. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-ksched-20261022.tar.gz` (SHA256
+`beac0986add988b8cf41b12301d3d3cce0272552f07a78293fcc47f9009204fa`; it
+includes the experiment patch and the asm timeline scripts).
+
+| Variant | AM plateau | 8192³ (static) | 8192²×4096 (dynamic) | 16384³ (static) |
+|---|---:|---:|---:|---:|
+| Baseline | 0.628 | — | — | — |
+| Scales before payload (partial `dscnt` waits) | 0.646 | +4.6% | −1.6 to −1.9% | +4.2% |
+| `GROUPED_PREFETCH` (1 WMMA : 2 loads) | 0.603 | +0.1% | −0.5% | +0.8% |
+| Scales first + grouped | 0.638 | +3.4% | −2.1% | +3.6% |
+| One merged barrier, refill after c10 | 0.584 | +8.9% | — | +7.9% |
+| Merged + scales first | 0.627 | +10.0% | −1.9% | +10.1% |
+| Early refill (read `b01` and `a10` in c00, refill before c01) | 0.644 | −0.2% | — | +0.1% |
+| Static slot unroll at K=4096 | — | — | −0.5% | — |
+
+Conclusions:
+
+- The merged barrier needs relaxed `local_load`s and a refill placed before
+  any next-slot read, or Membar adds the refill barrier back. That forced the
+  refill one quadrant later, and losing that quadrant of TDM lead time costs
+  about 8%. Gaining a quadrant (early refill) changes nothing. The current
+  lead is just sufficient, and the full-device static loop is limited by
+  input delivery, not by in-CTA scheduling.
+- AM (16 workgroups, no memory contention) rewards LDS-overlap changes that
+  hardware does not. Scales-first even slows the static loop on hardware,
+  likely by keeping more LDS reads in flight, which delays the release drain
+  and competes with incoming TDM writes. Do not tune the static loop on AM
+  plateau alone.
+- Adopted: `DYNAMIC_SCALES_FIRST` (default on) applies scales-first only to
+  the three-buffer dynamic-slot deferred-bottom loop (A8W8 K < 8192 in
+  `bench.py`). The
+  static-loop asm is unchanged. Hardware A/B of the final code: 8192²×4096
+  −0.5%, 4096³ −0.4%, 8192²×2048 −1.0%, 16384²×4096 −0.9%, against −1.6 to
+  −1.9% at 8192²×4096 in the three earlier rounds. AM: −1.9% dispatch
+  cycles. FFM passes. The mxgemm codegen tests fail in the same 125 cases
+  as on `HEAD`.
+- Static unroll at K=4096 is now −0.5% (it was +1.8% before the peel and
+  third C slot), small enough that `bench.py` keeps the K ≥ 8192 threshold.
 
 Pre-existing post-rebase breakage found during validation (not fixed):
 
