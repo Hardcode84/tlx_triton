@@ -2250,11 +2250,12 @@ def mxgemm_tdm_persistent_kernel(
     # partitions so the waves of a quadrant, which read alternating 32-row
     # blocks of the same operand subtile, contend less for one partition.
     # Group-major descriptors [rows // R, R, K] with R = 2 * PIECE_ROWS let
-    # each issuing wave fill one partition with one TDM instruction, but
-    # every instruction then fetches BLOCK // R separate row chunks. On gfx1250
-    # 64-row pieces speed up the static-slot loop (8192^3: -1.6%); 32-row
-    # pieces remove more conflicts (AM: -66%) but their 4 KiB chunks delay
-    # inputs more than they save (+3.6%). Other A8W8 schedules see no gain.
+    # each issuing wave fill one partition with one TDM instruction. On
+    # gfx1250 64-row pieces speed up the static-slot loop (8192^3: -1.6%).
+    # 32-row pieces remove more conflicts (AM: -66%) but are slower (+3.6%):
+    # each wave pair then reads only one partition half, the halves share
+    # their partitions unequally with other buffers, and the faster waves
+    # wait at every barrier. Other A8W8 schedules see no gain.
     PIECE_ROWS: tl.constexpr = (64 if STATIC_SLOT_UNROLL else 0) if LDS_PARTITIONED_AB is None else LDS_PARTITIONED_AB
     if PIECE_ROWS:
         tl.static_assert(DA == 1 and DB == 1 and TDM_FUSION == "partial" and OUTPUT_STAGING and BLOCK_K == 128,
