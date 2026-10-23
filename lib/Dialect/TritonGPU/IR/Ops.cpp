@@ -648,6 +648,53 @@ LogicalResult MemDescReshapeOp::verify() {
   return OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType);
 }
 
+// Fold a group-major partitioned view [G, P * r, C] (P partitions of r rows
+// along dim 1, one group) into [G * P * r, C] partitioned along dim 0 with G
+// groups. Both place pieces p, p + P, ... contiguously in partition p's buffer,
+// so a TDM copy can fill each partition with a single strided transfer.
+static LogicalResult
+inferPartitionedReshapeEncoding(ArrayRef<int64_t> srcShape,
+                                PartitionedSharedEncodingAttr enc,
+                                ArrayRef<int64_t> dstShape, Attribute &dstEnc) {
+  auto *ctx = enc.getContext();
+  if (srcShape.size() != 3 || dstShape.size() != 2 ||
+      enc.getPartitionDim() != 1 || enc.getNumGroups() != 1 ||
+      dstShape[0] != srcShape[0] * srcShape[1] || dstShape[1] != srcShape[2])
+    return failure();
+  auto padded = dyn_cast<PaddedSharedEncodingAttr>(enc.getPartitionLayout());
+  if (!padded)
+    return failure();
+  unsigned numPartitions = enc.getNumPartitions();
+  int64_t pieceRows = srcShape[1] / numPartitions;
+  int64_t cols = srcShape[2];
+  SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+  for (auto [interval, padding] :
+       llvm::zip_equal(padded.getIntervals(), padded.getPaddings())) {
+    // Padding must repeat within each piece so that concatenated pieces form
+    // one padded stream in both views.
+    if ((pieceRows * cols) % interval != 0)
+      return failure();
+    intervalPads.emplace_back(interval, padding);
+  }
+  auto srcPiece = PaddedSharedEncodingAttr::get(
+      ctx, intervalPads, {2, 1, 0}, {srcShape[0], pieceRows, cols},
+      CGAEncodingAttr::get1CTALayout(ctx, 3));
+  if (srcPiece != padded)
+    return failure();
+  auto dstPiece = PaddedSharedEncodingAttr::get(
+      ctx, intervalPads, {1, 0}, {pieceRows, cols},
+      CGAEncodingAttr::get1CTALayout(ctx, 2));
+  auto candidate = PartitionedSharedEncodingAttr::get(
+      ctx, numPartitions, srcShape[0], /*partitionDim=*/0, dstPiece);
+  // Both views share one padding pattern, so compare the unpadded mappings.
+  if (reshapeLayout(ctx, toLinearLayoutIgnoringPadding(srcShape, enc),
+                    dstShape) !=
+      toLinearLayoutIgnoringPadding(dstShape, candidate))
+    return failure();
+  dstEnc = candidate;
+  return success();
+}
+
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
@@ -677,6 +724,11 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
         }
       }
     }
+  } else if (auto partitioned =
+                 dyn_cast<PartitionedSharedEncodingAttr>(srcEnc)) {
+    // The generic linear fallback would drop the partition bases.
+    return inferPartitionedReshapeEncoding(srcShape, partitioned, dstShape,
+                                           dstEnc);
   } else if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
     LinearLayout ll = padded.getLinearComponent();
     LinearLayout dst = reshapeLayout(ctx, ll, dstShape);
@@ -710,7 +762,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   if (Attribute srcEnc = srcTy.getEncoding()) {
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
-      return failure();
+      return emitOptionalError(loc, "cannot infer the encoding of a reshaped ",
+                               srcEnc, " shared memory view");
   }
 
   SmallVector<int64_t> dstAllocShape =

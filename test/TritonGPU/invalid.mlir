@@ -1210,3 +1210,21 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
+
+// -----
+
+// Reshaping a partitioned view is only supported for folding group-major
+// pieces into the partition dimension; the generic fallback would drop the
+// partition bases.
+#piece_inv = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_inv3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#part_inv = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece_inv}>
+#part_inv3 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_inv3}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_unsupported(%d : !ttg.memdesc<256x128xi8, #part_inv, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_inv, #smem, mutable> -> !ttg.memdesc<4x64x128xi8, #part_inv3, #smem, mutable>
+    tt.return
+  }
+}

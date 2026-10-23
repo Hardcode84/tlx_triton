@@ -600,3 +600,22 @@ module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.
     tt.return %dot : !c
   }
 }
+
+// -----
+
+// A group-major partitioned view [G, 2 * r, C] (one group along dim 1) folds
+// into [G * 2 * r, C] partitioned along dim 0 with G groups: both keep pieces
+// p, p + 2, ... contiguous in partition p.
+#piece3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#piece2 = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#part3 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece3}>
+#part2 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece2}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: memdesc_reshape_partitioned_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_groups(%d : !ttg.memdesc<4x64x128xi8, #part3, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part3, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part2, #smem, mutable>
+    tt.return
+  }
+}
