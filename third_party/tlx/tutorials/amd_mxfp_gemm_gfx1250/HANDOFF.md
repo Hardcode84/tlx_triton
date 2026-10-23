@@ -143,6 +143,14 @@ clusters with chunked XCD remapping) measured on 2026-10-23, next to the
 | 16384³ | 1.1789 (7461) | 1.2105 | 1.3805 | 0.9566 (9195) | 0.9749 | 1.0230 |
 | 32768³ | 9.4373 (7456) | 9.7822 | 11.2131 | 7.5451 (9326) | 7.7185 | 8.1754 |
 
+Since `43869ddbf0` the 8192³ A8W8 default also spreads A/B over two LDS
+partitions (64-row pieces): about −1.6% in `hw_ship.py` timing (0.1505–0.1509
+ms against 0.1528–0.1532 ms in the same sessions; see [CDNA5 LDS partition
+conflicts](#bottlenecks-after-4x4-clusters-dc853dbc9d)). It needs the
+`memdesc_reshape` rule from `639c951130`, so `bench.py` on the remote
+(older Triton) cannot run it until that environment is rebuilt; the table
+above has not been re-measured with `bench.py`.
+
 ## Latest controlled hardware comparison
 
 Collected 2026-10-15, before the rebase. A8W8, M=N=8192, FP32 output.
@@ -1151,24 +1159,193 @@ Hardware ATT at 8192³ (one wave, CU 0), cycles per steady step:
 | Step mean (median) | 868 (848) | 843 (795) | 879 (825) |
 
 So the conflicts are real on hardware: removing most of them cuts this wave's
-LDS read cost by 31% and its own time by 4.5%. But each 32-row-piece TDM
-instruction fetches four separate 4 KiB row chunks instead of one 16 KiB
-block; inputs arrive later, and the wave waits ~1,300 cycles at each 16-CTA
-rendezvous for slower peers, so the kernel is slower. 128-row pieces (the
-baseline's contiguous fetch, no conflict change) cost nothing, which isolates
-the loss to the strided fetch. 64-row pieces (two 8 KiB chunks) remove fewer
-conflicts but help the static loop; the dynamic loops do not gain.
-`LDS_PARTITIONED_AB=None` therefore selects 64 rows with
-`STATIC_SLOT_UNROLL` (the 8192³ bench default) and 0 otherwise.
+LDS read cost by 31%, yet the kernel is slower. 128-row pieces cost nothing.
+64-row pieces remove fewer conflicts but help the static loop; the dynamic
+loops do not gain. `LDS_PARTITIONED_AB=None` therefore selects 64 rows with
+`STATIC_SLOT_UNROLL` (the 8192³ bench default) and 0 otherwise. The first
+explanation, that 32-row pieces lose because each TDM instruction fetches
+four 4 KiB chunks, does not hold; see the next paragraph.
 
-Untested follow-up: make each wave group read contiguous 64-row blocks (WMMA
-warp bases `(0,4),(4,0)`, register bases `(0,1),(1,0),(0,2),(2,0)`), so
-64-row pieces with 8 KiB fetches separate the wave groups as fully as
-32-row pieces do. The C-staging split along row bit 64 would then cross
-waves and must move to a 16/32-row register bit. Note also that AM fails
-correctness for every 4x4 (16-CTA multicast) configuration, including the
-baseline, while FFM and hardware pass; use 2x2 clusters for AM. Archive
-(AM summaries, hardware logs and ATT bundles, patches of the rejected fused
+**Contiguous wave rows (2026-10-23): fewer conflicts, slower; not kept.**
+A temporary `MXFP_WAVE_CONTIG` switch pinned WMMA warp bases `(0,4),(4,0)`
+and register bases `(0,1),(1,0),(0,2),(2,0)`, so each wave pair reads one
+contiguous 64-row half of every 128-row subtile. The E8M0 scale pins changed
+to match (wave stride 256, second value stride 128), and C staging split on
+row bit 32 into `[2, 32, 128]` slots stored with a 3D TDM descriptor (row
+bit 64 now selects the wave pair). The steady loop keeps the same LDS, WMMA,
+and barrier counts with no layout conversions. FFM 4x4 and AM 2x2 pass; all
+8192³ hardware outputs were bitwise identical.
+
+| A8W8 8192³ static loop | Interleaved, no pieces | Interleaved, 64-row (default) | Contiguous, no pieces | Contiguous, 64-row |
+|---|---:|---:|---:|---:|
+| AM read conflicts / LDS issue | 0.881 | 0.740 | 0.856 | 0.302 |
+| AM cycles (plateau) | 101,818 (0.628) | 101,875 (0.635) | 101,180 (0.612) | 99,698 (0.656) |
+| HW time, two passes | 0.1530 ms | −1.48 / −1.62% | −0.94 / −1.04% | +3.37 / +3.23% |
+| HW shader clock during timing | 1,813 MHz | 1,795 MHz | 1,804 MHz | 1,840 MHz |
+| ATT, 16 SEs: wave cycles median (max) | 258.8k (264.3k) | 249.2k (255.6k) | — | 260.8k (284.8k) |
+| … steady step: LDS reads | 279 | 233 | — | 184 |
+| … workgroup barrier | 63 | 73 | — | 134 |
+| … cluster barrier / tensor waits | 34 / 18 | 28 / 31 | — | 41 / 35 |
+
+Contiguous rows with 64-row pieces reach the 32-row conflict level in AM and
+fetch exactly like the default (two 8 KiB chunks), yet lose as much as
+32-row pieces on hardware. Every variant runs at the ~2,480 W power cap; the
+slow one runs at a higher clock, so the loss is not throttling but more
+cycles. Single-wave ATT on CU 0 was misleading (its wave was the fastest of
+all); one wave per shader engine shows the cause: the LDS read savings come
+with doubled workgroup-barrier waits and a slow tail (max 284.8k cycles).
+The two partition halves are not equally loaded. Per slot, A's rows 0–63 sit
+in P1, P1/P2, P2 and rows 64–127 in P3; B's rows 0–63 in P2, P2, P2/P3 and
+rows 64–127 in P4; C slots and scales occupy P0–P1. When each wave pair
+reads only one half, wave (0,0) reads A and B from the crowded P1/P2 region
+(also hit by C traffic) while wave (1,1) reads from P3/P4 alone, so the waves
+finish their reads at different times and wait at every barrier. The
+interleaved 32-row-piece layout also gives each pair one half, which explains
+its loss the same way; 64-row pieces with interleaved rows give every wave
+both halves and stay balanced. A balanced split would need each wave pair to
+see equally loaded partitions, for example A halves and B halves in four
+distinct partitions with C and scales in the fifth. The allocator does not
+let the kernel choose partition offsets; the one partition buffer per
+alloc fits (52,224 B per 64 KiB partition), but C's 96 KiB would have to
+share the leftover space. Archive (patch, AM summaries, clock samples,
+16-SE ATT bundles): `/home/ibutygin/tlx/perf-data/mxfp-wave-contig-20261023.tar.gz`
+(SHA256 `c9482bcd54be8a3855c47c05ea73189387a5f6ed68a67d2fe58c91299ab98a39`).
+
+**Upstream partition-aware wave layouts (2026-10-23): no gain; not
+kept.** Upstream Gluon solves the same problem with
+`gl.amd.cdna5.make_partitioned_dot_layouts` (#10145, #10809, #10334, #10911;
+moved to `cdna5` in #11183; the `mxfp_gemm_cdna5.py` example enables it with
+`RESOLVE_PARTITION_CONFLICTS`). For our 128x128 dot slice of a 256-row
+block it returns exactly our 64-row partitioned A/B layout plus a swizzled
+WMMA layout: warp bases `(4,4),(2,0)`, register bases
+`(0,1),(0,2),(1,0),(4,0)` (16x16 tiles, (M, N)). Warp bit 0 is XORed into
+the row group, so the two wave pairs read opposite A partition halves at
+every register step and each wave still reads both halves; each pair reads
+one B half. Gluon pins the layouts explicitly. TLX's `dot_scaled` still runs
+`TritonAMDGPUAccelerateMatmul`, which crashed on a swizzled pinned WMMA: it
+built the scale encoding with `LinearEncodingAttr::get` and checked
+`tiles_per_warp` via `getWarpsPerCTA`; both reject non-permutation
+layouts. Two small fixes (use `inferEncodingFromLinearLayout`; skip the
+check for a swizzled pinned WMMA) are in the archive patch, not in the tree.
+TLX `shape/stride` scale pins express the XOR by giving a warp bit and a
+register bit the same stride. C staging split on row bit 16 into
+`[4, 16, 128]` slots with a 3D TDM store.
+
+Variants on the 8192³ static loop (all with 64-row pieces): `swz1` = upstream
+layout; `swz2` = A and B both swizzled (warps `(4,2),(2,4)`, registers
+`(0,1),(1,0),(4,0),(0,4)`), so every wave reads both halves of both operands.
+FFM 4x4 and AM 2x2 pass; hardware outputs bitwise identical.
+
+| | Plain warps (default) | `swz1` (upstream) | `swz2` |
+|---|---:|---:|---:|
+| AM read conflicts / LDS issue | 0.740 | 0.359 | 0.433 |
+| AM cycles (plateau) | 101,875 (0.635) | 100,905 (0.651) | 102,612 (0.625) |
+| Steady-loop `ds_load` per 3 steps | 204 | 210 | 216 |
+| HW vs no pieces, two passes | −1.66 / −1.69% | +0.01 / −0.05% | +1.21 / +1.18% |
+| HW shader clock (sustained) | 1,795 MHz | 1,806 MHz | 1,814 MHz |
+| 16-SE ATT wave cycles median (max) | 249.2k (255.6k) | 267.0k (287.8k) | 245.1k (260.2k) |
+| … LDS reads / wg barrier per step | 233 / 73 | 180 / 154 | 208 / 80 |
+
+`swz1` removes conflicts but keeps the B-side imbalance (each pair owns one
+B half), so workgroup-barrier waits double as with contiguous rows. `swz2`
+is balanced and has the best traced step, yet loses in sustained timing.
+Its swizzled scale layouts split some scale reads (+6% LDS instructions).
+ATT runs are not a reliable ranking here: their eight-launch bursts run
+below the power cap (kernel 133–145 µs) while sustained timing sits at
+~2,480 W (~150 µs, 1.8 GHz), and relative stall costs shift with the clock.
+Use sustained `hw_ship.py`/`bench.py` timing as ground truth. Archive
+(patches, AM summaries, clock samples, ATT bundles):
+`/home/ibutygin/tlx/perf-data/mxfp-wave-swizzle-20261023.tar.gz` (SHA256
+`574c63d0ec5e19b9d3f5dd3f3590a92c5e34036ea059731a2d46a8881b559c8a`).
+
+**Scale reads under the swizzled layouts (2026-10-23): inconclusive.** The
+swizzled variants' extra LDS loads are all E8M0 scale reads (operand loads
+stay 192 `ds_load_b128` per three steps). Each lane needs rows r and r+64;
+the plain layout reads both with one `ds_load_2addr_b32`, but with the row
+group XORed by a warp bit the register that holds row r depends on the wave,
+the two offsets are no longer constant, and each read splits: `swz1`
+12 `ds_load_b32` + 6 `ds_load_b64`, `swz2` 24 `ds_load_b32` (17 instead of
+11 `s_wait_dscnt`). An upper-bound build replaced the per-step scale reads
+with constant E8M0 scales (TDM scale loads kept; outputs equal across
+variants):
+
+| 8192³ cycles (time × sustained clock) | No pieces | 64-row (default) | `swz1` | `swz2` |
+|---|---:|---:|---:|---:|
+| Real scales | 277k | 271k | 277k | 281k |
+| Constant scales | 343k | 325k | 284k | 344k |
+
+Removing scale reads made every kernel 20–27% *slower* in cycles: LLVM
+rescheduled the loop (29 instead of 11 `s_wait_dscnt` per three steps,
+exposing LDS waits) and the lighter power draw raised the clock ~9%. So this
+is not an upper bound. In that exposed-wait regime `swz1` needs 13% fewer
+cycles than the default with identical LDS instructions, which shows its
+operand pattern does relieve partition stalls, but not what it would gain in
+the real schedule. Recovering paired scale reads would need the scale layout
+to carry the swizzled row bit in a lane bit instead of a register bit (per-lane
+addresses are free; register assignment is static), i.e. a different
+`chooseScaledWmmaScaleLayout` choice and matching opsel in the scaled-WMMA
+lowering. Archive: `/home/ibutygin/tlx/perf-data/mxfp-scale-reads-20261023.tar.gz`
+(SHA256 `782bbbc8eb272449e38a0fd0195a77bed939d2685ee96ccc4ab1f6e271ba35f3`).
+
+**LDS partition conflicts: what we learned (2026-10-23).**
+
+| Experiment | Conflicts (AM, per LDS read) | 8192³ hardware | Status |
+|---|---:|---:|---|
+| Baseline (contiguous A/B slots) | 0.88 | 0.1530 ms | — |
+| 32-row pieces, 2D, 4 TDM instr/member | 0.32 | +9.6% | rejected (TDM cap) |
+| 32-row pieces, group-major 3D TDM | 0.30 | +3.6% | rejected (imbalance) |
+| **64-row pieces, group-major 3D TDM** | 0.74 | **−1.6%** | **default (static loop)** |
+| 128-row pieces | — | 0.0% | — |
+| Contiguous wave rows + 64-row pieces | 0.30 | +3.3% | rejected (imbalance) |
+| Contiguous wave rows, no pieces | 0.86 | −1.0% | not kept (default is better) |
+| Upstream swizzled waves (`swz1`) + 64-row | 0.36 | +0.0% | rejected (B imbalance, split scale reads) |
+| A+B swizzled waves (`swz2`) + 64-row | 0.43 | +1.2% | rejected (split scale reads) |
+
+1. Conflicts are real on hardware, not just in AM: removing most of them
+   cuts traced LDS read cost per step by about a third (279 → ~180 cycles).
+2. Reducing conflicts is not enough. What matters is the per-wave balance
+   of partition load. When each wave pair reads only one partition half, the
+   halves are unequally shared with other buffers (A, B, C slots and scales
+   in five 64 KiB partitions that the allocator places), the waves finish
+   their reads at different times, and workgroup-barrier waits double.
+   Interleaved 64-row pieces give every wave both halves and win.
+3. The pinned backend waits before any TDM issue with more than ten
+   outstanding (`s_wait_tensorcnt 0xa`), which caps instructions per stage
+   times ring depth. Splitting a fused member into several instructions
+   collapses the ring; group-major 3D descriptors keep one instruction per
+   wave.
+4. Swizzled (XOR) wave layouts, as in upstream
+   `make_partitioned_dot_layouts`, balance A (and B with `swz2`), but break
+   the paired E8M0 scale reads: the register holding row r depends on the
+   wave, so `ds_load_2addr_b32` splits. TLX also needed two
+   `AccelerateAMDMatmul` fixes to compile them (archived patch).
+5. Measurement: single-CU ATT can be unrepresentative (the CU-0 wave of a
+   losing variant was the fastest of all); trace one wave per shader engine.
+   Short ATT bursts run below the 2,480 W power cap (~135 µs vs ~150 µs per
+   kernel) and can rank variants differently; sustained timing is ground
+   truth. Record clocks: under the cap, data and instruction mix change the
+   clock (constant scales: +9%), so compare cycles = time × clock too.
+   Experiments that remove work (constant scales) can change the compiler's
+   schedule and are not valid upper bounds.
+6. AM fails correctness for 4x4 multicast clusters even for the baseline;
+   use 2x2 clusters for AM conflict counts.
+
+Open directions, in rough order of expected value:
+- Carry the swizzled row bit in a lane bit of the scale layout
+  (`chooseScaledWmmaScaleLayout` plus scaled-WMMA opsel) so swizzled waves
+  keep paired scale reads; then retest `swz1`/`swz2`. In a wait-exposed build
+  `swz1` needed 13% fewer cycles than the default with identical LDS loads.
+- Control partition placement (explicit LDS offsets or allocator support)
+  so A halves, B halves, and C/scales sit in separate partitions; this would
+  also allow per-slot rotation of heavy/light partitions in the static
+  unroll.
+- Re-evaluate 64-row pieces in the dynamic loops (8192²×4096: +0.8%,
+  16384³: +0.3%) after either of the above.
+
+Note also that AM fails correctness for every 4x4 (16-CTA multicast)
+configuration, including the baseline, while FFM and hardware pass; use 2x2
+clusters for AM. Archive of the partition experiments (AM summaries,
+hardware logs and ATT bundles, patches of the rejected fused
 multi-instruction lowering):
 `/home/ibutygin/tlx/perf-data/mxfp-lds-partition-20261023.tar.gz` (SHA256
 `dee1dd2846e4a4114575b69c7bcf7a91fb62ae1de104580475c9711cd0170bdd`).
@@ -1258,7 +1435,11 @@ Lessons to retain when designing the next change:
 4. Vary M/N at fixed K and K at fixed M/N to separate one-time startup from
    per-output-tile costs. At 256 programs with 256x256 tiles, square M/N
    sizes 4096, 8192, and 16384 give one, four, and sixteen tiles per program.
-5. Update the [resource/dependency model](../../tools/perf_model/README.md)
+5. LDS partition conflicts: see "LDS partition conflicts: what we learned"
+   above for the open directions (lane-bit scale layout for swizzled waves,
+   explicit partition placement). Rebuild the remote Triton with
+   `639c951130` before running `bench.py` with the new 8192³ default.
+6. Update the [resource/dependency model](../../tools/perf_model/README.md)
    with the measured service times and exposed dependencies. Choose the next
    schedule change from a quantified gap; retain ordinary defaults until
    repeated hardware results justify replacing them.
