@@ -2027,6 +2027,7 @@ def async_amd_descriptor_store(
     offsets: Optional[list[tl.tensor]] = None,
     clamp_bounds: tl.constexpr = True,
     warp_used_hint: tl.constexpr = None,
+    cache_modifier: tl.constexpr = "",
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
@@ -2042,6 +2043,10 @@ def async_amd_descriptor_store(
     the same bitmask rules as :func:`async_amd_descriptor_load`. Selected waves
     cover the whole source tile. Other waves still issue null descriptors;
     wave-uniform control flow is needed to suppress those instructions.
+
+    ``cache_modifier`` sets the store's cache policy, as for ``tl.store``:
+    ``".cs"`` streams (non-temporal), ``".wt"`` writes through, ``".cg"``
+    keeps device scope, ``".wb"`` is a regular write-back.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -2077,10 +2082,13 @@ def async_amd_descriptor_store(
             None,
             clamp_bounds,
         )
+    cache_modifier = tl._unwrap_if_constexpr(cache_modifier)
+    cache = (_semantic._str_to_store_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE)
     token_handle = _semantic.builder.create_async_tdm_copy_local_to_global(
         positioned_desc,
         source.handle,
         None,
+        cache,
     )
     warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
     if warp_used_hint is not None:

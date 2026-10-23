@@ -6478,6 +6478,35 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     assert ttgir.count("clamp_bounds") == 2
 
 
+@triton.jit
+def _async_amd_desc_store_cache_kernel(y_ptr, M: tl.constexpr, N: tl.constexpr, CACHE: tl.constexpr):
+    desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
+    store_view = tlx.local_view(tlx.local_alloc((M, N), tl.float16, 1), 0)
+    tlx.local_store(store_view, tl.zeros((M, N), tl.float16))
+    tlx.async_amd_descriptor_store(desc_out, store_view, [0, 0], cache_modifier=CACHE)
+    tlx.async_amd_descriptor_wait(pendings=0)
+
+
+@pytest.mark.parametrize("cache,policy", [("", ""), (".cs", "th:TH_STORE_NT"),
+                                          (".wt", "th:TH_STORE_BYPASS scope:SCOPE_SYS")])
+def test_async_amd_desc_store_cache_modifier_gfx1250(cache, policy):
+    """cache_modifier sets the cache policy of the TDM store instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_store_cache_kernel,
+        signature={"y_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 32, "CACHE": cache},
+    )
+    stores = [
+        line.split(";")[0].strip() for line in compiled.asm["amdgcn"].splitlines() if "tensor_store_from_lds" in line
+    ]
+    assert stores
+    for store in stores:
+        if policy:
+            assert store.endswith(policy), store
+        else:
+            assert "th:" not in store and "scope:" not in store, store
+
+
 @pytest.mark.parametrize("masked", [False, True])
 def test_async_amd_store_preserves_vector_layout_gfx1250(masked):
 

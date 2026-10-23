@@ -1244,11 +1244,13 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, Value src,
-             std::optional<Value> barrier) -> Value {
+             std::optional<Value> barrier,
+             tt::CacheModifier cacheModifier) -> Value {
             return self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                desc, src, barrier.value_or(Value()));
+                desc, src, barrier.value_or(Value()), cacheModifier);
           },
-          py::arg("desc"), py::arg("src"), py::arg("barrier").none())
+          py::arg("desc"), py::arg("src"), py::arg("barrier").none(),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def(
           "create_update_tensor_descriptor",
           [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
