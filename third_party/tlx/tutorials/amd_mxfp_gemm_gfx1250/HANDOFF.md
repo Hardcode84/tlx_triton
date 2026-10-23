@@ -104,6 +104,7 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Split cluster barrier | Off | On |
 | Early C stores | Off | On |
 | Static slot unroll | K = 8192 (three-stage ring) | Off |
+| A/B LDS partition pieces (`LDS_PARTITIONED_AB`) | 64 rows with static slot unroll | Off |
 | Input ring | 3 stages; 4 stages, 2 C slots for K >= 16384 | 3 stages |
 | Dedicated C slots | 3 (K < 16384) | — (C reuses A stages) |
 | Scales-first K loop (without static unroll) | On | — (BK256 path) |
@@ -1095,6 +1096,82 @@ alternating rounds per configuration, chunked vs none: MX8xMX8 −2.0%
 chunked` for 4x4 clusters. Archive:
 `/home/ibutygin/tlx/perf-data/mxfp-hw-xcd-20261023.tar.gz` (SHA256
 `3583b8e0113f0329ac799b15975516664e73ab9665f6c5d02e431ccaaf42e4c4`).
+
+**CDNA5 LDS partition conflicts (2026-10-23): real; 64-row partition
+pieces adopted for the static-slot loop.** gfx1250 LDS is five 64 KiB
+partitions (`getSharedMemoryPartitionSize`; partition = byte offset / 64 KiB).
+AM counts concurrent accesses to one partition in
+`tcp0.cu_cache_lds_lds_partition_{read,write}_conflicts`
+(`am-runs/mxfp-waits-20261021/lds_conflicts.py` sums them; DS bank conflicts
+are zero). Each A/B ring slot is one contiguous 34,816-byte block, so a
+quadrant's 128-row operand subtile sits in one partition, and all four waves
+read it together: with the native WMMA layout, `wn = 0` waves read rows
+0–31/64–95 and `wn = 1` rows 32–63/96–127 of each B subtile (A by `wm`).
+Hardware exposes no LDS conflict counter (`SQ_*LDS*` read 0 on this driver), so
+hardware evidence comes from ATT.
+
+`LDS_PARTITIONED_AB = r` alternates r-row pieces of A and B between two
+partitions. Fused TDM members are issued by two waves, so an ordinary 2D
+partitioned destination with 32-row pieces needs four TDM instructions per
+member, five per stage instead of two. The pinned backend inserts
+`s_wait_tensorcnt 0xa` before any TDM issue with more than ten outstanding,
+which collapses a three- or four-stage ring (hardware: +9.6% at 8192³, +8.5%
+at 8192²×4096, +23% at 16384³; still +1–3% with two buffers). The kept
+version instead views A/B as group-major `[rows / 2r, 2r, K]` descriptors and
+`[G, 2r, BK]` buffers partitioned along dim 1 with one group, so each issuing
+wave fills its partition with one 3D TDM instruction (same instruction and
+wait counts as the baseline). Reads reshape the slot to `[256, BK]`; this
+needed a `memdesc_reshape` rule for partitioned layouts (`Ops.cpp`, lit tests in
+`test/TritonGPU/{ops,invalid}.mlir`). Previously the reshape fell back to a
+shared-linear encoding that silently dropped the partition bases.
+
+| A8W8 | Base | 32-row pieces | 64-row | 128-row |
+|---|---:|---:|---:|---:|
+| AM 2x2 2048³: read conflicts / LDS issue | 0.881 | 0.300 | 0.740 | — |
+| AM: avg LDS latency (cycles) | 123 | 111 | 119 | — |
+| AM: cycles (plateau) | 101,818 (0.628) | 99,011 (0.656) | 101,875 (0.635) | — |
+| HW 8192³ (static loop) | 0.1528 ms | +3.6% | **−1.6%** | 0.0% |
+| HW 8192²×4096 (dynamic, 3 stages) | 0.0847 ms | −1.1% | +0.8% | — |
+| HW 16384³ (dynamic, 4 stages) | 1.1776 ms | +1.4% | +0.3% | +0.4% |
+| HW 32768³ (dynamic, 4 stages) | 9.444 ms | +1.1% | −0.1% | — |
+
+Hardware timings are `hw_ship.py` medians (bench-style warm timing), 64-row
+over three sessions (−1.69/−1.55/−1.75% at 8192³). All 8192-sized outputs
+were bitwise identical; FFM passes the 4x4 three-stage static and four-stage
+dynamic cases and the 55 ring-phase/grid-cluster pytest cases; AM 2x2 passes.
+
+Hardware ATT at 8192³ (one wave, CU 0), cycles per steady step:
+
+| | Base | 32-row | 64-row |
+|---|---:|---:|---:|
+| LDS reads (`ds_load` + `s_wait_dscnt`) | 264 | 181 | 231 |
+| Workgroup barrier | 82 | 48 | 83 |
+| Cluster barrier | 27 | 107 | 80 |
+| Tensor waits | 30 | 44 | 23 |
+| Step mean (median) | 868 (848) | 843 (795) | 879 (825) |
+
+So the conflicts are real on hardware: removing most of them cuts this wave's
+LDS read cost by 31% and its own time by 4.5%. But each 32-row-piece TDM
+instruction fetches four separate 4 KiB row chunks instead of one 16 KiB
+block; inputs arrive later, and the wave waits ~1,300 cycles at each 16-CTA
+rendezvous for slower peers, so the kernel is slower. 128-row pieces (the
+baseline's contiguous fetch, no conflict change) cost nothing, which isolates
+the loss to the strided fetch. 64-row pieces (two 8 KiB chunks) remove fewer
+conflicts but help the static loop; the dynamic loops do not gain.
+`LDS_PARTITIONED_AB=None` therefore selects 64 rows with
+`STATIC_SLOT_UNROLL` (the 8192³ bench default) and 0 otherwise.
+
+Untested follow-up: make each wave group read contiguous 64-row blocks (WMMA
+warp bases `(0,4),(4,0)`, register bases `(0,1),(1,0),(0,2),(2,0)`), so
+64-row pieces with 8 KiB fetches separate the wave groups as fully as
+32-row pieces do. The C-staging split along row bit 64 would then cross
+waves and must move to a 16/32-row register bit. Note also that AM fails
+correctness for every 4x4 (16-CTA multicast) configuration, including the
+baseline, while FFM and hardware pass; use 2x2 clusters for AM. Archive
+(AM summaries, hardware logs and ATT bundles, patches of the rejected fused
+multi-instruction lowering):
+`/home/ibutygin/tlx/perf-data/mxfp-lds-partition-20261023.tar.gz` (SHA256
+`dee1dd2846e4a4114575b69c7bcf7a91fb62ae1de104580475c9711cd0170bdd`).
 
 Pre-existing post-rebase breakage found during validation (not fixed):
 

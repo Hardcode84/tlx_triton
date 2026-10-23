@@ -33,6 +33,9 @@ at K=4096, where the larger code costs more than it saves. Use
 --static-slot-unroll or --no-static-slot-unroll to force it for every case.
 --static-slot-unroll requires the three-buffer BK128 staged-output schedule
 and selects MX8xMX8.
+With static slot unroll, A and B alternate 64-row pieces between two physical
+LDS partitions, so the waves reading one operand subtile contend less for a
+partition (1.6% faster at 8192^3 on hardware; no gain in the dynamic loops).
 MX8xMX8 also stages FP32 output through three dedicated 64x128 LDS slots
 instead of two, keeping more C stores in flight at each tile transition.
 Use --output-c-slots to choose another count.

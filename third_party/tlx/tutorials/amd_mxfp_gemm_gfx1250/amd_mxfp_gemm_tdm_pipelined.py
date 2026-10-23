@@ -58,6 +58,36 @@ def _scale_shared_layout(block_shape):
 
 
 @triton.constexpr_function
+def _partitioned_operand_shared_layout(block_shape):
+    # Group-major operand view [groups, 2 * rows, K]: alternate rows-row
+    # pieces between two physical LDS partitions. Partition p holds pieces
+    # p, p + 2, ... contiguously, so one TDM instruction per issuing wave fills
+    # it, and _mxgemm_flat_view reads it as [groups * 2 * rows, K].
+    groups, group_rows, cols = block_shape
+    pad_interval = 256 if cols <= 256 else cols
+    piece = tlx.padded_shared_layout_encoding.with_identity_for([[pad_interval, 16]], [groups, group_rows // 2, cols],
+                                                                [2, 1, 0])
+    return tlx.partitioned_shared_layout_encoding(2, 1, 1, piece)
+
+
+@tl.core.builtin
+def _mxgemm_desc_group_rows(desc, _semantic=None):
+    # Rows per group of a group-major [M // R, R, K] operand descriptor, or 0
+    # for an ordinary [M, K] descriptor.
+    shape = [tl.core._unwrap_if_constexpr(d) for d in desc.block_shape]
+    return tl.constexpr(shape[1] if len(shape) == 3 else 0)
+
+
+@tl.core.builtin
+def _mxgemm_flat_view(view, _semantic=None):
+    # Read a group-major [G, R, K] operand slot as [G * R, K].
+    shape = [tl.core._unwrap_if_constexpr(d) for d in view.type.shape]
+    if len(shape) != 3:
+        return view
+    return tlx.local_reshape(view, [shape[0] * shape[1], shape[2]], _semantic=_semantic)
+
+
+@triton.constexpr_function
 def _b_shared_layout(block_shape, transpose_b):
     if transpose_b:
         return _operand_shared_layout(block_shape)
@@ -104,6 +134,8 @@ def _mxgemm_position_load_descriptor(desc, offsets, pred):
     # Persistent loads inherit the enabled base descriptor's predicate.
     # Replacing it on every update can keep packed descriptor fields live
     # across the K loop and spill them into VGPR lanes.
+    if _mxgemm_desc_group_rows(desc) != 0:
+        offsets = [0, offsets[0], offsets[1]]
     if pred is None:
         return tlx.update_tensor_descriptor(desc, add_offsets=offsets, clamp_bounds=False)
     else:
@@ -531,7 +563,7 @@ def _mxgemm_load_a_operand(
     subtile_start_m: tl.constexpr = subtile_start_idx_m * subtile_m
     subtile_start_k: tl.constexpr = subtile_start_idx_k * subtile_k
 
-    a_view = tlx.local_view(a_buf, slot)
+    a_view = _mxgemm_flat_view(tlx.local_view(a_buf, slot))
     if NUM_SUBTILES_M != 1 or NUM_SUBTILES_K != 1:
         a_view = tlx.local_slice(a_view, [subtile_start_m, subtile_start_k // DIV_FACTOR_A],
                                  [subtile_m, subtile_k // DIV_FACTOR_A])
@@ -643,7 +675,7 @@ def _mxgemm_load_b_operand(
     subtile_start_n: tl.constexpr = subtile_start_idx_n * subtile_n
     subtile_start_k: tl.constexpr = subtile_start_idx_k * subtile_k
 
-    b_view = tlx.local_view(b_buf, slot)
+    b_view = _mxgemm_flat_view(tlx.local_view(b_buf, slot))
     if TRANSPOSE_B:
         if NUM_SUBTILES_N != 1 or NUM_SUBTILES_K != 1:
             b_view = tlx.local_slice(b_view, [subtile_start_n, subtile_start_k // DIV_FACTOR_B],
@@ -1417,8 +1449,14 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
     # Keep the K coordinate independent of the LDS ring slot. Adding (k - slot)
     # here and slot in the loader hides the invariant per-wave global base
     # from LLVM and repeats descriptor address work inside the K loop.
-    ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=False)
-    bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
+    if _mxgemm_desc_group_rows(a_desc) != 0:
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // _mxgemm_desc_group_rows(a_desc), 0, 0],
+                                          clamp_bounds=False)
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // _mxgemm_desc_group_rows(b_desc), 0, 0],
+                                          clamp_bounds=False)
+    else:
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=False)
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
     asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // 128, 0], clamp_bounds=False)
     bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // 128, 0], clamp_bounds=False)
     # Barriers align requests for multicast; late requests receive separate loads.
@@ -2092,6 +2130,7 @@ def mxgemm_tdm_persistent_kernel(
     OUTPUT_C_SLOTS: tl.constexpr = None,
     OUTPUT_C_COLS: tl.constexpr = None,
     DYNAMIC_SCALES_FIRST: tl.constexpr = True,
+    LDS_PARTITIONED_AB: tl.constexpr = None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -2203,16 +2242,46 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert(TDM_FUSION == "none")
         LOADS: tl.constexpr = 4 if WITH_A_SCALE else 3
 
-    a_desc = tl.make_tensor_descriptor(a_ptr, [M, K // DA], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K // DA])
-    b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
     as_desc = tl.make_tensor_descriptor(a_scale, [M // 128, K // 32 * 128], [stride_as, tl.constexpr(1)],
                                         [BLOCK_M // 128, BLOCK_K // 32 * 128])
     bs_desc = tl.make_tensor_descriptor(b_scale, [N // 128, K // 32 * 128], [stride_bs, tl.constexpr(1)],
                                         [BLOCK_N // 128, BLOCK_K // 32 * 128])
-    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
-                            layout=_operand_shared_layout([BLOCK_M, BLOCK_K // DA]))
-    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
-                            layout=_operand_shared_layout([BLOCK_N, BLOCK_K // DB]))
+    # Alternate PIECE_ROWS-row pieces of A and B between two 64 KiB LDS
+    # partitions so the waves of a quadrant, which read alternating 32-row
+    # blocks of the same operand subtile, contend less for one partition.
+    # Group-major descriptors [rows // R, R, K] with R = 2 * PIECE_ROWS let
+    # each issuing wave fill one partition with one TDM instruction, but
+    # every instruction then fetches BLOCK // R separate row chunks. On gfx1250
+    # 64-row pieces speed up the static-slot loop (8192^3: -1.6%); 32-row
+    # pieces remove more conflicts (AM: -66%) but their 4 KiB chunks delay
+    # inputs more than they save (+3.6%). Other A8W8 schedules see no gain.
+    PIECE_ROWS: tl.constexpr = (64 if STATIC_SLOT_UNROLL else 0) if LDS_PARTITIONED_AB is None else LDS_PARTITIONED_AB
+    if PIECE_ROWS:
+        tl.static_assert(DA == 1 and DB == 1 and TDM_FUSION == "partial" and OUTPUT_STAGING and BLOCK_K == 128,
+                         "LDS_PARTITIONED_AB requires A8W8 BK128 dedicated output staging with partial TDM fusion")
+        tl.static_assert(
+            HANDOFF_SCHEDULE == "current"
+            and not (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH or WAVE_SPECIALIZED_HANDOFF),
+            "LDS_PARTITIONED_AB requires the default operand schedule")
+        R: tl.constexpr = 2 * PIECE_ROWS
+        tl.static_assert(M % R == 0 and N % R == 0 and BLOCK_M % R == 0 and BLOCK_N % R == 0)
+        a_desc = tl.make_tensor_descriptor(a_ptr, [M // R, R, K // DA],
+                                           [R * stride_am, stride_am, tl.constexpr(1)],
+                                           [BLOCK_M // R, R, BLOCK_K // DA])
+        b_desc = tl.make_tensor_descriptor(b_ptr, [N // R, R, K // DB],
+                                           [R * stride_bn, stride_bn, tl.constexpr(1)],
+                                           [BLOCK_N // R, R, BLOCK_K // DB])
+        a_buf = tlx.local_alloc((BLOCK_M // R, R, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
+                                layout=_partitioned_operand_shared_layout([BLOCK_M // R, R, BLOCK_K // DA]))
+        b_buf = tlx.local_alloc((BLOCK_N // R, R, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
+                                layout=_partitioned_operand_shared_layout([BLOCK_N // R, R, BLOCK_K // DB]))
+    else:
+        a_desc = tl.make_tensor_descriptor(a_ptr, [M, K // DA], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K // DA])
+        b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
+        a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
+                                layout=_operand_shared_layout([BLOCK_M, BLOCK_K // DA]))
+        b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
+                                layout=_operand_shared_layout([BLOCK_N, BLOCK_K // DB]))
     as_buf = tlx.local_alloc((BLOCK_M // 128, BLOCK_K // 32 * 128), tlx.dtype_of(a_scale), NUM_BUFFERS,
                              layout=_scale_shared_layout([BLOCK_M // 128, BLOCK_K // 32 * 128]))
     bs_buf = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
@@ -3311,6 +3380,7 @@ def mxgemm_tdm_pipelined(
     STATIC_SLOT_UNROLL: bool = False,
     OUTPUT_C_SLOTS: int | None = None,
     DYNAMIC_SCALES_FIRST: bool = True,
+    LDS_PARTITIONED_AB: int | None = None,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3341,6 +3411,11 @@ def mxgemm_tdm_pipelined(
     without static slot unroll read each operand's scale before its payload,
     so each quadrant waits only for its own LDS reads. The static loop keeps
     the payload-first order, which is faster there.
+
+    ``LDS_PARTITIONED_AB`` alternates A8W8 A/B row pieces of that height
+    between two physical 64 KiB LDS partitions, reducing partition conflicts
+    between the waves that read one operand subtile. ``None`` selects 64 rows
+    with ``STATIC_SLOT_UNROLL`` and off otherwise; 0 disables it.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3659,6 +3734,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["OUTPUT_C_SLOTS"] = OUTPUT_C_SLOTS
     if not DYNAMIC_SCALES_FIRST:
         persistent_options["DYNAMIC_SCALES_FIRST"] = False
+    if LDS_PARTITIONED_AB is not None:
+        persistent_options["LDS_PARTITIONED_AB"] = LDS_PARTITIONED_AB
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -3831,9 +3908,12 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
-                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
-                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False),
-            OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST", True))
+                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS",
+                                                      False), ASYNC_OUTPUT=cfg.get("ASYNC_OUTPUT", False),
+            STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
+                                       False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get(
+                                           "DYNAMIC_SCALES_FIRST",
+                                           True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -3923,6 +4003,10 @@ if __name__ == "__main__":
                         help="dedicated BK128 FP32 output staging slots (default: 2)")
     parser.add_argument("--static_slot_unroll", action="store_true",
                         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots")
+    parser.add_argument(
+        "--lds_partitioned_ab", type=int, default=None,
+        help="A8W8 A/B LDS partition piece height in rows, 0 to disable "
+        "(default: 64 with --static_slot_unroll, else 0)")
     parser.add_argument("--no_dynamic_scales_first", action="store_true",
                         help="read payloads before scales in the A8W8 K loop without static slot unroll")
     parser.add_argument("--streamed_operands", action="store_true",
@@ -4048,6 +4132,7 @@ if __name__ == "__main__":
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
         OUTPUT_C_SLOTS=args.output_c_slots,
         DYNAMIC_SCALES_FIRST=not args.no_dynamic_scales_first,
+        LDS_PARTITIONED_AB=args.lds_partitioned_ab,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
     )
