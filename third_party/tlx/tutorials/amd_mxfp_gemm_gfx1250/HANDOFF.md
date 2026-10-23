@@ -825,6 +825,156 @@ K ≤ 8192), and from K=16384 the 4x4 four-stage ring adds 4–5%. `bench.py`
 now defaults to 4x4 clusters with interval 8 for both variants, and to the
 four-stage A8W8 ring (two C slots, dynamic slots) for K ≥ 16384.
 
+### Bottlenecks after 4x4 clusters (`dc853dbc9d`)
+
+Hardware ATT of the committed `bench.py` defaults (one traced wave, CU 0,
+dispatch 1025 after warmup), analyzed with `att_phases.py` (in the archive
+below). Every executed instruction is assigned to its innermost loop
+(backward branches in `code.json`); the cycles until the next issue are
+charged to that instruction's class, so waits and barriers carry their
+stall time. "WMMA issue" is time charged to WMMAs and their dependency
+gaps; the WMMA floor is 512 cycles per K step. The earlier 2x2 trace is
+included for comparison.
+
+| | A8W8 8192³ 2x2 (old) | A8W8 8192³ | A8W8 16384³ (4-stage) | A8W4 8192³ | A8W4 16384³ |
+|---|---:|---:|---:|---:|---:|
+| Wave WMMA utilization | 0.47 | 0.50 | 0.52 | 0.61 | 0.65 |
+| Steady loop share of wave | 82% | 81% | 83% | 74% | 87% |
+| Steady step, mean (median) | 954 (934) | 884 (827) | 842 (807) | 687 (683) | 718 (685) |
+| … LDS reads: `ds_load` issue + `s_wait_dscnt` | 260 | 265 | 261 | 193 | 197 |
+| … workgroup barrier waits | 146 | 61 | 44 | 7 | 20 |
+| … cluster barrier waits | 32 | 58 | 56 (separate block) | 0 | 7 (separate block) |
+| … tensor (TDM) waits | 49 | 34 | 19 | 2 | 17 |
+| … scalar + vector ALU | 29 | 29 | 82 | 45 | 45 |
+| Tile loop outside the steady K loop | 14% | 14% | 11% | 25% | 12% |
+
+Per-step values are cycles per 64-WMMA step. 4x4 cut the late-input
+barrier waits from 146 to 61 cycles per step at 8192 cubed; the remaining
+input waits (workgroup + cluster barrier + TDM, ~150 cycles) now cost about
+half as much as LDS operand reads.
+
+1. **LDS operand reads (largest in-loop cost, both variants).** About 260
+   cycles per A8W8 step and 195 per A8W4 step go to issuing `ds_load_b128`
+   and waiting on them: 28-31% of A8W8 steady time and 27% of A8W4's. The
+   A8W8 count did not change with 4x4. AM had already shown −19% for a step
+   without LDS reads. Each wave reads 32 KB of operands per BK128 step.
+2. **Input arrival and cluster synchronization (A8W8).** ~150 cycles per
+   step at 8192 cubed (barrier waits behind late TDM data, plus the 16-CTA
+   cluster rendezvous every eight steps, which now costs more than with four
+   CTAs). In the four-stage dynamic loop at 16384 cubed the cluster block is
+   5.5% of the wave. A8W4 barely waits.
+3. **Tile transitions and K tail.** A8W8: 14% of the wave at 8192 cubed,
+   11% at 16384 cubed; A8W4: 25% at 8192 cubed (about 13k cycles per tile,
+   mostly `s_wait_tensorcnt` on C stores and next-tile loads, plus
+   `ds_store` of C), 12% at 16384 cubed.
+4. **Scalar overhead in the four-stage A8W8 loop.** 68 SALU cycles per step
+   (27 instructions) against 27 in the unrolled three-stage loop; the
+   dynamic slot loop carries slot and address arithmetic.
+
+L2 counters (rocprofv3, one warm dispatch, A8W8, bench defaults otherwise):
+
+| | 8192³ 2x2 | 8192³ 4x4 | 16384³ 2x2 | 16384³ 4x4 (4-stage) |
+|---|---:|---:|---:|---:|
+| GL2C_REQ | 17.5M | 9.4M | 136.6M | 70.4M |
+| GL2C_READ_SECTORS | 67.1M | 33.9M | 537M | 269M |
+| Hit rate | 89% | 84% | 82% | 71% |
+| GL2C_MISS | 1.92M | 1.54M | 24.7M | 20.5M |
+| GL2C_EA_RDREQ_DRAM | 7.4M | 4.3M | 160M | 131M |
+| GL2C_BUSY / GL2C_CYCLE | 68% | 64% | 94% | 93% |
+
+4x4 halves L2 requests and read sectors as predicted. At 8192 cubed the L2
+is busy 64% of the time; at 16384 cubed it stays busy 93% even with 4x4,
+and 29% of requests miss (L2 capacity, since each XCD's L2 holds a larger
+working set). `GL2C_BUSY` is not a throughput limit, though: the
+scales-in-VGPR experiment below ran 2.2x longer at 16384 cubed with only 7%
+more requests and still read 93% busy, so the counter tracks outstanding
+work. The miss rate is the more useful signal; L2 locality (XCD-aware
+ordering of 4x4 clusters, which currently requires `XCD_REMAP=none`) is the
+input-side lever left to test. SQ counters (`SQ_INSTS_LDS`, `SQ_WAIT_ANY`) read zero on this
+device and were not used.
+
+Archive: `/home/ibutygin/tlx/perf-data/mxfp-hw-prof-20261022.tar.gz` (SHA256 `50ce93e3e0adc630b71b09038598e852d41995a761ba95b423737e488c93c7c9`).
+
+**LDS read scheduling (2026-10-22): no gain, reverted. The loop is LDS
+bandwidth bound.** Experiments on the 4x4 defaults. All 8192-sized hardware
+outputs were bitwise identical; FFM passed for the riskiest variants. Patch
+and logs: `/home/ibutygin/tlx/perf-data/mxfp-hw-lds-20261022.tar.gz` (SHA256
+`5dac54f1af9ae0acb80fb29f7c023cc7015ed9bbec104bfaa0f492834db053f3`).
+
+- `STEP_LDS_INTERLEAVE=r`: `sched_group_barrier` groups of r LDS reads per
+  WMMA in the quadrants that read operands (c00, c01, and c11 when B moves
+  there), leaving the c10 barrier region free.
+- `STEP_B_AFTER_C10`: read the next stage's B during c11 instead of c10
+  (17 + 17 loads instead of a 34-load burst).
+- `FOUR_BUFFER_GROUPED=False`: drop the 1-WMMA:2-read grouping that the
+  four-stage loop uses by default.
+- Static slot unroll for the four-stage ring (no loop-carried operand
+  copies, loop-invariant slots).
+
+| Static A8W8 loop, 4x4 | 8192³ | 16384³ |
+|---|---:|---:|
+| LLVM schedule (base) | 0.15458 ms | 1.27905 ms |
+| r = 1 / 2 / 3 | +0.6 / +0.6 / +11.3% | −0.6 / +7.9 / +11.9% |
+| B after C10 | +0.5% | −1.9% |
+| r = 2 / 3 + B after C10 | +3.0 / +8.3% | +2.0 / +9.3% |
+| r = 2 in all four quadrants | +2.0% | +6.6% |
+
+| Four-stage A8W8 loop (16384³ / 32768³ default) | 16384³ | 32768³ |
+|---|---:|---:|
+| Grouped, dynamic slots (default) | 1.2140 ms | 9.879 ms |
+| Ungrouped | +1.1% | +0.2% |
+| Ungrouped + B after C10 | +0.4% | +0.7% |
+| Static unroll, grouped | +1.2% (8192³ −0.8%) | +0.7% |
+| Static unroll, ungrouped | +1.9% (8192³ +1.0%) | +0.5% |
+
+B after C10 in the three-stage dynamic loop (8192²×4096) was +0.7%. Pinned
+interleaves move loads behind WMMAs that still read the destination
+registers, so LLVM inserts `s_wait_alu depctr_va_vdst(0)` (a full WMMA drain)
+before them; LLVM's own front-loaded order avoids most of those.
+
+Why scheduling cannot help: per 64-WMMA step a CU's LDS takes the TDM writes
+plus the 2x2 wave reads. A8W8: 64 KB written + 128 KB read = 192 KB in
+884 (8192³) / 842 (16384³) cycles, 217-228 B/clk. A8W4 per 128 K: 48 + 96 =
+144 KB in 687 / 718 cycles, 200-210 B/clk. The two variants' step ratio
+(0.78) tracks their LDS byte ratio (0.75), and both sit at about the same
+LDS throughput, so the steady step is set by LDS bandwidth, not by latency
+or ordering. The 2x2 wave layout already minimizes reads for four waves
+(4x1 or 1x4 would read 160 KB). Further steady-loop gains need fewer LDS
+bytes per FLOP: for example one operand fed to VGPRs without an LDS round
+trip, or LDS-write/read reuse that four waves cannot provide today.
+
+**E8M0 scales through VGPRs (2026-10-23): much slower, reverted.** The
+static A8W8 step loaded its four 128-row scale subtiles per K step straight
+from the preshuffled global scale tensor into the WMMA scale registers
+(two `buffer_load_b32` per subtile per lane, D steps ahead in a register
+FIFO), keeping TDM scale loads to LDS for the K tail. The payload LDS reads
+then end with payload, so quadrant waits became partial without reordering.
+This needed a compiler fix: coalescing replaced the load's layout (whose
+warps replicate along one axis) with a blocked layout and converted both
+ways through LDS. `Coalesce.cpp` now keeps a user-pinned pointer layout
+(`tlx.require_layout` on the pointer tensor) for global loads and stores,
+like the existing pinned-store case (lit test in
+`test/TLX/user-register-layout.mlir`; uncommitted). Kernels were compiled
+locally with that fix and launched on the remote host from their code
+objects (`hw_ship.py`), since the remote Triton build lacks it.
+
+| | 8192³ | 16384³ | VGPRs / spills |
+|---|---:|---:|---:|
+| Scales via TDM + LDS (base) | 0.15432 ms | 1.28042 ms | 857 / 0 |
+| VGPR scales, 1 step ahead | +9.6% | +72.4% | 861 / 0 |
+| VGPR scales, 2 steps ahead | +227% | +226% | 878 / 31 |
+
+Outputs were bitwise identical (FFM and hardware). L2 requests rose only 7%
+(9.3M → 10.0M, 73.4M → 78.6M), so the loss is exposed global latency: one
+step (~800 cycles) of lead does not cover a load, especially at 16384 cubed
+where 28% of L2 requests miss, while TDM loads scales three stages ahead
+and multicasts them across the 4x4 cluster. Two steps ahead spills
+(register-bank pressure at 878 of 1024 VGPRs). The upside was small in any
+case: scales are about 6 KB (2 KB written, 4 KB read) of the 192 KB of LDS
+traffic per step. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-vgpr-20261023.tar.gz` (SHA256
+`44cf735f99f9152b82b4c9e72b305c66a04c6d0dc1be8561615ba59e8ec2ed3e`).
+
 Pre-existing post-rebase breakage found during validation (not fixed):
 
 - `SCHED_MODE_2=True` no longer compiles. The kernel calls
