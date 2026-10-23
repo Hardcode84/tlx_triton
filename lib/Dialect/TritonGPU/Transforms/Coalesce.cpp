@@ -29,6 +29,18 @@ namespace gpu {
 // destination layout will affect the shared memory load/store generated. So we
 // still want to allow vectorization for the src/destination layout up to
 // 16bytes.
+// Returns the concrete distributed layout of a pointer tensor whose layout the
+// user pinned (PinnedEncodingTrait, possibly under TLX wrappers), or null.
+static Attribute getPinnedPtrLayout(Value ptr) {
+  auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!ptrType || !containsPinnedEncoding(ptrType.getEncoding()))
+    return {};
+  Attribute concrete = triton::unwrapTlxWrappers(ptrType.getEncoding());
+  if (!isa_and_nonnull<DistributedEncodingTrait>(concrete))
+    return {};
+  return concrete;
+}
+
 static Attribute pickDescriptorLoadStoreLayout(int numWarps, int threadsPerWarp,
                                                RankedTensorType type) {
   auto shapePerCTA = triton::gpu::getShapePerCTA(type);
@@ -197,6 +209,11 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         }
         if (pinned) {
           layoutMap[curr] = pinned;
+        } else if (Attribute pinnedPtr = getPinnedPtrLayout(ptr)) {
+          // A user-pinned pointer layout (tlx.require_layout on the pointer
+          // tensor) fixes the access layout of a global load or store, e.g.
+          // to load straight into the register layout of a dot operand.
+          layoutMap[curr] = pinnedPtr;
         } else {
           auto tensorType = cast<RankedTensorType>(ptr.getType());
           CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());

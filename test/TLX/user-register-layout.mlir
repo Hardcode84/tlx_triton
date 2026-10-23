@@ -53,3 +53,30 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
     tt.return %required, %local : tensor<1024xf32, #blocked>, tensor<1024xf32, #blocked>
   }
 }
+
+// -----
+
+// A user-pinned *pointer* layout on a global load (tlx.require_layout on the
+// pointer tensor) fixes the access layout, e.g. to load E8M0 scales straight
+// into a dot operand's register layout whose warps replicate along one axis.
+// Coalescing must not replace it with a blocked layout and convert through
+// shared memory.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [32, 0]], block = []}>
+#user = #tlx.user_layout<#linear>
+
+// CHECK-DAG: #[[$LIN:.*]] = #ttg.linear<{register = {{\[\[}}0, 1], [0, 2], [64, 0]]
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @pinned_pointer_load
+  tt.func @pinned_pointer_load(%ptr: !tt.ptr<i8> {tt.divisibility = 16 : i32},
+                               %offs: tensor<128x4xi32, #blocked>) -> tensor<128x4xi8, #user> {
+    %ptrs = tt.splat %ptr : !tt.ptr<i8> -> tensor<128x4x!tt.ptr<i8>, #blocked>
+    %addr = tt.addptr %ptrs, %offs : tensor<128x4x!tt.ptr<i8>, #blocked>, tensor<128x4xi32, #blocked>
+    %pinned = tlx.require_layout %addr : tensor<128x4x!tt.ptr<i8>, #blocked> -> tensor<128x4x!tt.ptr<i8>, #user>
+    // CHECK: tt.load {{.*}} : tensor<128x4x!tt.ptr<i8>, #[[$LIN]]>
+    // CHECK-NOT: ttg.convert_layout {{.*}} -> tensor<128x4xi8, #blocked
+    %v = tt.load %pinned : tensor<128x4x!tt.ptr<i8>, #user>
+    tt.return %v : tensor<128x4xi8, #user>
+  }
+}
