@@ -109,8 +109,9 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Scales-first K loop (without static unroll) | On | — (BK256 path) |
 
 Common launch settings: group-M 8, 256 programs capped by tile count,
-16-workgroup multicast with a 4x4 cluster layout, and a cluster barrier
-every eight input K blocks. XCD remapping and SCHED_MODE[2] are disabled;
+16-workgroup multicast with a 4x4 cluster layout, a cluster barrier every
+eight input K blocks, and chunked XCD remapping of whole clusters (eight
+XCDs, chunk two). SCHED_MODE[2] is disabled;
 L2 prefetch distance is -1. Optional cluster rendezvous promotes multicast
 matching; it must not be confused with required LDS reuse synchronization.
 
@@ -130,15 +131,16 @@ hardware at 8192 cubed, its mean was 0.1875 ms against a median of
 drift up about 1% over 12 s under the power cap. Older single-batch `bench.py`
 numbers (about 0.19–0.20 ms at 8192 cubed) are therefore not comparable with
 warmed-up numbers. With the pinned codegen, the current defaults (4x4
-clusters) measured, against the previous 2x2 configuration in the same
-session (2026-10-22; ms, TFLOPS):
+clusters with chunked XCD remapping) measured on 2026-10-23, next to the
+4x4 defaults without remapping (same session) and the 2x2 configuration
+(2026-10-22 session); ms, TFLOPS:
 
-| Shape | MX8xMX8 | MX8xMX8 2x2 | MX8xMX4 | MX8xMX4 2x2 |
-|---|---:|---:|---:|---:|
-| 8192³ | 0.1559 (7051) | 0.1707 (6440) | 0.1287 (8541) | 0.1330 (8265) |
-| 8192²×4096 | 0.0849 (6478) | 0.0884 (6216) | 0.0733 (7500) | 0.0758 (7252) |
-| 16384³ | 1.2080 (7282) | 1.3805 (6372) | 0.9742 (9029) | 1.0230 (8598) |
-| 32768³ | 9.7577 (7212) | 11.2131 (6276) | 7.7148 (9121) | 8.1754 (8607) |
+| Shape | MX8xMX8 | no remap | 2x2 | MX8xMX4 | no remap | 2x2 |
+|---|---:|---:|---:|---:|---:|---:|
+| 8192³ | 0.1530 (7185) | 0.1563 | 0.1707 | 0.1276 (8619) | 0.1286 | 0.1330 |
+| 8192²×4096 | 0.0848 (6483) | 0.0849 | 0.0884 | 0.0733 (7504) | 0.0738 | 0.0758 |
+| 16384³ | 1.1789 (7461) | 1.2105 | 1.3805 | 0.9566 (9195) | 0.9749 | 1.0230 |
+| 32768³ | 9.4373 (7456) | 9.7822 | 11.2131 | 7.5451 (9326) | 7.7185 | 8.1754 |
 
 ## Latest controlled hardware comparison
 
@@ -974,6 +976,125 @@ case: scales are about 6 KB (2 KB written, 4 KB read) of the 192 KB of LDS
 traffic per step. Archive:
 `/home/ibutygin/tlx/perf-data/mxfp-hw-vgpr-20261023.tar.gz` (SHA256
 `44cf735f99f9152b82b4c9e72b305c66a04c6d0dc1be8561615ba59e8ec2ed3e`).
+
+**Related work in other branches and `../TDM.md` (surveyed 2026-10-23).**
+Remote refs as last fetched: `upstream` and `int` (AMD internal
+triton-mi450) on 2026-10-23, `my` up to 2026-10-22. SSH fetches from this
+host fail (publickey), so newer work may exist.
+
+`/home/ibutygin/tlx/TDM.md` (single-CTA microbenchmarks of the same
+BM=BN=256, BK=128 slot, 66 KiB with scales):
+
+- Warm repeated fill 370 ns (183 GB/s per CTA); warm single fill 440 ns;
+  cold 840 ns. An L2 prefetch issued 320 ns ahead restores warm fill time
+  on an idle device.
+- Full-grid TDM streaming 17.5-18.4 TB/s, about 95% of the BabelStream HBM
+  read reference (19.3 TB/s).
+- Our steady step takes in 66 KiB of LDS per CU in about 420-460 ns
+  (145-157 GB/s), close to the warm single-CTA fill rate. This agrees with
+  the LDS-bound analysis above. Its GEMM-with-prefetch attempt was also
+  about 10% slower, as were our L2 prefetch experiments.
+
+Kernel-relevant work not in this branch (it shares only a 2025-08 merge
+base with `upstream/main`):
+
+- **Clustered warp-pipeline GEMM in Gluon**
+  (`third_party/amd/python/examples/gluon/gemm_warp_pipeline_cdna5.py`,
+  upstream #12073, also on `int/shared/gfx1250`). The closest design to
+  ours: 4x4 (or 2x2) CTA clusters with TDM multicast, but eight waves per
+  CTA in a warp pipeline. MXFP8 uses BK256 with 256x256 CTA tiles (two
+  data, three scale slots) or BK512 with 64/128 tiles, a five-stage
+  pipeline and six-tile unroll; optional two-buffer output epilogue and a
+  fully unrolled `--flat-pipeline`. No performance numbers are recorded.
+  With eight waves on a 256x256 tile each operand is read from LDS more
+  often than with our 2x2 four-wave layout, so it must win on latency
+  hiding. Benchmark it against our 7050 TFLOPS (8192 cubed); this needs a
+  Triton build from `int/shared/gfx1250` or upstream.
+- **Gluon MXFP GEMM** (`mxfp_gemm_cdna5.py`; multi-CTA #12119, CTA-local
+  slicing #12143). Clusters come from a CGA layout on the cluster tile
+  rather than per-CTA masks. It has a sliceMNK variant that splits A and B
+  into two TDM loads each, and an option to load scales with async copies
+  instead of TDM.
+- **GL2 residency hints** (`int/danherna/gfx1250-cache-residency`):
+  `eviction_policy="evict_last"` on TDM load, store, fused-load and
+  prefetch, buffer ops and async copies. It only helps with persisting L2
+  ways reserved via
+  `hipDeviceSetLimit(hipLimitPersistingL2CacheSize, bytes)`. Relevant to the
+  28% L2 miss rate at 16384 cubed: FP32 C stores (1 GiB at 16384 cubed) may
+  evict reused A/B, so try streaming C stores or residency hints on A/B.
+- **Newer AMD codegen**: upstream #12471 builds it at LLVM `05e432a8`
+  (llvm/llvm-project); we pin `d26ff26e`. No `05e432a8` build exists
+  locally or on the remote host.
+- **Barrier placement**: upstream #12342 always inserts a workgroup barrier
+  before a cluster barrier; #12423 schedules async-wait barriers before
+  potential global-memory waits. Check against our cluster rendezvous
+  sequence after a rebase.
+- Smaller items: `int/saananth/fused-tdm-offsets-api` exposes counted
+  instruction-group scheduling hints and an LDS-DMA group mask in Gluon;
+  `int/qian/lds-prefetch-dot-scaled` adds LDS prefetch for scaled dot to
+  the compiler pipeliner (not Gluon); `int/qian/mxfp_gemm_slice` documents
+  that slicing only helps by avoiding register spills and is neutral at
+  matched pipeline depth (fp16 x fp8); upstream #12315 adds native fp4/e8m0
+  types. `my/*` branches carry TLX work (cluster launches, WMMA queuing
+  option, automatic wave specialization, grouped-GEMM API), no Gluon.
+
+**Cache hints on C stores (2026-10-23): no effect.** `tlx.async_amd_descriptor_store`
+gained `cache_modifier=` (passed to `amdgpu.async_tdm_copy_local_to_global`,
+whose lowering already mapped it to gfx1250 cache-policy bits; TLX builder
+binding updated, uncommitted). A temporary `C_STORE_CACHE` kernel constexpr
+applied it to every staged C store. `.cs` emits `tensor_store_from_lds ...
+th:TH_STORE_NT`; `.wt` emits `th:TH_STORE_BYPASS scope:SCOPE_SYS`. Kernels
+were compiled locally and launched remotely (`hw_ship.py`). Bench defaults;
+outputs bitwise identical at 8192 cubed:
+
+| A8W8 | 8192³ | 16384³ | 32768³ | GL2C_MISS 8192³ / 16384³ |
+|---|---:|---:|---:|---:|
+| No hint | 0.15649 ms | 1.21488 ms | 9.85818 ms | 1.54M / 20.49M |
+| `.cs` (non-temporal) | +0.09% | +0.01% | +0.04% | 1.54M / 20.48M |
+| `.wt` (bypass, system scope) | +0.03% | +0.03% | +0.11% | 1.55M / 20.48M |
+
+Even bypassing the cache for the 1 GiB FP32 output at 16384 cubed leaves
+L2 misses and DRAM read requests unchanged, so the 28% miss rate is not C
+stores evicting A/B; it comes from the input working set itself (L2
+capacity and ordering). Residency hints on A/B, XCD-aware cluster ordering,
+or larger reuse windows are the remaining levers there. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-cstore-20261023.tar.gz` (SHA256
+`b6637349816479000e2a5715bfd1fecce541c2a73b23aedefcdcbf059a32361e`).
+
+**XCD remapping of 4x4 clusters (2026-10-23): adopted.** Grid layouts now
+accept the persistent XCD remaps; `_mxgemm_cluster_program_id` applies them
+to whole clusters (any bijection on cluster ids keeps multicast partners
+together). With 256 programs there are 16 clusters per wave of tiles, and
+`chunked` (eight XCDs, chunk two) and `balanced` give the same permutation.
+FFM tile-coverage tests pass for every grid layout with 16 clusters and the
+chunked remap; all 8192-sized hardware outputs were bitwise identical.
+
+A diagnostic probe could not read the XCD: on gfx1250 the assembler rejects
+`HW_REG_XCC_ID`, `HW_REG_HW_ID1` only carries WGP/SA bits (17 distinct
+values, SE bits zero), and `HW_REG_HW_ID2` and `ttmp8` are constant across
+programs. The results fit clusters dispatched round-robin (XCD = cluster %
+8): without remapping each XCD's two clusters share A rows and need two B
+column blocks; chunked remapping gives them the same B column block, and
+successive persistent waves on an XCD keep the same A row pair.
+
+`hw_ab.py`, A8W8 bench defaults (four-stage ring from K=16384):
+
+| Variant | 8192³ | 16384³ | 32768³ |
+|---|---:|---:|---:|
+| No remap | 0.15636 ms | 1.21584 ms | 9.87164 ms |
+| Chunked, 8 XCDs x 2 | −1.75% | −2.72% | −3.44% |
+| Chunked, 4 XCDs x 4 | +3.50% | +3.42% | +1.57% |
+| `GROUP_SIZE_M=4` | −1.78% | +0.61% | +0.10% |
+| `GROUP_SIZE_M=4` + chunked 8x2 | +3.40% | +0.77% | +0.28% |
+
+`GROUP_SIZE_M=4` matches the chunked remap at 8192 cubed (where it also
+puts B-sharing clusters on one XCD) but not at larger N. `bench.py`, two
+alternating rounds per configuration, chunked vs none: MX8xMX8 −2.0%
+(8192³), −0.4% (8192²×4096), −2.6% (16384³), −3.6% (32768³); MX8xMX4
+−0.8%, −0.6%, −1.8%, −2.1%. `bench.py` now defaults to `--xcd-remap
+chunked` for 4x4 clusters. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-hw-xcd-20261023.tar.gz` (SHA256
+`3583b8e0113f0329ac799b15975516664e73ab9665f6c5d02e431ccaaf42e4c4`).
 
 Pre-existing post-rebase breakage found during validation (not fixed):
 

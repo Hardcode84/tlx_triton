@@ -8,7 +8,8 @@ disabled by default. Use --variant mx8xmx4
 --cross-tile-prefetch to start refilling each A/B stage as its C slot retires.
 Use --compact-k-tail to test one loop body for A8W4's final three K256 stages.
 It selects MX8xMX4 and can be combined with --cross-tile-prefetch.
-Both use 256 persistent programs, group-M 8, no XCD remapping, and 16-workgroup
+Both use 256 persistent programs, group-M 8, chunked XCD remapping of whole
+clusters (8 XCDs, chunk 2), and 16-workgroup
 multicast in a 4x4 tile layout (each A and B tile shared by four workgroups),
 with a cluster barrier every eight input K blocks. MX8xMX8 uses a four-stage
 input ring with two C slots for K >= 16384, and three stages otherwise.
@@ -420,8 +421,10 @@ def parse_benchmark_args(argv=None):
         help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
     parser.add_argument("--num-programs", type=int, default=256,
                         help="persistent program count, capped by tile count (default: 256)")
-    parser.add_argument("--xcd-remap", choices=("none", "balanced", "chunked"), default="none",
-                        help="persistent program remapping (default: none)")
+    parser.add_argument(
+        "--xcd-remap", choices=("none", "balanced", "chunked"), default=None,
+        help="persistent program remapping (default: chunked for 4x4 clusters, which remaps whole "
+        "clusters; none otherwise)")
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--xcd-chunk", type=int, default=2)
     parser.add_argument(
@@ -479,6 +482,10 @@ def parse_benchmark_args(argv=None):
         args.cluster_layout = ("linear" if args.streamed_operands else default_layouts.get(args.cluster_size, "linear"))
     if args.cluster_barrier_interval is None:
         args.cluster_barrier_interval = 8 if args.cluster_layout == "4x4" else 4
+    if args.xcd_remap is None:
+        # Chunked remapping of whole 4x4 clusters places clusters that share a B
+        # column block on the same XCD (-1.8% at 8192^3, -3.4% at 32768^3).
+        args.xcd_remap = "chunked" if args.cluster_layout == "4x4" else "none"
 
     dims = (args.M, args.N, args.K)
     if any(dim is not None for dim in dims):
@@ -525,13 +532,13 @@ def parse_benchmark_args(argv=None):
                          "without --streamed-operands")
         if args.group_m % rows:
             parser.error(f"--cluster-layout {args.cluster_layout} requires --group-m divisible by {rows}")
-        if args.cluster_layout != "2x2" and args.xcd_remap != "none":
-            parser.error(f"--cluster-layout {args.cluster_layout} requires --xcd-remap none")
     if not args.persistent and (args.xcd_remap != "none" or args.cluster_size > 1):
         parser.error("XCD remapping and clustering require --persistent")
     if args.cluster_size > 1:
-        if args.xcd_remap != "none" and (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2):
-            parser.error("clustering requires --xcd-remap none or chunked with --num-xcds 8 --xcd-chunk 2")
+        if (args.xcd_remap != "none" and args.cluster_layout in ("linear", "2x2")
+                and (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2)):
+            parser.error("linear and 2x2 clusters require --xcd-remap none or chunked with --num-xcds 8 "
+                         "--xcd-chunk 2")
         if args.group_m not in (4, 8) or args.tdm_fusion == "none":
             parser.error("clustering requires --group-m 4 or 8 and partial, 2way, or 4way TDM fusion")
     if args.output_staging and not (args.warp_pipeline or args.operand_pipeline):

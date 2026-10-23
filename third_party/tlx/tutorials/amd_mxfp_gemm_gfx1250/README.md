@@ -35,7 +35,8 @@ default and reuses the A ring for output. The summary and CSV identify each
 variant and its configuration.
 
 Both variants default to 256 persistent programs (capped by tile count),
-group-M 8, no XCD remapping, and 16-workgroup multicast in a 4x4 tile layout
+group-M 8, chunked XCD remapping of whole clusters (eight XCDs, chunk two;
+2-4% faster at 16384 and 32768 cubed), and 16-workgroup multicast in a 4x4 tile layout
 with a cluster barrier every eight input K blocks: each A tile is shared by
 the four workgroups of its cluster row and each B tile by the four of its
 column, halving the unique input each CU loads per K step compared with the
@@ -440,8 +441,8 @@ Use `--cluster-size 2|4|8|16` with `--xcd-remap none|chunked` to multicast
 inputs across independent workgroups. The benchmark defaults to cluster size
 16 with `--cluster-layout 4x4`; use `--cluster-size 1` to disable clustering.
 Grid layouts `RxC` (`2x2`, `4x2`, `2x4`, `4x4`, `8x2`, `2x8`) place R M tiles by
-C N tiles in a cluster of R*C workgroups and require no XCD remapping (except
-`2x2`), a group-M divisible by R, and N tiles divisible by C. Data and their
+C N tiles in a cluster of R*C workgroups and require a group-M divisible by R
+and N tiles divisible by C. XCD remapping permutes whole clusters. Data and their
 E8M0 scales use the same recipient masks. Without remapping, a cluster shares
 B and its scales across consecutive M tiles, for either `--group-m 4` or
 `--group-m 8`. With chunked remapping, a two-workgroup cluster shares B and

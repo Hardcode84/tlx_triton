@@ -2106,7 +2106,6 @@ def mxgemm_tdm_persistent_kernel(
                      or (_mxgemm_grid_rows(CLUSTER_LAYOUT) > 1
                          and _mxgemm_grid_rows(CLUSTER_LAYOUT) * _mxgemm_grid_cols(CLUSTER_LAYOUT) == CLUSTER_SIZE))
     tl.static_assert(CLUSTER_LAYOUT == "linear" or GROUP_SIZE_M % _mxgemm_grid_rows(CLUSTER_LAYOUT) == 0)
-    tl.static_assert(CLUSTER_LAYOUT == "linear" or CLUSTER_LAYOUT == "2x2" or XCD_REMAP_MODE == 0)
     if SPLIT_CLUSTER_BARRIER or EARLY_C_STORES:
         tl.static_assert(OUTPUT_STAGING and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 3)
         tl.static_assert(tlx.num_warps() == 4 and DTYPE_A == "e4m3" and WITH_A_SCALE)
@@ -2117,7 +2116,10 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert(CLUSTER_SIZE > 1 and CLUSTER_BARRIER_INTERVAL > 0)
         tl.static_assert(not OUTPUT_TAIL_REUSE or HANDOFF_SCHEDULE == "ab-reuse")
     if CLUSTER_SIZE > 1:
-        tl.static_assert(XCD_REMAP_MODE == 0 or (XCD_REMAP_MODE == 2 and NUM_XCDS == 8 and XCD_CHUNK == 2))
+        # Grid layouts remap whole clusters (any bijection keeps multicast
+        # partners together); the 2x2/linear masks assume the chunked 8x2 remap.
+        tl.static_assert(XCD_REMAP_MODE == 0 or (XCD_REMAP_MODE == 2 and NUM_XCDS == 8 and XCD_CHUNK == 2)
+                         or (CLUSTER_LAYOUT != "linear" and CLUSTER_LAYOUT != "2x2"))
         tl.static_assert(GROUP_SIZE_M == 4 or GROUP_SIZE_M == 8)
         tl.static_assert(NUM_PROGRAMS % 16 == 0)
     DA: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
@@ -3206,14 +3208,13 @@ def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_
     grid_rows, grid_cols = _MXGEMM_GRID_LAYOUTS.get(cluster_layout, (1, 1))
     if cluster_layout != "linear" and grid_rows * grid_cols != cluster_size:
         raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires CLUSTER_SIZE={grid_rows * grid_cols}")
-    if cluster_layout not in ("linear", "2x2") and xcd_remap != "none":
-        raise ValueError(f"CLUSTER_LAYOUT={cluster_layout} requires XCD_REMAP=none")
     if not persistent and (xcd_remap != "none" or cluster_size > 1):
         raise ValueError("XCD remapping and clustering require persistence")
     if cluster_size == 1:
         return
-    if xcd_remap != "none" and (xcd_remap, num_xcds, xcd_chunk) != ("chunked", 8, 2):
-        raise ValueError("clustering requires XCD_REMAP=none or chunked with NUM_XCDS=8 and XCD_CHUNK=2")
+    if (xcd_remap != "none" and cluster_layout in ("linear", "2x2")
+            and (xcd_remap, num_xcds, xcd_chunk) != ("chunked", 8, 2)):
+        raise ValueError("linear and 2x2 clusters require XCD_REMAP=none or chunked with NUM_XCDS=8 and XCD_CHUNK=2")
     if group_m not in (4, 8) or M % (group_m * block_m) or N % (max(2, grid_cols) * block_n):
         raise ValueError("clustering requires GROUP_SIZE_M=4 or 8, full M groups, and an even number of N tiles "
                          "(a multiple of the cluster columns for grid layouts)")

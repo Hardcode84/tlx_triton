@@ -963,15 +963,17 @@ def test_mxgemm_cluster_2x2_tile_coverage(num_m, num_n, programs, group_m, remap
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4", "8x2", "2x8"])
-@pytest.mark.parametrize("num_m,num_n,programs", [(16, 16, 32), (8, 16, 64), (16, 8, 128)])
-def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs):
+@pytest.mark.parametrize("num_m,num_n,programs", [(16, 16, 32), (8, 16, 64), (16, 8, 128), (16, 16, 256)])
+@pytest.mark.parametrize("remap", [0, 2])
+def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap):
     # Every tile is covered once, and rank r of each R x C cluster covers M
     # tile r % R and N tile r // R of one aligned block, matching the A
-    # (equal r % R) and B (equal r // R) multicast masks.
+    # (equal r % R) and B (equal r // R) multicast masks. Chunked XCD remapping
+    # permutes whole clusters (eight XCDs, chunk two).
     rows_per, cols_per = map(int, layout.split("x"))
     size = rows_per * cols_per
     output = torch.empty(num_m * num_n, dtype=torch.int32, device="cuda")
-    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, 8, 0, layout, num_warps=4,
+    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, 8, remap, layout, num_warps=4,
                                          ctas_per_cga=(size, 1, 1))
     ids = output.cpu().reshape(-1, size)
     torch.testing.assert_close(ids.flatten().sort().values, torch.arange(num_m * num_n, dtype=torch.int32))
@@ -995,8 +997,8 @@ def test_mxgemm_bench_cluster_and_output_options():
         assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
 
-    # Defaults: 4x4 clusters with an eight-block barrier interval for both
-    # variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
+    # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
+    # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     for variant, dtype_b, args in variants:
         for shape in shapes:
@@ -1004,6 +1006,7 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--cluster_layout") + 1] == "4x4"
             assert cmd[cmd.index("--cluster_size") + 1] == "16"
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
+            assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
             four_stage = variant == "mx8xmx8" and shape[2] >= 16384
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
             assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)

@@ -517,6 +517,9 @@ def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
     del application[slots:slots + 2]
     application[application.index("--cluster_size") + 1] = "4"
     application[application.index("--cluster_barrier_interval") + 1] = "4"
+    # 4x4 clusters remap whole clusters across XCDs; streamed operands do not.
+    assert application[application.index("--xcd_remap") + 1] == "chunked"
+    application[application.index("--xcd_remap") + 1] = "none"
     assert streamed["application"] == application[:application.index("--num_programs")] + [
         "--streamed_operands"
     ] + application[application.index("--num_programs"):]
