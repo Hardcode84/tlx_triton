@@ -2552,6 +2552,62 @@ patches, ship, ATT, scheduler and liveness reports, hardware log):
 `/home/ibutygin/tlx/perf-data/mxfp-scale-wave-split-20261024.tar.gz`
 (SHA256 `0f61cf23146f430bb28bf8c4fa3fce88566583ea6e16dbfdf28980fa3b607efa`).
 
+#### FP16 output (`OUT_DTYPE="fp16"`, 2026-10-24): kept as an option
+
+**Kernel.** C's element type follows `c_ptr`:
+
+- `_mxgemm_persistent_store` converts the pinned FP32 accumulators in
+  registers (`v_cvt_pk_f16_f32`, round to nearest even) before staging or
+  direct stores; non-persistent direct stores convert too;
+- dedicated staging slots use C's type, so a 64x128 FP16 chunk is 16 KiB;
+- the four-buffer default chunk is 16 KiB of columns (64 FP32, 128 FP16);
+- a static assert rejects non-FP32 C for output schedules that reinterpret
+  A/B input stages as FP32 C buffers (BK256 output reuse, i.e. the MX8xMX4
+  default; register pipeline; output-tail reuse; `ab-reuse`).
+
+**Launcher, CLI and bench.** `mxgemm_tdm_pipelined(OUT_DTYPE=...)`,
+`matmul(config={"OUT_DTYPE": ...})`, the CLI's `--out_dtype`, and
+`bench.py --out-dtype` (which rejects the MX8xMX4 BK256 default). FP32 code
+is unchanged: the 8192³ and 16384³ FP32 assembly is identical.
+
+FP16 codegen at 8192³:
+
+- the steady loop keeps its WMMA overlap around the rendezvous and is 24
+  instructions shorter;
+- 104 SGPRs; 913 VGPRs (conversion temporaries), no spills;
+- 128 instead of 256 `ds_store_b128`, 256 `v_cvt_pk_f16_f32`;
+- LDS 267,432 instead of 316,584 bytes with three slots.
+
+**Correctness.**
+
+- New `test_mxgemm_fp16_output_ring_phase`: static (6 and 3 slots),
+  dynamic (6 slots), four buffers, and direct stores, clusters 1 and 4,
+  checked against the FP32 reference with rtol 1e-3. Passes under FFM,
+  together with sampled FP32 ring-phase tests (29 passed).
+- `test_mxgemm_fp16_output_rejects_input_stage_reuse` passes (CPU-only).
+- Hardware: every FP16 output equals the FP32 kernel's output rounded with
+  `.half()`, bit for bit (8192³ and 8192²×4096).
+
+**Hardware sustained timing** (`hw_power2.py`, four rounds, change against
+FP32 output in the same run):
+
+| Shape | FP32 | FP16, 3 slots | FP16, 4 slots | FP16, 6 slots |
+| --- | ---: | ---: | ---: | ---: |
+| 8192³ | 0.15033 ms | −3.17% | −4.12% | **−4.44%** (0.14366 ms, 7,654 TFLOPS) |
+| 8192²×4096 | 0.08360 ms | −5.60% | −6.40% | **−6.73%** (0.07798 ms) |
+
+| 16384³, four buffers | FP32 | FP16, 2 × 64x64 | FP16, 2 × 64x128 | FP16, 3 × 64x64 |
+| --- | ---: | ---: | ---: | ---: |
+| Sustained | 1.17928 ms | +1.35% | **−3.72%** (1.13544 ms) | −0.77% |
+
+Energy per launch drops by the same fractions (all runs at the power
+cap). `bench.py` therefore uses six FP16 C slots for the three-buffer ring,
+and the kernel's four-buffer default is two 64x128 FP16 slots. MX8xMX4 FP16
+output would need the A-reuse C layout rebuilt for 2-byte elements (A's
+69,632-byte slot stride); not done. Archive (ships, harness, logs):
+`/home/ibutygin/tlx/perf-data/mxfp-fp16-output-20261024.tar.gz` (SHA256
+`d0f296f9d42f78a4c5b2833ceab8ec480113ea298c751f54f554aa6d8bb0262b`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

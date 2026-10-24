@@ -692,7 +692,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
                                       SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
                                       WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False):
+                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32"):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -714,20 +714,24 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         a.cuda(),
         b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
-        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
-                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
-                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
-                    OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
-                    STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
-                    HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION,
-                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
-                    EARLY_C_STORES=EARLY_C_STORES, WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF,
-                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL))
-    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
+            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
+            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
+            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
+            WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF, STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL,
+            OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL, OUT_DTYPE=OUT_DTYPE))
+    if OUT_DTYPE == "fp32":
+        torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
+    else:
+        # FP32 accumulation rounded once to FP16 (relative step 2**-11).
+        assert out.dtype == torch.float16
+        torch.testing.assert_close(out.cpu().float(), ref, atol=2e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -768,6 +772,35 @@ def test_mxgemm_overlap_peel_ring_phase(schedule, k_iters, cluster_size):
                                       cluster_size, False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
                                       STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=None if four else 3,
                                       OVERLAP_PEEL=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("schedule,slots,k_iters",
+                         [("static", 6, k) for k in (4, 5, 9)] + [("static", 3, 5)] + [("dynamic", 6, k)
+                                                                                       for k in (4, 5, 6)] +
+                         [("4buf", None, k) for k in (5, 7)] + [("direct", None, k) for k in (3, 5)])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_fp16_output_ring_phase(schedule, slots, k_iters, cluster_size):
+    # FP16 C halves the dedicated staging slots. Cover the overlapped epilogue
+    # with six (default) or three 64x128 slots on static and dynamic K loops,
+    # two default 64x128 slots with four buffers, and unstaged direct stores,
+    # across ring phases, uneven tile counts, and multicast clusters.
+    four = schedule == "4buf"
+    staged = schedule != "direct"
+    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, staged, 4, False, False,
+                                      cluster_size, False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=slots,
+                                      OVERLAP_PEEL=staged, OUT_DTYPE="fp16")
+
+
+def test_mxgemm_fp16_output_rejects_input_stage_reuse():
+    # BK256 output staging reuses A input stages as FP32 C buffers.
+    a = torch.zeros((256, 256), dtype=torch.uint8)
+    b = torch.zeros((256, 128), dtype=torch.uint8)  # packed FP4, [N, K / 2]
+    with pytest.raises(ValueError, match="OUT_DTYPE"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, a, a, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True,
+                                           NUM_BUFFERS=3, DTYPE_A="e4m3", DTYPE_B="e2m1", PERSISTENT=True,
+                                           OUTPUT_STAGING=True, OUT_DTYPE="fp16")
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

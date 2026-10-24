@@ -87,6 +87,17 @@ three-buffer MX8xMX8, which keeps more C stores in flight at each tile
 transition: 1.5% faster at 8192 cubed and 1.8% faster at K=4096 on hardware.
 See [HANDOFF.md](HANDOFF.md#hardware-ab).
 
+`--out-dtype fp16` (`OUT_DTYPE="fp16"`) writes FP16 C: the FP32 accumulators
+are rounded once (round to nearest even) in registers before staging, which
+halves C's LDS, TDM, and memory traffic. Dedicated staging slots and direct
+stores support it; output schedules that reuse A/B input stages as FP32 C
+buffers (the MX8xMX4 BK256 default, register pipeline, output-tail reuse,
+`ab-reuse` handoff) and the warp, operand, and streamed pipelines reject it.
+With FP16, `bench.py` uses six 64x128 C slots for three-buffer MX8xMX8, and
+the four-buffer ring defaults to two 64x128 slots. On hardware against FP32
+output: 8192^3 -4.4%, 8192^2x4096 -6.7%, 16384^3 -3.7%. See
+[HANDOFF.md](HANDOFF.md).
+
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash

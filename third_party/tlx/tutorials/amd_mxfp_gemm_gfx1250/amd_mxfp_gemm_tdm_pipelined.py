@@ -1292,7 +1292,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                       instr_shape=STORE_INSTR_SHAPE)
         c_mask_store = tlx.require_amd_wmma_layout(c_mask, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
                                                    instr_shape=STORE_INSTR_SHAPE)
-        tlx.buffer_store(acc, c_ptr, c_offsets_store, mask=c_mask_store)
+        tlx.buffer_store(acc.to(tlx.dtype_of(c_ptr)), c_ptr, c_offsets_store, mask=c_mask_store)
     else:
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for i in tl.range(0, K_ITERS):
@@ -1323,7 +1323,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                       instr_shape=STORE_INSTR_SHAPE)
         c_mask_store = tlx.require_amd_wmma_layout(c_mask, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
                                                    instr_shape=STORE_INSTR_SHAPE)
-        tlx.buffer_store(acc, c_ptr, c_offsets_store, mask=c_mask_store)
+        tlx.buffer_store(acc.to(tlx.dtype_of(c_ptr)), c_ptr, c_offsets_store, mask=c_mask_store)
 
 
 DTYPE_TO_TRITON = {
@@ -1846,6 +1846,8 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
     WARP_BASES: tl.constexpr = ((0, 2), (0, 4), (2, 0)) if tlx.num_warps() == 8 else ((0, 2), (2, 0))
     acc = tlx.require_amd_wmma_layout(acc, warp_bases=WARP_BASES, reg_bases=((0, 1), (1, 0)),
                                       instr_shape=(INSTR_M, 16, 128))
+    # Narrow outputs convert in registers; staging and stores use C's type.
+    acc = acc.to(tlx.dtype_of(c_ptr))
     base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
     if c_buf is not None:
         tl.static_assert(BM == 128 and BN == 128 and INSTR_M == 16)
@@ -2227,6 +2229,11 @@ def mxgemm_tdm_persistent_kernel(
     tl.static_assert(HANDOFF_SCHEDULE == "current" or HANDOFF_SCHEDULE == "b-prefetch"
                      or HANDOFF_SCHEDULE == "staggered" or HANDOFF_SCHEDULE == "ab-reuse")
     AB_C_REUSE: tl.constexpr = HANDOFF_SCHEDULE == "ab-reuse"
+    # Output schedules that reinterpret A/B input stages as FP32 C buffers
+    # keep FP32 output; dedicated staging and direct stores use C's type.
+    tl.static_assert(
+        tlx.dtype_of(c_ptr) == tl.float32 or not (OUTPUT_REUSE or OUTPUT_TAIL_REUSE or REGISTER_PIPELINE or AB_C_REUSE),
+        "non-FP32 output requires dedicated C staging slots or direct stores")
     tl.static_assert(HANDOFF_TDM_FUSION == "partial" or HANDOFF_TDM_FUSION == "4way")
     tl.static_assert(HANDOFF_TDM_FUSION == "partial" or AB_C_REUSE)
     HANDOFF_LOADS: tl.constexpr = 1 if HANDOFF_TDM_FUSION == "4way" else 2
@@ -2320,8 +2327,11 @@ def mxgemm_tdm_persistent_kernel(
                              layout=_scale_shared_layout([BLOCK_M // 128, BLOCK_K // 32 * 128]))
     bs_buf = tlx.local_alloc((BLOCK_N // 128, BLOCK_K // 32 * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
                              layout=_scale_shared_layout([BLOCK_N // 128, BLOCK_K // 32 * 128]))
-    # Two 64x64 output slots leave room for a fourth BK128 input stage.
-    C_COLS: tl.constexpr = OUTPUT_C_COLS if OUTPUT_C_COLS is not None else (64 if NUM_BUFFERS == 4 else BLOCK_N // 2)
+    # Two 16 KiB output slots (64x64 FP32 or 64x128 FP16) leave room for a
+    # fourth BK128 input stage.
+    C_COLS: tl.constexpr = OUTPUT_C_COLS if OUTPUT_C_COLS is not None else ((256 //
+                                                                             tlx.dtype_of(c_ptr).primitive_bitwidth *
+                                                                             8) if NUM_BUFFERS == 4 else BLOCK_N // 2)
     C_ROWS: tl.constexpr = 128 if OUTPUT_REUSE else 64
     # Dedicated staging defaults to two slots; OUTPUT_C_SLOTS/OUTPUT_C_COLS
     # (None selects the default) let output stores overlap more deeply.
@@ -2353,7 +2363,7 @@ def mxgemm_tdm_persistent_kernel(
             # Without overlap, all C transfers drain before reloading A.
             c_buf = tlx.local_alloc((128, BLOCK_N // 2), tl.float32, NUM_BUFFERS, reuse=a_buf)
     else:
-        c_buf = tlx.local_alloc((C_ROWS, C_COLS), tl.float32, C_SLOTS) if OUTPUT_STAGING else None
+        c_buf = tlx.local_alloc((C_ROWS, C_COLS), tlx.dtype_of(c_ptr), C_SLOTS) if OUTPUT_STAGING else None
     num_m, num_n = M // BLOCK_M, N // BLOCK_N
     total_tiles = num_m * num_n
     k_iters = K // BLOCK_K
@@ -3454,6 +3464,9 @@ def _mxfp_timed_batches(batch: Callable[[], float], warmup_seconds: float, durat
     return statistics.median(samples), len(samples)
 
 
+_OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
+
+
 def mxgemm_tdm_pipelined(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3511,8 +3524,17 @@ def mxgemm_tdm_pipelined(
     DYNAMIC_SCALES_FIRST: bool = True,
     LDS_PARTITIONED_AB: int | None = None,
     OVERLAP_PEEL: bool = False,
+    OUT_DTYPE: str = "fp32",
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
+
+    ``OUT_DTYPE`` selects the C element type, ``"fp32"`` (default) or
+    ``"fp16"``. Accumulation stays FP32; FP16 output converts in registers
+    before staging, which halves C's LDS, TDM, and memory traffic. FP16
+    requires dedicated C staging slots or direct stores: it rejects output
+    schedules that reuse A/B input stages as FP32 C buffers (BK256 staging,
+    register pipeline, output-tail reuse, ab-reuse handoff) and the separate
+    warp, operand, and streamed pipeline kernels.
 
     ``BENCHMARK`` also accepts a callback receiving the allocation-free launch
     function. The hardware trace collector uses it for controlled warmup and
@@ -3675,6 +3697,14 @@ def mxgemm_tdm_pipelined(
     else:
         Kb = b.shape[0] * (2 if DTYPE_B == "e2m1" else 1)
     assert K == Kb
+    if OUT_DTYPE not in _OUT_DTYPES:
+        raise ValueError(f"OUT_DTYPE must be one of {tuple(_OUT_DTYPES)}, got {OUT_DTYPE!r}")
+    if OUT_DTYPE != "fp32" and (WARP_PIPELINE or OPERAND_PIPELINE or STREAMED_OPERANDS or
+                                (PERSISTENT and
+                                 (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or HANDOFF_SCHEDULE == "ab-reuse" or
+                                  (OUTPUT_STAGING and BLOCK_K == 256)))):
+        raise ValueError("non-FP32 OUT_DTYPE requires dedicated C staging slots or direct stores: no BK256 staging, "
+                         "register/warp/operand/streamed pipelines, output-tail reuse, or ab-reuse handoff")
     persistent_kernel = mxgemm_tdm_persistent_kernel
     if CLUSTER_LAYOUT != "linear" and (not PERSISTENT or STREAMED_OPERANDS):
         raise ValueError("CLUSTER_LAYOUT requires the persistent kernel without STREAMED_OPERANDS")
@@ -3854,7 +3884,7 @@ def mxgemm_tdm_pipelined(
                               group_m=GROUP_SIZE_M, with_a_scale=WITH_A_SCALE, fusion=TDM_FUSION, xcd_remap=XCD_REMAP,
                               num_xcds=NUM_XCDS, xcd_chunk=XCD_CHUNK, cluster_size=CLUSTER_SIZE,
                               cluster_barrier_interval=CLUSTER_BARRIER_INTERVAL, cluster_layout=CLUSTER_LAYOUT)
-    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    c = torch.empty((M, N), device=a.device, dtype=_OUT_DTYPES[OUT_DTYPE])
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     a_scale_arg = a_scale if WITH_A_SCALE else b_scale
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
@@ -4057,11 +4087,17 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
                     False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
-                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False),
-            OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST", True),
-            LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"), OVERLAP_PEEL=cfg.get("OVERLAP_PEEL", False))
+                        "ASYNC_OUTPUT",
+                        False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
+                                                           False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"),
+            DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST",
+                                         True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"), OVERLAP_PEEL=cfg.get(
+                                             "OVERLAP_PEEL", False), OUT_DTYPE=cfg.get("OUT_DTYPE", "fp32"))
 
-    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    out_dtype = cfg.get("OUT_DTYPE", "fp32")
+    if out_dtype not in _OUT_DTYPES:
+        raise ValueError(f"OUT_DTYPE must be one of {tuple(_OUT_DTYPES)}, got {out_dtype!r}")
+    c = torch.empty((M, N), device=a.device, dtype=_OUT_DTYPES[out_dtype])
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
     mxgemm_tdm_pipelined_kernel[grid](
@@ -4155,6 +4191,8 @@ if __name__ == "__main__":
         "(default: 64 with --static_slot_unroll, else 0)")
     parser.add_argument("--overlap_peel", action="store_true",
                         help="run each next tile's first K step inside the A8W8 BK128 output epilogue")
+    parser.add_argument("--out_dtype", choices=tuple(_OUT_DTYPES), default="fp32",
+                        help="C element type; FP16 converts the FP32 accumulators before staging")
     parser.add_argument("--no_dynamic_scales_first", action="store_true",
                         help="read payloads before scales in the A8W8 K loop without static slot unroll")
     parser.add_argument("--streamed_operands", action="store_true",
@@ -4282,6 +4320,7 @@ if __name__ == "__main__":
         DYNAMIC_SCALES_FIRST=not args.no_dynamic_scales_first,
         LDS_PARTITIONED_AB=args.lds_partitioned_ab,
         OVERLAP_PEEL=args.overlap_peel,
+        OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
     )

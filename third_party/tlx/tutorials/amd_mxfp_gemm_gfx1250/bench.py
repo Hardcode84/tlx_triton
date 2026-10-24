@@ -46,6 +46,9 @@ output-slot waits, and the next tile's first ring refill precedes the last
 C chunks. This is 0.2% faster at 8192^3 and 1.2% faster at K=4096 on
 hardware; the power-bound four-stage ring is unchanged, so it stays off there.
 Use --no-overlap-peel to disable it.
+--out-dtype fp16 writes FP16 C (FP32 accumulation, one rounding before
+staging) for MX8xMX8. It uses six FP16 C slots for the three-buffer ring and
+two 64x128 slots for the four-buffer ring.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -207,8 +210,10 @@ def _overlap_peel(args, case, dtype_b):
 
 
 # Three dedicated 64x128 C slots fit beside the three-buffer BK128 input ring
-# and cut A8W8 tile transitions by about 35% on gfx1250.
+# and cut A8W8 tile transitions by about 35% on gfx1250. FP16 slots take half
+# the LDS, so six fit (8192^3 -1.3%, 8192^2x4096 -1.2% versus three).
 DEFAULT_OUTPUT_C_SLOTS = 3
+DEFAULT_FP16_OUTPUT_C_SLOTS = 6
 
 
 def _supports_default_output_c_slots(args, dtype_b):
@@ -245,7 +250,7 @@ def _variant_args(args, dtype_b):
                                 and args.static_slot_unroll is not True
                                 and _supports_default_output_c_slots(resolved, dtype_b))
     if resolved.output_c_slots is None and _supports_default_output_c_slots(resolved, dtype_b):
-        resolved.output_c_slots = DEFAULT_OUTPUT_C_SLOTS
+        resolved.output_c_slots = DEFAULT_OUTPUT_C_SLOTS if args.out_dtype == "fp32" else DEFAULT_FP16_OUTPUT_C_SLOTS
     return resolved
 
 
@@ -342,6 +347,8 @@ def _command(args, case, dtype_b):
         command.append("--static_slot_unroll")
     if _overlap_peel(args, case, dtype_b):
         command.append("--overlap_peel")
+    if args.out_dtype != "fp32":
+        command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
         command.extend(["--output_c_slots", str(args.output_c_slots)])
     if not args.dynamic_scales_first:
@@ -438,15 +445,17 @@ def parse_benchmark_args(argv=None):
     parser.add_argument("--wave-specialized-handoff", action="store_true",
                         help="use separate input/output TDM waves during the three-buffer A8W8 handoff")
     parser.add_argument(
-        "--output-c-slots", type=int, default=None,
-        help=f"dedicated BK128 FP32 output staging slots (default: {DEFAULT_OUTPUT_C_SLOTS} for three-buffer MX8xMX8, "
-        "otherwise 2)")
+        "--output-c-slots", type=int, default=None, help=
+        f"dedicated BK128 output staging slots (default for three-buffer MX8xMX8: {DEFAULT_OUTPUT_C_SLOTS} with FP32 "
+        f"and {DEFAULT_FP16_OUTPUT_C_SLOTS} with FP16 output; otherwise 2)")
     parser.add_argument("--dynamic-scales-first", action=argparse.BooleanOptionalAction, default=True,
                         help="read scales before payloads in the A8W8 K loop without static slot unroll (default: on)")
     parser.add_argument(
         "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
         f"(default: MX8xMX8 cases with K >= {STATIC_SLOT_UNROLL_MIN_K})")
+    parser.add_argument("--out-dtype", choices=("fp32", "fp16"), default="fp32",
+                        help="C element type; FP16 needs dedicated output staging (not the MX8xMX4 BK256 output reuse)")
     parser.add_argument(
         "--overlap-peel", action=argparse.BooleanOptionalAction, default=None,
         help="run each next tile's first K step inside the BK128 C epilogue "
@@ -599,6 +608,13 @@ def parse_benchmark_args(argv=None):
                      or run_args.streamed_operands or run_args.output_tail_reuse or run_args.wave_specialized_handoff)):
             parser.error("--output-c-slots requires at least two slots and persistent BK128 dedicated output staging "
                          "without other output schedules")
+        if run_args.out_dtype != "fp32" and (
+                run_args.warp_pipeline or run_args.operand_pipeline or run_args.streamed_operands or
+            (run_args.persistent and
+             (run_args.register_pipeline or run_args.output_tail_reuse or run_args.handoff_schedule == "ab-reuse" or
+              (run_args.output_staging and run_args.block_k == 256)))):
+            parser.error(f"--out-dtype {run_args.out_dtype} requires dedicated BK128 output staging or direct "
+                         "stores (use --variant mx8xmx8 or --block-k 128)")
         if run_args.overlap_peel and not _supports_overlap_peel(run_args):
             parser.error("--overlap-peel requires persistent BK128 tiles with four warps, dedicated output staging, "
                          "cross-tile prefetch, and the current handoff schedule without other schedule variants")
@@ -779,8 +795,9 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
-            output_c_slots=run_args.output_c_slots or 2, dynamic_scales_first=run_args.dynamic_scales_first,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
+                                                                     dtype_b), output_c_slots=run_args.output_c_slots
+            or 2, dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
             async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
@@ -818,6 +835,7 @@ def main():
             f"static_slot_unroll={'auto' if run_args.static_slot_unroll is None else run_args.static_slot_unroll}, "
             f"overlap_peel={'auto' if run_args.overlap_peel is None else run_args.overlap_peel}, "
             f"output_c_slots={run_args.output_c_slots or 2}, "
+            f"out_dtype={run_args.out_dtype}, "
             f"dynamic_scales_first={run_args.dynamic_scales_first}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
             f"streamed_operands={run_args.streamed_operands}, "
