@@ -691,7 +691,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
                                       HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
                                       SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
-                                      WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None):
+                                      WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
+                                      OVERLAP_PEEL=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -725,7 +726,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION,
                     CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
                     EARLY_C_STORES=EARLY_C_STORES, WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF,
-                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS))
+                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL))
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
@@ -749,6 +750,24 @@ def test_mxgemm_output_c_slots_ring_phase(k_iters, cluster_size, static_slot_unr
     test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
                                       STATIC_SLOT_UNROLL=static_slot_unroll, OUTPUT_C_SLOTS=3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("schedule,k_iters", [(schedule, k)
+                                              for schedule in ("static", "dynamic")
+                                              for k in (4, 5, 6, 9)] + [("4buf", k) for k in (5, 6, 7, 10)])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_overlap_peel_ring_phase(schedule, k_iters, cluster_size):
+    # Each next tile's first K step runs in the previous C epilogue, and its
+    # first ring refill precedes the last C chunks. Cover every starting slot,
+    # uneven tile counts, the last tile's plain stores, short steady loops, and
+    # both C staging shapes: three 64x128 slots, or two 64x64 slots with four
+    # buffers (where the refill splits a quadrant's stores).
+    four = schedule == "4buf"
+    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, True, 4, False, False,
+                                      cluster_size, False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=None if four else 3,
+                                      OVERLAP_PEEL=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

@@ -1835,7 +1835,12 @@ def _mxgemm_c_tdm_store(desc, view, offsets, C_TDM_ISSUER: tl.constexpr):
 def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constexpr, BN: tl.constexpr,
                              INSTR_M: tl.constexpr, c_buf=None, C_ROWS: tl.constexpr = 64, C_SLOTS: tl.constexpr = 2,
                              QUADRANT: tl.constexpr = 0, C_COLS: tl.constexpr = 128,
-                             INITIAL_C_SLOTS_FREE: tl.constexpr = False, C_TDM_ISSUER: tl.constexpr = None):
+                             INITIAL_C_SLOTS_FREE: tl.constexpr = False, C_TDM_ISSUER: tl.constexpr = None,
+                             EXTRA_PENDING: tl.constexpr = 0, PART_BEGIN: tl.constexpr = 0,
+                             PART_END: tl.constexpr = None):
+    # EXTRA_PENDING: TDM operations issued after older chunks that each slot
+    # reuse may leave pending. PART_BEGIN/PART_END store a subrange of the
+    # 64-row chunks. Both apply to dedicated 64-row slots only.
     # Pin values so output extraction stays in registers. Direct stores also
     # pin their offsets below to avoid an implicit LDS transpose.
     WARP_BASES: tl.constexpr = ((0, 2), (0, 4), (2, 0)) if tlx.num_warps() == 8 else ((0, 2), (2, 0))
@@ -1845,6 +1850,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
     if c_buf is not None:
         tl.static_assert(BM == 128 and BN == 128 and INSTR_M == 16)
         desc = tl.make_tensor_descriptor(base, [BM, BN], [stride_cm, tl.constexpr(1)], [C_ROWS, C_COLS])
+        tl.static_assert(C_ROWS == 64 or (EXTRA_PENDING == 0 and PART_BEGIN == 0 and PART_END is None))
         if C_ROWS == 128 and C_COLS == 128:
             if not INITIAL_C_SLOTS_FREE or QUADRANT >= C_SLOTS:
                 _mxgemm_c_slot_wait(C_SLOTS - 1, C_TDM_ISSUER)
@@ -1865,7 +1871,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
         else:
             tl.static_assert(C_ROWS == 64 and C_SLOTS >= 2 and (C_COLS == 64 or C_COLS == 128))
             PARTS: tl.constexpr = 2 * (BN // C_COLS)
-            for part in tl.static_range(PARTS):
+            for part in tl.static_range(PART_BEGIN, PARTS if PART_END is None else PART_END):
                 # Dedicated slots are free on entry: the current tile's tail
                 # waits retired any previous C stores. Start the first C_SLOTS
                 # chunks while next-tile inputs remain in flight, then wait
@@ -1873,7 +1879,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                 # Chunk QUADRANT * PARTS + part, computed inline so tuple slot
                 # views keep a constant index.
                 if not INITIAL_C_SLOTS_FREE or QUADRANT * PARTS + part >= C_SLOTS:
-                    _mxgemm_c_slot_wait(C_SLOTS - 1, C_TDM_ISSUER)
+                    _mxgemm_c_slot_wait(C_SLOTS - 1 + EXTRA_PENDING, C_TDM_ISSUER)
                 lo, hi = tl.split(tl.reshape(acc, (2, 64, BN)).permute(1, 2, 0))
                 if C_COLS == 128:
                     chunk = lo if part == 0 else hi
@@ -1893,6 +1899,32 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
         offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=WARP_BASES, reg_bases=((0, 1), (1, 0)),
                                               instr_shape=(INSTR_M, 16, 128))
         tlx.buffer_store(acc, base, offsets)
+
+
+@triton.jit
+def _mxgemm_overlap_store(c_ptr, acc, off_m, off_n, stride_cm, c_buf, C_SLOTS: tl.constexpr, QUADRANT: tl.constexpr,
+                          C_COLS: tl.constexpr, REFILL_CHUNK: tl.constexpr, LOADS: tl.constexpr, a_desc, b_desc,
+                          as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n, n_phase, BK: tl.constexpr,
+                          DA: tl.constexpr, DB: tl.constexpr, BUFFERS: tl.constexpr, WITH_A_SCALE: tl.constexpr,
+                          FUSION: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr,
+                          GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr,
+                          CLUSTER_BARRIER_INTERVAL: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr):
+    # Store one 128x128 C quadrant through dedicated 64-row slots. Before
+    # chunk REFILL_CHUNK, refill the next tile's stage-0 slot with stage
+    # BUFFERS. TDM operations complete in order, so each later chunk's
+    # slot-reuse wait also leaves the refill's LOADS operations pending.
+    PARTS: tl.constexpr = 2 * (128 // C_COLS)
+    SPLIT: tl.constexpr = REFILL_CHUNK - QUADRANT * PARTS
+    if SPLIT > 0:
+        _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, c_buf, 64, C_SLOTS, QUADRANT,
+                                 C_COLS, True, PART_END=SPLIT if SPLIT < PARTS else PARTS)
+    if SPLIT >= 0 and SPLIT < PARTS:
+        _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n, BUFFERS,
+                                n_phase, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
+                                GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+    if SPLIT < PARTS:
+        _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, c_buf, 64, C_SLOTS, QUADRANT,
+                                 C_COLS, True, EXTRA_PENDING=LOADS, PART_BEGIN=SPLIT if SPLIT > 0 else 0)
 
 
 @triton.jit
@@ -2131,6 +2163,7 @@ def mxgemm_tdm_persistent_kernel(
     OUTPUT_C_COLS: tl.constexpr = None,
     DYNAMIC_SCALES_FIRST: tl.constexpr = True,
     LDS_PARTITIONED_AB: tl.constexpr = None,
+    OVERLAP_PEEL: tl.constexpr = False,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     if SCHED_MODE_2:
@@ -2205,7 +2238,7 @@ def mxgemm_tdm_persistent_kernel(
                                             and K // BLOCK_K > NUM_BUFFERS + 1)
     # Static-slot steps pin their dots to the native output layout, so every
     # dot in that schedule must use the same pinned layout.
-    dot: tl.constexpr = _mxgemm_native_dot if DEFERRED_C_REFILL or STATIC_SLOT_UNROLL else tlx.dot_scaled
+    dot: tl.constexpr = _mxgemm_native_dot if DEFERRED_C_REFILL or STATIC_SLOT_UNROLL or OVERLAP_PEEL else tlx.dot_scaled
     if OUTPUT_STAGING:
         tl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and DA == 1)
         if OUTPUT_REUSE:
@@ -2336,13 +2369,36 @@ def mxgemm_tdm_persistent_kernel(
                                 GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE,
                                 CLUSTER_LAYOUT=CLUSTER_LAYOUT)
 
+    if OVERLAP_PEEL:
+        # Every later tile's zero-accumulator first K step runs inside the
+        # previous tile's C epilogue. Run the first tile's here, so each tile
+        # enters its K loop at step 1 with the accumulators carried in.
+        tl.static_assert(DEFER_BOTTOM and CROSS_TILE_PREFETCH and K // BLOCK_K > NUM_BUFFERS,
+                         "OVERLAP_PEEL requires the BK128 staged-output schedule with cross-tile prefetch")
+        tl.static_assert(
+            not (EARLY_C_STORES or OUTPUT_REUSE or OUTPUT_TAIL_REUSE or WAVE_SPECIALIZED_HANDOFF or DEFERRED_C_REFILL
+                 or AB_C_REUSE or REGISTER_PIPELINE or FIRST_USE_PREFETCH or PEEL_HANDOFF or PEEL_FUSION_TRANSITION
+                 or B_TAIL_PREFETCH), "OVERLAP_PEEL does not combine with other handoff or output schedules")
+        tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+        a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, 0, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS, WITH_A_SCALE)
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, 0, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+        c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+            tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros(
+                (BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32),
+            tl.zeros((BLOCK_M // 2, BLOCK_N // 2),
+                     tl.float32), a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+            off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE,
+            TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER)
+
     while tile < total_tiles:
         off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N,
                                             CLUSTER_LAYOUT=CLUSTER_LAYOUT)
-        c00 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
-        c01 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
-        c10 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
-        c11 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+        if not OVERLAP_PEEL:
+            c00 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+            c01 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+            c10 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+            c11 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
         if REGISTER_PIPELINE:
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             a0, sa0 = _mxgemm_persistent_a(a_buf, as_buf, phase, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS, WITH_A_SCALE,
@@ -2553,13 +2609,17 @@ def mxgemm_tdm_persistent_kernel(
                 # waves may still have two C stores ahead of K3. By K3 both
                 # queues contain the same three input stages, so the usual
                 # steady-loop wait remains valid throughout the transition.
+            elif OVERLAP_PEEL:
+                # The previous epilogue (or the prologue) acquired stage 1.
+                step1_slot = tl.where(phase == NUM_BUFFERS - 1, 0, phase + 1)
             elif not DEFERRED_C_REFILL or tile < NUM_PROGRAMS:
                 tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
-            a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, phase, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
+            entry_slot = step1_slot if OVERLAP_PEEL else phase
+            a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, entry_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                              WITH_A_SCALE)
-            b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, phase, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+            b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, entry_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
             steady_end = k_iters - NUM_BUFFERS
-            slot = phase
+            slot = entry_slot if not STATIC_SLOT_UNROLL else phase
             if AB_C_REUSE and PEEL_HANDOFF:
                 # K0 was loaded in the old tail and K1 before its final C
                 # store. Acquire K1 while leaving that younger store pending.
@@ -2691,7 +2751,8 @@ def mxgemm_tdm_persistent_kernel(
                 # removes the per-tile zeroing of 512 accumulator VGPRs. Step k
                 # uses slots[k % NUM_BUFFERS] throughout.
                 PEEL: tl.constexpr = 1 if STEADY_STEPS > 0 else 0
-                for j in tl.static_range(PEEL):
+                # With OVERLAP_PEEL, step 0 already ran in the previous epilogue.
+                for j in tl.static_range(0 if OVERLAP_PEEL else PEEL):
                     c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                         c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
                         as_buf, bs_buf, off_m, off_n, j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N,
@@ -2721,8 +2782,8 @@ def mxgemm_tdm_persistent_kernel(
                 slot = slots[STEADY_STEPS % NUM_BUFFERS]
             # With STATIC_SLOT_UNROLL the steps above consume the whole range.
             for i in tl.range(
-                    steady_end if STATIC_SLOT_UNROLL else (2 if PEEL_FUSION_TRANSITION else (1 if PEEL_HANDOFF else 0)),
-                    steady_end):
+                    steady_end if STATIC_SLOT_UNROLL else (2 if PEEL_FUSION_TRANSITION else
+                                                           (1 if PEEL_HANDOFF or OVERLAP_PEEL else 0)), steady_end):
                 # Carry the physical slot so the hot loop needs only an increment
                 # and wrap, including when K does not divide the ring depth.
                 tl.assume(slot >= 0)
@@ -2733,8 +2794,8 @@ def mxgemm_tdm_persistent_kernel(
                         c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N, BLOCK_K,
                         DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
                         ARRIVE_K=i + NUM_BUFFERS if SPLIT_CLUSTER_BARRIER else None, CLUSTER_SIZE=CLUSTER_SIZE,
-                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=STATIC_SLOT_UNROLL,
-                        SCALES_FIRST=STEP_SCALES_FIRST)
+                        CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=STATIC_SLOT_UNROLL
+                        or OVERLAP_PEEL, SCALES_FIRST=STEP_SCALES_FIRST)
                     last_b00, last_sb00 = b00, sb00
                 elif OUTPUT_REUSE:
                     c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
@@ -2850,7 +2911,7 @@ def mxgemm_tdm_persistent_kernel(
                         c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
                             c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
                             BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
-                            PIN_NATIVE=STATIC_SLOT_UNROLL)
+                            PIN_NATIVE=STATIC_SLOT_UNROLL or OVERLAP_PEEL)
                         last_b00, last_sb00 = b00, sb00
                     if DEFERRED_C_REFILL and K // BLOCK_K == NUM_BUFFERS and j == 0 and tile >= NUM_PROGRAMS:
                         # With an empty steady loop, the first tail stage also
@@ -2947,7 +3008,7 @@ def mxgemm_tdm_persistent_kernel(
                             c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
                                 c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
                                 BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH,
-                                PIN_NATIVE=STATIC_SLOT_UNROLL)
+                                PIN_NATIVE=STATIC_SLOT_UNROLL or OVERLAP_PEEL)
                         last_b00, last_sb00 = b00, sb00
                     elif OUTPUT_REUSE:
                         c00, c01, c10, c11, a01, sa01, a11, sa11, b10, sb10, b11, sb11, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_256(
@@ -3142,8 +3203,74 @@ def mxgemm_tdm_persistent_kernel(
                 else:
                     c00 = dot(a00, sa00, DTYPE_A, last_b00, last_sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
-            _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M,
-                                     output_buf, C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
+            if OVERLAP_PEEL:
+                # Overlap the next tile's zero-accumulator first K step with
+                # this tile's C stores. Once a quadrant's chunks are staged, its
+                # registers take that quadrant's next-tile dot, whose WMMAs run
+                # during the following slot-reuse waits. The tail prefetched all
+                # next-tile stages; stage 0 is the oldest pending load.
+                tl.static_assert(C_ROWS == 64 and INITIAL_C_SLOTS_FREE and INSTR_M == 16,
+                                 "OVERLAP_PEEL requires dedicated 64-row C staging slots")
+                C_PARTS: tl.constexpr = 2 * ((BLOCK_N // 2) // C_COLS)
+                C_CHUNKS: tl.constexpr = 4 * C_PARTS
+                # Refill stage 0's slot with next-tile stage NUM_BUFFERS after
+                # its last read (end of quadrant 1) and as early as possible.
+                # TDM operations complete in order, so the refill may precede
+                # only the last C_SLOTS chunks: each of those reuses a slot whose
+                # previous chunk is older than the refill. Any earlier, a chunk
+                # would wait for the refill's global loads.
+                REFILL_CHUNK: tl.constexpr = (C_CHUNKS - C_SLOTS if C_CHUNKS - C_SLOTS > 2 * C_PARTS else 2 * C_PARTS)
+                n_phase = (phase + k_iters) % NUM_BUFFERS
+                tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+                if has_next:
+                    na00, nsa00 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
+                                                       WITH_A_SCALE)
+                    nb00, nsb00 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
+                    for q in tl.static_range(4):
+                        acc = c00 if q == 0 else (c01 if q == 1 else (c10 if q == 2 else c11))
+                        _mxgemm_overlap_store(c_ptr, acc, off_m + (q // 2) * (BLOCK_M // 2),
+                                              off_n + (q % 2) * (BLOCK_N // 2), stride_cm, output_buf, C_SLOTS, q,
+                                              C_COLS, REFILL_CHUNK, LOADS, a_desc, b_desc, as_desc, bs_desc, a_buf,
+                                              b_buf, as_buf, bs_buf, next_m, next_n, n_phase, BLOCK_K, DA, DB,
+                                              NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
+                                              GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT)
+                        tlx.amd_sched_barrier()
+                        zero = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
+                        if q == 0:
+                            c00 = _mxgemm_native_dot(na00, nsa00, DTYPE_A, nb00, nsb00, DTYPE_B, zero,
+                                                     tiles_per_warp=[2, 2])
+                            nb01, nsb01 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 1, BLOCK_N, BLOCK_K, DB,
+                                                               NUM_BUFFERS)
+                        elif q == 1:
+                            c01 = _mxgemm_native_dot(na00, nsa00, DTYPE_A, nb01, nsb01, DTYPE_B, zero,
+                                                     tiles_per_warp=[2, 2])
+                            na10, nsa10 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 1, 0, BLOCK_M, BLOCK_K, DA,
+                                                               NUM_BUFFERS, WITH_A_SCALE)
+                        elif q == 2:
+                            c10 = _mxgemm_native_dot(na10, nsa10, DTYPE_A, nb00, nsb00, DTYPE_B, zero,
+                                                     tiles_per_warp=[2, 2])
+                        else:
+                            c11 = _mxgemm_native_dot(na10, nsa10, DTYPE_A, nb01, nsb01, DTYPE_B, zero,
+                                                     tiles_per_warp=[2, 2])
+                        tlx.amd_sched_barrier()
+                    # Acquire stage 1: stages 2..NUM_BUFFERS-1, every C chunk,
+                    # and the refill are younger.
+                    tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * LOADS + C_CHUNKS + LOADS)
+                else:
+                    _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M,
+                                             output_buf, C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
+                    _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
+                                             BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 1, C_COLS,
+                                             INITIAL_C_SLOTS_FREE)
+                    _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2,
+                                             BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 2, C_COLS,
+                                             INITIAL_C_SLOTS_FREE)
+                    _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm,
+                                             BLOCK_M // 2, BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 3,
+                                             C_COLS, INITIAL_C_SLOTS_FREE)
+            else:
+                _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, INSTR_M,
+                                         output_buf, C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
             if EARLY_C_STORES:
                 # Keep each completed quadrant's transfer ahead of the next
                 # quadrant's independent matrix work. Do not drain A/B here.
@@ -3153,8 +3280,9 @@ def mxgemm_tdm_persistent_kernel(
                 else:
                     c01 = dot(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
-            _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                     INSTR_M, output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE)
+            if not OVERLAP_PEEL:
+                _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
+                                         INSTR_M, output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE)
             if EARLY_C_STORES:
                 tlx.amd_sched_barrier()
                 if BLOCK_K == 256:
@@ -3183,7 +3311,7 @@ def mxgemm_tdm_persistent_kernel(
                 _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm,
                                          BLOCK_M // 2, BLOCK_N // 2, INSTR_M, output_buf, C_ROWS, C_SLOTS, 0, C_COLS,
                                          True)
-            else:
+            elif not OVERLAP_PEEL:
                 _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
                                          INSTR_M, output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE)
                 if EARLY_C_STORES:
@@ -3382,6 +3510,7 @@ def mxgemm_tdm_pipelined(
     OUTPUT_C_SLOTS: int | None = None,
     DYNAMIC_SCALES_FIRST: bool = True,
     LDS_PARTITIONED_AB: int | None = None,
+    OVERLAP_PEEL: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3417,6 +3546,14 @@ def mxgemm_tdm_pipelined(
     between two physical 64 KiB LDS partitions, reducing partition conflicts
     between the waves that read one operand subtile. ``None`` selects 64 rows
     with ``STATIC_SLOT_UNROLL`` and off otherwise; 0 disables it.
+
+    ``OVERLAP_PEEL`` runs each next tile's first K step inside the current
+    tile's FP32 output epilogue: after a C quadrant is staged, its registers
+    take that quadrant's next-tile WMMAs, which run during later output-slot
+    waits. The next tile's first ring refill is issued before the last C
+    chunks rather than after all of them. It requires the persistent BK128
+    schedule with dedicated output staging and cross-tile prefetch, and works
+    with and without ``STATIC_SLOT_UNROLL`` and with three or four buffers.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3571,6 +3708,14 @@ def mxgemm_tdm_pipelined(
                                             or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH)):
         raise ValueError("STATIC_SLOT_UNROLL requires persistent E4M3 x E4M3, 256x256x128 tiles, three buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
+    if OVERLAP_PEEL and not (
+            PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and BLOCK_K == 128 and NUM_WARPS == 4
+            and K // BLOCK_K > NUM_BUFFERS and HANDOFF_SCHEDULE == "current"
+            and not (REGISTER_PIPELINE or WARP_PIPELINE or OPERAND_PIPELINE or STREAMED_OPERANDS or OUTPUT_TAIL_REUSE
+                     or FIRST_USE_PREFETCH or WAVE_SPECIALIZED_HANDOFF or SPLIT_CLUSTER_BARRIER or EARLY_C_STORES)):
+        raise ValueError("OVERLAP_PEEL requires persistent BK128 tiles with four warps, dedicated output staging, "
+                         "cross-tile prefetch, more K tiles than buffers, and the current handoff schedule "
+                         "without other schedule variants")
     if OUTPUT_C_SLOTS is not None and not (isinstance(OUTPUT_C_SLOTS, int) and OUTPUT_C_SLOTS >= 2 and PERSISTENT
                                            and OUTPUT_STAGING and BLOCK_K == 128 and
                                            not (REGISTER_PIPELINE or WARP_PIPELINE or OPERAND_PIPELINE
@@ -3737,6 +3882,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["DYNAMIC_SCALES_FIRST"] = False
     if LDS_PARTITIONED_AB is not None:
         persistent_options["LDS_PARTITIONED_AB"] = LDS_PARTITIONED_AB
+    if OVERLAP_PEEL:
+        persistent_options["OVERLAP_PEEL"] = True
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -3909,12 +4056,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
-                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS",
-                                                      False), ASYNC_OUTPUT=cfg.get("ASYNC_OUTPUT", False),
-            STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
-                                       False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get(
-                                           "DYNAMIC_SCALES_FIRST",
-                                           True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"))
+                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
+                        "ASYNC_OUTPUT", False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL", False),
+            OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST", True),
+            LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"), OVERLAP_PEEL=cfg.get("OVERLAP_PEEL", False))
 
     c = torch.empty((M, N), device=a.device, dtype=torch.float32)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
@@ -4008,6 +4153,8 @@ if __name__ == "__main__":
         "--lds_partitioned_ab", type=int, default=None,
         help="A8W8 A/B LDS partition piece height in rows, 0 to disable "
         "(default: 64 with --static_slot_unroll, else 0)")
+    parser.add_argument("--overlap_peel", action="store_true",
+                        help="run each next tile's first K step inside the A8W8 BK128 output epilogue")
     parser.add_argument("--no_dynamic_scales_first", action="store_true",
                         help="read payloads before scales in the A8W8 K loop without static slot unroll")
     parser.add_argument("--streamed_operands", action="store_true",
@@ -4134,6 +4281,7 @@ if __name__ == "__main__":
         OUTPUT_C_SLOTS=args.output_c_slots,
         DYNAMIC_SCALES_FIRST=not args.no_dynamic_scales_first,
         LDS_PARTITIONED_AB=args.lds_partitioned_ab,
+        OVERLAP_PEEL=args.overlap_peel,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
     )
