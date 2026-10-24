@@ -39,6 +39,13 @@ partition (1.6% faster at 8192^3 on hardware; no gain in the dynamic loops).
 MX8xMX8 also stages FP32 output through three dedicated 64x128 LDS slots
 instead of two, keeping more C stores in flight at each tile transition.
 Use --output-c-slots to choose another count.
+Three-stage MX8xMX8 also overlaps each next tile's first K step with the
+FP32 output epilogue (--overlap-peel): once a C quadrant is staged, its
+registers take that quadrant's next-tile WMMAs, which run during later
+output-slot waits, and the next tile's first ring refill precedes the last
+C chunks. This is 0.2% faster at 8192^3 and 1.2% faster at K=4096 on
+hardware; the power-bound four-stage ring is unchanged, so it stays off there.
+Use --no-overlap-peel to disable it.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -180,6 +187,25 @@ def _static_slot_unroll(args, case, dtype_b):
     return _supports_static_slot_unroll(args, dtype_b) and case[2] >= STATIC_SLOT_UNROLL_MIN_K
 
 
+def _supports_overlap_peel(args):
+    return (args.persistent and args.output_staging and args.cross_tile_prefetch and args.block_k == 128
+            and args.num_warps == 4 and args.handoff_schedule == "current"
+            and not (args.register_pipeline or args.warp_pipeline or args.operand_pipeline or args.streamed_operands
+                     or args.output_tail_reuse or args.first_use_prefetch or args.wave_specialized_handoff
+                     or args.split_cluster_barrier or args.early_c_stores))
+
+
+# Overlapping each next tile's first K step with the C epilogue speeds up the
+# three-stage MX8xMX8 schedules on gfx1250 (8192^3: -0.2%, K=4096: -1.2%); the
+# power-bound four-stage ring is unchanged (-0.03 to +0.12%).
+def _overlap_peel(args, case, dtype_b):
+    if not (_supports_overlap_peel(args) and case[2] // args.block_k > args.num_buffers):
+        return False
+    if args.overlap_peel is not None:
+        return args.overlap_peel
+    return dtype_b == "float8_e4m3" and args.num_buffers == 3
+
+
 # Three dedicated 64x128 C slots fit beside the three-buffer BK128 input ring
 # and cut A8W8 tile transitions by about 35% on gfx1250.
 DEFAULT_OUTPUT_C_SLOTS = 3
@@ -314,6 +340,8 @@ def _command(args, case, dtype_b):
         command.append("--wave_specialized_handoff")
     if _static_slot_unroll(args, case, dtype_b):
         command.append("--static_slot_unroll")
+    if _overlap_peel(args, case, dtype_b):
+        command.append("--overlap_peel")
     if args.output_c_slots is not None:
         command.extend(["--output_c_slots", str(args.output_c_slots)])
     if not args.dynamic_scales_first:
@@ -419,6 +447,10 @@ def parse_benchmark_args(argv=None):
         "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
         f"(default: MX8xMX8 cases with K >= {STATIC_SLOT_UNROLL_MIN_K})")
+    parser.add_argument(
+        "--overlap-peel", action=argparse.BooleanOptionalAction, default=None,
+        help="run each next tile's first K step inside the BK128 C epilogue "
+        "(default: three-buffer MX8xMX8; forced on only where K has more tiles than buffers)")
     parser.add_argument(
         "--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
         help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
@@ -567,6 +599,9 @@ def parse_benchmark_args(argv=None):
                      or run_args.streamed_operands or run_args.output_tail_reuse or run_args.wave_specialized_handoff)):
             parser.error("--output-c-slots requires at least two slots and persistent BK128 dedicated output staging "
                          "without other output schedules")
+        if run_args.overlap_peel and not _supports_overlap_peel(run_args):
+            parser.error("--overlap-peel requires persistent BK128 tiles with four warps, dedicated output staging, "
+                         "cross-tile prefetch, and the current handoff schedule without other schedule variants")
         if run_args.static_slot_unroll and not _supports_static_slot_unroll(run_args, dtype_b):
             parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
@@ -744,12 +779,12 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), output_c_slots=run_args.output_c_slots or 2,
-            dynamic_scales_first=run_args.dynamic_scales_first, handoff_schedule=run_args.handoff_schedule,
-            compact_k_tail=run_args.compact_k_tail, handoff_tdm_fusion=run_args.handoff_tdm_fusion,
-            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
-            sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
-            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
+            output_c_slots=run_args.output_c_slots or 2, dynamic_scales_first=run_args.dynamic_scales_first,
+            handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
+            handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
+            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
+            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
@@ -781,6 +816,7 @@ def main():
             f"first_use_prefetch={run_args.first_use_prefetch}, "
             f"wave_specialized_handoff={run_args.wave_specialized_handoff}, "
             f"static_slot_unroll={'auto' if run_args.static_slot_unroll is None else run_args.static_slot_unroll}, "
+            f"overlap_peel={'auto' if run_args.overlap_peel is None else run_args.overlap_peel}, "
             f"output_c_slots={run_args.output_c_slots or 2}, "
             f"dynamic_scales_first={run_args.dynamic_scales_first}, "
             f"compact_k_tail={run_args.compact_k_tail}, "

@@ -1030,6 +1030,14 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
             assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
             assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and shape[2] == 8192)
+            assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
+    # Opting out, and forcing it on for the four-stage ring.
+    for flag, expected in (("--no-overlap-peel", (False, False)), ("--overlap-peel", (True, True))):
+        _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx8", flag, "--dry-run"])
+        (_, dtype_b, args), = variants
+        for shape, want in zip((shapes[0], shapes[2]), expected):
+            cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)
+            assert ("--overlap_peel" in cmd) == want
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
