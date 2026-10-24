@@ -104,6 +104,7 @@ four waves, partial unsplit TDM, sliceMNK scheduling, and C output staging.
 | Split cluster barrier | Off | On |
 | Early C stores | Off | On |
 | Static slot unroll | K = 8192 (three-stage ring) | Off |
+| Overlap peel (`OVERLAP_PEEL`) | Three-stage ring (K < 16384) | Off |
 | A/B LDS partition pieces (`LDS_PARTITIONED_AB`) | 64 rows with static slot unroll | Off |
 | Input ring | 3 stages; 4 stages, 2 C slots for K >= 16384 | 3 stages |
 | Dedicated C slots | 3 (K < 16384) | — (C reuses A stages) |
@@ -150,6 +151,10 @@ conflicts](#bottlenecks-after-4x4-clusters-dc853dbc9d)). It needs the
 `memdesc_reshape` rule from `639c951130`, so `bench.py` on the remote
 (older Triton) cannot run it until that environment is rebuilt; the table
 above has not been re-measured with `bench.py`.
+
+`OVERLAP_PEEL` (default for three-stage A8W8 in `bench.py`, see "Overlap
+peel option") measured −0.21% at 8192³ and −1.20% at 8192²×4096 in
+`hw_power.py` timing; it was not measured with `bench.py` either.
 
 ## Latest controlled hardware comparison
 
@@ -1361,6 +1366,474 @@ Pre-existing post-rebase breakage found during validation (not fixed):
   all six cases on its tensor-wait-count assertions, with the unmodified
   tutorial source and with both the Meta and the pinned codegen.
 
+### A8W8 8192³ profile and tile transition (2026-10-24)
+
+Committed default after `c1086cc8e2` (static slot unroll, 64-row LDS
+partition pieces, three C slots, 4x4 clusters, chunked XCD remap), compiled
+locally and launched with `hw_ship.py`; the binary is identical to the
+`p64` kernel of the partition experiments. Archive (kernel, scripts, clock
+samples, ATT bundles, per-wave phase reports):
+`/home/ibutygin/tlx/perf-data/mxfp-a8w8-8k-profile-20261024.tar.gz` (SHA256
+`00cf6e3a22f220e09ad06c93d31ef8548d3480186ea6b04f83838c14971034f2`).
+
+**Sustained: 0.1502 ms (7,320 TFLOPS) at 1,800 MHz and 2,477 W**, i.e. at
+the ~2,480 W power cap (unprofiled bursts and profiled runs reach 2,419 MHz).
+That is about 270k cycles per kernel, 49% of the per-SIMD WMMA cycle floor.
+The power cap is the top-level limiter: removing stalls raises power and
+lowers the clock, which ate the cycle savings of the recent layout
+experiments. A change has to save energy, or at least not add work, to show
+in wall time. Under the cap the clock also depends on the data (constant
+E8M0 scales: ~1.96 GHz), so `hw_ship.py` and `bench.py` inputs may land at
+different clocks.
+
+ATT, one fully decoded wave per shader engine (16 waves), dispatch 64 and
+dispatch 16,000 of back-to-back launches. Under the profiler the device
+stays at ~995 W and 2.4 GHz (dispatches are serialized), so these show where
+cycles go, not how the power cap reshapes them. Medians:
+
+| | Dispatch 64 | Dispatch 16,000 |
+|---|---:|---:|
+| Wave cycles (max) | 249,130 (256,695) | 247,489 (254,492) |
+| Steady K loop share | 79% | 81% |
+| Steady step (WMMA floor 512) | 823 | 830 |
+| … LDS reads (`ds_load` + `s_wait_dscnt`) | 228 | 226 |
+| … workgroup barrier (range over waves) | 56 (33–105) | 72 |
+| … cluster barrier | 36 | 33 |
+| … TDM waits | 38 | 34 |
+| … scalar ALU | 31 | 31 |
+| Tile transition and K tail | ~17% | ~15% |
+
+**Tile transition.** Counting from the last steady-loop instruction of one
+tile to the first of the next (K tail, epilogue, peeled first step; 96
+transitions over both traces), a transition costs a median 9.7k cycles,
+about 12% of the wave. By instruction class: `s_wait_tensorcnt` 3.3k,
+`s_wait_dscnt` 2.1k, WMMA issue 1.7k, workgroup barriers 1.0k, scalar ALU
+0.7k, `ds_load` 0.7k, `ds_store` 0.4k, cluster barrier 0.4k. One typical
+transition (8.8k cycles):
+
+| Phase | Cycles | Content |
+|---|---:|---|
+| K tail (3 steps) | ~3,200 | ~1,060 per step vs 823 steady. Each step issues next-tile loads and drains LDS fully (`s_wait_dscnt 0x0` ~245), copies operands (`v_dual_mov_b32` ×32, ~60); the first step also waits ~280 at the cluster barrier |
+| C epilogue (8 × 64x128 FP32 chunks) | ~4,250 | per chunk: `ds_store` → drain ~120 → barrier ~20 → TDM store; slot reuse waits 608 / 531 / 194 cycles (chunks 4, 7, 8), one 446-cycle barrier where waves wait for the slowest wave's slot wait |
+| Next-tile start (peeled step) | ~1,100 | includes a 346-cycle LDS wait for the first operands |
+
+The epilogue is bound by C-store latency, not by next-tile loads: a slot
+frees 1.2–1.5k cycles after its TDM store regardless of position, and the
+next-tile loads issued during the tail finished 1–3k cycles earlier. With
+three 32 KB slots, eight stores need about 8/3 × 1.3k ≈ 3.5k cycles
+(observed ~3.7k), during which the matrix unit idles.
+
+**Next-tile address work** is already mostly off the critical path: the
+next tile's A/B TDM loads and their descriptors are issued in the K tail
+(cross-tile prefetch), the eight C-store descriptors take ~35 cycles before
+the first store, and each later store needs one scalar add. What remains
+after the last C store and before the next tile's first LDS read is 39
+scalar instructions (~120 cycles): the ring-phase update `phase = (phase +
+k_iters) % 3` (emitted as a division, although `k_iters` is a compile-time
+constant), the loop test and `tile = next_tile`, the static-unroll
+`slot1`/`slot2` selects, the peeled step's LDS operand addresses, and the
+descriptor position of its refill load. None depends on the C stores; the
+`amd_sched_barrier` fences around the epilogue keep LLVM from moving them.
+Hoisting them in source to just before the first C-slot reuse wait would
+hide them in that stall, but the gain (~0.1–0.2k cycles per transition,
+about 0.1% of the kernel) is below timing noise; fold it into a larger
+transition change rather than testing it alone.
+
+Transition ideas, roughly by expected value per effort (1–3 measured below:
+no net gain; 3 saves ~1.5k cycles per transition but slows the steady loop):
+
+1. **Static K tail.** Give the three tail steps the static-slot treatment of
+   the steady loop: no full `s_wait_dscnt 0x0` drains, no 32-register copy
+   blocks, less control flow. Bounded by ~1.1k cycles per transition
+   (about 1% of the wave).
+2. **Batch the first three chunks.** Chunks 1–3 have free slots; write all
+   three with one LDS drain and one fill barrier instead of three
+   (~250–300 cycles per transition).
+3. **Overlap the peeled step with the remaining C stores.** After a
+   quadrant's chunks are in LDS, its accumulators are free; the peeled step
+   sees zero accumulators, so its WMMAs for that quadrant can run while the
+   later chunks wait for slots. A deeper version computes the first
+   prefetched stages quadrant by quadrant (re-reading A/B subtiles from LDS
+   instead of reusing them in registers). Largest potential (up to ~3k
+   cycles per transition, the idle matrix-unit time of the epilogue), and
+   the largest rework; VGPRs (859 used) allow only one tile's accumulators.
+4. **Even out the slot waits across waves.** Each wave's tensor counter
+   includes its own next-tile loads (A on waves 0/2, B on 1/3), so slot
+   waits differ by wave and the others wait at the following barrier
+   (446 cycles in the traced transition).
+5. Hoist the next-tile address work above (small; combine with 1–3).
+
+**Static K tail and batched first C fill (2026-10-24): no gain; not
+kept.** Temporary kernel constexprs: `STATIC_TAIL` replaced the compact
+`tl.range` tail with three unrolled steps that use the steady loop's static
+`slots` (refilling each freed slot with the next tile's stage j);
+`BATCH_C_FILL` wrote chunks 0–2 (both halves of C00 and the top of C01)
+before issuing their three TDM stores, so the compiler inserts one drain and
+fill barrier instead of three; the C01 store then starts at its second half.
+Static tail: no `v_dual_mov_b32` copies left, 20 instead of 16
+`tensor_load_to_lds`, 881 instead of 859 VGPRs, 2,272 instead of 2,046
+instructions. Batched fill: two fewer barriers and drains. FFM passed 4x4 at
+2048×1024×2048 and unclustered uneven tile counts (1280×512, 3 programs,
+K = 1152 and 1536); AM 2x2 passed; hardware outputs bitwise identical.
+
+| 8192³ hardware (three passes) | vs default |
+|---|---:|
+| Static tail | +0.21 / +0.21 / +0.23% |
+| Batched first fill | +0.43 / +0.44 / +0.39% |
+| Both | +0.14 / +0.11 / +0.15% |
+| AM 2x2 2048³ cycles: default / tail / batch / both | 101,875 / 105,778 / 103,519 / 106,835 |
+
+ATT (16 SEs, dispatch 64), per transition (median gap; class totals):
+
+| Cycles per transition | Default | Static tail | Batched fill |
+|---|---:|---:|---:|
+| Transition gap (median) | 10,137 | 9,926 | 10,155 |
+| `s_wait_dscnt` | 2,104 | 1,635 | 1,769 |
+| Workgroup barrier | 904 | 716 | 495 |
+| Scalar + vector ALU | 946 | 492 | 947 |
+| Cluster barrier | 320 | 648 | 368 |
+| `s_wait_tensorcnt` | 3,059 | 3,114 | 3,642 |
+
+Removing local work turns into waiting elsewhere. The static tail removes
+~900 cycles of drains, copies, and ALU, but ~330 return as cluster-barrier
+waits (the tail reaches the 16-CTA rendezvous earlier and waits for slower
+peers); the net ~200 cycles do not pay for the larger code (an extra long
+cold-start dip in AM, instruction-cache misses at tile starts) and 22 more
+VGPRs. The batched fill saves the intended ~750 cycles of drains and
+barriers, but the first C store now issues only after three chunks are
+written, so the store-latency chain starts later and slot waits grow by
+~580. The transition is paced by C-store latency and by cluster peers, not
+by per-chunk overhead; useful changes must add overlap (idea 3) or issue
+the first stores earlier, not trim local work. Archive (patch, scripts, AM
+summaries, ATT bundles):
+`/home/ibutygin/tlx/perf-data/mxfp-tile-transition-20261024.tar.gz` (SHA256
+`12a4db112c83da643e1474550ed166df1c4dd0ca9d849cec015249b70da0a86d`).
+
+**Next-tile peeled step overlapped with C stores (2026-10-24): transitions
+−14%, steady loop +4%; not kept.** Temporary `OVERLAP_PEEL` (static-slot
+path): the first tile's zero-accumulator step runs before the tile loop;
+every later tile's runs inside the previous epilogue. Stage-0 operands of
+the next tile are read once its prefetch lands, and after each quadrant's two
+C chunks are written its registers take that quadrant's next-tile dot
+(store C00 → dot C00′ → store C01 → dot C01′ → …), so the 16 WMMAs per
+quadrant run during the following slot-reuse waits. After the last store the
+stage-3 refill is issued and stage 1 acquired with `wait(12)` (stage 2, eight
+C stores, and the refill are younger). The tile loop then starts at step 1
+and carries the accumulators. Variants: `=1` also carries the step-1
+operands; `=2` carries only the accumulators and reloads step-1 operands at
+the loop top; `=3` additionally loads each next-tile dot's operands right
+before it. The asm interleaves as intended (C00′/C01′/C10′ WMMAs precede the
+chunk 3/6/8 slot waits). FFM passed 4x4 at 2048×1024×2048 and unclustered
+1280×512 with K = 512, 1152, 1536; AM 2x2 passed; hardware outputs bitwise
+identical.
+
+| 8192³ | Default | `=1` | `=2` |
+|---|---:|---:|---:|
+| HW vs default (three passes) | — | +1.09 / +0.98 / +1.06% | +0.91 / +0.93 / +0.88% |
+| VGPRs; steady-loop instructions | 859; 702 | 875; 714 | 859; 706 |
+| ATT transition gap (median) | 10,587 | 10,218 | **9,092** |
+| ATT steady step (LDS, wg barrier) | 824 (231, 64) | 874 (249, 72) | 858 (234, 66) |
+| ATT wave cycles (median) | 247,217 | 260,618 | 252,717 |
+
+The overlap itself works: `=2` shortens each transition by ~1.5k cycles
+(about 4.5k per wave). But carrying the accumulators across the tile loop
+changes LLVM's register assignment for the steady loop, which now
+recomputes six LDS operand addresses in one of its three unrolled steps
+(`v_add`/`v_dual_add` from slot SGPRs plus per-lane VGPRs, three `v_nop`, an
+extra `depctr_vm_vsrc` wait): the "per-step VALU address add makes the
+following `ds_load` wait for in-flight WMMAs" pattern the static unroll was
+built to avoid. That costs ~34 cycles per step (~6k per wave) and the net is
++0.9%. (Later shown not to be the cause; see "Why `OVERLAP_PEEL` was
+slower".) `=3` (shorter operand lifetimes in the epilogue) produces the same
+steady loop, so epilogue pressure is not the cause; `=1` also moves operands
+to other VGPR banks (875 VGPRs). If the steady loop could keep the
+default's code (e.g. by preventing that rematerialization, or keeping the
+addresses in non-rematerializable form), the overlap would be worth about
+1.8% of the wave at 8192³. Archive (patch with all three variants, ATT
+bundles, loop listings):
+`/home/ibutygin/tlx/perf-data/mxfp-overlap-peel-20261024.tar.gz` (SHA256
+`a29d7d7a4c37d18081b804cd87031c71e3f7b4b57a66732e8b75c350f8e6fe80`).
+
+**Where the in-loop LDS address adds come from (2026-10-24).** Traced
+through the stages for the default and `OVERLAP_PEEL=2`: the Triton/TLX LLVM
+IR steady loops are identical (4,296 instructions) and every one of the 216
+LDS loads uses a loop-invariant `getelementptr` defined before the loop.
+CodeGenPrepare then sinks all 216 addresses into the loop (`sunkaddr` = slot
+base + lane offset + constant) so constants fold into `ds_load` offsets;
+instruction selection emits one `V_ADD_U32` per distinct (slot base SGPR,
+lane-offset VGPR) pair, 24 in the loop; Machine CSE removes only those with
+an identical copy in a dominating block (the tile-start operand loads and
+the peeled step provide 18 in the default, 12 with the peel moved to the
+epilogue), and Machine LICM does not hoist the rest although their operands
+are loop-invariant (`-hoist-cheap-insts` does not help). So the default also
+carries 6 such adds. `-disable-cgp` removes the sinking but spills (1,024
+VGPRs). Sched barriers cannot help: they only order instructions within a
+scheduling region and cannot move them out of the loop's blocks. A fix
+belongs in the TLX LDS-load lowering (an opaque per-slot base + lane value,
+e.g. `freeze`, before the loop) or in LLVM. Also, `slot = wmma_idx %
+NUM_BUFFERS` in `_mxgemm_load_a_operand` on an already reduced slot becomes
+a `V_CNDMASK_B32`, putting the slot index in a VGPR.
+
+**Newer AMD codegen (2026-10-24): `05e432a8` is 13% slower; keep the pin.**
+Packages from the upstream blob store: `amd-codegen-6bc4aaf6-ubuntu-x64-6`
+(upstream `main`'s pin, checksum matches) and `amd-codegen-05e432a8-ubuntu-
+x64-1` (#12471; no checksum published yet, SHA256 `1d262f1b…`). Kernels
+compiled locally with each and launched with `hw_ship.py`; FFM passed with
+`05e432a8` (static 4x4, overlap `=2`, dynamic K=1024); outputs bitwise
+identical.
+
+| vs pinned `d26ff26e` (two passes) | 8192³ | 8192²×4096 | 16384³ | 32768³ |
+|---|---:|---:|---:|---:|
+| `6bc4aaf6` | +0.38 / +0.38% | | | |
+| `05e432a8` | +13.1 / +13.5% | +2.6 / +2.4% | +0.26 / +0.19% | +0.29 / +0.31% |
+| `05e432a8`, `OVERLAP_PEEL=2` | +12.0 / +12.2% | | | |
+
+`05e432a8` shrinks the 8192³ steady loop from 702 to 611 instructions
+(`s_set_vgpr_msb` 177 → 101, ALU waits 19 → 9, address adds 6 → 3, partial
+`s_wait_dscnt` counts) at 933 instead of 859 VGPRs, but ATT (16 SEs) shows
+the step at 1,054 instead of 855 cycles: LDS reads 153 vs 227, TDM waits 147
+vs 36, cluster barrier 101 vs 46, workgroup barrier 108 vs 84, WMMA issue
+494 vs 423. The old scheduler keeps ~5 WMMAs in flight across each step's
+rendezvous (barrier → TDM refill → `s_wait_tensorcnt 0x4` → barrier); the
+new one emits that sequence back to back with at most one WMMA in between,
+exposing the input waits. Adopting it needs those WMMAs placed explicitly
+(e.g. `sched_group_barrier` around the refill) or a backend fix. Archive
+(ATT bundles, asm/LLIR per codegen, scripts):
+`/home/ibutygin/tlx/perf-data/mxfp-codegen-05e432a8-20261024.tar.gz` (SHA256
+`97db038cbb465f3b2d9fdeb58598f4f0bba4db2944340bf529c97bdf9213c575`).
+
+**Forcing address CSE / keeping addresses alive (2026-10-24): the in-loop
+adds are a VGPR-pressure decision; pinning them spills.** Three probes, all
+temporary:
+
+1. Kernel-level keep-alive (`KEEP_ADDR_PROBE`): dummy `local_load`s before
+   the steady loop, consumed by side-effect inline asm, to create dominating
+   address copies for Machine CSE. LLVM merged the probe loads before ISel,
+   so the loop was unchanged (the six adds only appeared as three
+   `v_dual_add`s in one build, which first looked like a reduction).
+2. Redundant modulo (`REDUCED_SLOT`): skipping `slot = wmma_idx %
+   NUM_BUFFERS` on an already reduced slot removes the `V_CNDMASK` and a
+   VGPR multiply. Static loop 702 → 683 instructions, ALU waits 19 → 15,
+   the `v_nop`s of `OVERLAP_PEEL=2` vanish, but six adds remain. Hardware
+   (three passes, 8192³): +0.32 to +0.48% slower; with `OVERLAP_PEEL=2`
+   +1.0 to +1.2%. Controls with identical code stayed within ±0.2%.
+3. LLIR rewrite as a proxy for a TLX "pin address" op: each (slot base,
+   lane offset) sum goes through an `asm "=v,0"` identity before the loop
+   so it cannot be rematerialized. This removes the in-loop adds but
+   spills: pinning all 18 pairs gives 34–36 spilled VGPRs; pinning only the
+   group that is still recomputed gives zero adds and 12 spills (default
+   config). **The spills are an artifact (see the next paragraph):** on
+   gfx1250 the inline-asm `v` constraint maps to `VGPR_32_Lo256`
+   (`SIISelLowering.cpp`, `has1024AddressableVGPRs`), so the pinned values
+   had to stay in v0–v255 across the loop.
+
+Archive (patch, `pin_lds_addr.py`, `llir_to_asm.py`, asm per variant,
+hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-addr-pin-20261024.tar.gz` (SHA256
+`858d88556c545de81458a009e0670ef68f7bf57096d9d2cd1b162364266fa4ba`).
+
+**Live values across the steady K loop; class-neutral address pin
+(2026-10-24): VGPR pressure is not binding; removing the in-loop adds is
++0.45% slower.** `mir_live.py` computes liveness on the pre-RA MIR (after
+`amdgpu-pre-ra-long-branch-reg`) of the 8192³ default and classifies what
+is live at the K-loop header:
+
+| Live at loop header (8192³ default) | VGPRs | SGPRs |
+|---|---:|---:|
+| Accumulators c00..c11 (carried) | 512 | |
+| Next step's first A/B operands, loaded before the back edge (carried) | 128 | |
+| Scale operands (carried, `vreg_64_lo256`) | 4 | |
+| Slot index, cluster state, TDM descriptor parts (carried) | | 13 |
+| LDS addresses: 6 lane terms, 8 A/B slot-base + lane sums, 6 scale address terms (invariant, used) | 20 | |
+| TDM descriptors and bases used in the loop (invariant) | | 25 |
+| Used only after the loop: 5 lane terms; C/epilogue TDM descriptors, kernel args, tile-offset terms | 5 | 52 |
+| Total live-in / peak inside the loop | 669 / ~807 | 90 |
+
+Allocation is 859 VGPRs of 1,024, so there is ~165 VGPRs of slack and
+almost nothing VGPR-side to recompute outside the loop (5 registers).
+SGPRs are the tight file (96 used, 104 with `OVERLAP_PEEL=2`, of ~106):
+52 live-through SGPRs are only needed after the loop, while the loop
+rebuilds TDM descriptor groups every step (56 SALU per three steps, mostly
+`s_mov_b32 sN, s29`). That is the only real "recompute outside" candidate,
+and it is cheap SALU that overlaps WMMA.
+
+Re-running the pin with an identity that does not constrain the register
+class (`llvm.amdgcn.mov.dpp8` with selector `0xFAC688`, emitted as
+`v_mov_b32_dpp ... dpp8:[0,1,2,3,4,5,6,7]` before the loop) and compiling
+through `TRITON_KERNEL_OVERRIDE`: zero in-loop address adds, no spills,
+861 VGPRs (pins land in v816+), steady loop 702 → 693 instructions for the
+default and 706 → 688 for `OVERLAP_PEEL=2`. The rest of the loop is the
+same code (same `ds_load`/WMMA order, same sync skeleton). Outputs are
+bitwise identical. Hardware, 8192³, three passes:
+
+| vs default | pass 1 | pass 2 | pass 3 |
+|---|---:|---:|---:|
+| pinned | +0.45% | +0.44% | +0.49% |
+| `OVERLAP_PEEL=2` | +0.83% | +0.94% | +1.07% |
+| `OVERLAP_PEEL=2` + pinned | +1.55% | +1.70% | +1.78% |
+
+ATT (16 SEs, one dispatch each) puts the difference in the steady loop:
+median loop cycles per wave 193.8k → 205.6k, mostly workgroup-barrier wait
+(13.7k → 24.5k), i.e. the step barrier after the TDM refill
+(`s_wait_tensorcnt 0x4` → signal → 5 WMMAs → wait) waits about twice as
+long. The six adds sat between the `ds_load` groups after that barrier;
+without them the loads issue back to back and peers arrive later
+(hypothesis: LDS request timing across waves). Conclusions: the in-loop
+address adds are not a cost, they did not cause the `OVERLAP_PEEL`
+steady-loop regression, and a TLX "keep address alive" op is not worth
+adding for this kernel. The `OVERLAP_PEEL` loss must be explained by
+something else in its steady loop (compare its ATT barrier and LDS waits
+against the default). Archive (`mir_live.py`, `dump_prera.py`, pinned
+LLIR, asm, ATT bundles and per-instruction stall diffs, hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-live-values-20261024.tar.gz` (SHA256
+`c0af5bc3bccd803bbe1f41adf29d2eee0e4e872a56d3e50bc7e7ee5fcfa737a1`).
+
+**Why `OVERLAP_PEEL` was slower (2026-10-24): the next tile's stage-3
+refill sat behind the C stores in the TDM queue. With that fixed the
+overlap breaks even.** Variants (temporary patch, archived): `ovl2` =
+`OVERLAP_PEEL=2`; `g` = `OVERLAP_GUARD` (the next-tile dots run only when
+`has_next`, and the last tile does plain C stores); `e` =
+`OVERLAP_EARLY_REFILL` (the stage-3 refill is issued right after quadrant
+2's C stores instead of after all eight, and quadrant 3's slot waits allow
+`LOADS` more pending). Sustained `hw_power.py` timing at the power cap
+(about 2,480 W), 3–4 interleaved rounds each. Cycles = time × sampled gfx
+clock. All outputs are bitwise identical.
+
+| 8192³ vs default | Time | Cycles | Notes |
+|---|---:|---:|---|
+| `ovl2` | +0.79 / +0.93% | +1.25 / +1.35% | `GRBM_GUI_ACTIVE` +1.22% |
+| `ovl2g` | +0.67 to +0.75% | +1.24 to +1.33% | guard saves about 0.18% |
+| `ovl2ge` | **−0.10 / −0.15%** | −0.05 / −0.14% | two sessions |
+| `ovl2ge`, refill after quadrant 1 | +0.44% | +0.55% | chunk 7's slot wait then waits for the refill |
+
+- **Wasted step:** without the guard, the last tile's epilogue still runs
+  the first step of a next tile that does not exist: 64 WMMAs and 68 LDS
+  loads per wave (ATT: 16,448 vs 16,384 WMMAs per wave).
+- **Late stage-3 data:** in the overlap epilogue, the stage-3 refill is
+  issued after the eight C stores. TDM completes in order, so the refill
+  lands late. The first loop iteration's step-2 `s_wait_tensorcnt 0x4`
+  rises from 169 to 651 cycles (ATT mean, 144 waves), about 480 cycles per
+  tile. Issuing the refill before the last two C chunks removes the
+  remaining loss. Moving it before the last four is worse, because chunk 7
+  reuses chunk 4's slot and must then wait for the refill too.
+- **Hardware shape factorial (`base` vs `ovl2g`, identical loop code in
+  every shape):** 4096²×8192 (one tile per program) −0.37%; 4096²×32768
+  −2.3%; 8192²×32768 (four tiles) −4.4% (−7% cycles; `GL2C_REQ` −5% with
+  the same misses). The overlap's steady-loop code is not slower. The 8192³
+  loss came only from the transitions. Long K strongly favors the overlap;
+  the L2-request difference there is not explained yet.
+
+Leads ruled out on the way:
+
+- **The in-loop differences ATT shows are not the cause.** ATT shows `ovl2`
+  iterations about 50–70 cycles longer (WMMA +18, `ds_load` +26, VALU +17)
+  and two extra full drains (`s_wait_alu depctr_va_vdst(0)`) per iteration.
+  The drains are write-after-read hazards: the next step's `ds_load`
+  overwrites `v[64:79]` four instructions after a WMMA reads it. There is
+  also a header wait merged from the epilogue path that comes out as
+  `va_vdst(0)` instead of `base`'s `va_vdst(12)`. Hand-editing the asm
+  through `TRITON_KERNEL_OVERRIDE` to remove the first (move the loads
+  after the next drain) was neutral (+0.78% vs +0.72%). Relaxing the
+  second to `va_vdst(10)`, with a full wait on the entry edge, was worse
+  (+1.15%). In the one-tile shape, ATT shows the same per-iteration excess
+  (+1.8% wave cycles) while hardware shows `ovl2g` 0.37% faster.
+  Single-CU ATT apparently inflates issue-level differences, perhaps
+  through trace overhead per instruction, so don't use ATT for effects
+  under about 2%.
+- **The address pin is not the fix.** Pinned builds are slower (`basepin`
+  +0.36%, `ovl2gpin` +2.06%). As with the drain edits, removing stalls
+  in the loop tends to make it slower: the steady loop behaves like a
+  contended shared resource, where per-wave stalls act as throttles.
+- **Power is not the cause.** Every variant runs at the same cap. The
+  overlap variants run at the same or higher clocks, and the cycle counter
+  shows the same ordering when not throttled.
+
+Archive (probe patch with `OVERLAP_GUARD`/`OVERLAP_EARLY_REFILL`,
+`hw_power.py`, ATT bundles with tile/iteration/drain scripts, PMC, asm and
+override files, logs):
+`/home/ibutygin/tlx/perf-data/mxfp-overlap-reason-20261024.tar.gz` (SHA256
+`f44a38692b928b3e3a2927dac00f79e66c1489624665ebdc8107a61f62e6c5d8`).
+
+**Overlap across shapes, dynamic-loop port, and multicast alignment
+(2026-10-24).** `ovl` = `OVERLAP_PEEL=2` + `OVERLAP_GUARD` +
+`OVERLAP_EARLY_REFILL`. The probe patch now also runs the overlap in the
+three-stage dynamic `DEFER_BOTTOM` loop: the loop starts at step 1 from the
+slot after `phase`, and both loop kinds use the pinned native dot so the
+carried accumulators keep one layout. Outputs match the default at K=1408
+(8 dynamic steps), 4096 and 8192. Sustained timing vs the `bench.py`
+default for each shape:
+
+| Shape (bench default) | 3-stage static | static + `ovl` | dynamic + `ovl` |
+|---|---:|---:|---:|
+| 8192³ (static) | — | **−0.10 to −0.27%** (4 runs) | +0.28% (dynamic default +0.75%) |
+| 8192²×4096 (3-stage dynamic) | +6.9% | +2.6% | **−0.93%** |
+| 8192²×32768 (4-stage dynamic) | +15.8% | +12.8% | n/a |
+| 16384³ (4-stage dynamic) | +9.1% | +4.8% | n/a |
+| 32768³ (4-stage dynamic) | +8.1% | +2.4% | n/a |
+
+So the overlap is a small win on both three-stage default paths. Long K
+would need it ported to the four-stage ring (two C slots, different
+slot-wait accounting).
+
+The large long-K overlap gains were measured against the weaker three-stage
+build, and most of them come from cluster multicast alignment. A multicast
+load merges only when the cluster peers request it close together;
+otherwise late peers issue separate loads, which hit in L2. PMC for the
+three-stage static build (40 dispatches each):
+
+| vs `s3` (barrier interval 8) | K=8192 L2 req | K=8192 cycles | K=32768 L2 req | K=32768 cycles |
+|---|---:|---:|---:|---:|
+| `ovl` | −0.3% | −0.2% | −3.2% | −3.6% |
+| interval 4 | −1.2% | +1.4% | −14.5% | −6.0% |
+| `ovl` + interval 4 | −1.1% | +1.2% | −15.0% | −6.5% |
+| interval 16 | +4.5% | +7.1% | +31.6% | +18.8% |
+
+L2 misses and DRAM reads are unchanged; only L2 hits move, i.e. duplicate
+requests from unmerged multicasts. Timing agrees: at 8192²×32768, interval
+4 is −4.9% and `ovl` + interval 4 −5.8% vs the 3-stage build, and at
+8192³ interval 4 is +1.05% and 16 is +7.3%. The four-stage default does not
+gain from a tighter interval: 4 and 6 are +0.5 to +1.1% at 8192²×32768,
+16384³ and 32768³, so 8 stays. Archive (probe patch with the dynamic port,
+logs, PMC, asm):
+`/home/ibutygin/tlx/perf-data/mxfp-overlap-shapes-20261024.tar.gz` (SHA256
+`2ad08ff07f94fe727649ec3c704b9cec809a102d7897ff7a8a1d8d3c18c2e5e6`).
+
+**Overlap peel option (2026-10-24).** The probe is now one option,
+`OVERLAP_PEEL` (`--overlap_peel`, `bench.py --overlap-peel`), which always
+includes the last-tile guard and the early refill. It runs in the static and
+dynamic loops with three or four buffers. `_mxgemm_overlap_store` stores a C
+quadrant and issues the next tile's stage-`NUM_BUFFERS` refill before chunk
+`max(chunks − C_SLOTS, 2 × parts per quadrant)`: chunk 5 of 8 with three
+64x128 slots (the probe used 6), and chunk 14 of 16 with the four-stage
+ring's two 64x64 slots, splitting quadrant 3's stores. The chunks after the
+refill pass `EXTRA_PENDING=LOADS` to their slot waits. Default builds
+compile to identical code. Hardware (`hw_power.py`, three rounds, vs the
+`bench.py` default; outputs bitwise identical at K = 1408, 2176, 4096,
+8192, 9344, and 32768):
+
+| Shape | Ring | `OVERLAP_PEEL` |
+|---|---|---:|
+| 8192³ | 3 stages, static | −0.21% |
+| 8192²×4096 | 3 stages, dynamic | **−1.20%** |
+| 8192²×32768 | 4 stages, dynamic | −0.03% |
+| 16384³ | 4 stages, dynamic | +0.12% |
+| 32768³ | 4 stages, dynamic | −0.03% |
+
+The four-stage ring runs at the power cap (2,500 W, about 1.64 GHz), and
+removing transition stalls does not reduce its time. `bench.py` therefore
+enables the overlap only for three-buffer A8W8. The four-stage builds spill
+10–12 SGPRs with the overlap, against 6–8 without. FFM:
+`test_mxgemm_overlap_peel_ring_phase` (24 cases: static, dynamic, and
+four-stage rings; 4–10 K blocks; with and without 2x2 clusters) passes.
+Archive (patch, hardware log, asm):
+`/home/ibutygin/tlx/perf-data/mxfp-overlap-option-20261024.tar.gz` (SHA256
+`f603424020146799824451609d0f3ec312dc68ca4357ded216da9d4a25cb8d47`).
+
+Not worth repeating: issuing next-tile loads after the C stores (+1.6%),
+next-tile L2 prefetch, wave-specialized handoff, and more but smaller C
+slots (6 × 64x64), all measured earlier in this document. A fourth 32 KB C
+slot does not fit (316,584 of 327,680 bytes of LDS used).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
@@ -1435,11 +1908,23 @@ Lessons to retain when designing the next change:
 4. Vary M/N at fixed K and K at fixed M/N to separate one-time startup from
    per-output-tile costs. At 256 programs with 256x256 tiles, square M/N
    sizes 4096, 8192, and 16384 give one, four, and sixteen tiles per program.
-5. LDS partition conflicts: see "LDS partition conflicts: what we learned"
+5. Tile transition: see "A8W8 8192³ profile and tile transition
+   (2026-10-24)" for the measured breakdown and ideas. Static K tail and
+   batched first C fill gave no gain. Overlapping the next tile's peeled
+   step with the C stores saves ~1.5k cycles per transition but makes LLVM
+   rematerialize LDS addresses in the steady loop. The real cause was the
+   late stage-3 refill plus a wasted last-tile step (see "Why
+   `OVERLAP_PEEL` was slower"). With guard and early refill it breaks even
+   at 8192³ (−0.1 to −0.3%) and, ported to the dynamic loop, −0.9% at
+   8192²×4096 (see "Overlap across shapes"). It is now the `OVERLAP_PEEL`
+   option and a three-stage `bench.py` default (see "Overlap peel
+   option"); it is neutral on the power-bound four-stage ring. Re-measure
+   the defaults with `bench.py` once the remote Triton is rebuilt.
+6. LDS partition conflicts: see "LDS partition conflicts: what we learned"
    above for the open directions (lane-bit scale layout for swizzled waves,
    explicit partition placement). Rebuild the remote Triton with
    `639c951130` before running `bench.py` with the new 8192³ default.
-6. Update the [resource/dependency model](../../tools/perf_model/README.md)
+7. Update the [resource/dependency model](../../tools/perf_model/README.md)
    with the measured service times and exposed dependencies. Choose the next
    schedule change from a quantified gap; retain ordinary defaults until
    repeated hardware results justify replacing them.
