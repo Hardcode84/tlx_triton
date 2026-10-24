@@ -1829,10 +1829,728 @@ Archive (patch, hardware log, asm):
 `/home/ibutygin/tlx/perf-data/mxfp-overlap-option-20261024.tar.gz` (SHA256
 `f603424020146799824451609d0f3ec312dc68ca4357ded216da9d4a25cb8d47`).
 
+**Redundant scalar work (2026-10-24): present, but worth at most about
+0.1%.** In the 8192³ bench default (`OVERLAP_PEEL`, static loop), the steady
+loop issues 56 SALU per iteration (three K steps). Each step rebuilds its TDM
+descriptor groups: the fused A+B load's group 2 (`<64,0,0,0>`) and group 3
+(zeros) are constants shared by every load in LLVM IR, but the allocator
+splits them and copies them back from a zero SGPR every step (about 14 movs
+per iteration). Two `s_mov_b64` per iteration are fully dead and four are
+half dead (overwritten by `s_mov_b32` before use). The rest is needed: global
+address updates, LDS slot address writes, and the `k % 8` cluster-barrier
+check.
+
+The cause is SGPR pressure (104 of about 106). After allocation, 83 SGPRs are
+live at the K-loop header and 39 of them are never referenced in the loop.
+They are tile-invariant C-store state hoisted to the kernel preheader: the
+C descriptor's group 1, three per-C-slot group-0 templates (flags plus each
+wave's LDS slot address), and `c_ptr` and C-address terms. LLVM options do
+not help: `disable-machine-licm` frees 10 SGPRs but adds SALU (62);
+`sink-insts-to-avoid-spills` and `greedy-regclass-priority-trumps-globalness`
+change at most one instruction.
+
+Sensitivity on hardware (asm through `TRITON_KERNEL_OVERRIDE`, three rounds,
+outputs identical): removing the dead copies and narrowing the half-dead ones
+(56 → 52) is −0.04% (noise). Adding 60 independent SALU per iteration (116)
+costs +0.31% (+0.52% cycles), about 0.005% per SALU per iteration. Even
+removing all ~20 redundant loop SALU is worth about 0.1%, so it is not worth
+TLX-level contortions to keep the C-store state out of the loop.
+
+The tile transition (K tail, overlapped epilogue, tile entry) issues 342
+SALU per tile. The avoidable parts are tile coordinates computed twice per
+tile (current tile at entry, next tile in the tail, about 32 SALU each;
+carrying `next_m`/`next_n` would remove one) and per-chunk C descriptor and
+address work (about 10 SALU per 64-row chunk; one tile base would halve it).
+That is about 70 SALU per tile in a wait-dominated transition, likely under
+0.1%. Archive (asm variants, scripts, MIR liveness, hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-salu-20261024.tar.gz` (SHA256
+`31e4e57eb8f39c59d81b35caea29d40152facebdd022f89c687af988ca5d6b67`).
+
+**Automatic wave specialization (2026-10-24): mixed, not adopted.** The
+local `wave-specialization` branch (6 commits, MLIR uniformity analysis plus
+`HIPOptions.enable_wave_specialization`) cherry-picks cleanly onto
+`46500c4c5b` (local branch `ws-test`). It first failed to compile this
+kernel: after cloning, the canonicalizer merged blocks that differ only in a
+TDM wait count into one block argument, and LLVM rejected the non-immediate
+`llvm.amdgcn.s.wait.tensorcnt` operand ("immarg operand has non-immediate
+parameter"). Lowering `AsyncTDMIntrinsicWait` to `ROCDL::WaitTensorcntOp`
+(count as an attribute) fixes it; `test/Conversion/amd` lit passes with the
+CHECKs updated. With the option off, the 8192³ default compiles to
+identical code.
+
+The pass splits on the fused-TDM A/B wave selector (a wave-ID bit) and
+clones the kernel body into two versions (code 2,500 → 4,743 instructions).
+It does remove the selector work: the base LLVM IR has 29 `select`s on that
+one predicate (`icmp eq (and %wave, 5), 0`: 15 LDS pointers, 6 global
+bases, 6 descriptor words, 2 whole 256-bit descriptor groups) and the
+specialized IR has none; `s_cselect` goes from 69 to 48 across both
+versions. But 12 of the selects are in the kernel prologue and 17 in the
+tile transition, none in the K loop, and after each select only the chosen
+descriptor is live, so the loop's SGPR use is unchanged: each version still issues 56 SALU per iteration and the function
+still uses 104 SGPRs. The loop shrinks by 16 instructions (fewer
+`s_set_vgpr_msb`/`v_nop`), and per-tile transition SALU drops from 342 to
+about 270. Hardware (`hw_power.py`, three rounds, vs the `OVERLAP_PEEL`
+bench default; outputs identical): 8192³ +0.34% (cycles +0.36%),
+8192²×4096 −0.48% (cycles −1.1%). The transition-heavy K=4096 case gains
+and 8192³ loses, possibly from the doubled instruction footprint.
+
+Why the 17 transition selects stay per tile (base LLVM IR): every one
+depends on a tile-loop phi. The 8 descriptor-word and global-base selects
+depend on the tile index: `select(isA, addrA(off_m), addrB(off_n))`, where
+both arms differ in the base descriptor and in the per-tile offset. The 9 LDS
+slot-pointer selects depend on the ring phase: both arms are
+`gep(base_piece, slot * 17408)` with the same offset, but the A/B choice is
+wrapped around a second wave-dependent choice (an `extractelement` from a
+`<2 x ptr>` vector of LDS partition pieces, by wave bit 1). LLVM can fold
+`select(c, gep(a, i), gep(b, i))` to `gep(select(c, a, b), i)`, but not
+through that vector, and not for two different sums. So each wave computes
+both the A and the B candidate from per-tile data and then selects. The 12
+prologue selects run once per kernel.
+
+To hoist them, the select must take tile-invariant inputs, with the
+per-tile part applied once afterwards: select the base descriptor and LDS
+partition base (hoisted by LICM), then per tile select only the scalar
+offset (`off_m`/`off_n`), apply one descriptor update, and add one slot
+offset. The fused-TDM lowering cannot do this: it sees member descriptors
+that already include the per-tile offset (from `update_tensor_descriptor`),
+and lowerings must not inspect producer ops. It needs a transform before
+lowering: recognize fused members built as `update_tensor_descriptor(base,
+offsets)` plus `local_view(buf, slot)`, and rewrite the fused load into a
+form taking per-member base, offsets, and slot. A source-level rewrite that
+picks `off_m`/`off_n` from the wave ID would put a hidden warp-varying scalar
+in the kernel, which `AGENTS.md` forbids. Expected value: up to what wave
+specialization removed from the transition (about 72 of 342 SALU per tile;
+−0.48% at K=4096) without its code-size cost at 8192³, so roughly 0.2–0.5%
+at K=4096 and a small gain at 8192³. Not implemented. Archive
+(lowering patch, compile wrapper, binaries, log):
+`/home/ibutygin/tlx/perf-data/mxfp-wave-specialization-20261024.tar.gz`
+(SHA256 `920dc59809194171dc03eb1fda344d2ef9905c270239a10cb39d803fd8f0153f`).
+
+**Profile of the current defaults with `OVERLAP_PEEL` (2026-10-24).**
+Sustained: 8192³ 0.1497 ms (7,346 TFLOPS) at 1,797 MHz and 2,472 W (at the
+power cap); 8192²×4096 0.0833 ms (6,602 TFLOPS) at 1,886 MHz and 2,431 W.
+ATT, 48 waves per shape (3 dispatches × 16 SEs), stall cycles charged to
+the instruction before the next issue (`att_breakdown.py`); percentages are
+of mean wave cycles (8192³: 249.6k; K=4096: 138.6k). ATT runs below the
+power cap and inflates small issue-level differences, so use it for the
+split, not for sub-2% comparisons.
+
+| Share of wave | 8192³ (static loop) | 8192²×4096 (dynamic loop) |
+|---|---:|---:|
+| WMMA floor (8 cycles/WMMA) | 52.5% | 47.3% |
+| Steady K loop | 83.0% | 71.6% |
+| … WMMA issue | 41.2% | 34.1% |
+| … `ds_load` issue + LDS waits | 14.7% + 8.1% | 14.8% + 9.7% |
+| … workgroup + cluster barriers | 6.9% + 4.1% | 0.9% + 2.5% |
+| … SALU / VALU | 3.4% / 0.8% | 4.6% / 3.4% |
+| … TDM waits | 3.4% | 1.0% |
+| Tile transitions (3 per wave) | 11.3% | 19.3% |
+| Final epilogue (last tile's C) | 3.9% | 6.3% |
+| Prologue | 1.7% | 2.8% |
+
+8192³ steady step (iterations 1–18, per K step): 849 cycles: WMMA issue
+428, `ds_load` issue 152, LDS wait 79, workgroup barrier 67, cluster
+barrier 40, SALU 41, TDM wait 33, VALU 8. A step reads about 139 KB of LDS
+per CU (68 `ds_load_b128` per wave), about 164 B/cycle. The first iteration of
+each tile costs 3,136 cycles for three steps (2,547 steady), mostly barrier
+waits. Transitions are about 9.4k cycles each (8.9k at K=4096); the largest
+stalls are the C-slot reuse wait (`s_wait_tensorcnt 0x2`, about 2.8k per
+wave), the stage acquire (`s_wait_tensorcnt 0x4`, about 2.5k), and LDS
+waits for C staging and the overlapped next-tile reads. The final epilogue
+mostly waits for the last C stores (TDM 4.3k).
+
+Bottlenecks in order: (1) LDS reads in the steady loop, about 23–25% of
+the wave on both paths (but see "LDS reads, deeper": much of this is
+matrix-pipe time charged to loads, and the rest is latency exposed at the
+step boundary, not LDS bandwidth); (2) at 8192³, per-step
+workgroup and cluster barriers (11%); the dynamic K=4096 loop shows only
+3.4%, so the static loop's per-step rendezvous or its wave balance is worth a
+targeted look; (3) tile transitions plus final epilogue (15% at 8192³, 26%
+at K=4096), now bound by C-store drain and slot reuse; (4) SALU/VALU address
+work (4–8%), mostly hidden (see "Redundant scalar work"). L2 hit rate is
+85.9% (8192³) and 80.3% (K=4096); the EA/DRAM counters read implausibly low
+and are not used. Archive (ATT bundles, PMC, binaries, scripts):
+`/home/ibutygin/tlx/perf-data/mxfp-profile-overlap-defaults-20261024.tar.gz`
+(SHA256 `6bac4522b2dbee4c320675de35bd8bea612dc14d7d64c3d266f061da4ecf8689`).
+
+**LDS reads, deeper (2026-10-24): LDS bandwidth is not the limit;
+exposed latency after each step's synchronization is.**
+
+Hardware microbenchmarks (`ldsbw/` in the archive; device-only HIP code
+objects launched through `libamdhip64` with ctypes, because the remote HIP
+headers do not match the gfx1250 compiler; one workgroup per CU with almost
+all LDS allocated; timing with `s_get_shader_cycles_u64`):
+
+- Dependent `ds_load_b128` latency: about 75 cycles with 1, 4, or 8 waves
+  per CU (load to use; 56–59 cycles for the first load of a burst).
+- One wave issues `ds_load_b128` back to back at one per cycle; a burst of
+  N completes after about 56 + 2·N cycles (inline asm, so the compiler
+  cannot insert waits). That is about 256 B/cycle per wave.
+- CU throughput with 16 waves: 512 B/cycle when loads spread over at least
+  two partitions, 256 B/cycle when all hit one partition, 367 B/cycle when
+  every wave alternates between the same two. Four waves move 48 KB in
+  105 cycles across two partitions (about 470 B/cycle including latency) and
+  in 167 cycles from one partition (about 290 B/cycle).
+- Caution: a C++ version of the same test compiled with `s_wait_dscnt`
+  between its loads and reported a false per-wave limit of one load per
+  13–15 cycles at any width. Check the ISA of LDS microbenchmarks.
+
+The GEMM averages about 154 B/cycle of reads plus about 78 B/cycle of TDM
+writes per CU at 8192³, far below these rates. The 849-cycle steady step
+(ATT, per K step, `pcm-8192.txt` timeline) decomposes as: WMMA floor 512
+(64 × 8); step synchronization about 140 (stage acquire
+`s_wait_tensorcnt 0x4` about 33, the workgroup barrier after it 41–75,
+cluster barrier 40 amortized); LDS waits 79, which is the latency of the new
+stage's first operand loads, issued only after that barrier while about five
+deferred WMMAs of the old stage cover it; extra load-issue cost about 69
+(68 loads at about 1.9 cycles each, beyond what overlaps the matrix pipe,
+including about 22 cycles of the two full WMMA drains,
+`s_wait_alu depctr_va_vdst(0)`, that ATT charges to the preceding load); and
+SALU/VALU about 49. So LDS-related time is about 150 cycles per step and
+synchronization about 140, both around the step boundary.
+
+Ways to cut it: cover the post-barrier load latency with more matrix work
+(a deeper register prefetch of the next stage needs about 256 more VGPRs per
+wave, over the 1,024 budget at 859 now), shorten the barrier (wave skew),
+and avoid the two drains (register assignment, see "Why `OVERLAP_PEEL` was
+slower"). More waves do not help: `num_warps=8` (2 waves per SIMD, 512
+VGPRs, 2 spills, dynamic loop) has fewer loads per wave (52 vs 68) but two
+waves share each matrix unit (10.8 cycles per WMMA) and the step grows to
+957 cycles; hardware +9.8% at 8192³ and +7.2% at 8192²×4096 (outputs
+identical). Archive (microbenchmark sources and runners, 8-wave ATT, logs,
+step timeline): `/home/ibutygin/tlx/perf-data/mxfp-lds-deep-20261024.tar.gz`
+(SHA256 `78ce79d5472558fab5d9a8a465f6c4c1238bc11ba2d650c88fd3327875c5d947`).
+
+**WMMA queuing, SCHED_MODE[2] (2026-10-24): no gain.** The kernel's
+`SCHED_MODE_2` parameter no longer compiles (see the post-rebase breakage
+note); the equivalent is the backend option `enable_wmma_queuing=True`,
+which only adds `s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1`
+at kernel entry (the rest of the code is identical). Hardware against the
+current defaults (`hw_power.py`, four rounds, outputs identical): 8192³
++0.43% (cycles +0.67%), 8192²×4096 +0.05% (cycles −0.21%). With one wave per
+SIMD and the step bound by synchronization and exposed LDS latency, queuing
+WMMAs behind scalar and memory work does not shorten it. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-wmma-queuing-20261024.tar.gz` (SHA256
+`4be760dc5ca4cd5ccda67865919477b8681b13dd314b7c121e14652de066fa07`).
+
+**Avoiding the WMMA drains from register reuse (2026-10-24): possible, but
+every attempt so far costs more than it saves.** The 8192³ static loop has
+five full `va_vdst(0)` drains per three K steps
+(`drain_summary.py`). One is costly (about 27 cycles in ATT): the next
+step's `a00` loads (`ds_load_b128 v[64:67]`) land in the registers of the
+current `a00`, four instructions after `c01`'s last WMMA reads them. Each
+16-VGPR operand is one virtual register that dies at its last WMMA, and the
+next loads start right after, so the allocator is free to reuse it. The
+dynamic K=4096 loop has no full drains.
+
+- Allocator options (`greedy-reverse-local-assignment`,
+  `greedy-regclass-priority-trumps-globalness`, `sink-insts-to-avoid-spills`,
+  `amdgpu-use-amdgpu-trackers`) leave the reuse unchanged.
+- Loading the next `a00` after `c10` (temporary `MXFP_A_AFTER_C10`): the
+  drain moves to another operand at WAR distance 1 (875 VGPRs); hardware
+  +0.86% (cycles +1.40%).
+- `llvm.fake.use` on each in-loop WMMA operand, placed before the next WMMA
+  after its last use (LLVM IR rewrite `fake_use.py`, 46 fake uses): removes
+  all short-distance WAR drains (one left at distance 29) and shortens the
+  loop (703 → 667 instructions), 910 VGPRs, no spills. But the fake uses act
+  as scheduling barriers: the WMMAs that used to straddle each step's
+  barrier → TDM → `s_wait_tensorcnt` → barrier rendezvous are gone
+  (`B Q T Q T B` with no WMMA, then a 34-load burst), the same failure as
+  codegen `05e432a8`. Hardware +13.6% (cycles +22.9%). Outputs identical in
+  all variants.
+
+A working fix has to extend the operand live ranges after scheduling,
+without constraining it: for example an AMDGPU pass between the machine
+scheduler and register allocation that adds each WMMA's A/B vregs as
+implicit uses of a later WMMA, or allocation hints against registers read
+by in-flight WMMAs. That needs a codegen change (the pinned AMDGPU codegen
+is a prebuilt library). Expected value is about 20–25 cycles per K step
+(about 2.5%) at best. Archive (rewrite script, LLVM IR, binaries, patch,
+hardware log): `/home/ibutygin/tlx/perf-data/mxfp-war-drains-20261024.tar.gz`
+(SHA256 `9418f098e2f53c8a0506a0da75047e6d7d503d522ba63ae8a0ee02d06f9fedb7`).
+
 Not worth repeating: issuing next-tile loads after the C stores (+1.6%),
 next-tile L2 prefetch, wave-specialized handoff, and more but smaller C
 slots (6 × 64x64), all measured earlier in this document. A fourth 32 KB C
 slot does not fit (316,584 of 327,680 bytes of LDS used).
+
+#### Patching the AMDGPU codegen: cost and a working pass (2026-10-24)
+
+Rebuilding the pinned codegen locally is cheap. The pinned library
+(`libtriton_amd_codegen.so`, revision `d26ff26e`) is the 349-line wrapper
+`third_party/amd/backend/codegen/amdgpu_codegen.cc` linked statically
+against upstream llvm-project `d26ff26e` (recipe:
+`.github/workflows/amd-codegen-llvm-build.yml`; the prebuilt LLVM bootstrap
+package is a 404 on the blob store, so build LLVM yourself).
+
+- LLVM `d26ff26e`, AMDGPU only, Release + assertions, clang/lld, static:
+  worktree `~/llvm/llvm-d26`, build `~/llvm/llvm-d26-build`, install
+  `~/llvm/llvm-d26-install`. Full build 72 s on this host (384 cores).
+- Wrapper: copy `third_party/amd/backend/codegen`, point CMake at the LLVM
+  install, about 4 s to build. Use it with
+  `TRITON_AMD_CODEGEN_PATH=<install>/lib/libtriton_amd_codegen.so`.
+- The local build produces the same machine code as the pinned library on
+  the default 8192³ kernel; only the `.ident` lines differ.
+- The wrapper sets every codegen flag to `true`; the local copy accepts
+  `name=value` (5-line change), which integer options need.
+
+A custom MachineFunctionPass does not need an LLVM patch and does not need
+MIR round trips. LLVM calls the callbacks registered with
+`RegisterTargetPassConfigCallback` before it builds the codegen pipeline,
+and `TargetPassConfig::insertPass` is public, so the wrapper can insert its
+own pass instances after any pass ID, including AMDGPU-internal IDs such as
+`SIFixVGPRCopiesID`, which the static library exports. One trap: register the
+callback from the wrapper's `initializeTarget()`, not from a static
+initializer, because LLVM's callback list is constructed after the
+wrapper's static initializers and wipes earlier registrations (static
+initialization order).
+
+Why `llvm.fake.use` broke scheduling: `MachineScheduler`'s `isSchedBoundary`
+treats every `FAKE_USE` as a region boundary, both before and after register
+allocation. The pass below therefore inserts `FAKE_USE`s only after the
+pre-RA scheduler and erases them after allocation (before the post-RA
+scheduler and `SIInsertWaitcnts`).
+
+Prototype `wmma_src_live.cc` (about 200 lines):
+
+1. After `MachineScheduler`, for each WMMA it adds a `FAKE_USE` for each
+   512-bit or larger A/B source vreg after the WMMA that is `d` WMMAs later
+   in the same block, then recomputes those live intervals.
+2. After `SIFixVGPRCopies`, it erases every `FAKE_USE`.
+
+Options:
+
+- `triton-wmma-src-live-distance=d`;
+- `triton-wmma-src-live-cross-block` for dominated successor blocks;
+- `triton-wmma-src-live-block-end`;
+- `triton-wmma-src-live-verbose`.
+
+The machine verifier passes. Steady-loop results on the 8192³ default:
+
+| variant | `va_vdst` waits | `va_vdst(0)` | loop instrs | VGPRs |
+| --- | --- | --- | --- | --- |
+| default | 14 | 5 (one at WAR distance 4) | 703 | 859 |
+| `d=2`, `d=4` | 16-17 | 3 | 699-708 | 877-878 |
+| `d=6` | 9 | 3 (2 WAR, block boundary) | 696 | 939 |
+| `d=8` | 9 | 3 (2 WAR, block boundary) | 680 | 947 |
+| `d=6/8` cross-block | 10-13 | 4 | 692-726 | 1024, 16 spilled |
+| `amdgpu-va-vdst-war-hazard=false` | 3 | 1 | 692 | 859 |
+
+The steady loop spans several basic blocks (header, conditional TDM-issue
+blocks, latch). The pass removes every short-distance drain inside a block,
+including the costly distance-4 `a00` one. The two remaining WAR drains sit
+at block boundaries. Following WMMAs across dominated blocks pushes VGPRs
+to the limit and moves the drains to the scale loads.
+
+Hardware 8192³, compiled with the same local codegen:
+
+- Upper bound with WAR waits switched off (`amdgpu-va-vdst-war-hazard=false`):
+  bitwise-identical outputs over 10 screens, sustained 0.14969 vs 0.14998 ms
+  (−0.20%, cycles −0.41%). This is not shippable: it drops waits that
+  protect WMMA source reads.
+- `FAKE_USE` pass, `d=6` and `d=8`: identical outputs over 10 screens;
+  sustained 0.15033 and 0.15036 vs 0.15010 ms (+0.15%, +0.17%; cycles
+  +0.14%, +0.18%). Fewer drains, but the extra live ranges cost as much as
+  they save.
+
+Conclusion: WMMA WAR drains are worth at most about 0.4% of cycles at
+8192³, far below the 2.5% estimated from the ATT stall attribution, and
+the safe fix gains nothing. Drop this direction. The
+`FAKE_USE` pass is a cheap, safe way to steer allocation, and the same
+callback hook works for other post-scheduler experiments (for example,
+forcing operand placement or setting allocation hints).
+Archive (pass source, wrapper diff, flag compile script, assembly, ship
+tarballs, hardware scripts and logs):
+`/home/ibutygin/tlx/perf-data/mxfp-codegen-plugin-20261024.tar.gz` (SHA256
+`07258becd96989869e13e96d2a59b72db4c8af6f2d4026c036d5eba79d2e0635`).
+
+#### Wave imbalance in the 8192³ steady loop (2026-10-24)
+
+There is no work imbalance between the four waves of a workgroup. The
+per-step synchronization cost (about 140 cycles: workgroup barrier 67,
+cluster barrier 40, TDM wait 33) is mostly late TDM data, seen either
+directly or through other waves and other CTAs.
+
+Method: on gfx1250, `--att-simd-select` takes a SIMD index (the old `0xF`
+traced SIMD 3 only). The other SIMDs appear only as category-5 timestamps
+without a SIMD ID, so they cannot be separated. We collected four ATT runs
+of the ship29 default (dispatch 40, target CU 0, all 16 SEs), one per SIMD,
+giving 16 fully decoded waves per SIMD role. Steady-loop structure per K
+step:
+
+1. release barrier (`s_wait_dscnt 0` → signal, wait five WMMAs later);
+2. TDM refill;
+3. `s_wait_tensorcnt 0x4`;
+4. acquire barrier;
+5. every eighth step, a workgroup barrier and then the cluster barrier
+   (wave 0 signals `-3`, all waves wait `0xfffd`).
+
+- **Workgroup barriers:** for every SIMD role, the time from signal to
+  release equals the floor (38–47 cycles, the barrier round trip) in 92–98%
+  of release barriers and about 80–90% of acquire barriers. The four waves
+  therefore arrive within a few cycles of each other. The release-barrier
+  stall is 2 cycles median, 4–7 mean, because the round trip hides behind
+  the five WMMAs between signal and wait.
+- **Acquire barrier tail:** the stall is 2 cycles median but 20–90 cycles
+  mean, with lead p90 100–280. It comes from `s_wait_tensorcnt 0x4`
+  (median 1–2 cycles, mean 25–100, p90 up to 260): in about 10% of steps
+  one wave's TDM data is late, and the other waves then wait at the
+  barrier. The slow wave changes between runs, so no SIMD role is
+  systematically slow. TDM tail plus acquire stall is about 55–100 cycles
+  per step per wave.
+- **Cluster barrier:** 240–310 cycles median per occurrence (means
+  270–590, rare 2–6k outliers), 27–40 cycles per step for every wave. No
+  CTA is consistently last: each traced CTA is last in 1–6 of its 20
+  cluster barriers, with median lead 210–420 cycles. This is random drift
+  across the 16 CTAs from the same TDM tails accumulated over eight steps.
+- **The tails depend on step position:**
+  - in the two steps after a cluster barrier, only 1–2% of
+    `s_wait_tensorcnt 0x4` waits exceed 100 cycles;
+  - from the third step on, 16–19% do;
+  - the third step of each tile has the highest rate, 28% (mean 142).
+
+  The first two steps consume loads issued before the barrier, and the
+  roughly 300-cycle barrier wait gave them time to land. So the barrier
+  and the TDM tails are one latency budget: TDM delivery takes longer than
+  the ring's two-step lookahead (about 1.7k cycles at the 2.4 GHz trace
+  clock) in roughly 17% of steps.
+
+Caveat: ATT runs at about 2.4 GHz and 995 W with serialized dispatches.
+Under the sustained power cap (about 1.8 GHz) the same memory latency is
+about 25% fewer core cycles, so production sees fewer tails than these
+traces. Levers, in order:
+
+1. more lookahead without more LDS (issue the refill earlier in the step,
+   or retest the four-stage ring with two C slots under current defaults);
+2. retest cluster interval 16 and the split cluster barrier under current
+   defaults (both predate static unroll and overlap peel);
+3. shorten the transition, which causes the step-2 tail.
+
+Archive (decoded ATT bundles for SIMD 0–3, analysis scripts, report):
+`/home/ibutygin/tlx/perf-data/mxfp-wave-imbalance-20261024.tar.gz` (SHA256
+`d2ef5937547abfab1ff9c25e911f0e4ab11a37d918b4ddd816f8dc2b105022d4`).
+
+#### Sync levers and spaced L2 prefetch (2026-10-24): all slower
+
+Hardware 8192³ against the current default (ship29 configuration), four
+sustained rounds. Every output was bitwise identical to the default over 10
+screens.
+
+| Variant | Sustained | Cycles | Energy/launch |
+| --- | ---: | ---: | ---: |
+| Cluster barrier interval 16 | +3.6% | +5.2% | +3.3% |
+| Split cluster barrier | +3.2% | +4.7% | +2.9% |
+| Four-stage ring, two C slots, dynamic slots (321,736 B LDS) | +1.6% | +1.6% | +1.3% |
+| Mid-step L2 prefetch, d=1 | +9.6% | +14.8% | +9.4% |
+| Mid-step L2 prefetch, d=2 | +8.3% to +8.5% | +12.7% | +8.0% |
+| Mid-step L2 prefetch, d=4 | +8.0% | +12.3% | +8.0% |
+| d=2 with `SCOPE_DEV` (LLVM IR override, hint 16) | +8.3% | +12.7% | +8.3% |
+| d=2 control: prefetches replaced by an empty asm using the address | +1.5% | +2.3% | +1.5% |
+
+- **Cluster rendezvous:** a less frequent or split rendezvous costs more
+  than it saves. The barrier keeps the 16 CTAs aligned so their multicast
+  requests coalesce; more drift means more separate loads. Interval 8,
+  unsplit, stays.
+- **Four-stage ring:** adds one stage of lookahead but loses the static
+  unroll and the third C slot. The net is still a loss at 8192³, so the
+  late TDM completions are not fixed by more lookahead alone.
+- **Earlier refill (not built):** with three stages the refill overwrites
+  the slot read in the previous step. It must follow the release barrier,
+  where it already issues.
+- **L2 prefetch, mid-step:**
+  - Placement: stage `i + 3 + d`, issued after the `c10` dot (about
+    WMMA 48 of 64) via a temporary `MID_L2_PREFETCH` knob.
+  - Dedup: ownership rotates per step among the four CTAs sharing each A
+    (or B) tile, so each CTA runs a prefetch block on about half the steps.
+  - Guards: branches on block-uniform predicates; speculative, so no NT
+    hint.
+  - Result: about 2.5x better than the October attempt next to the refill
+    (+20%), but still +8%. The control isolates the cost: the per-lane
+    address VALU (64-bit `v_add` after WMMAs, `va_vdst(0)` drains, loop
+    703 → 837 instructions) costs 1.5%; the prefetch memory traffic itself
+    costs about 7%. Scope does not matter. The earlier PMC data agrees:
+    prefetch doubles L2 requests and does not reduce L2 misses (85.9% hit
+    rate).
+- **Removing the address VALU:** this needs the scalar-base form of
+  `global_prefetch_b8` (SGPR base plus 32-bit VGPR offset). The address is
+  invariant per-lane offset plus a uniform step offset, but codegen LICM
+  hoists the `zext` of the lane offset out of the loop, and the scalar-base
+  matcher needs the `zero_extend` in the same selection DAG. LLVM IR
+  rewrites (`saddr_pf.py`: `readfirstlane` on the scalar part, an asm
+  identity on the lane offset) did not get there and caused spills. A
+  lowering change in `emitTDMPrefetch` would be needed, but it can recover
+  at most the 1.5% overhead, not the 7% traffic cost.
+- **Source:** reverted to HEAD.
+
+Archive (knob patch, ship tarballs, LLVM IR overrides, scripts, hardware
+logs): `/home/ibutygin/tlx/perf-data/mxfp-sync-l2pf-20261024.tar.gz` (SHA256
+`b63a254f89c4f3ab492d6db68c133e06af751bc45447204ff89423274bcc5b3b`).
+
+#### Outside the K loop: current breakdown (2026-10-24)
+
+Source: the four SIMD-select ATT runs of the current default (8192³, 64
+waves, 192 transitions). Each wave runs four tiles: prologue, three
+transitions, final epilogue. Each transition is split at the first C
+`ds_store` into the K tail (last three K steps plus the next tile's stage
+loads) and the C epilogue (eight 64x128 FP32 chunks through three LDS slots,
+overlapped with the next tile's first step). Mean cycles per occurrence:
+
+| Phase | Cycles | WMMAs | Largest classes |
+| --- | ---: | ---: | --- |
+| K tail (×3) | 3,782 | 192 | WMMA 1,327, `s_wait_dscnt` 756, SALU 580, `ds_load` 426, cluster barrier 304, VALU 210 |
+| C epilogue (×3) | 5,321 | 64 | `s_wait_tensorcnt` 1,851, `s_wait_dscnt` 1,221, `ds_store` 763, workgroup barrier 582, WMMA 489 |
+| Prologue | 4,215 | 64 | `s_wait_tensorcnt` 1,649, SALU 1,029, workgroup barrier 570, WMMA 443 |
+| Final epilogue | 9,829 | 192 | `s_wait_tensorcnt` 4,307, `s_wait_dscnt` 1,695, WMMA 1,327, SALU 579, cluster barrier 533 |
+
+Totals per wave:
+
+- **Outside the K loop:** about 41k of 247k cycles (17%), containing 1,024
+  WMMAs. At the steady-loop rate (849 cycles per 64-WMMA step) that work
+  takes about 13.6k cycles, so the excess is about 27k cycles (about 11% of
+  the wave). Median transition: 9.0k cycles (p10 8.2k, p90 10.1k).
+- **Excess by cause:**
+  - TDM waits, about 11.6k: C-slot reuse and store drain in the epilogue,
+    the final store drain, first-tile load latency in the prologue;
+  - LDS waits, about 7.9k: the `s_wait_dscnt 0` that closes each C chunk
+    fill, and full drains in the compact tail;
+  - barriers, about 4.5k;
+  - SALU, about 4.1k;
+  - `ds_store` issue, about 2.7k.
+
+Median transition timeline: the K tail ends at about 4.0k cycles. The last
+next-tile stage loads issue just before the first chunk store, and since TDM
+completes in order, the first slot-reuse wait (about 650 cycles) also waits
+for them. After that, chunks retire every 450–600 cycles (`0x4` waits of
+380–460), about 64 B/cycle per CU. Filling a 32 KB chunk takes about 250
+cycles (16 `ds_store_b128` per wave plus the drain), about 130 B/cycle of LDS
+writes.
+
+The C path is the bottleneck: 256 KB of FP32 per CU per tile, written to LDS
+at about 130 B/cycle and drained by TDM at about 64 B/cycle, with only one
+next-tile step (64 WMMAs) to overlap, because the VGPR budget allows one
+tile's accumulators. At about 64 B/cycle on all 256 CUs, the drain rate
+(about 39 TB/s at the 2.4 GHz trace clock) is far above HBM write
+bandwidth, so stores land in L2/MALL. Whether the per-CU drain rate is a
+TDM-engine limit or an L2 write limit is not measured.
+
+Already measured and not to repeat: static K tail, batched first fill,
+next-tile loads after the C stores, wave-specialized handoff, more and
+smaller C slots, overlap peel (now default), L2 prefetch.
+
+Open questions, in order:
+
+1. **Store drain limit:** run the same ATT with fewer programs (fewer CUs
+   storing at once). If chunk retire time stays at 450–600 cycles, the
+   limit is per CU (TDM engine or LDS read); if it drops, it is the memory
+   side.
+2. **LDS write conflicts:** check the C staging layout's `ds_store`
+   partition and bank conflicts (AM reports partition conflicts). About
+   130 B/cycle is well below the LDS read rate measured earlier.
+3. **Narrower output:** BF16/FP16 C halves LDS fill, TDM drain and memory
+   writes. This changes the kernel's output contract (FP32 today).
+4. **Direct stores:** write part of C (one quadrant) with
+   `global_store_b128` from registers alongside the TDM path, if the drain
+   limit is per CU.
+
+Archive (scripts, report; trace bundles are in
+`mxfp-wave-imbalance-20261024.tar.gz`):
+`/home/ibutygin/tlx/perf-data/mxfp-transition-breakdown-20261024.tar.gz`
+(SHA256 `ce1d36b5efaa44235a90bcd53c462071181467a1de20ed6214ff7946bda1902d`).
+
+#### C epilogue experiments (2026-10-24): no gain; the output type stays FP32
+
+**1. Store-drain limit (ATT with fewer programs).** The same default kernel,
+compiled for 128 and 64 programs (each CTA then runs 8 or 16 tiles), was
+traced on SIMD 0 against the 256-program trace. Cycles per occurrence:
+
+| Programs | Epilogue TDM waits | LDS fill (`ds_store` + `s_wait_dscnt`) | Final-epilogue TDM waits |
+| ---: | ---: | ---: | ---: |
+| 256 | 1,678 | 725 + 1,207 | 4,605 |
+| 128 | 1,285 | 699 + 1,262 | 3,191 |
+| 64 | 1,282 | 721 + 1,265 | 3,308 |
+
+Per epilogue `s_wait_tensorcnt`, in order (256 / 128 / 64 programs):
+
+- first slot-reuse wait: 659 / 646 / 619;
+- next wait: 146 / 71 / 63;
+- the three later `0x4` waits: 231 / 65 / 76, 364 / 208 / 239, and
+  255 / 274 / 263.
+
+Device-wide store contention is real but bounded: about 400 cycles per
+transition and about 1.4k in the final epilogue, the same at 128 and 64
+programs. The remainder is per CU:
+
+- the first slot-reuse wait (about 650 cycles) waits behind the next-tile
+  stage-2 loads, issued just before chunk 0 (TDM completes in order);
+- the later drain waits are 210–270 cycles each;
+- the LDS fill takes about 1.95k cycles per transition at any program count.
+
+**2. LDS partition conflicts in the C fill.** AM (`runs/am-ovl`, 2048³,
+16 programs) counts partition write conflicts almost only in the transition
+windows: about 0 per sample in the steady loop, and 1,500–2,000 per sample
+in the epilogues, about 2 per C `ds_store_b128`. DS bank conflicts are
+zero. The C slots (64x128 FP32, rows padded by 16 bytes, 33,792 bytes) sit
+at LDS offsets 0, 33,792 and 67,584; waves 0–1 fill rows 0–31 of a chunk
+and waves 2–3 rows 32–63.
+
+Temporary `C_PARTITIONED` gave the C slots a `partitioned_shared` layout:
+32-row pieces in two partitions, the same `ds_store`/TDM instruction
+counts, and 852 VGPRs. The allocator then moved A/B to 0–208,895 and C to
+208,896 and up.
+
+- Hardware: bitwise identical; sustained +0.14%, burst −0.17%.
+- ATT: the fill is unchanged (`ds_store` 756 + `s_wait_dscnt` 1,157), and
+  so is the epilogue (5,126 vs 4,960 cycles).
+
+The AM partition-conflict counts do not show up as fill time on hardware.
+
+**3. Direct stores for one quadrant.** Temporary `DIRECT_C_QUADRANTS=1`
+stored quadrant 3 straight from registers (32 `buffer_store_b128` per
+wave), staging six chunks through LDS/TDM instead of eight. Chunk count,
+refill position and the stage-1 acquire wait were adjusted accordingly.
+891 VGPRs, no spills; bitwise identical. Hardware: **+9.5%** sustained
+(cycles +12%).
+
+**Conclusion.** The fill is bound neither by partitions nor by device-wide
+drain. The remaining per-CU levers:
+
+- **Stage-2 load after chunk 2.** Issue the next tile's stage-2 load after
+  the first three C chunks instead of at the end of the tail, so the first
+  slot-reuse wait no longer waits on it (up to about 0.4–0.6k cycles per
+  transition, about 0.5%). Wait counts that must change:
+  - the stage-0 acquire before the overlapped step becomes `LOADS`;
+  - reuse waits for chunks 3–5 need `+LOADS` (chunk 5 also the refill's);
+  - the stage-1 acquire count stays 12.
+- **The final drain** (all CTAs at once).
+
+Patch, ship tarballs, ATT bundles, scripts, logs:
+`/home/ibutygin/tlx/perf-data/mxfp-c-epilogue-exp-20261024.tar.gz` (SHA256
+`e324b6b00be0e564a5190327c6afc3742411d2a10457108350e5250e81a54415`).
+
+**3b. Direct quadrant issued first (fourth output channel).** Same knob
+plus `DIRECT_C_FIRST`: quadrant 0 goes straight from registers before any
+LDS chunk, so the three slots, the first slot-reuse wait and the stage-0
+refill all shift later. The TDM chunks are numbered over quadrants 1–3 (six
+chunks); the refill stays before the last two chunks; the stage-1 acquire
+wait is 10.
+
+- Hardware: bitwise identical; **+10.9%** sustained (cycles +14.0%),
+  versus +9.5% with the direct quadrant last.
+- The asm issues the 32 `buffer_store_b128`, then `s_wait_xcnt 0x0`, then
+  the TDM chunk sequence.
+
+The direct store itself is the cost. In the WMMA register layout, each
+`buffer_store_b128` writes 16 bytes per lane to 16 different rows (two
+16-byte pieces per row): about 8x the memory requests of full-line TDM
+writes, about 4k partial-line requests per CU per quadrant. Issuing it
+first only moves the transfer wait ahead of the TDM work.
+
+A useful direct path would first need a cross-lane transpose so each
+instruction writes whole 128-byte row segments (for example
+`ds_bpermute`/permlane, about 128 permutes per wave per quadrant). Not
+tried. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-direct-first-20261024.tar.gz` (SHA256
+`b9d0e3a084a86d5ec31580a850d2080991ec1a3c1e0208474224cebd43389a30`).
+
+**4. Wave-specialized overlap epilogue (`OVERLAP_WS`, temporary): +11.9%;
+the gain is small even before the loop regression.** Waves 0/1 issue
+every next-tile input load, both in the tail (stages 0–2) and in the
+epilogue (the stage-3 refill, moved earlier to quadrant 2); waves 2/3 issue
+every C chunk store. Each role waits only on its own TDM counter:
+
+- C slot reuse: `wait(2)` on the output waves;
+- input acquires: exact per-wave counts in the tail and the epilogue.
+
+All barriers stay in common code, with only the TDM issue and wave waits
+in uniform role branches; the asm matches. The partitioned A/B layout
+cannot be used: a fused TDM load needs two to four members with disjoint
+wave masks, and a partitioned member needs an even number of issuing
+waves, so waves 0/1 alone cannot fill A and B pieces with multicast. The
+variant therefore uses `LDS_PARTITIONED_AB=0`, compared with `np` (the
+default with that same setting).
+
+| 8192³ hardware | Sustained | Cycles |
+| --- | ---: | ---: |
+| `np` (unpartitioned A/B) | +1.34% | +2.31% |
+| `OVERLAP_WS` | **+11.92%** | +20.46% |
+
+Outputs are bitwise identical.
+
+- **Why the K loop slowed:** ATT puts most of the loss inside the K loop,
+  about 1,020–1,060 vs 847 cycles per step; cluster-barrier waits roughly
+  triple. The LLVM IR of the loop is identical, but the steady-loop machine
+  regions now exceed the 106-SGPR target (108–115). The pre-RA
+  rematerialization stage then runs ("reduce spilling", `-debug-only=
+  machine-scheduler` with the local d26 build) and reschedules the
+  function. The barrier → TDM → `s_wait_tensorcnt` → barrier rendezvous
+  loses its straddling WMMAs, the same failure as codegen `05e432a8` and
+  `llvm.fake.use`. What does not fix it:
+  - `amdgpu-disable-unclustered-high-rp-reschedule`;
+  - recomputing the wave role at each use through an opaque asm.
+
+  The extra SGPRs come from the role-split handoff code. Pinning them, as
+  `_mxgemm_handoff_load_stage` does, would be needed.
+- **The epilogue itself barely improves:** on output waves, the first
+  slot-reuse wait drops from about 920 to about 610 cycles; another reuse
+  wait reaches about 1,140. So a C store takes about 600 cycles or more to
+  complete even with no input loads in that wave's queue: the latency is
+  physical, not counter ordering. Input waves wait about 2.7k cycles per
+  transition at barriers for the output waves. Even with the loop fixed,
+  the gain is bounded by a few hundred cycles per transition (≤0.5%).
+
+Archive (patch, ship, ATT bundles, scheduler logs, hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-overlap-ws-20261024.tar.gz` (SHA256
+`11ba61886673de8d0b86ffe02cc6932318ace9d32d514d59029b79304a616ba4`).
+
+**5. C stores on the scale waves (`OVERLAP_SW`, temporary): +4.7%.**
+Today all waves issue partial-fusion loads: A data on waves 0/2, B data on
+1/3, scales likewise, two TDM instructions per wave per stage. Plain 4-way
+fusion (A→w0, B→w1, As→w2, Bs→w3) does not fit partitioned A/B, since a
+partitioned member needs two issuing waves.
+
+**Version 1 (handoff loads only).** Next-tile loads use
+`[A pieces (w0,w1), As (w2)]` and `[B pieces (w0,w1), Bs (w3)]`; waves 2/3
+issue the C stores. Problems:
+
+- fused members must have the same descriptor rank, so the scales need a
+  3D view: descriptor `[M/256, 2, K/32·128]`, LDS slot reinterpreted as
+  `[1, 2, 512]` with identical padding;
+- per-role wait counts are needed in the tail and epilogue;
+- the new descriptor groups stay live through the K loop: live-through-
+  unused SGPR units 53 → 106–123. Building them after the loop from opaque
+  pointers and shapes did not help; 70–96 SGPR spills.
+
+**Version 2 (measured).** Every load in the kernel, K loop included, uses
+`[A pieces (w0,w1), As (w2,w3)]` and `[B pieces (w0,w1), Bs (w2,w3)]`, one
+scale row per wave. Every wave still issues two instructions per stage, so
+all existing wait counts stay valid. Only the C slot-reuse waits (waves
+2/3) and the epilogue's final stage-1 acquire (4 on waves 0/1, 12 on waves
+2/3) are per role.
+
+- Codegen: 107 SGPRs, 11 spilled; two of the three loop steps lose their
+  WMMA overlap.
+- Hardware: bitwise identical; sustained **+4.69%** (cycles +7.5%).
+
+ATT (SIMD 0 = data wave, SIMD 2 = scale/C wave):
+
+- **First slot-reuse wait:** 943 → 810 cycles. With no data loads in the
+  store waves' queue it still takes about 800 cycles: C-store latency
+  dominates.
+- **Later reuse waits:** 394 / 320 → 412 / 645. With C issued by two
+  waves instead of four, each wave stores twice the bytes per chunk and
+  the chunks drain more slowly.
+- **Data waves:** about 3.1k cycles per transition at barriers waiting for
+  the store waves, so the epilogue grows from about 5.0–5.6k to 6.1k.
+- **Steady step:** about 880–895 vs 843–866 cycles (3D scale descriptors,
+  SGPR spills).
+
+Conclusion: in the current kernel, separating the TDM counters gains at
+most about 100–300 cycles per transition. Spreading C stores over fewer
+waves slows the drain, and the default sits at 104 of 106 SGPRs, so any
+new descriptor group breaks the static K-loop schedule. Archive (both
+patches, ship, ATT, scheduler and liveness reports, hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-scale-wave-split-20261024.tar.gz`
+(SHA256 `0f61cf23146f430bb28bf8c4fa3fce88566583ea6e16dbfdf28980fa3b607efa`).
 
 ## Earlier shape-scaling evidence
 
