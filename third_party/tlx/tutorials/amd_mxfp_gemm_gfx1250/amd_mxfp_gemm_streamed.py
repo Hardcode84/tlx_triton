@@ -239,7 +239,6 @@ def mxgemm_tdm_streamed_kernel(
     NUM_PROGRAMS: tl.constexpr,
     CROSS_TILE_PREFETCH: tl.constexpr = True,
     OUTPUT_STAGING: tl.constexpr = True,
-    SCHED_MODE_2: tl.constexpr = False,
     XCD_REMAP_MODE: tl.constexpr = 0,
     NUM_XCDS: tl.constexpr = 8,
     XCD_CHUNK: tl.constexpr = 2,
@@ -257,8 +256,6 @@ def mxgemm_tdm_streamed_kernel(
     tl.static_assert(not FIRST_USE_PREFETCH)
     tl.static_assert(not OUTPUT_TAIL_REUSE or NUM_BUFFERS == 4)
     tl.static_assert(M > 0 and N > 0 and M % 256 == 0 and N % 256 == 0 and K >= NUM_BUFFERS * 128 and K % 128 == 0)
-    if SCHED_MODE_2:
-        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     mma: tl.constexpr = tlx.amd_wmma_layout(((0, 1), (1, 0)))
     ad = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, 1], [256, 128])
     bd = tl.make_tensor_descriptor(b_ptr, [N, K], [stride_bn, 1], [256, 128])

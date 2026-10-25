@@ -2169,7 +2169,6 @@ def mxgemm_tdm_persistent_kernel(
     NUM_PROGRAMS: tl.constexpr,
     CROSS_TILE_PREFETCH: tl.constexpr = True,
     OUTPUT_STAGING: tl.constexpr = False,
-    SCHED_MODE_2: tl.constexpr = False,
     XCD_REMAP_MODE: tl.constexpr = 0,
     NUM_XCDS: tl.constexpr = 8,
     XCD_CHUNK: tl.constexpr = 2,
@@ -2194,9 +2193,6 @@ def mxgemm_tdm_persistent_kernel(
     OVERLAP_PEEL: tl.constexpr = False,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
-    if SCHED_MODE_2:
-        # Allow WMMA queuing with one wave per SIMD; preserve mode bits 0-1.
-        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
     tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4 or CLUSTER_SIZE == 8
@@ -3675,8 +3671,9 @@ def mxgemm_tdm_pipelined(
     register pipeline. It requires both scales, partial TDM fusion, and
     output staging. It retains one next-tile input stage and reuses the
     free A/B stage for four 256x64 FP32 output panels.
-    ``SCHED_MODE_2`` optionally enables hardware WMMA queuing in the persistent
-    kernel. It defaults to false, leaving the hardware scheduling mode unchanged.
+    ``SCHED_MODE_2`` launches the persistent kernel with the HIP option
+    ``enable_wmma_queuing=True``, which sets SCHED_MODE[2] at kernel entry to
+    allow hardware WMMA queuing. It defaults to false (no register write).
     ``XCD_REMAP`` selects none, balanced, or chunked persistent program ordering.
     ``CLUSTER_SIZE=2|4`` groups independent workgroups for input/scale multicast;
     ``CLUSTER_MULTICAST=False`` keeps the cluster barriers with independent loads.
@@ -3959,11 +3956,11 @@ def mxgemm_tdm_pipelined(
                 b_scale.stride(0), DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, WITH_A_SCALE=WITH_A_SCALE, TDM_FUSION=TDM_FUSION,
                 NUM_PROGRAMS=NUM_PROGRAMS, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
-                REGISTER_PIPELINE=REGISTER_PIPELINE, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, SCHED_MODE_2=SCHED_MODE_2,
+                REGISTER_PIPELINE=REGISTER_PIPELINE, OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE,
                 FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
-                ctas_per_cga=(CLUSTER_SIZE, 1, 1), **persistent_options)
+                ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=SCHED_MODE_2, **persistent_options)
         kernel = mxgemm_tdm_operand_pipeline_kernel if OPERAND_PIPELINE else mxgemm_tdm_pipelined_kernel
         return kernel[grid](
             a,
