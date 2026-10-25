@@ -1355,7 +1355,8 @@ multi-instruction lowering):
 `/home/ibutygin/tlx/perf-data/mxfp-lds-partition-20261023.tar.gz` (SHA256
 `dee1dd2846e4a4114575b69c7bcf7a91fb62ae1de104580475c9711cd0170bdd`).
 
-Pre-existing post-rebase breakage found during validation (not fixed):
+Pre-existing post-rebase breakage found during validation (both fixed on
+2026-10-25; see "TLX AMD test repair"):
 
 - `SCHED_MODE_2=True` no longer compiles. The kernel calls
   `tlx.amd_set_wave_sched_mode`, which the pre-rebase branch defined in
@@ -2635,8 +2636,8 @@ padding (256 B + 16 B), so FP16 stores two 256x128 panels per tile with
   FP16.
 - Fixed in passing: the warp-pipeline launcher's absolute import broke
   package use.
-- Still broken and unrelated: `SCHED_MODE_2` calls a removed
-  `tlx.amd_set_wave_sched_mode`; it fails at HEAD too.
+- `SCHED_MODE_2` now launches with `enable_wmma_queuing` (see the test
+  repair notes below).
 
 *Bench.* `bench.py --out-dtype fp16` now works for both variants (only
 `--async-output` is rejected), and the final table has an `out` column.
@@ -2669,6 +2670,36 @@ directory were recreated), so compare these MX8xMX4 numbers only with
 each other. Archive:
 `/home/ibutygin/tlx/perf-data/mxfp-fp16-all-variants-20261025.tar.gz`
 (SHA256 `a2f5f11410db6dc579c8b60cb42bf08dafef5e05c476743858ab7134d19a6955`).
+
+#### TLX AMD test repair (2026-10-25)
+
+All TLX AMD pytest files pass under FFM (1161 passed, 502 skipped across
+`test_tlx_amd_{gfx1250,gfx942,gfx950,hip,fa_bwd_gfx950}.py`), and
+`test_tlx_codegen.py` passes (746 passed, 8 xfailed); the mxgemm codegen
+tests previously failed in 125 cases. Fixes:
+
+- `SCHED_MODE_2`: the persistent and streamed kernels called the removed
+  `tlx.amd_set_wave_sched_mode`. The host wrapper now passes
+  `enable_wmma_queuing=SCHED_MODE_2` at launch (upstream `33856162ca`), and
+  the kernels no longer take a `SCHED_MODE_2` constexpr.
+- `tlx.barrier_arrive` read `options.cluster_dims`, which `HIPOptions`
+  lacks, so every AMD mbarrier arrive failed to compile. It now reads the
+  cluster dimensions only for `cta_mask` (NVIDIA-only).
+- Codegen helper: it passed handoff constants to the streamed kernel, which
+  does not declare them.
+- TDM hazard waits: the pinned backend's `GCNHazardRecognizer::fixTDM`
+  inserts `s_wait_tensorcnt 10` directly before a TDM instruction unless an
+  earlier wait already bounds the count. It caps the TDM queue at ten and
+  never drains the transfers the schedule checks reason about, so the
+  mxgemm codegen checks strip exactly those waits
+  (`_strip_tdm_hazard_waits`). This fixed the output staging, A8W4 C
+  staging, first-use prefetch, wave-specialized handoff, and operand
+  pipeline checks.
+- Known drift (xfail): clustered four-stage streamed operands now get
+  identity `v_perm_b32 x, y, y, 0x3020104` copies in the steady loop (56 per
+  loop) and, with async output, scratch spills. The kernel source from
+  `4a940284a0`, where the test was last updated, does the same, so this
+  comes from the code generator. Streamed operands are not a bench default.
 
 #### Address and scalar-work scan of the default kernel (2026-10-25)
 
