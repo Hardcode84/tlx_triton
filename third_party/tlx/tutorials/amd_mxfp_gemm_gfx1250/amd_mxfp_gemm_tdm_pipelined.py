@@ -71,6 +71,11 @@ def _partitioned_operand_shared_layout(block_shape):
 
 
 @tl.core.builtin
+def _mxgemm_view_rows(view, _semantic=None):
+    return tl.constexpr(tl.core._unwrap_if_constexpr(view.type.shape[0]))
+
+
+@tl.core.builtin
 def _mxgemm_desc_group_rows(desc, _semantic=None):
     # Rows per group of a group-major [M // R, R, K] operand descriptor, or 0
     # for an ordinary [M, K] descriptor.
@@ -127,6 +132,17 @@ def torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K):
         a_scale_f32 = fp8e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
     b_scale_f32 = fp8e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
     return torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+
+@triton.jit
+def _mxgemm_c_slot(buf, idx, ROWS: tl.constexpr, COLS: tl.constexpr):
+    # C buffers that alias input ring slots keep the input slot pitch. A
+    # narrower C type allocates proportionally more rows per slot with the
+    # same element padding; use the leading ROWS rows of the indexed slot.
+    view = buf[idx]
+    if _mxgemm_view_rows(view) != ROWS:
+        view = tlx.local_slice(view, [0, 0], [ROWS, COLS])
+    return view
 
 
 @triton.jit
@@ -1856,7 +1872,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
         if C_ROWS == 128 and C_COLS == 128:
             if not INITIAL_C_SLOTS_FREE or QUADRANT >= C_SLOTS:
                 _mxgemm_c_slot_wait(C_SLOTS - 1, C_TDM_ISSUER)
-            view = c_buf[QUADRANT % C_SLOTS]
+            view = _mxgemm_c_slot(c_buf, QUADRANT % C_SLOTS, C_ROWS, C_COLS)
             tlx.local_store(view, acc)
             _mxgemm_c_tdm_store(desc, view, [0, 0], C_TDM_ISSUER)
         elif C_ROWS == 128:
@@ -1867,7 +1883,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
             for part in tl.static_range(2):
                 if not INITIAL_C_SLOTS_FREE:
                     _mxgemm_c_slot_wait(1, C_TDM_ISSUER)
-                view = c_buf[part]
+                view = _mxgemm_c_slot(c_buf, part, C_ROWS, C_COLS)
                 tlx.local_store(view, left if part == 0 else right)
                 _mxgemm_c_tdm_store(desc, view, [0, part * C_COLS], C_TDM_ISSUER)
         else:
@@ -2009,32 +2025,42 @@ def _mxgemm_register_next_stage(c00, c01, c10, c11, a0, sa0, a1, sa1, b0, sb0, b
 
 
 @triton.constexpr_function
-def _mxgemm_register_output_layout():
-    # Preserve the byte layout: 256 FP8 values + 16 padding bytes become
-    # 64 FP32 values + four padding elements, within the same input slot.
-    return tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [256, 64], [1, 0])
+def _mxgemm_register_output_layout(c_bits):
+    # Preserve the byte layout of a free BK256 input stage: each 256-byte FP8
+    # row plus 16 padding bytes. FP32 views it as [256, 64] with [64:+4]
+    # padding; FP16 as [256, 128] with [128:+8]. TDM store padding must
+    # match the panel width, so FP16 stores 128-column panels.
+    cols = 64 * 32 // c_bits
+    return tlx.padded_shared_layout_encoding.with_identity_for([[cols, 4 * 32 // c_bits]], [256, cols], [1, 0])
 
 
 @triton.jit
 def _mxgemm_store_register_panels(c_ptr, c00, c01, c10, c11, off_m, off_n, stride_cm, c_a, c_b):
+    # One panel fills one free input stage: four 64-column FP32 panels, or
+    # two 128-column FP16 panels.
+    PANEL: tl.constexpr = 64 * 32 // tlx.dtype_of(c_ptr).primitive_bitwidth
     base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
-    desc = tl.make_tensor_descriptor(base, [256, 256], [stride_cm, tl.constexpr(1)], [256, 64])
+    desc = tl.make_tensor_descriptor(base, [256, 256], [stride_cm, tl.constexpr(1)], [256, PANEL])
     # Joining top and bottom quadrants only changes register indexing.
     # The free A/B stages form two output slots; wait(1) protects reuse.
-    for part in tl.static_range(4):
-        top = c00 if part < 2 else c01
-        bot = c10 if part < 2 else c11
-        left, right = tl.split(tl.reshape(top, (128, 2, 64)).permute(0, 2, 1))
-        top_half = left if part % 2 == 0 else right
-        left, right = tl.split(tl.reshape(bot, (128, 2, 64)).permute(0, 2, 1))
-        bot_half = left if part % 2 == 0 else right
-        panel = tl.reshape(tl.join(top_half, bot_half).permute(2, 0, 1), (256, 64))
+    for part in tl.static_range(256 // PANEL):
+        if PANEL == 64:
+            top = c00 if part < 2 else c01
+            bot = c10 if part < 2 else c11
+            left, right = tl.split(tl.reshape(top, (128, 2, 64)).permute(0, 2, 1))
+            top_half = left if part % 2 == 0 else right
+            left, right = tl.split(tl.reshape(bot, (128, 2, 64)).permute(0, 2, 1))
+            bot_half = left if part % 2 == 0 else right
+        else:
+            top_half = c00 if part == 0 else c01
+            bot_half = c10 if part == 0 else c11
+        panel = tl.reshape(tl.join(top_half, bot_half).permute(2, 0, 1), (256, PANEL))
         panel = tlx.require_amd_wmma_layout(panel, warp_bases=((0, 2), (2, 0)), reg_bases=((0, 1), (1, 0)),
                                             instr_shape=(16, 16, 128))
         view = c_a if part % 2 == 0 else c_b
         tlx.async_amd_descriptor_wait(1)
-        tlx.local_store(view, panel)
-        tlx.async_amd_descriptor_store(desc, view, [0, part * 64], clamp_bounds=False)
+        tlx.local_store(view, panel.to(tlx.dtype_of(c_ptr)))
+        tlx.async_amd_descriptor_store(desc, view, [0, part * PANEL], clamp_bounds=False)
 
 
 @triton.jit
@@ -2229,11 +2255,10 @@ def mxgemm_tdm_persistent_kernel(
     tl.static_assert(HANDOFF_SCHEDULE == "current" or HANDOFF_SCHEDULE == "b-prefetch"
                      or HANDOFF_SCHEDULE == "staggered" or HANDOFF_SCHEDULE == "ab-reuse")
     AB_C_REUSE: tl.constexpr = HANDOFF_SCHEDULE == "ab-reuse"
-    # Output schedules that reinterpret A/B input stages as FP32 C buffers
-    # keep FP32 output; dedicated staging and direct stores use C's type.
-    tl.static_assert(
-        tlx.dtype_of(c_ptr) == tl.float32 or not (OUTPUT_REUSE or OUTPUT_TAIL_REUSE or REGISTER_PIPELINE or AB_C_REUSE),
-        "non-FP32 output requires dedicated C staging slots or direct stores")
+    # C buffers that alias input ring slots keep the input slot pitch: a
+    # narrower C type allocates C_ROW_SCALE times the rows per slot.
+    tl.static_assert(tlx.dtype_of(c_ptr) == tl.float32 or tlx.dtype_of(c_ptr) == tl.float16)
+    C_ROW_SCALE: tl.constexpr = 32 // tlx.dtype_of(c_ptr).primitive_bitwidth
     tl.static_assert(HANDOFF_TDM_FUSION == "partial" or HANDOFF_TDM_FUSION == "4way")
     tl.static_assert(HANDOFF_TDM_FUSION == "partial" or AB_C_REUSE)
     HANDOFF_LOADS: tl.constexpr = 1 if HANDOFF_TDM_FUSION == "4way" else 2
@@ -2346,9 +2371,12 @@ def mxgemm_tdm_persistent_kernel(
     elif OUTPUT_TAIL_REUSE:
         # Each alias has the same physical slot size as a padded FP8 input
         # stage. This preserves ring offsets while changing the output layout.
-        c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
-        ca_buf = tlx.local_alloc((64, 128), tl.float32, NUM_BUFFERS, layout=c_layout, reuse=a_buf)
-        cb_buf = tlx.local_alloc((64, 128), tl.float32, NUM_BUFFERS, layout=c_layout, reuse=b_buf)
+        c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]],
+                                                                                     [64 * C_ROW_SCALE, 128], [1, 0])
+        ca_buf = tlx.local_alloc((64 * C_ROW_SCALE, 128), tlx.dtype_of(c_ptr), NUM_BUFFERS, layout=c_layout,
+                                 reuse=a_buf)
+        cb_buf = tlx.local_alloc((64 * C_ROW_SCALE, 128), tlx.dtype_of(c_ptr), NUM_BUFFERS, layout=c_layout,
+                                 reuse=b_buf)
         c_buf = None
     elif REGISTER_PIPELINE:
         c_buf = None
@@ -2357,11 +2385,14 @@ def mxgemm_tdm_persistent_kernel(
             # Match A's 69,632-byte physical slot stride. The ordinary C
             # padding has a 67,584-byte stride and crosses A-slot boundaries,
             # so retiring one such C slot would not free the matching A slot.
-            c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [128, 128], [1, 0])
-            c_buf = tlx.local_alloc((128, 128), tl.float32, NUM_BUFFERS, layout=c_layout, reuse=a_buf)
+            c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]],
+                                                                                         [128 * C_ROW_SCALE, 128],
+                                                                                         [1, 0])
+            c_buf = tlx.local_alloc((128 * C_ROW_SCALE, 128), tlx.dtype_of(c_ptr), NUM_BUFFERS, layout=c_layout,
+                                    reuse=a_buf)
         else:
             # Without overlap, all C transfers drain before reloading A.
-            c_buf = tlx.local_alloc((128, BLOCK_N // 2), tl.float32, NUM_BUFFERS, reuse=a_buf)
+            c_buf = tlx.local_alloc((128, BLOCK_N // 2), tlx.dtype_of(c_ptr), NUM_BUFFERS, reuse=a_buf)
     else:
         c_buf = tlx.local_alloc((C_ROWS, C_COLS), tlx.dtype_of(c_ptr), C_SLOTS) if OUTPUT_STAGING else None
     num_m, num_n = M // BLOCK_M, N // BLOCK_N
@@ -3146,10 +3177,11 @@ def mxgemm_tdm_persistent_kernel(
             tlx.amd_sched_barrier()
             tl.static_assert(OUTPUT_STAGING)
             free_slot = (phase + k_iters - 1) % NUM_BUFFERS
-            c_a = tlx.local_reinterpret(a_buf[free_slot], tl.float32, [256, 64],
-                                        layout=_mxgemm_register_output_layout())
-            c_b = tlx.local_reinterpret(b_buf[free_slot], tl.float32, [256, 64],
-                                        layout=_mxgemm_register_output_layout())
+            C_BITS: tl.constexpr = tlx.dtype_of(c_ptr).primitive_bitwidth
+            c_a = tlx.local_reinterpret(a_buf[free_slot], tlx.dtype_of(c_ptr), [256, 64 * 32 // C_BITS],
+                                        layout=_mxgemm_register_output_layout(C_BITS))
+            c_b = tlx.local_reinterpret(b_buf[free_slot], tlx.dtype_of(c_ptr), [256, 64 * 32 // C_BITS],
+                                        layout=_mxgemm_register_output_layout(C_BITS))
             _mxgemm_store_register_panels(c_ptr, c00, c01, c10, c11, off_m, off_n, stride_cm, c_a, c_b)
             tlx.async_amd_descriptor_wait(0)
             tlx.amd_sched_barrier()
@@ -3171,17 +3203,20 @@ def mxgemm_tdm_persistent_kernel(
                 output_phase = (phase + k_iters) % NUM_BUFFERS
                 c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 4]], [128, 128],
                                                                                              [1, 0])
-                first_c = tlx.local_alloc((128, 128), tl.float32, 1, layout=c_layout,
+                first_c = tlx.local_alloc((128, 128), tlx.dtype_of(c_ptr), 1, layout=c_layout,
                                           reuse=a_buf[(output_phase + 2) % NUM_BUFFERS])
-                second_c = tlx.local_alloc((128, 128), tl.float32, 1, layout=c_layout,
+                second_c = tlx.local_alloc((128, 128), tlx.dtype_of(c_ptr), 1, layout=c_layout,
                                            reuse=a_buf[(output_phase + 1) % NUM_BUFFERS])
                 # Match B's physical pitch and TDM's row-padding contract:
                 # [256:+16] bytes is [64:+4] FP32 elements. Each half uses
                 # exactly one 34,816-byte stage; B0 stays intact.
-                b_c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [128, 64],
+                b_c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]],
+                                                                                               [128 * C_ROW_SCALE, 64],
                                                                                                [1, 0])
-                b_c_buf = tlx.local_alloc((128, 64), tl.float32, NUM_BUFFERS, layout=b_c_layout, reuse=b_buf)
-                output_b_buf = (b_c_buf[(output_phase + 1) % NUM_BUFFERS], b_c_buf[(output_phase + 2) % NUM_BUFFERS])
+                b_c_buf = tlx.local_alloc((128 * C_ROW_SCALE, 64), tlx.dtype_of(c_ptr), NUM_BUFFERS, layout=b_c_layout,
+                                          reuse=b_buf)
+                output_b_buf = (_mxgemm_c_slot(b_c_buf, (output_phase + 1) % NUM_BUFFERS, 128,
+                                               64), _mxgemm_c_slot(b_c_buf, (output_phase + 2) % NUM_BUFFERS, 128, 64))
                 output_buf = (first_c[0], second_c[0])
             elif DEFERRED_C_REFILL:
                 # Keep next-tile stage 0 intact. Each retired A stage holds
@@ -3189,16 +3224,16 @@ def mxgemm_tdm_persistent_kernel(
                 # ring pitch while selecting C's independent row padding.
                 c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 4]], [128, 128],
                                                                                              [1, 0])
-                first_c = tlx.local_alloc((128, 128), tl.float32, 1, layout=c_layout,
+                first_c = tlx.local_alloc((128, 128), tlx.dtype_of(c_ptr), 1, layout=c_layout,
                                           reuse=a_buf[(phase + k_iters - 2) % NUM_BUFFERS])
-                second_c = tlx.local_alloc((128, 128), tl.float32, 1, layout=c_layout,
+                second_c = tlx.local_alloc((128, 128), tlx.dtype_of(c_ptr), 1, layout=c_layout,
                                            reuse=a_buf[(phase + k_iters - 1) % NUM_BUFFERS])
                 output_buf = (first_c[0], second_c[0])
             elif OUTPUT_TAIL_REUSE:
                 # The first two next-tile stages remain live. The last retired
                 # A/B stage holds output until its stores complete.
                 free_slot = (phase + k_iters - 1) % NUM_BUFFERS
-                output_buf = (ca_buf[free_slot], cb_buf[free_slot])
+                output_buf = (_mxgemm_c_slot(ca_buf, free_slot, 64, 128), _mxgemm_c_slot(cb_buf, free_slot, 64, 128))
             else:
                 output_buf = c_buf
             INSTR_M: tl.constexpr = 32 if DA == 2 and DB == 2 else 16
@@ -3530,11 +3565,10 @@ def mxgemm_tdm_pipelined(
 
     ``OUT_DTYPE`` selects the C element type, ``"fp32"`` (default) or
     ``"fp16"``. Accumulation stays FP32; FP16 output converts in registers
-    before staging, which halves C's LDS, TDM, and memory traffic. FP16
-    requires dedicated C staging slots or direct stores: it rejects output
-    schedules that reuse A/B input stages as FP32 C buffers (BK256 staging,
-    register pipeline, output-tail reuse, ab-reuse handoff) and the separate
-    warp, operand, and streamed pipeline kernels.
+    before staging, which halves C's LDS, TDM, and memory traffic. C buffers
+    that alias input ring slots keep the input slot pitch (FP16 slots hold
+    twice the rows and use the leading half). Every schedule supports FP16
+    except ``ASYNC_OUTPUT``, which addresses FP32 lanes directly.
 
     ``BENCHMARK`` also accepts a callback receiving the allocation-free launch
     function. The hardware trace collector uses it for controlled warmup and
@@ -3699,12 +3733,8 @@ def mxgemm_tdm_pipelined(
     assert K == Kb
     if OUT_DTYPE not in _OUT_DTYPES:
         raise ValueError(f"OUT_DTYPE must be one of {tuple(_OUT_DTYPES)}, got {OUT_DTYPE!r}")
-    if OUT_DTYPE != "fp32" and (WARP_PIPELINE or OPERAND_PIPELINE or STREAMED_OPERANDS or
-                                (PERSISTENT and
-                                 (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or HANDOFF_SCHEDULE == "ab-reuse" or
-                                  (OUTPUT_STAGING and BLOCK_K == 256)))):
-        raise ValueError("non-FP32 OUT_DTYPE requires dedicated C staging slots or direct stores: no BK256 staging, "
-                         "register/warp/operand/streamed pipelines, output-tail reuse, or ab-reuse handoff")
+    if OUT_DTYPE != "fp32" and ASYNC_OUTPUT:
+        raise ValueError("non-FP32 OUT_DTYPE does not support ASYNC_OUTPUT, which addresses FP32 lanes directly")
     persistent_kernel = mxgemm_tdm_persistent_kernel
     if CLUSTER_LAYOUT != "linear" and (not PERSISTENT or STREAMED_OPERANDS):
         raise ValueError("CLUSTER_LAYOUT requires the persistent kernel without STREAMED_OPERANDS")
@@ -3818,7 +3848,10 @@ def mxgemm_tdm_pipelined(
                 or not b_scale.is_contiguous() or a_scale.shape != (M // 128, K * 4)
                 or b_scale.shape != (N // 128, K * 4)):
             raise ValueError("WARP_PIPELINE requires contiguous K and packed scales of shape (rows // 128, K * 4)")
-        from amd_mxfp_gemm_warp_pipeline import get_layouts, mxfp8_warp_pipeline_kernel
+        if __package__:
+            from .amd_mxfp_gemm_warp_pipeline import get_layouts, mxfp8_warp_pipeline_kernel
+        else:
+            from amd_mxfp_gemm_warp_pipeline import get_layouts, mxfp8_warp_pipeline_kernel
         warp_layouts = get_layouts()
     if FIRST_USE_PREFETCH and not (
             PERSISTENT and OUTPUT_STAGING and WITH_A_SCALE and TDM_FUSION == "partial" and NUM_WARPS == 4 and

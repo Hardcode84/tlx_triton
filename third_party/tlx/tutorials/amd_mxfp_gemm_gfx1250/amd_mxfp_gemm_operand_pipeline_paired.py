@@ -262,12 +262,13 @@ def mxgemm_tdm_operand_pipeline_kernel(
         slot = next_slot
     tlx.async_amd_descriptor_wait(0)
     out_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[256, 16]], [256, 256])
-    out = tlx.local_view(tlx.local_alloc((256, 256), tl.float32, 1, layout=out_layout), 0)
+    out = tlx.local_view(tlx.local_alloc((256, 256), tlx.dtype_of(c_ptr), 1, layout=out_layout), 0)
     out_view = tlx.local_reshape(out, [2, 4, 32, 2, 4, 32])
     out_view = tlx.local_reshape(tlx.local_trans(out_view, (1, 0, 2, 4, 3, 5)), [256, 256])
     for row in tl.static_range(4):
         for col in tl.static_range(4):
-            tlx.local_store(tlx.local_slice(out_view, [row * 64, col * 64], [64, 64]), acc[row * 4 + col])
+            tlx.local_store(tlx.local_slice(out_view, [row * 64, col * 64], [64, 64]),
+                            acc[row * 4 + col].to(tlx.dtype_of(c_ptr)))
     cd = tl.make_tensor_descriptor(c_ptr, [M, N], [stride_cm, 1], [256, 256])
     tlx.async_amd_descriptor_store(cd, out, [pm * 256, pn * 256])
     tlx.async_amd_descriptor_wait(0)

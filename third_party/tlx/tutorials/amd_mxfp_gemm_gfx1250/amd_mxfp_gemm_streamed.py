@@ -269,19 +269,27 @@ def mxgemm_tdm_streamed_kernel(
     sab = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
     sbb = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
     C_COLS: tl.constexpr = 64 if NUM_BUFFERS == 4 and not OUTPUT_TAIL_REUSE else 128
+    C_DTYPE: tl.constexpr = tlx.dtype_of(c_ptr)
+    tl.static_assert(C_DTYPE == tl.float32 or C_DTYPE == tl.float16)
+    # The async output path addresses FP32 lanes directly.
+    tl.static_assert(C_DTYPE == tl.float32 or not ASYNC_OUTPUT, "ASYNC_OUTPUT requires FP32 output")
+    # The input-slot alias keeps the FP8 slot pitch: FP16 uses twice the rows.
+    C_ROW_SCALE: tl.constexpr = 32 // C_DTYPE.primitive_bitwidth
     C_PARTS_PER_ROW: tl.constexpr = 256 // C_COLS
     if OUTPUT_TAIL_REUSE:
         # Preserve the padded FP8 ring's physical slot size in the FP32 alias.
         # The second output slot is separate so its final transfer can overlap
         # the next tile's refill of the aliased input stage.
-        c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
-        ca = tlx.local_alloc((64, 128), tl.float32, NUM_BUFFERS, layout=c_layout, reuse=ab)
-        cb = tlx.local_alloc((64, 128), tl.float32, 1, layout=c_layout)
+        c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]],
+                                                                                     [64 * C_ROW_SCALE, 128], [1, 0])
+        ca = tlx.local_alloc((64 * C_ROW_SCALE, 128), C_DTYPE, NUM_BUFFERS, layout=c_layout, reuse=ab)
+        cb_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
+        cb = tlx.local_alloc((64, 128), C_DTYPE, 1, layout=cb_layout)
     elif ASYNC_OUTPUT:
         c_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, C_COLS], [1, 0])
         cb = tlx.local_alloc((64, C_COLS), tl.float32, 2, layout=c_layout)
     else:
-        cb = tlx.local_alloc((64, C_COLS), tl.float32, 2)
+        cb = tlx.local_alloc((64, C_COLS), C_DTYPE, 2)
     num_m, num_n = M // 256, N // 256
     total_tiles = num_m * num_n
     tile = _mxgemm_remap_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
@@ -348,6 +356,8 @@ def mxgemm_tdm_streamed_kernel(
             # Retire every wave's LDS reads before changing that A slot to C.
             tlx.workgroup_barrier()
             output_a = tlx.local_view(ca, slot)
+            if C_ROW_SCALE != 1:
+                output_a = tlx.local_slice(output_a, [0, 0], [64, 128])
         # For TDM output, the first NUM_BUFFERS-1 K-step waits retire the
         # previous tile's stores. Direct output was retired separately above.
         for part in tl.static_range(4 * C_PARTS_PER_ROW):
@@ -366,7 +376,7 @@ def mxgemm_tdm_streamed_kernel(
             for r in tl.static_range(2):
                 for c in tl.static_range(C_COLS // 32):
                     value = acc[((part // C_PARTS_PER_ROW) * 2 + r) * 8 + (part % C_PARTS_PER_ROW) * (C_COLS // 32) + c]
-                    tlx.local_store(tlx.local_slice(view, [r * 32, c * 32], [32, 32]), value)
+                    tlx.local_store(tlx.local_slice(view, [r * 32, c * 32], [32, 32]), value.to(C_DTYPE))
             out_m = off_m + (part // C_PARTS_PER_ROW) * 64
             out_n = off_n + (part % C_PARTS_PER_ROW) * C_COLS
             if ASYNC_OUTPUT:

@@ -793,14 +793,79 @@ def test_mxgemm_fp16_output_ring_phase(schedule, slots, k_iters, cluster_size):
                                       OVERLAP_PEEL=staged, OUT_DTYPE="fp16")
 
 
-def test_mxgemm_fp16_output_rejects_input_stage_reuse():
-    # BK256 output staging reuses A input stages as FP32 C buffers.
+def test_mxgemm_fp16_output_rejects_async_output():
+    # The streamed kernel's async output addresses FP32 lanes directly.
     a = torch.zeros((256, 256), dtype=torch.uint8)
-    b = torch.zeros((256, 128), dtype=torch.uint8)  # packed FP4, [N, K / 2]
     with pytest.raises(ValueError, match="OUT_DTYPE"):
-        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, a, a, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True,
-                                           NUM_BUFFERS=3, DTYPE_A="e4m3", DTYPE_B="e2m1", PERSISTENT=True,
-                                           OUTPUT_STAGING=True, OUT_DTYPE="fp16")
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, a, a, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, TRANSPOSE_B=True,
+                                           NUM_BUFFERS=3, DTYPE_A="e4m3", DTYPE_B="e4m3", PERSISTENT=True,
+                                           OUTPUT_STAGING=True, STREAMED_OPERANDS=True, ASYNC_OUTPUT=True,
+                                           OUT_DTYPE="fp16")
+
+
+_FP16_OUTPUT_SCHEDULES = {
+    # name: (K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, NUM_WARPS, REGISTER_PIPELINE, CLUSTER_SIZE,
+    #        OUTPUT_TAIL_REUSE, extra keyword arguments)
+    "a8w4-bench": (5, 3, False, "float4", 256, 4, False, 4, False,
+                   dict(CLUSTER_LAYOUT="2x2", SPLIT_CLUSTER_BARRIER=True, EARLY_C_STORES=True)),
+    "a8w4-reuse-prefetch": (4, 3, True, "float4", 256, 4, False, 1, False, {}),
+    "a8w4-reuse-prefetch-cluster": (9, 3, True, "float4", 256, 4, False, 4, False, dict(CLUSTER_LAYOUT="2x2")),
+    "a8w4-deferred": (5, 3, True, "float4", 256, 4, False, 4, True, {}),
+    "a8w4-ab-reuse":
+    (5, 3, True, "float4", 256, 4, False, 4, True, dict(HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION="partial")),
+    "a8w4-ab-reuse-4way":
+    (6, 3, True, "float4", 256, 4, False, 1, True, dict(HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION="4way")),
+    "a8w4-compact-tail": (5, 3, True, "float4", 256, 4, False, 4, False, dict(COMPACT_K_TAIL=True)),
+    "a8w8-tail-reuse": (5, 3, True, "float8_e4m3", 128, 4, False, 4, True, {}),
+    "a8w8-eight-warps": (4, 3, True, "float8_e4m3", 128, 8, False, 1, False, {}),
+    "a8w8-wave-specialized": (5, 3, True, "float8_e4m3", 128, 4, False, 4, False,
+                              dict(CLUSTER_LAYOUT="2x2", WAVE_SPECIALIZED_HANDOFF=True)),
+    "register": (5, 2, True, "float8_e4m3", 256, 4, True, 1, False, {}),
+    "register-cluster": (9, 2, True, "float8_e4m3", 256, 4, True, 4, False, {}),
+    "streamed": (5, 3, True, "float8_e4m3", 128, 4, False, 4, False, dict(STREAMED_OPERANDS=True)),
+    "streamed-tail-reuse": (7, 4, True, "float8_e4m3", 128, 4, False, 1, True, dict(STREAMED_OPERANDS=True)),
+}
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("schedule", list(_FP16_OUTPUT_SCHEDULES))
+def test_mxgemm_fp16_output_schedules_ring_phase(schedule):
+    # Output schedules whose C buffers alias A/B input ring slots keep the
+    # input slot pitch with FP16 (twice the rows per slot); others only change
+    # the staged type. Cover every C staging scheme with FP16 output.
+    k_iters, buffers, prefetch, dtype_b, block_k, warps, register, cluster, tail_reuse, extra = (
+        _FP16_OUTPUT_SCHEDULES[schedule])
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, prefetch, dtype_b, block_k, True, warps, register, False,
+                                      cluster, tail_reuse, OUT_DTYPE="fp16", **extra)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("kernel", ["direct", "warp-pipeline", "operand-pipeline", "operand-pipeline-bk256"])
+def test_mxgemm_fp16_output_nonpersistent(kernel):
+    # The nonpersistent kernels store each tile once; FP16 converts before
+    # the direct store or the dedicated LDS output tile.
+    M, N, K = (512, 512, 1024)
+    torch.manual_seed(123)
+    a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
+    b = (torch.randn((K, N)) * 0.5).to(torch.float8_e4m3fn)
+    sa = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    sb = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    expected = _gfx1250_mxfp.torch_gemm_mxfp(a, b, sa, sb, 32, M, N, K)
+    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=2, num_warps=4, DTYPE_A="e4m3", DTYPE_B="e4m3",
+                  TRANSPOSE_B=True, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial",
+                  OUT_DTYPE="fp16")
+    if kernel == "warp-pipeline":
+        config.update(WARP_PIPELINE=True, BLOCK_K=256, num_warps=8, OUTPUT_STAGING=True)
+    elif kernel == "operand-pipeline":
+        config.update(OPERAND_PIPELINE=True, NUM_BUFFERS=4, OUTPUT_STAGING=True)
+    elif kernel == "operand-pipeline-bk256":
+        config.update(OPERAND_PIPELINE=True, BLOCK_K=256, NUM_BUFFERS=2, OUTPUT_STAGING=True)
+    result = _gfx1250_mxfp.matmul(a.cuda(),
+                                  b.T.contiguous().cuda(),
+                                  _gfx1250_mxfp.pack_scale(sa).cuda(),
+                                  _gfx1250_mxfp.pack_scale(sb).cuda(), config=config)
+    assert result.dtype == torch.float16
+    torch.testing.assert_close(result.cpu().float(), expected, atol=2e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -1051,7 +1116,10 @@ def test_mxgemm_bench_cluster_and_output_options():
 
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
     # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
+    # Each variant runs with FP32 and then FP16 output.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
+    assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
+                                                                            ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
     for variant, dtype_b, args in variants:
         for shape in shapes:
             cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)
@@ -1064,9 +1132,13 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
             assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and shape[2] == 8192)
             assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
+            assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
+    _, _, variants = bench.parse_benchmark_args(["--dry-run", "--out-dtype", "fp16"])
+    assert [args.out_dtype for _, _, args in variants] == ["fp16", "fp16"]
     # Opting out, and forcing it on for the four-stage ring.
     for flag, expected in (("--no-overlap-peel", (False, False)), ("--overlap-peel", (True, True))):
-        _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx8", flag, "--dry-run"])
+        _, shapes, variants = bench.parse_benchmark_args(
+            ["--variant", "mx8xmx8", "--out-dtype", "fp32", flag, "--dry-run"])
         (_, dtype_b, args), = variants
         for shape, want in zip((shapes[0], shapes[2]), expected):
             cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)

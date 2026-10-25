@@ -1,7 +1,7 @@
 """Benchmark persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
 Both variants run at 8192x8192x8192, 8192x8192x4096, 16384x16384x16384, and
-32768x32768x32768 by default, with FP32 output, persistent 256x256 M/N tiles,
+32768x32768x32768 by default, each with FP32 and then FP16 output, persistent 256x256 M/N tiles,
 three input buffers, output staging, and partial TDM fusion. MX8xMX8 uses
 BK128 with cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch
 disabled by default. Use --variant mx8xmx4
@@ -46,9 +46,10 @@ output-slot waits, and the next tile's first ring refill precedes the last
 C chunks. This is 0.2% faster at 8192^3 and 1.2% faster at K=4096 on
 hardware; the power-bound four-stage ring is unchanged, so it stays off there.
 Use --no-overlap-peel to disable it.
---out-dtype fp16 writes FP16 C (FP32 accumulation, one rounding before
-staging) for MX8xMX8. It uses six FP16 C slots for the three-buffer ring and
-two 64x128 slots for the four-buffer ring.
+FP16 output writes FP16 C (FP32 accumulation, one rounding before staging)
+for every variant except --async-output, which runs FP32 only by default.
+Repeat --out-dtype to choose output types (default: fp32 and fp16). MX8xMX8 uses six FP16 C
+slots for the three-buffer ring and two 64x128 slots for the four-buffer ring.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -146,6 +147,7 @@ from pathlib import Path
 
 DEFAULT_CASES = ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
 VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
+OUT_DTYPES = ("fp32", "fp16")
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
 
@@ -454,8 +456,10 @@ def parse_benchmark_args(argv=None):
         "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
         f"(default: MX8xMX8 cases with K >= {STATIC_SLOT_UNROLL_MIN_K})")
-    parser.add_argument("--out-dtype", choices=("fp32", "fp16"), default="fp32",
-                        help="C element type; FP16 needs dedicated output staging (not the MX8xMX4 BK256 output reuse)")
+    parser.add_argument(
+        "--out-dtype", choices=OUT_DTYPES, action="append",
+        help="repeatable C element type; default: fp32 and fp16 (fp32 only with --async-output). "
+        "FP16 rounds the FP32 accumulators once and does not support --async-output")
     parser.add_argument(
         "--overlap-peel", action=argparse.BooleanOptionalAction, default=None,
         help="run each next tile's first K step inside the BK128 C epilogue "
@@ -588,7 +592,10 @@ def parse_benchmark_args(argv=None):
     if args.output_staging and not (args.warp_pipeline or args.operand_pipeline):
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
-    variants = [(variant, dtype_b, _variant_args(args, dtype_b)) for variant, dtype_b in variants]
+    out_dtypes = list(dict.fromkeys(args.out_dtype or (("fp32", ) if args.async_output else OUT_DTYPES)))
+    variants = [(variant, dtype_b, _variant_args(argparse.Namespace(**{**vars(args), "out_dtype": out_dtype}), dtype_b))
+                for variant, dtype_b in variants
+                for out_dtype in out_dtypes]
     for _, dtype_b, run_args in variants:
         if run_args.wave_specialized_handoff and not (
                 run_args.persistent and run_args.output_staging and run_args.cross_tile_prefetch and
@@ -608,13 +615,8 @@ def parse_benchmark_args(argv=None):
                      or run_args.streamed_operands or run_args.output_tail_reuse or run_args.wave_specialized_handoff)):
             parser.error("--output-c-slots requires at least two slots and persistent BK128 dedicated output staging "
                          "without other output schedules")
-        if run_args.out_dtype != "fp32" and (
-                run_args.warp_pipeline or run_args.operand_pipeline or run_args.streamed_operands or
-            (run_args.persistent and
-             (run_args.register_pipeline or run_args.output_tail_reuse or run_args.handoff_schedule == "ab-reuse" or
-              (run_args.output_staging and run_args.block_k == 256)))):
-            parser.error(f"--out-dtype {run_args.out_dtype} requires dedicated BK128 output staging or direct "
-                         "stores (use --variant mx8xmx8 or --block-k 128)")
+        if run_args.out_dtype != "fp32" and run_args.async_output:
+            parser.error(f"--out-dtype {run_args.out_dtype} does not support --async-output")
         if run_args.overlap_peel and not _supports_overlap_peel(run_args):
             parser.error("--overlap-peel requires persistent BK128 tiles with four warps, dedicated output staging, "
                          "cross-tile prefetch, and the current handoff schedule without other schedule variants")
@@ -765,13 +767,14 @@ def main():
         run_args = _case_args(run_args, case)
         label = "x".join(map(str, case))
         command = _command(run_args, case, dtype_b)
-        print(f"\n[{index}/{len(runs)}] {variant} {label} ({args.dtype_a} x {dtype_b})", flush=True)
+        print(f"\n[{index}/{len(runs)}] {variant} {label} ({args.dtype_a} x {dtype_b} -> {run_args.out_dtype})",
+              flush=True)
         print(f"$ {shlex.join(command)}", flush=True)
         if args.dry_run:
             continue
         cwd = None
         if args.output_dir is not None:
-            cwd = args.output_dir.resolve() / f"{index:02d}-{variant}-{label}"
+            cwd = args.output_dir.resolve() / f"{index:02d}-{variant}-{run_args.out_dtype}-{label}"
             cwd.mkdir(parents=True, exist_ok=False)
         ms = tflops = None
         with subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -819,7 +822,7 @@ def main():
     for variant, _, run_args in variants:
         kernel_name = _kernel_name(run_args)
         print(
-            f"\nConfiguration ({variant}): {kernel_name}, "
+            f"\nConfiguration ({variant}, {run_args.out_dtype}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}"
             f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K})' if run_args.auto_ring_depth else ''}, "
@@ -853,12 +856,12 @@ def main():
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms batches, "
             f"warmup={run_args.warmup_seconds:g} s, median over {run_args.duration_seconds:g} s, "
             f"amd_codegen={codegen}", flush=True)
-    print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'M':>7} {'N':>7} {'K':>7} "
+    print(f"\n{'variant':>9} {'dtype A':>12} {'dtype B':>12} {'out':>5} {'M':>7} {'N':>7} {'K':>7} "
           f"{'BK':>4} {'ms':>12} {'TFLOPS':>12}  status")
     for row in results:
         ms = "-" if row["ms"] is None else f"{row['ms']:.4f}"
         tflops = "-" if row["tflops"] is None else f"{row['tflops']:.2f}"
-        print(f"{row['variant']:>9} {row['dtype_a']:>12} {row['dtype_b']:>12} "
+        print(f"{row['variant']:>9} {row['dtype_a']:>12} {row['dtype_b']:>12} {row['out_dtype']:>5} "
               f"{row['M']:7d} {row['N']:7d} {row['K']:7d} {row['block_k']:4d} {ms:>12} {tflops:>12}  {row['status']}")
     if args.csv is not None:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
