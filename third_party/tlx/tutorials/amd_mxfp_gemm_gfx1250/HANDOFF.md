@@ -2608,6 +2608,68 @@ output would need the A-reuse C layout rebuilt for 2-byte elements (A's
 `/home/ibutygin/tlx/perf-data/mxfp-fp16-output-20261024.tar.gz` (SHA256
 `d0f296f9d42f78a4c5b2833ceab8ec480113ea298c751f54f554aa6d8bb0262b`).
 
+**FP16 output for every variant (2026-10-25).**
+
+*Aliased C buffers.* C buffers that alias input ring slots keep the input
+slot pitch: FP16 allocates `C_ROW_SCALE` = 2 times the rows per slot with the
+same element padding (exactly the FP32 bytes), and `_mxgemm_c_slot` slices
+the leading rows. This covers:
+
+- MX8xMX4 BK256 output reuse, with and without cross-tile prefetch;
+- output-tail reuse (`ca`/`cb`), the `ab-reuse` B halves, and the streamed
+  kernel's A alias.
+
+Single C buffers placed inside one input stage (deferred C refill,
+`ab-reuse` A quadrants) just change type.
+
+*Register pipeline.* It reinterprets a free BK256 stage. TDM store padding
+must equal the panel width, and the reinterpret must keep the stage's byte
+padding (256 B + 16 B), so FP16 stores two 256x128 panels per tile with
+`[128:+8]` padding instead of four 256x64 FP32 panels.
+
+*Other kernels and fixes.*
+
+- Warp and operand pipelines (dedicated output tiles) convert before
+  `local_store`.
+- Only the streamed kernel's `ASYNC_OUTPUT` (FP32 lane addressing) rejects
+  FP16.
+- Fixed in passing: the warp-pipeline launcher's absolute import broke
+  package use.
+- Still broken and unrelated: `SCHED_MODE_2` calls a removed
+  `tlx.amd_set_wave_sched_mode`; it fails at HEAD too.
+
+*Bench.* `bench.py --out-dtype fp16` now works for both variants (only
+`--async-output` is rejected), and the final table has an `out` column.
+
+*Code and tests.*
+
+- FP32 code is unchanged: MX8xMX8 and MX8xMX4 bench defaults assemble
+  identically to HEAD.
+- MX8xMX4 FP16: 922 VGPRs, no spills; 64 instead of 128 `ds_store`; same LDS
+  (C lives in A).
+- FFM: `test_mxgemm_fp16_output_schedules_ring_phase` (14 schedules) and
+  `test_mxgemm_fp16_output_nonpersistent` (direct, warp pipeline, two
+  operand pipelines) pass, plus an FP32 regression sample of the touched
+  paths: 225 of 225 tests pass (register, output tail reuse, A8W4 C
+  staging, streamed, compact K tail, early C stores with AB reuse, wave
+  specialized, overlap peel, operand pipeline ring; `pytest -n 48`, 3m23s).
+
+Hardware, MX8xMX4 bench default (BK256, early C stores, split cluster
+barrier); FP16 outputs equal the FP32 kernel's output rounded to FP16, bit
+for bit:
+
+| Shape | FP32 | FP16 | Change |
+| --- | ---: | ---: | ---: |
+| 8192³ | 0.13486 ms | 0.12855 ms | −4.68% |
+| 8192²×4096 | 0.07758 ms | 0.07083 ms | −8.70% |
+| 16384³ | 1.02583 ms | 0.99883 ms | −2.63% |
+
+The remote host rebooted before this run (its `/tmp` and the remote ship
+directory were recreated), so compare these MX8xMX4 numbers only with
+each other. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-fp16-all-variants-20261025.tar.gz`
+(SHA256 `a2f5f11410db6dc579c8b60cb42bf08dafef5e05c476743858ab7134d19a6955`).
+
 #### Address and scalar-work scan of the default kernel (2026-10-25)
 
 **Method.** `scan.py` walks the 8192³ default asm (unchanged by the FP16
