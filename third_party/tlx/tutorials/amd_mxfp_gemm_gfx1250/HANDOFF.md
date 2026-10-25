@@ -2671,6 +2671,38 @@ each other. Archive:
 `/home/ibutygin/tlx/perf-data/mxfp-fp16-all-variants-20261025.tar.gz`
 (SHA256 `a2f5f11410db6dc579c8b60cb42bf08dafef5e05c476743858ab7134d19a6955`).
 
+#### Post-reboot slowdown is the machine, not the kernel (2026-10-25)
+
+The pre-reboot `ship49` A8W8 binaries (2026-10-24), rerun unchanged with the
+same harness (`hw_power2.py`, four rounds), are 6-7% slower. Cycles per
+launch are unchanged; the sustained clock at the 2500 W cap dropped by the
+same fraction, and energy per launch rose:
+
+| Shape (FP32) | Before | After | Time | Clock | Cycles |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192³ | 0.15003 ms, 1793 MHz | 0.15989 ms, 1685 MHz | +6.6% | −6.0% | +0.2% |
+| 8192²×4096 | 0.08356 ms, 1878 MHz | 0.08849 ms, 1786 MHz | +5.9% | −4.9% | +0.7% |
+| 16384³ | 1.17881 ms, 1632 MHz | 1.26639 ms, 1512 MHz | +7.4% | −7.4% | −0.5% |
+
+Short bursts at both 8192 shapes are 11% slower too, and with light load
+the shader clock now sits at ~2200 MHz instead of ~2420 MHz. The
+current HEAD build of the bench default is instruction-identical to `ship49`
+at all three shapes (only DWARF line numbers differ), and the outputs match
+bit for bit.
+
+Machine changes during the downtime: the host was reprovisioned at
+01:07 UTC on 2026-10-25. `amdgpu-dkms` and `amdgpu-dkms-firmware` were
+reinstalled as a new build of the same version (7.1.0.31300009, package
+build 2410483 -> 2415424), and the board now reports IFWI 00207988 (built
+2026/10/17, part 113-M4500001-001). The 2026-10-21 snapshot showed IFWI
+00205629 (2026/10/01, part -900B), SCLK levels 500/2400 MHz (now
+250/2234/2400), DF 1250/1900 MHz (now 500/1950), and PPT1 3750 W (now
+3700 W). No snapshot from the 2026-10-24 boot exists, so the IFWI may have
+changed at an earlier reboot, but the driver/firmware package swap is
+certain. Compare only post-reboot numbers with each other. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-reboot-check-20261025.tar.gz` (SHA256
+`ffb74e6a17f05bb87a572ccc1d9f94606e718afd8213e5a8d78bf9b1a1f0a5d4`).
+
 #### TLX AMD test repair (2026-10-25)
 
 All TLX AMD pytest files pass under FFM (1161 passed, 502 skipped across
