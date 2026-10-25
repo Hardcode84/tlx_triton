@@ -2608,6 +2608,68 @@ output would need the A-reuse C layout rebuilt for 2-byte elements (A's
 `/home/ibutygin/tlx/perf-data/mxfp-fp16-output-20261024.tar.gz` (SHA256
 `d0f296f9d42f78a4c5b2833ceab8ec480113ea298c751f54f554aa6d8bb0262b`).
 
+#### Address and scalar-work scan of the default kernel (2026-10-25)
+
+**Method.** `scan.py` walks the 8192³ default asm (unchanged by the FP16
+commit) and charges each instruction its issue gap from the four
+SIMD-select ATT runs. ATT does not record `s_set_vgpr_msb`; its issue time
+lands on the preceding instruction. Totals per wave, about 247k cycles per
+wave:
+
+| Region | Class | Static | Executions | Gap cycles |
+| --- | --- | ---: | ---: | ---: |
+| Steady loop | SALU | 59 | 4,084 | 7,643 |
+| Steady loop | VALU | 10 | 800 | 1,521 |
+| Steady loop | `s_nop`/`v_nop` | 3 | 240 | 400 |
+| Steady loop | `s_set_vgpr_msb` | 172 | — | not traced |
+| Transitions (×3) | SALU / VALU | 339 / 89 | 1,439 / 684 | 2,481 / 900 |
+| Prologue | SALU / VALU | 212 / 30 | 242 | 315 |
+
+**Steady loop, per iteration (three K steps):**
+
+- **TDM descriptor regroup copies** (`s_mov sN, s29`, about 15 per step):
+  SGPR-pressure allocation copies, already measured at most ~0.1%
+  ("Redundant scalar work").
+- **`k % 8` cluster-barrier test:** `s_add` + `s_and` + `s_cbranch` per
+  step. The branch waits about 10 cycles on the `s_and` (about 30 cycles
+  per iteration). It sits right before the step's `s_wait_dscnt 0`, which
+  waits for LDS loads anyway, so most of it is hidden.
+- **LDS address adds** (about 6–8 VALU per step) and three `v_nop`:
+  pinning them out of the loop was measured at +0.45% ("Live values").
+- **Loop control:** about 11 cycles per iteration.
+
+**Transitions, about 1.1k SALU/VALU cycles each:**
+
+- about 400: the compact K-tail loop's 32-VGPR `v_dual_mov` copy blocks
+  (a static tail removes them, +0.2% net, measured);
+- tile coordinates computed twice per tile;
+- slot `% 3` selects;
+- per-chunk C descriptor math.
+
+All but the copy blocks were measured earlier at under 0.1%.
+
+**New candidate tested: the double workgroup barrier on cluster steps.**
+Every eighth step runs `cluster_barrier()` (`s_wait_dscnt 0` → workgroup
+barrier → wave 0 `s_barrier_signal -3` → wait), and then the refill's
+release barrier that Membar inserts at the join. Temporary
+`MERGED_CLUSTER_RELEASE`:
+
+| Variant | What changes | 8192³ | 8192²×4096 |
+| --- | --- | ---: | ---: |
+| `mcr` | One explicit, unconditional release barrier before the `k % 8` branch, then arrive/wait. Signal and wait become adjacent (no WMMAs between), exposing the barrier round trip every step | +2.50% | +1.84% |
+| `mcr2` | Keep Membar's release barrier; on cluster steps only arrive/wait (drop `cluster_barrier`'s leading workgroup barrier). Loop schedule otherwise unchanged | +0.48% | −0.13% |
+
+Outputs are bitwise identical. The leading workgroup barrier is not needed
+for LDS safety, but aligning each CTA's waves before wave 0 signals the
+cluster helps multicast matching more than it costs.
+
+**Conclusion:** after this scan, no address or scalar work in the default
+kernel is removable for a measurable gain. The remaining candidates are
+each at most ~0.1% or were already measured as losses. Archive (`scan.py`,
+per-instruction gaps, patch, ship, hardware log):
+`/home/ibutygin/tlx/perf-data/mxfp-addr-scan-20261025.tar.gz` (SHA256
+`54bc799e1a807072497c860eb97552362181e398a6e38cb97b6fea49d56f7cf9`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
