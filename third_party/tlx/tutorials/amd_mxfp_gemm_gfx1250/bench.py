@@ -1,6 +1,6 @@
 """Benchmark persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
-Both variants run at 8192x8192x8192, 8192x8192x4096, 16384x16384x16384, and
+Both variants run at 8192x8192x4096, 8192x8192x8192, 16384x16384x16384, and
 32768x32768x32768 by default, each with FP32 and then FP16 output, persistent 256x256 M/N tiles,
 three input buffers, output staging, and partial TDM fusion. MX8xMX8 uses
 BK128 with cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch
@@ -145,7 +145,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_CASES = ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
+DEFAULT_CASES = ((8192, 8192, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (32768, 32768, 32768))
 VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
 OUT_DTYPES = ("fp32", "fp16")
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
