@@ -188,21 +188,27 @@ class MetaLlvmInfoTest(unittest.TestCase):
                 package = build_helpers.get_llvm_package_info(helper_args)
         self.assertEqual("", package.url)
 
-    def test_amd_codegen_builds_against_core_meta_llvm(self) -> None:
+    def test_amd_codegen_uses_amdgpu_pin_with_meta_core_llvm(self) -> None:
+        # The Meta override selects only the core LLVM. The AMD code generator
+        # still comes from cmake/amd-llvm-info.json.
+        amd_info = {
+            "llvm_hash": "d26ff26ef4e94a4de9ce5228ef5b32b5290cca8f", "build_number": 1, "sha256sum":
+            {"ubuntu-x64": "pinned"}
+        }
         with tempfile.TemporaryDirectory() as base_dir:
             self._write(base_dir, self.META)
-            built = Path(base_dir) / "built" / "libtriton_amd_codegen.so"
-            built.parent.mkdir()
-            built.write_bytes(b"so")
-            helper_args = _helper_args(base_dir, llvm_system_suffix="macos-arm64", llvm_syspath="/opt/llvm")
+            (Path(base_dir) / "cmake" / "amd-llvm-info.json").write_text(json.dumps(amd_info))
+            library = "libtriton_amd_codegen.so"
+            pinned = Path(base_dir) / "amd" / "amd-codegen-d26ff26e-ubuntu-x64-1" / "lib" / library
+            pinned.parent.mkdir(parents=True)
+            pinned.write_bytes(b"pinned")
+            helper_args = _helper_args(base_dir, llvm_system_suffix="ubuntu-x64")
             with patch.object(build_helpers, "get_base_dir", return_value=base_dir), \
-                    patch.object(build_helpers, "amd_codegen_library_name", return_value=built.name), \
-                    patch.object(build_helpers, "build_amd_codegen", return_value=str(built)) as build, \
-                    patch.object(build_helpers, "get_amd_codegen_package_info") as oai_package:
+                    patch.object(build_helpers, "amd_codegen_library_name", return_value=library), \
+                    patch.object(build_helpers, "build_amd_codegen") as build, \
+                    patch.object(build_helpers, "_download_and_extract") as download:
                 build_helpers.download_and_copy_amd_codegen(helper_args)
-            info, _ = build.call_args.args
-            self.assertEqual(self.META["llvm_hash"], info["llvm_hash"])
-            self.assertEqual("/opt/llvm", build.call_args.kwargs["llvm_path"])
-            oai_package.assert_not_called()
-            copied = Path(base_dir) / "third_party" / "amd" / "backend" / "lib" / built.name
-            self.assertEqual(b"so", copied.read_bytes())
+            build.assert_not_called()
+            download.assert_not_called()
+            copied = Path(base_dir) / "third_party" / "amd" / "backend" / "lib" / library
+            self.assertEqual(b"pinned", copied.read_bytes())

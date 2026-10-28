@@ -633,12 +633,8 @@ def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelpe
     return llvm_path
 
 
-def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_path: Optional[str] = None):
-    # A caller-provided LLVM (the Meta core bundle) links with the host
-    # compiler, as libtriton does; its clang may not find a matching libstdc++.
-    use_sdk_compilers = llvm_path is None
-    if llvm_path is None:
-        llvm_path = download_codegen_llvm("amd", amd_llvm_info, helper_args)
+def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs):
+    llvm_path = download_codegen_llvm("amd", amd_llvm_info, helper_args)
     revision = f'{amd_llvm_info["llvm_hash"]}-{amd_llvm_info["build_number"]}'
     system_suffix = get_llvm_system_suffix(helper_args)
     source_path = os.path.join(get_base_dir(), "third_party", "amd", "backend", "codegen")
@@ -660,7 +656,7 @@ def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_pa
         f"-DTRITON_AMD_LLVM_REVISION={revision}",
         "-DCMAKE_BUILD_TYPE=Release",
     ]
-    if sys.platform != "win32" and use_sdk_compilers:
+    if sys.platform != "win32":
         clang = os.path.join(llvm_path, "bin", "clang")
         clangxx = os.path.join(llvm_path, "bin", "clang++")
         if os.path.isfile(clang) and os.path.isfile(clangxx):
@@ -685,27 +681,15 @@ def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_pa
     return os.path.join(install_path, "lib", amd_codegen_library_name())
 
 
-def build_and_copy_meta_amd_codegen(helper_args: BuildHelperArgs, library: str):
-    # The Meta LLVM fork carries AMDGPU fixes that OAI's codegen artifact lacks.
-    # Build against the core Meta LLVM, as fbsource does, until Meta pins its
-    # own AMD codegen LLVM.
-    core_llvm = _get_thirdparty_package_cmake_vars(get_llvm_package_info(helper_args), helper_args)
-    source_path = build_amd_codegen(load_llvm_info(), helper_args, llvm_path=core_llvm["LLVM_SYSPATH"])
-    if not os.path.isfile(source_path):
-        raise RuntimeError(f"Cannot find AMD code generation at {source_path}; set TRITON_AMD_CODEGEN_PATH")
-    destination_path = os.path.join(get_base_dir(), "third_party", "amd", "backend", "lib", library)
-    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-    print(f"copy {source_path} to {destination_path} ...")
-    shutil.copy2(source_path, destination_path)
-
-
 def download_and_copy_amd_codegen(helper_args: BuildHelperArgs):
     if helper_args.amd_codegen_path is not None:
         return
 
+    # Always use the AMDGPU LLVM pinned in cmake/amd-llvm-info.json, even when
+    # cmake/meta-llvm-info.json selects a different core LLVM. Building the
+    # code generator against the core LLVM loses AMDGPU backend changes the
+    # pin carries (e.g. in-order va_vdst modeling for WMMA writes).
     library = amd_codegen_library_name()
-    if has_meta_llvm_info():
-        return build_and_copy_meta_amd_codegen(helper_args, library)
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
         amd_llvm_info = json.load(amd_llvm_info_file)
