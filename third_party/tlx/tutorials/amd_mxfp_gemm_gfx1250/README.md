@@ -3,8 +3,10 @@
 This directory contains the FP8/FP4 TDM-pipelined GEMM tutorial and a persistent
 MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 
-See [HANDOFF.md](HANDOFF.md) for the performance investigation checkpoint,
-measured results, toolchain caveats, and next validation steps.
+See [WRITEUP.md](WRITEUP.md) for an overview of the kernel design,
+configuration, performance, and bottlenecks, and [HANDOFF.md](HANDOFF.md)
+for the performance investigation checkpoint, measured results, toolchain
+caveats, and next validation steps.
 
 - `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
   `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
