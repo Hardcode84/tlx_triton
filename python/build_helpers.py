@@ -646,9 +646,11 @@ def download_and_copy_amd_codegen(helper_args: BuildHelperArgs):
     if helper_args.amd_codegen_path is not None:
         return
 
+    # Always use the AMDGPU LLVM pinned in cmake/amd-llvm-info.json, even when
+    # cmake/meta-llvm-info.json selects a different core LLVM. Building the
+    # code generator against the core LLVM loses AMDGPU backend changes the
+    # pin carries (e.g. in-order va_vdst modeling for WMMA writes).
     library = amd_codegen_library_name()
-    if meta_llvm.enabled(get_base_dir()):
-        return meta_llvm.copy_amd_codegen(helper_args, library)
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
         amd_llvm_info = json.load(amd_llvm_info_file)
