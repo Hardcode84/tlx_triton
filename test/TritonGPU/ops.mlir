@@ -544,3 +544,78 @@ module attributes {"ttg.target" = "hip:gfx1260", "ttg.num-ctas" = 1 : i32, "ttg.
     tt.return
   }
 }
+
+// -----
+
+// Partitioned GEMMs use mixed warp bases. Both dot operations and the helper
+// call/return boundaries must accept these non-permutation layouts.
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [0, 2], [1, 0], [4, 0]], warp = [[4, 4], [2, 0]]}, instrShape = [16, 16, 32]}>
+!a = tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
+!b = tensor<32x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
+!c = tensor<128x128xf32, #mma>
+
+module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @call_wmma_mixed_warps
+  tt.func @call_wmma_mixed_warps(%a: !a, %b: !b, %c: !c) -> !c {
+    // CHECK: %[[RESULT:.*]] = tt.call @wmma_mixed_warps
+    %result = tt.call @wmma_mixed_warps(%a, %b, %c) : (!a, !b, !c) -> !c
+    // CHECK: tt.return %[[RESULT]]
+    tt.return %result : !c
+  }
+
+  // CHECK-LABEL: tt.func private @wmma_mixed_warps
+  tt.func private @wmma_mixed_warps(%a: !a, %b: !b, %c: !c) -> !c {
+    // CHECK: %[[DOT:.*]] = tt.dot
+    %dot = tt.dot %a, %b, %c, inputPrecision = ieee : !a * !b -> !c
+    // CHECK: tt.return %[[DOT]]
+    tt.return %dot : !c
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [0, 2], [1, 0], [4, 0]], warp = [[4, 4], [2, 0]]}, instrShape = [16, 16, 128]}>
+#scale_a = #ttg.generic_linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[64, 0], [32, 0]], block = []}>
+#scale_b = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[64, 0], [0, 0]], block = []}>
+!a = tensor<128x128xf8E4M3FN, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>
+!b = tensor<128x128xf8E4M3FN, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>
+!c = tensor<128x128xf32, #mma>
+!sa = tensor<128x4xi8, #scale_a>
+!sb = tensor<128x4xi8, #scale_b>
+
+module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @call_wmma_scaled_mixed_warps
+  tt.func @call_wmma_scaled_mixed_warps(%a: !a, %b: !b, %c: !c, %sa: !sa, %sb: !sb) -> !c {
+    // CHECK: %[[RESULT:.*]] = tt.call @wmma_scaled_mixed_warps
+    %result = tt.call @wmma_scaled_mixed_warps(%a, %b, %c, %sa, %sb) : (!a, !b, !c, !sa, !sb) -> !c
+    // CHECK: tt.return %[[RESULT]]
+    tt.return %result : !c
+  }
+
+  // CHECK-LABEL: tt.func private @wmma_scaled_mixed_warps
+  tt.func private @wmma_scaled_mixed_warps(%a: !a, %b: !b, %c: !c, %sa: !sa, %sb: !sb) -> !c {
+    // CHECK: %[[DOT:.*]] = tt.dot_scaled
+    %dot = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : !a, !sa * !b, !sb -> !c
+    // CHECK: tt.return %[[DOT]]
+    tt.return %dot : !c
+  }
+}
+
+// -----
+
+// A group-major partitioned view [G, 2 * r, C] (one group along dim 1) folds
+// into [G * 2 * r, C] partitioned along dim 0 with G groups: both keep pieces
+// p, p + 2, ... contiguous in partition p.
+#piece3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#piece2 = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#part3 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece3}>
+#part2 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece2}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: memdesc_reshape_partitioned_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_groups(%d : !ttg.memdesc<4x64x128xi8, #part3, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part3, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part2, #smem, mutable>
+    tt.return
+  }
+}

@@ -1,4 +1,5 @@
 import enum
+import hashlib
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
@@ -286,6 +287,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
         self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
 
+    def __repr__(self):
+        return f"padded_shared_layout_encoding({vars(self)!r})"
+
     @staticmethod
     @constexpr_function
     def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
@@ -369,6 +373,48 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
         )
+
+
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor's pieces between physical LDS partitions on gfx1250.
+
+    ``partition_layout`` describes one piece. Along ``partition_dim``, each
+    of ``num_groups`` groups contains ``num_partitions`` consecutive pieces.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        self.num_partitions = int(num_partitions)
+        self.num_groups = int(num_groups)
+        self.partition_dim = int(partition_dim)
+        self.partition_layout = tl._unwrap_if_constexpr(partition_layout)
+        for name, value in (("num_partitions", self.num_partitions), ("num_groups", self.num_groups)):
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{name} must be a positive power of two")
+        if self.partition_dim < 0:
+            raise ValueError("partition_dim must be non-negative")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared-memory layout")
+
+    def __repr__(self):
+
+        def describe(layout):
+            fields = {
+                name: describe(value) if isinstance(value, layout_encoding) else value
+                for name, value in vars(layout).items()
+            }
+            return type(layout).__name__, fields
+
+        return repr(describe(self))
+
+    def make_permute(self, dims):
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups,
+                                                  tuple(dims).index(self.partition_dim),
+                                                  self.partition_layout.make_permute(dims))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
 
 
 class shared_linear_layout_encoding(shared_layout_encoding):
@@ -485,6 +531,29 @@ class amd_mfma_layout(layout_encoding):
         del shape, element_type
         return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class amd_wmma_layout(layout_encoding):
+    """Explicit AMD WMMA accumulator distribution for one CTA."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 128), version=3, transposed=True):
+        super().__init__()
+        self.warp_bases = [list(b) for b in tl._unwrap_if_constexpr(warp_bases)]
+        self.reg_bases = [list(b) for b in tl._unwrap_if_constexpr(reg_bases)]
+        self.instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        if len(self.instr_shape) != 3 or any(dim <= 0 for dim in self.instr_shape):
+            raise ValueError("instr_shape must contain three positive dimensions")
+        if any(len(basis) != 2 or any(value < 0 for value in basis) for basis in (*self.warp_bases, *self.reg_bases)):
+            raise ValueError("WMMA bases must contain two nonnegative coordinates")
+
+    def __repr__(self):
+        return f"amd_wmma_layout({vars(self)!r})"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, 2)
 
 
 class slice_layout(layout_encoding):
@@ -1339,7 +1408,8 @@ class buffered_tensor(tl.base_value):
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout,
+                                         ir_type=handle.get_type() if handle is not None else None)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -1367,6 +1437,7 @@ class buffered_tensor_type(tl.block_type):
         num: int,
         storage: storage_kind,
         layout: Optional[shared_layout_encoding] = None,
+        ir_type=None,
     ):
         super().__init__(element_ty, shape)
         # Storage
@@ -1375,6 +1446,10 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
+        # Views carry an allocation shape and concrete encoding that cannot be
+        # reconstructed from their logical shape and frontend layout alone.
+        # Keep that type across JIT calls, just as the descriptor value does.
+        self._ir_type = ir_type
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
         value = buffered_tensor(
@@ -1392,19 +1467,24 @@ class buffered_tensor_type(tl.block_type):
         shape = "_".join(map(str, self.shape))
         if self.num > 0:
             shape += f"_{self.num}"
-        return f"buffered_{elt}S{shape}"
+        suffix = ""
+        if self._ir_type is not None:
+            suffix = "M" + hashlib.sha256(str(self._ir_type).encode()).hexdigest()[:16]
+        return f"buffered_{elt}S{shape}{suffix}"
 
     def __str__(self) -> str:
         return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
 
     def __eq__(self, other) -> bool:
         return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
-                and self.num == other.num)
+                and self.num == other.num and self._ir_type == other._ir_type)
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self._ir_type is not None:
+            return self._ir_type
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)

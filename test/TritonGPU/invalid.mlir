@@ -292,7 +292,7 @@ tt.func public @result_rank_too_large(%arg0: !ttg.memdesc<3x8x16xf32, #shared, #
 #smem = #ttg.shared_memory
 tt.func public @memdesc_index_result_alloc_shape_mismatch(%arg0: !ttg.memdesc<3x8x16xf32, #shared, #smem>) {
     %zero = arith.constant 0 : i32
-    // expected-error @+1 {{alloc shape must match shape for the result}}
+    // expected-error @+1 {{result must preserve the source allocation shape after dropping the buffer dimension}}
     %a = ttg.memdesc_index %arg0[%zero] : !ttg.memdesc<3x8x16xf32, #shared, #smem> -> !ttg.memdesc<8x16xf32, #shared, #smem, 3x8x16>
     tt.return
 }
@@ -302,7 +302,7 @@ tt.func public @memdesc_index_result_alloc_shape_mismatch(%arg0: !ttg.memdesc<3x
 #smem = #ttg.shared_memory
 tt.func public @memdesc_index_inner_subview(%arg0: !ttg.memdesc<3x8x8xf32, #shared, #smem, 3x8x16>) {
     %zero = arith.constant 0 : i32
-    // expected-error @+1 {{We only support memdesc_index of a multibuffer-prefix subview}}
+    // expected-error @+1 {{result must preserve the source allocation shape after dropping the buffer dimension}}
     %a = ttg.memdesc_index %arg0[%zero] : !ttg.memdesc<3x8x8xf32, #shared, #smem, 3x8x16> -> !ttg.memdesc<8x8xf32, #shared, #smem>
     tt.return
 }
@@ -1208,5 +1208,23 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
       ttg.predicate_yield %init : tensor<64xf32, #carried>
     } : (tensor<64xi1, #predicate>, tensor<64xf32, #carried>) -> tensor<64xf32, #carried>
     tt.return %result : tensor<64xf32, #carried>
+  }
+}
+
+// -----
+
+// Reshaping a partitioned view is only supported for folding group-major
+// pieces into the partition dimension; the generic fallback would drop the
+// partition bases.
+#piece_inv = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_inv3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#part_inv = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece_inv}>
+#part_inv3 = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_inv3}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_unsupported(%d : !ttg.memdesc<256x128xi8, #part_inv, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_inv, #smem, mutable> -> !ttg.memdesc<4x64x128xi8, #part_inv3, #smem, mutable>
+    tt.return
   }
 }

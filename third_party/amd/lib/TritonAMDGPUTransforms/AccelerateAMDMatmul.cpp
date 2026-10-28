@@ -9,6 +9,7 @@
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
 #include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
@@ -188,8 +189,16 @@ LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
   auto cgaLayout = ttg::getCGALayout(resultType.getEncoding());
   auto shapePerCTA =
       ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), resultType.getShape());
-  auto warpsPerTile =
-      planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  SmallVector<unsigned> warpsPerTile;
+  if (auto wmma = dyn_cast<ttg::AMDWmmaEncodingAttr>(
+          tt::unwrapTlxWrappers(resultType.getEncoding()))) {
+    // A pinned WMMA already selected its wave distribution. Replanning it
+    // as a blocked dot can reject a valid tile, especially for chained dots.
+    warpsPerTile = ttg::getWarpsPerCTA(wmma, resultType.getShape());
+  } else {
+    warpsPerTile =
+        planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  }
   SmallVector<unsigned> instrPerDim = {mDim, nDim};
   for (auto [dim, tiles] : llvm::enumerate(requested)) {
     if (tiles <= 0)
@@ -1190,9 +1199,13 @@ public:
     }
 
     RankedTensorType oldRetType = dotOp.getType();
-    if (!isa_and_nonnull<BlockedEncodingAttr>(oldRetType.getEncoding())) {
+    // Register-only slices can give an unaccelerated dot a linear encoding,
+    // including one behind TLX's inference wrappers. They still need native
+    // operand and scale layouts; already selected WMMA layouts do not.
+    if (!isa_and_nonnull<BlockedEncodingAttr, ttg::LinearEncodingAttr>(
+            tt::unwrapTlxWrappers(oldRetType.getEncoding()))) {
       return rewriter.notifyMatchFailure(
-          dotOp, "expected blocked encoding result tensor");
+          dotOp, "expected blocked or linear encoding result tensor");
     }
 
     unsigned rank = oldRetType.getRank();
