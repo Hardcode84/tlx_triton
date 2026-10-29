@@ -275,12 +275,15 @@ def barrier_arrive(
     if is_warp_bar:
         _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
     else:
+        # Cluster dimensions are only needed for cta_mask, which is NVIDIA-only;
+        # HIP options do not define cluster_dims.
+        cluster_dims = list(_semantic.builder.options.cluster_dims) if cta_mask_value is not None else []
         _semantic.builder.create_barrier_arrive(
             bar.handle,
             arrive_count.value,
             pred_handle,
             cta_mask_value,
-            list(_semantic.builder.options.cluster_dims),
+            cluster_dims,
         )
 
 
