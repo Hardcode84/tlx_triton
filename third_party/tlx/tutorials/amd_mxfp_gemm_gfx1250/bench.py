@@ -50,6 +50,9 @@ FP16 output writes FP16 C (FP32 accumulation, one rounding before staging)
 for every variant except --async-output, which runs FP32 only by default.
 Repeat --out-dtype to choose output types (default: fp32 and fp16). MX8xMX8 uses six FP16 C
 slots for the three-buffer ring and two 64x128 slots for the four-buffer ring.
+For FP16 MX8xMX8 below K=16384 it uses a four-stage static-slot ring with two C
+slots, the overlap peel, and one merged handoff barrier per K step
+(--merged-handoff-barrier; 1.6-2.2% faster on gfx1250).
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -177,11 +180,16 @@ GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 
 # With 4x4 multicast, a four-stage MX8xMX8 ring (two C slots, dynamic slots)
 # beats three stages from K=16384 (-4 to -5% on gfx1250) but not at K<=8192.
 FOUR_BUFFER_MIN_K = 16384
+# Below that K, FP16 output leaves room for a four-stage static-slot ring with
+# two C slots, the overlap peel, and one merged handoff barrier per K step
+# (gfx1250: 8192^3 -1.6%, 8192^2x4096 -2.2%). With three stages, or at
+# K>=16384, the merged barrier starves the TDM input (+23% at 8192^3, +7.6% at
+# 32768^3); the static four-stage ring alone does not help there either.
 
 
 def _supports_static_slot_unroll(args, dtype_b):
     return (args.persistent and args.output_staging and (args.block_m, args.block_n, args.block_k) == (256, 256, 128)
-            and args.num_buffers == 3 and args.num_warps == 4 and args.dtype_a == dtype_b == "float8_e4m3"
+            and args.num_buffers in (3, 4) and args.num_warps == 4 and args.dtype_a == dtype_b == "float8_e4m3"
             and not (args.register_pipeline or args.warp_pipeline or args.operand_pipeline or args.streamed_operands
                      or args.output_tail_reuse or args.first_use_prefetch))
 
@@ -257,13 +265,25 @@ def _variant_args(args, dtype_b):
 
 
 def _case_args(args, case):
-    if not (args.auto_ring_depth and case[2] >= FOUR_BUFFER_MIN_K):
+    if not args.auto_ring_depth:
         return args
-    resolved = argparse.Namespace(**vars(args))
-    resolved.num_buffers = 4
-    resolved.output_c_slots = None
-    resolved.static_slot_unroll = False
-    return resolved
+    if case[2] >= FOUR_BUFFER_MIN_K:
+        resolved = argparse.Namespace(**vars(args))
+        resolved.num_buffers = 4
+        resolved.output_c_slots = None
+        resolved.static_slot_unroll = False
+        return resolved
+    if (args.out_dtype == "fp16" and args.static_slot_unroll is None and args.merged_handoff_barrier is not False
+            and case[2] // args.block_k > 4):
+        resolved = argparse.Namespace(**vars(args))
+        resolved.num_buffers = 4
+        resolved.output_c_slots = 2
+        resolved.static_slot_unroll = True
+        resolved.merged_handoff_barrier = True
+        if resolved.overlap_peel is None:
+            resolved.overlap_peel = True
+        return resolved
+    return args
 
 
 def _kernel_name(args):
@@ -349,6 +369,8 @@ def _command(args, case, dtype_b):
         command.append("--static_slot_unroll")
     if _overlap_peel(args, case, dtype_b):
         command.append("--overlap_peel")
+    if args.merged_handoff_barrier:
+        command.append("--merged_handoff_barrier")
     if args.out_dtype != "fp32":
         command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
@@ -456,6 +478,10 @@ def parse_benchmark_args(argv=None):
         "--static-slot-unroll", action=argparse.BooleanOptionalAction, default=None,
         help="unroll the three-buffer A8W8 steady loop by its ring depth with loop-invariant slots "
         f"(default: MX8xMX8 cases with K >= {STATIC_SLOT_UNROLL_MIN_K})")
+    parser.add_argument(
+        "--merged-handoff-barrier", action=argparse.BooleanOptionalAction, default=None,
+        help="one workgroup barrier per static-slot K step with relaxed operand loads "
+        f"(default: four-stage FP16 MX8xMX8 below K={FOUR_BUFFER_MIN_K}; requires --static-slot-unroll)")
     parser.add_argument(
         "--out-dtype", choices=OUT_DTYPES, action="append",
         help="repeatable C element type; default: fp32 and fp16 (fp32 only with --async-output). "
@@ -620,8 +646,10 @@ def parse_benchmark_args(argv=None):
         if run_args.overlap_peel and not _supports_overlap_peel(run_args):
             parser.error("--overlap-peel requires persistent BK128 tiles with four warps, dedicated output staging, "
                          "cross-tile prefetch, and the current handoff schedule without other schedule variants")
+        if run_args.merged_handoff_barrier and not run_args.static_slot_unroll:
+            parser.error("--merged-handoff-barrier requires --static-slot-unroll")
         if run_args.static_slot_unroll and not _supports_static_slot_unroll(run_args, dtype_b):
-            parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three buffers, "
+            parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three or four buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
         if run_args.split_cluster_barrier and (run_args.cluster_size == 1 or run_args.cluster_barrier_interval == 0 or
                                                (run_args.output_tail_reuse
@@ -798,9 +826,9 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
-                                                                     dtype_b), output_c_slots=run_args.output_c_slots
-            or 2, dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
+            output_c_slots=run_args.output_c_slots or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier),
+            dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
             async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
@@ -825,7 +853,7 @@ def main():
             f"\nConfiguration ({variant}, {run_args.out_dtype}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}"
-            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K})' if run_args.auto_ring_depth else ''}, "
+            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K}, and static/merged for FP16 below it)' if run_args.auto_ring_depth else ''}, "
             f"warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"scale_buffers={3 if run_args.warp_pipeline else run_args.num_buffers}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
