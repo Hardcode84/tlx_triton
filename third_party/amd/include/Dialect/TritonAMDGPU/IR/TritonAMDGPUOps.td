@@ -1188,7 +1188,8 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
 def AsyncCopyLocalToGlobalOp
     : TT_AMDGPU_Op<
           "async_copy_local_to_global",
-          [DeclareOpInterfaceMethods<PredicatedOpInterface>,
+          [SameLoadStoreOperandsEncoding,
+           DeclareOpInterfaceMethods<PredicatedOpInterface>,
            OptionalTypesMatchWith<"infer mask type from dst type", "dst",
                                   "mask", "getI1SameShape($_self)">,
 ]> {
@@ -1411,6 +1412,11 @@ def AsyncTDMCopyLocalToGlobalOp
     amdg.update_tensor_descriptor; this op applies only the per-warp distribution.
     The operation can also take an optional 64bit LDS barrier address, in which case
     it sends an "LDS atomic arrive" to signal its completion.
+
+    `warp_used_hint` selects the waves carrying real descriptors, with the
+    same axis-aligned bitmask rules as AsyncTDMCopyGlobalToLocalOp. The selected
+    waves cover the entire source tile. Other waves issue null descriptors;
+    use wave-uniform control flow as well to suppress their instructions.
   }];
 
   let arguments =
@@ -1418,9 +1424,17 @@ def AsyncTDMCopyLocalToGlobalOp
           Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
           Arg<Optional<TTG_MemDescType>, "", BarrierSharedWrite>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
-                            "triton::CacheModifier::NONE">:$cache);
+                            "triton::CacheModifier::NONE">:$cache,
+          OptionalAttr<I32Attr>:$warp_used_hint);
 
   let results = (outs TTG_AsyncToken:$token);
+
+  let builders = [OpBuilder<(ins "Value":$desc, "Value":$src,
+      "Value":$barrier,
+      CArg<"triton::CacheModifier", "triton::CacheModifier::NONE">:$cache), [{
+    return build($_builder, $_state, desc, src, barrier, cache,
+                 /*warp_used_hint=*/IntegerAttr());
+  }]>];
 
   let assemblyFormat = [{
     $desc `from` $src (`,` `barrier` `=` $barrier^)?

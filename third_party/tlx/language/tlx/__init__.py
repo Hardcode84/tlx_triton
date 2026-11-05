@@ -33,6 +33,7 @@ from .mem_ops import (
     async_amd_descriptor_load_fused,
     async_amd_descriptor_store,
     async_amd_descriptor_wait,
+    async_amd_store,
     async_store,
     async_descriptor_gather,
     async_descriptor_load,
@@ -208,6 +209,7 @@ __all__ = [
     # mem_ops
     "assume_uniform",
     "async_store",
+    "async_amd_store",
     "buffer_atomic_add",
     "buffer_load",
     "buffer_load_to_local",

@@ -2243,6 +2243,7 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       MaterializeFatPointer<tt::AtomicStoreOp>,
       MaterializeFatPointer<tt::BitcastOp>, MaterializeFatPointer<tt::LoadOp>,
       MaterializeFatPointer<triton::gpu::AsyncCopyGlobalToLocalOp>,
+      MaterializeFatPointer<triton::amdgpu::AsyncCopyLocalToGlobalOp, 1>,
       MaterializeFatPointer<tt::PtrToIntOp>, MaterializeFatPointer<tt::StoreOp>,
       MaterializeFatPointer<tt::MakeTensorDescOp>,
       MaterializeFatPointerVariadic<tt::CallOp>,

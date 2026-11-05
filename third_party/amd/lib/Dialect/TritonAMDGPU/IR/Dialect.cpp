@@ -2132,9 +2132,25 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
+  if (auto warpUsedHintAttr = getWarpUsedHintAttr()) {
+    uint32_t hint = static_cast<uint32_t>(warpUsedHintAttr.getInt());
+    if (auto numWarps = gpu::maybeLookupNumWarps(getOperation())) {
+      if (failed(validateWarpUsedHint(getOperation(), hint, *numWarps)))
+        return failure();
+    }
+    if (failed(verifyPartitionedHintFitsSingleInstruction(getOperation(),
+                                                          smemTy, hint)))
+      return failure();
+  }
+
   auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
-  auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
-  if (!paddedEnc && !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
+  auto partitionedEnc = llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(enc);
+  if (partitionedEnc &&
+      failed(verifyTDMSharedMemoryEncoding(getOperation(), smemTy)))
+    return failure();
+  auto paddedEnc = gpu::getPaddedEncoding(enc);
+  if (!paddedEnc && !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc) &&
+      !partitionedEnc)
     return emitOpError("Invalid shared memory layout for TDM");
 
   auto blockShape = tensorDescTy.getShape();
