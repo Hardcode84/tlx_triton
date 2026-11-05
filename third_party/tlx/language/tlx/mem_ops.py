@@ -962,6 +962,9 @@ def local_slice(
     used. Runtime offsets must keep the view within the source allocation and
     satisfy the same tile-alignment contract as static offsets; violating
     either condition is undefined behavior.
+
+    For a buffered tensor, ``offset`` and ``shape`` include the leading buffer
+    dimension. The returned view preserves that dimension as its buffer count.
     """
     has_runtime_offset = any(isinstance(value, tl.tensor) for value in offset)
     if buffer.type.storage == tlx.storage_kind.tmem:
@@ -972,22 +975,21 @@ def local_slice(
         assert shape[0] == buffer.type.shape[0]
         return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
 
+    unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_rank = len(buffer.type.shape) + (buffer.type.num > 0)
+    assert len(offset) == source_rank == len(unwrapped_shape), "local_slice offset and shape must match the source rank"
     if has_runtime_offset:
         assert buffer.type.storage == tlx.storage_kind.smem, "runtime local_slice offsets are only supported for SMEM"
-        unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
-        assert len(offset) == len(
-            buffer.type.shape) == len(unwrapped_shape), "local_slice offset and shape must match the source rank"
         offset_handles = [_semantic._convert_elem_to_ir_value(value, require_i64=False) for value in offset]
         slice_handle = _semantic.builder.create_memdesc_dynamic_subslice(buffer.handle, offset_handles, unwrapped_shape)
-        shape = unwrapped_shape
     else:
-        slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
+        slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, unwrapped_shape)
 
     return tlx.buffered_tensor(
         slice_handle,
         buffer.type.scalar,
-        shape,
-        0,
+        unwrapped_shape[1:] if buffer.type.num > 0 else unwrapped_shape,
+        unwrapped_shape[0] if buffer.type.num > 0 else 0,
         buffer.type.storage,
         buffer.type.layout,
     )
@@ -1115,8 +1117,9 @@ def async_load_commit_group(
     _semantic=None,
 ) -> tlx.async_token:
     """
-    Commits all prior initiated but uncommitted async_load ops an async group.
-    Each token represents a tracked async load operation.
+    Commits all prior uncommitted async copies into an async group.
+    On gfx1250 this includes both ``async_load`` and ``async_amd_store``.
+    Each token represents a tracked async copy operation.
     """
     handles = [t.handle for t in tokens]
     return tlx.async_token(_semantic.builder.create_async_commit_group(handles))
@@ -1130,6 +1133,8 @@ def async_load_wait_group(
 ) -> tlx.async_token:
     """
     Wait for completion of prior asynchronous copy operations.
+    On gfx1250 this includes both ``async_load`` and ``async_amd_store``,
+    independently of TDM descriptor operations.
     Each token represents a tracked async commit group operation.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
@@ -1886,6 +1891,7 @@ def async_amd_descriptor_load(
     offsets: Optional[list[tl.tensor]] = None,
     pred: tl.tensor = None,
     clamp_bounds: tl.constexpr = True,
+    warp_used_hint: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
@@ -1897,6 +1903,10 @@ def async_amd_descriptor_load(
     ``offsets=None`` to avoid a redundant update. Supplying ``offsets`` is a
     convenience that advances the descriptor and clamps its remaining bounds
     by default; set ``clamp_bounds=False`` for position-only advancement.
+
+    ``warp_used_hint`` optionally selects the issuing waves with a bitmask.
+    The selected waves must form an axis-aligned set; partitioned destinations
+    also require a whole number of waves per logical piece.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -1947,6 +1957,13 @@ def async_amd_descriptor_load(
         result.handle,
         None,
     )
+    warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+    if warp_used_hint is not None:
+        if not isinstance(warp_used_hint, int) or isinstance(warp_used_hint, bool) or warp_used_hint <= 0:
+            raise ValueError("warp_used_hint must be a positive integer bitmask")
+        if warp_used_hint >= 1 << _semantic.builder.options.num_warps:
+            raise ValueError("warp_used_hint sets bits beyond num_warps")
+        token_handle.set_attr("warp_used_hint", _semantic.builder.get_int32_attr(warp_used_hint))
     return tlx.async_token(token_handle)
 
 
@@ -2044,6 +2061,8 @@ def async_amd_descriptor_store(
     source: tlx.buffered_tensor,
     offsets: Optional[list[tl.tensor]] = None,
     clamp_bounds: tl.constexpr = True,
+    warp_used_hint: tl.constexpr = None,
+    cache_modifier: tl.constexpr = "",
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
@@ -2054,6 +2073,15 @@ def async_amd_descriptor_store(
     ``offsets=None`` stores through an already positioned descriptor. When
     offsets are supplied, the convenience update clamps remaining bounds by
     default; set ``clamp_bounds=False`` for position-only advancement.
+
+    ``warp_used_hint`` selects the waves carrying the store descriptors, with
+    the same bitmask rules as :func:`async_amd_descriptor_load`. Selected waves
+    cover the whole source tile. Other waves still issue null descriptors;
+    wave-uniform control flow is needed to suppress those instructions.
+
+    ``cache_modifier`` sets the store's cache policy, as for ``tl.store``:
+    ``".cs"`` streams (non-temporal), ``".wt"`` writes through, ``".cg"``
+    keeps device scope, ``".wb"`` is a regular write-back.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -2066,7 +2094,8 @@ def async_amd_descriptor_store(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = source.type.layout
-    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, (tlx.padded_shared_layout_encoding, tlx.partitioned_shared_layout_encoding))):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
@@ -2088,11 +2117,21 @@ def async_amd_descriptor_store(
             None,
             clamp_bounds,
         )
-    _semantic.builder.create_async_tdm_copy_local_to_global(
+    cache_modifier = tl._unwrap_if_constexpr(cache_modifier)
+    cache = (_semantic._str_to_store_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE)
+    token_handle = _semantic.builder.create_async_tdm_copy_local_to_global(
         positioned_desc,
         source.handle,
         None,
+        cache,
     )
+    warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+    if warp_used_hint is not None:
+        if not isinstance(warp_used_hint, int) or isinstance(warp_used_hint, bool) or warp_used_hint <= 0:
+            raise ValueError("warp_used_hint must be a positive integer bitmask")
+        if warp_used_hint >= 1 << _semantic.builder.options.num_warps:
+            raise ValueError("warp_used_hint sets bits beyond num_warps")
+        token_handle.set_attr("warp_used_hint", _semantic.builder.get_int32_attr(warp_used_hint))
 
 
 @tl.builtin
@@ -2277,6 +2316,48 @@ def async_descriptor_store(
         }
         reduce_kind = reduce_kind_map[store_reduce]
         _semantic.builder.create_async_TMA_reduce(reduce_kind, desc.handle, offsets, source_handle, evict)
+
+
+@tl.builtin
+def async_amd_store(
+    dst: tl.tensor,
+    src: tlx.buffered_tensor,
+    mask: Optional[tl.tensor] = None,
+    cache_modifier: str = "",
+    eviction_policy: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """Copy shared memory directly to global memory asynchronously on gfx1250.
+
+    ``dst`` is a tensor of pointers with the same shape and element type as
+    the unbuffered shared-memory view ``src``. Its register layout controls
+    which lanes perform the copies and their vector width. ``mask``, if
+    provided, must be boolean and broadcastable to that shape.
+
+    Commit copies with ``async_load_commit_group`` and wait with
+    ``async_load_wait_group`` before reusing the source or consuming the
+    output. These copies share completion tracking with ``async_load``;
+    ``async_amd_descriptor_wait`` only waits for TDM and cannot retire them.
+    """
+    if not dst.type.is_block() or not dst.dtype.is_ptr():
+        raise ValueError("async_amd_store requires a tensor of destination pointers")
+    if src.type.num != 0:
+        raise ValueError("async_amd_store requires a single buffer view; use local_view")
+    if dst.dtype.element_ty != src.type.element_ty:
+        raise ValueError("async_amd_store requires matching source and destination element types")
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        if mask.dtype != tl.int1:
+            raise ValueError("async_amd_store requires a boolean mask")
+        dst, mask = _semantic.broadcast_impl_value(dst, mask)
+    if dst.type.shape != src.type.shape:
+        raise ValueError("async_amd_store requires matching source and destination shapes")
+    cache = _semantic._str_to_store_cache_modifier(cache_modifier)
+    eviction = _semantic._str_to_eviction_policy(eviction_policy)
+    return tlx.async_token(
+        _semantic.builder.create_async_amd_store(src.handle, dst.handle, mask.handle if mask is not None else None,
+                                                 cache, eviction))
 
 
 @tl.builtin

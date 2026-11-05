@@ -287,6 +287,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
         self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
 
+    def __repr__(self):
+        return f"padded_shared_layout_encoding({vars(self)!r})"
+
     @staticmethod
     @constexpr_function
     def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):

@@ -29,6 +29,13 @@ namespace {
 // physical allocation is described by the layout-ranked suffix; leading
 // dimensions represent repeated pipeline copies of that layout.
 int64_t getMemDescStorageBits(ttg::MemDescType ty) {
+  if (isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace())) {
+    int64_t elements =
+        ttg::getAllocationElems(ty.getEncoding(), ty.getAllocShape());
+    if (auto padded = ttg::getPaddedEncoding(ty.getEncoding()))
+      elements = padded.getPaddedSize({elements});
+    return elements * ty.getElementTypeBitWidth();
+  }
   auto rank = cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank();
   auto shape = ty.getAllocShape().take_back(rank);
   LinearLayout layout = isa<ttg::PaddedSharedEncodingAttr>(ty.getEncoding())
@@ -101,9 +108,26 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
         assert(aliasClasses.count(srcOp) && "Base alloc not in map");
         aliasClasses[srcOp].push_back(aliasOp);
         aliasToAlloc[aliasOp] = srcOp;
+      } else if (auto index = dyn_cast<ttg::MemDescIndexOp>(srcOp)) {
+        auto type = index.getType();
+        // A complete indexed stage has its own fixed extent. Keep its base
+        // address (and the parent's physical stage pitch) instead of treating
+        // it as an alias of the entire ring. Layout subviews need a separate
+        // owned-offset calculation and cannot be widened this way.
+        if (!isa<ttg::SharedMemorySpaceAttr>(type.getMemorySpace()) ||
+            type.getShape() != type.getAllocShape() ||
+            isa<ttg::PartitionedSharedEncodingAttr>(type.getEncoding())) {
+          op->emitError(
+              "LocalAliasOp requires a complete indexed shared-memory "
+              "stage with a non-partitioned layout");
+          return WalkResult::interrupt();
+        }
+        aliasClasses[srcOp].push_back(aliasOp);
+        aliasToAlloc[aliasOp] = srcOp;
       } else {
         op->emitError(
-            "LocalAliasOp must refer to a local_alloc or local_alias op");
+            "LocalAliasOp must refer to a local_alloc, local_alias, or "
+            "complete shared-memory memdesc_index op");
         return WalkResult::interrupt();
       }
     }
@@ -154,6 +178,10 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       auto aliasType = dyn_cast<ttg::MemDescType>(alias.getResult().getType());
       auto aliasStorageSize = getMemDescStorageBits(aliasType);
       if (aliasStorageSize > maxStorageSize) {
+        if (isa<ttg::MemDescIndexOp>(allocOp))
+          return alias.emitError("LocalAliasOp cannot grow an indexed buffer: ")
+                 << aliasStorageSize << " bits required, but the stage owns "
+                 << maxStorageSize << " bits";
         maxStorageType = aliasType;
         maxStorageSize = aliasStorageSize;
       }
