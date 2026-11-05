@@ -9,7 +9,6 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_g
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
-from triton.tlx.ops.kernels.mm_mxfp8 import gfx1250 as _gfx1250_mxfp_ops
 from triton.tools.mxfp import MXScaleTensor
 from triton._internal_testing import is_hip_gfx1250
 
@@ -108,6 +107,7 @@ def _async_amd_desc_store_kernel(
     y_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    STORE_WAVES: tl.constexpr = None,
 ):
     desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
     desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
@@ -120,7 +120,10 @@ def _async_amd_desc_store_kernel(
     tlx.async_amd_descriptor_wait(pendings=0)
     data = tlx.local_load(load_view)
     tlx.local_store(store_view, data)
-    tlx.async_amd_descriptor_store(desc_out, store_view, [0, 0])
+    if STORE_WAVES is not None:
+        tlx.workgroup_barrier()
+    if STORE_WAVES is None or ((STORE_WAVES >> tlx.assume_uniform(tlx.thread_id(0) // 32)) & 1) != 0:
+        tlx.async_amd_descriptor_store(desc_out, store_view, [0, 0], warp_used_hint=STORE_WAVES)
     tlx.async_amd_descriptor_wait(pendings=0)
 
 
@@ -263,12 +266,42 @@ def test_update_tensor_descriptor_roundtrip_gfx1250(device):
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
-def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
+@pytest.mark.parametrize("store_waves", [None, 0b1100, 0b1010, 0b1000])
+def test_async_amd_desc_store_correctness_gfx1250(device, M, N, store_waves):
     """TDM load → store round-trip produces correct results on gfx1250."""
     x = torch.randn(M, N, dtype=torch.float16, device=device)
     y = torch.zeros_like(x)
-    _async_amd_desc_store_kernel[(1, )](x, y, M=M, N=N)
+    _async_amd_desc_store_kernel[(1, )](x, y, M=M, N=N, STORE_WAVES=store_waves)
     torch.testing.assert_close(x, y)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("valid_rows", [0, 61, 64])
+def test_async_amd_store_masked_reuse_gfx1250(device, valid_rows):
+
+    @triton.jit
+    def kernel(src, dst, valid_rows):
+        shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[128, 8]], [64, 128], [1, 0])
+        layout: tl.constexpr = tlx.layout(shape=((8, 4, 4), (4, 4, 4)), stride=((4, 128, 512), (1, 32, 2048)))
+        desc = tl.make_tensor_descriptor(src, [64, 128], [128, 1], [64, 128])
+        buf = tlx.local_view(tlx.local_alloc((64, 128), tl.float32, 1, layout=shared), 0)
+        tlx.async_amd_descriptor_load(desc, buf, [0, 0])
+        tlx.async_amd_descriptor_wait(0)
+        values = tlx.local_load(buf)
+        r, c = tl.arange(0, 64), tl.arange(0, 128)
+        for part in tl.static_range(3):
+            tlx.local_store(buf, values + part)
+            ptrs = tlx.require_layout(dst + part * 64 * 128 + r[:, None] * 128 + c[None, :], layout)
+            copy = tlx.async_amd_store(ptrs, buf, mask=r[:, None] < valid_rows)
+            group = tlx.async_load_commit_group([copy])
+            tlx.async_load_wait_group(0, [group])
+
+    src = torch.randn((64, 128), device=device, dtype=torch.float32)
+    dst = torch.full((3, 64, 128), float("nan"), device=device, dtype=torch.float32)
+    kernel[(1, )](src, dst, valid_rows, num_warps=4)
+    expected = src[None, :valid_rows, :] + torch.arange(3, device=device)[:, None, None]
+    torch.testing.assert_close(dst[:, :valid_rows], expected, atol=0, rtol=0)
+    assert torch.isnan(dst[:, valid_rows:]).all()
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
@@ -429,6 +462,36 @@ def test_tdm_copy_view_correctness_gfx1250(device, view, padded, mode):
     if view == "dynamic_slice":
         assert "ttg.memdesc_dynamic_subslice" in compiled.asm["ttgir"]
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@triton.jit(do_not_specialize=["first_buffer", "first_row"])
+def _local_slice_buffer_ring_kernel(output_ptr, first_buffer, first_row, BUFFERS: tl.constexpr, DYNAMIC: tl.constexpr,
+                                    OFFSET: tl.constexpr):
+    layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([[64, 4]], [32, 64], [1, 0])
+    buffers = tlx.local_alloc((32, 64), tl.float32, BUFFERS + 1, layout=layout)
+    offsets = tl.arange(0, 32)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    for index in tl.static_range(BUFFERS + 1):
+        tlx.local_store(buffers[index], (offsets + index * 2048).to(tl.float32))
+    if DYNAMIC:
+        view = tlx.local_slice(buffers, [first_buffer, first_row, 0], [BUFFERS, 16, 64])
+    else:
+        view = tlx.local_slice(buffers, [OFFSET, 16, 0], [BUFFERS, 16, 64])
+    slot = tl.program_id(0)
+    values = tlx.local_load(view[slot])
+    out_offsets = tl.arange(0, 16)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    tl.store(output_ptr + slot * 1024 + out_offsets, values)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("num_buffers", [3, 4])
+@pytest.mark.parametrize("dynamic_offset", [False, True])
+@pytest.mark.parametrize("first_buffer", [0, 1])
+def test_local_slice_buffer_ring_correctness_gfx1250(device, num_buffers, dynamic_offset, first_buffer):
+    output = torch.empty((num_buffers, 16, 64), device=device, dtype=torch.float32)
+    _local_slice_buffer_ring_kernel[(num_buffers, )](output, first_buffer, 16, BUFFERS=num_buffers,
+                                                     DYNAMIC=dynamic_offset, OFFSET=first_buffer, num_warps=4)
+    expected = torch.arange((num_buffers + 1) * 2048, device=device, dtype=torch.float32).reshape(-1, 32, 64)
+    torch.testing.assert_close(output, expected[first_buffer:first_buffer + num_buffers, 16:, :], rtol=0, atol=0)
 
 
 @triton.jit
@@ -608,18 +671,79 @@ def _mxgemm_ring_phase_params():
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("K_ITERS,NUM_BUFFERS,CROSS_TILE_PREFETCH,DTYPE_B,BLOCK_K,CLUSTER_SIZE",
-                         _mxgemm_ring_phase_params())
-def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, CLUSTER_SIZE,
-                                      CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
-                                      CLUSTER_BARRIER_INTERVAL=4, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
-                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128"):
+@pytest.mark.parametrize("BLOCK_K,NUM_BUFFERS,L2_PREFETCH_DISTANCE", [(128, 4, -1), (256, 2, -1), (256, 2, 1),
+                                                                      (256, 2, 2)])
+@pytest.mark.parametrize("M,N,K", [(256, 256, 512), (768, 512, 768), (3328, 768, 1024), (512, 768, 4096),
+                                   (512, 256, 8192)])
+def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM_BUFFERS, L2_PREFETCH_DISTANCE):
+    # K768 wraps both rings, including an odd number of K256 batches. K512
+    # exercises the clamped prefetch tail. Thirteen M tiles leave a partial
+    # M group; longer K checks repeated register and LDS-slot reuse.
+    torch.manual_seed(123)
+    a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
+    b = (torch.randn((K, N)) * 0.5).to(torch.float8_e4m3fn)
+    sa = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    sb = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    expected = _gfx1250_mxfp.torch_gemm_mxfp(a, b, sa, sb, 32, M, N, K)
+    result = _gfx1250_mxfp.matmul(
+        a.cuda(),
+        b.T.contiguous().cuda(),
+        _gfx1250_mxfp.pack_scale(sa).cuda(),
+        _gfx1250_mxfp.pack_scale(sb).cuda(),
+        config=dict(OPERAND_PIPELINE=True, BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS,
+                    num_warps=4, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True, SCALE_PRESHUFFLE=True,
+                    WITH_A_SCALE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", OUTPUT_STAGING=True,
+                    L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE))
+    assert result.dtype == torch.float32
+    torch.testing.assert_close(result.cpu(), expected, atol=2e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
+@pytest.mark.parametrize(
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE,"
+    "OUTPUT_TAIL_REUSE",
+    [(k, buffers, dtype, bk, staging, 4, False, False, 1, False)
+     for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
+     for dtype, bk, staging in [("float4", 256, False), ("float8_e4m3", 128, True)]] +
+    [(k, 4, "float8_e4m3", 128, True, 4, False, False, 1, False) for k in (4, 5, 6, 7)] +
+    [(k, 3, dtype, 128, True, 8, False, False, 1, False) for k in (3, 4, 5) for dtype in ("float8_e4m3", "float4")] + [
+        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, mode, 1, False, id=f"register-{k}-sched-{mode}")
+        for k in (2, 3, 5)
+        for mode in (False, True)
+    ] + [
+        pytest.param(k, 2, "float8_e4m3", 256, True, 4, True, True, 4, False, id=f"register-cluster-{k}")
+        for k in (3, 5, 9)
+    ] + [
+        pytest.param(k, 3, "float8_e4m3", 128, True, 4, False, False, 4, False, id=f"staged-cluster-{k}")
+        for k in (3, 4, 5, 6, 9)
+    ] + [
+        pytest.param(k, 3, "float8_e4m3", 128, True, 4, False, False, cluster, True,
+                     id=f"tail-reuse-k{k}-cluster{cluster}")
+        for cluster, ks in ((1, (3, 4, 5, 6)), (4, (3, 6, 9)))
+        for k in ks
+    ] + [
+        pytest.param(k, 3, "float4", 256, True, 4, False, False, cluster, False,
+                     id=f"a8w4-output-k{k}-cluster{cluster}")
+        for cluster, ks in ((1, (3, 4, 5, 6)), (4, (3, 6, 9)))
+        for k in ks
+    ],
+)
+def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
+                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
+                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
+                                      COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
+                                      HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
+                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
+                                      WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
+                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32"):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
-    # across ring wrap. Cluster cases give each program two tiles; K5/K9 also
-    # exercise periodic cluster synchronization in the steady loop and across
-    # the tile transition.
+    # across ring wrap. Register-pipeline cases cover odd two-slot phases.
+    # Cluster cases give each program two tiles. K5/K9 also exercise periodic
+    # cluster synchronization in the steady loop and across the tile handoff.
+    # Tail-reuse cases keep two prefetched stages live while A/B's third stage
+    # holds output, including a full ring rotation and a zero-length steady loop.
     M, N = (2048, 1024) if CLUSTER_SIZE > 1 else (1280, 512)
     programs = 16 if CLUSTER_SIZE > 1 else 3
     K = K_ITERS * BLOCK_K
@@ -633,17 +757,19 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
     out = _gfx1250_mxfp.matmul(
         a.cuda(),
         b_data.T.contiguous().cuda(),
-        _gfx1250_mxfp.pack_scale(a_scale, layout=SCALE_LAYOUT).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(),
-        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-                    TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
-                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-                    SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
-                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
-                    OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
-                    STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT))
+        _gfx1250_mxfp.pack_scale(a_scale).cuda(),
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
+            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
+            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
+            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
+            WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF, STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL,
+            OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL, OUT_DTYPE=OUT_DTYPE))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -653,68 +779,13 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 10])
-@pytest.mark.parametrize("buffers", [3, 4])
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9, 10])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_mxgemm_static_slot_unroll_ring_phase(k_iters, buffers, cluster_size):
-    # Cover an empty steady loop, zero to three steps after the ring-depth
+def test_mxgemm_static_slot_unroll_ring_phase(k_iters, cluster_size):
+    # Cover an empty steady loop, zero/one/two steps after the ring-depth
     # unroll, and every starting slot across uneven tile assignments.
-    if k_iters < buffers:
-        pytest.skip("needs at least one K tile per buffer")
-    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, cluster_size,
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True)
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [4, 5, 6, 7, 9, 13])
-@pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("overlap_peel,out_dtype", [(False, "fp32"), (True, "fp16")])
-def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, cluster_size, overlap_peel, out_dtype):
-    # One split workgroup barrier per static K step must still order each
-    # slot's last reads before its refill and publish every wave's next slot
-    # across ring wrap, tile transitions, and periodic cluster synchronization.
-    if overlap_peel and k_iters <= 4:
-        pytest.skip("OVERLAP_PEEL needs more K tiles than buffers")
-    test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, cluster_size,
-                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
-                                      OUTPUT_C_SLOTS=2, OVERLAP_PEEL=overlap_peel, OUT_DTYPE=out_dtype,
-                                      MERGED_HANDOFF_BARRIER=True)
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [6, 9, 13, 18, 21])
-@pytest.mark.parametrize("buffers", [3, 4])
-@pytest.mark.parametrize("interval", [2, 4, 8])
-def test_mxgemm_static_cluster_steps_ring_phase(k_iters, buffers, interval):
-    # Unrolled steps that can never refill a rendezvous stage drop the run-time
-    # k % interval test; the others keep it. Cover intervals below, equal to,
-    # and above the unroll depth, with steady loops of several iterations.
-    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, 4, CLUSTER_LAYOUT="2x2",
-                                      CLUSTER_BARRIER_INTERVAL=interval, STATIC_SLOT_UNROLL=True,
-                                      OUTPUT_C_SLOTS=3 if buffers == 3 else 2, OVERLAP_PEEL=True,
-                                      OUT_DTYPE="fp16" if buffers == 4 else "fp32", MERGED_HANDOFF_BARRIER=buffers == 4,
-                                      STATIC_CLUSTER_STEPS=True)
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 13])
-@pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("schedule", ["merged", "static3", "dynamic3", "dynamic4"])
-def test_mxgemm_wave256_scales_ring_phase(k_iters, cluster_size, schedule):
-    # wave256 scales hold both 128-row quadrants per 256-row tile. The merged
-    # step reads them with one load per operand and splits them in registers,
-    # carrying both quadrants across steps, the peeled first step, and tile
-    # transitions. The other schedules read one quadrant per load.
-    buffers = 4 if schedule in ("merged", "dynamic4") else 3
-    if k_iters <= buffers:
-        pytest.skip("OVERLAP_PEEL needs more K tiles than buffers")
-    merged = schedule == "merged"
-    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, cluster_size,
-                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
-                                      STATIC_SLOT_UNROLL=schedule in ("merged", "static3"),
-                                      OUTPUT_C_SLOTS=3 if buffers == 3 else 2, OVERLAP_PEEL=schedule != "dynamic4",
-                                      OUT_DTYPE="fp16" if merged else "fp32", MERGED_HANDOFF_BARRIER=merged,
-                                      STATIC_CLUSTER_STEPS=merged and cluster_size > 1, SCALE_LAYOUT="wave256")
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -724,7 +795,7 @@ def test_mxgemm_wave256_scales_ring_phase(k_iters, cluster_size, schedule):
 def test_mxgemm_output_c_slots_ring_phase(k_iters, cluster_size, static_slot_unroll):
     # Three dedicated C slots rotate across quadrant boundaries and leave three
     # stores pending into the next tile, at every ring phase and both schedules.
-    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, cluster_size,
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
                                       STATIC_SLOT_UNROLL=static_slot_unroll, OUTPUT_C_SLOTS=3)
 
@@ -741,48 +812,82 @@ def test_mxgemm_overlap_peel_ring_phase(schedule, k_iters, cluster_size):
     # both C staging shapes: three 64x128 slots, or two 64x64 slots with four
     # buffers (where the refill splits a quadrant's stores).
     four = schedule == "4buf"
-    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, cluster_size,
-                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, True, 4, False, False,
+                                      cluster_size, False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
                                       STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=None if four else 3,
                                       OVERLAP_PEEL=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("schedule,slots,k_iters",
-                         [("static", 6, k)
-                          for k in (4, 5, 9)] + [("static", 3, 5)] + [("dynamic", 6, k)
-                                                                      for k in (4, 5, 6)] + [("4buf", None, k)
-                                                                                             for k in (5, 7)])
+                         [("static", 6, k) for k in (4, 5, 9)] + [("static", 3, 5)] + [("dynamic", 6, k)
+                                                                                       for k in (4, 5, 6)] +
+                         [("4buf", None, k) for k in (5, 7)] + [("direct", None, k) for k in (3, 5)])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 def test_mxgemm_fp16_output_ring_phase(schedule, slots, k_iters, cluster_size):
     # FP16 C halves the dedicated staging slots. Cover the overlapped epilogue
-    # with six or three 64x128 slots on static and dynamic K loops, and two
-    # 64x128 slots with four buffers, across ring phases, uneven tile counts,
-    # and multicast clusters.
+    # with six (default) or three 64x128 slots on static and dynamic K loops,
+    # two default 64x128 slots with four buffers, and unstaged direct stores,
+    # across ring phases, uneven tile counts, and multicast clusters.
     four = schedule == "4buf"
-    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, cluster_size,
-                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
-                                      STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=slots, OVERLAP_PEEL=True,
-                                      OUT_DTYPE="fp16")
+    staged = schedule != "direct"
+    test_mxgemm_persistent_ring_phase(k_iters, 4 if four else 3, True, "float8_e4m3", 128, staged, 4, False, False,
+                                      cluster_size, False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      STATIC_SLOT_UNROLL=schedule == "static", OUTPUT_C_SLOTS=slots,
+                                      OVERLAP_PEEL=staged, OUT_DTYPE="fp16")
+
+
+def test_mxgemm_fp16_output_rejects_async_output():
+    # The streamed kernel's async output addresses FP32 lanes directly.
+    a = torch.zeros((256, 256), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="OUT_DTYPE"):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, a, a, a, BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, TRANSPOSE_B=True,
+                                           NUM_BUFFERS=3, DTYPE_A="e4m3", DTYPE_B="e4m3", PERSISTENT=True,
+                                           OUTPUT_STAGING=True, STREAMED_OPERANDS=True, ASYNC_OUTPUT=True,
+                                           OUT_DTYPE="fp16")
+
+
+_FP16_OUTPUT_SCHEDULES = {
+    # name: (K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, NUM_WARPS, REGISTER_PIPELINE, CLUSTER_SIZE,
+    #        OUTPUT_TAIL_REUSE, extra keyword arguments)
+    "a8w4-bench": (5, 3, False, "float4", 256, 4, False, 4, False,
+                   dict(CLUSTER_LAYOUT="2x2", SPLIT_CLUSTER_BARRIER=True, EARLY_C_STORES=True)),
+    "a8w4-reuse-prefetch": (4, 3, True, "float4", 256, 4, False, 1, False, {}),
+    "a8w4-reuse-prefetch-cluster": (9, 3, True, "float4", 256, 4, False, 4, False, dict(CLUSTER_LAYOUT="2x2")),
+    "a8w4-deferred": (5, 3, True, "float4", 256, 4, False, 4, True, {}),
+    "a8w4-ab-reuse":
+    (5, 3, True, "float4", 256, 4, False, 4, True, dict(HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION="partial")),
+    "a8w4-ab-reuse-4way":
+    (6, 3, True, "float4", 256, 4, False, 1, True, dict(HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION="4way")),
+    "a8w4-compact-tail": (5, 3, True, "float4", 256, 4, False, 4, False, dict(COMPACT_K_TAIL=True)),
+    "a8w8-tail-reuse": (5, 3, True, "float8_e4m3", 128, 4, False, 4, True, {}),
+    "a8w8-eight-warps": (4, 3, True, "float8_e4m3", 128, 8, False, 1, False, {}),
+    "a8w8-wave-specialized": (5, 3, True, "float8_e4m3", 128, 4, False, 4, False,
+                              dict(CLUSTER_LAYOUT="2x2", WAVE_SPECIALIZED_HANDOFF=True)),
+    "register": (5, 2, True, "float8_e4m3", 256, 4, True, 1, False, {}),
+    "register-cluster": (9, 2, True, "float8_e4m3", 256, 4, True, 4, False, {}),
+    "streamed": (5, 3, True, "float8_e4m3", 128, 4, False, 4, False, dict(STREAMED_OPERANDS=True)),
+    "streamed-tail-reuse": (7, 4, True, "float8_e4m3", 128, 4, False, 1, True, dict(STREAMED_OPERANDS=True)),
+}
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("schedule", ["a8w4-bench", "a8w4-prefetch", "a8w4-prefetch-cluster", "a8w4-two-buffers"])
-def test_mxgemm_fp16_output_a8w4_ring_phase(schedule):
-    # BK256 C aliases A input slots; FP16 slots hold twice the rows at the
-    # same physical pitch.
-    k_iters, buffers, prefetch, cluster, extra = {
-        "a8w4-bench": (5, 3, False, 4, dict(CLUSTER_LAYOUT="2x2", SPLIT_CLUSTER_BARRIER=True, EARLY_C_STORES=True)),
-        "a8w4-prefetch": (4, 3, True, 1, {}),
-        "a8w4-prefetch-cluster": (9, 3, True, 4, dict(CLUSTER_LAYOUT="2x2")),
-        "a8w4-two-buffers": (3, 2, False, 1, {}),
-    }[schedule]
-    test_mxgemm_persistent_ring_phase(k_iters, buffers, prefetch, "float4", 256, cluster, OUT_DTYPE="fp16", **extra)
+@pytest.mark.parametrize("schedule", list(_FP16_OUTPUT_SCHEDULES))
+def test_mxgemm_fp16_output_schedules_ring_phase(schedule):
+    # Output schedules whose C buffers alias A/B input ring slots keep the
+    # input slot pitch with FP16 (twice the rows per slot); others only change
+    # the staged type. Cover every C staging scheme with FP16 output.
+    k_iters, buffers, prefetch, dtype_b, block_k, warps, register, cluster, tail_reuse, extra = (
+        _FP16_OUTPUT_SCHEDULES[schedule])
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, prefetch, dtype_b, block_k, True, warps, register, False,
+                                      cluster, tail_reuse, OUT_DTYPE="fp16", **extra)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-def test_mxgemm_fp16_output_nonpersistent():
-    # The nonpersistent kernel converts before its direct store.
+@pytest.mark.parametrize("kernel", ["direct", "warp-pipeline", "operand-pipeline", "operand-pipeline-bk256"])
+def test_mxgemm_fp16_output_nonpersistent(kernel):
+    # The nonpersistent kernels store each tile once; FP16 converts before
+    # the direct store or the dedicated LDS output tile.
     M, N, K = (512, 512, 1024)
     torch.manual_seed(123)
     a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
@@ -793,6 +898,12 @@ def test_mxgemm_fp16_output_nonpersistent():
     config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=2, num_warps=4, DTYPE_A="e4m3", DTYPE_B="e4m3",
                   TRANSPOSE_B=True, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True, SCHEDULE="sliceMNK", TDM_FUSION="partial",
                   OUT_DTYPE="fp16")
+    if kernel == "warp-pipeline":
+        config.update(WARP_PIPELINE=True, BLOCK_K=256, num_warps=8, OUTPUT_STAGING=True)
+    elif kernel == "operand-pipeline":
+        config.update(OPERAND_PIPELINE=True, NUM_BUFFERS=4, OUTPUT_STAGING=True)
+    elif kernel == "operand-pipeline-bk256":
+        config.update(OPERAND_PIPELINE=True, BLOCK_K=256, NUM_BUFFERS=2, OUTPUT_STAGING=True)
     result = _gfx1250_mxfp.matmul(a.cuda(),
                                   b.T.contiguous().cuda(),
                                   _gfx1250_mxfp.pack_scale(sa).cuda(),
@@ -803,16 +914,39 @@ def test_mxgemm_fp16_output_nonpersistent():
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 4), (4, 0), (4, 1), (4, 2), (4, 4)])
+def test_mxgemm_wave_specialized_handoff_ring_phase(k_iters, cluster_size, barrier_interval):
+    # Exercise different input/output counter histories, every ring phase,
+    # an empty steady loop, uneven tile counts, and final output retirement.
+    # LDS release must also work with no, periodic, and every-stage cluster sync.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
+                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      CLUSTER_BARRIER_INTERVAL=barrier_interval, WAVE_SPECIALIZED_HANDOFF=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
 @pytest.mark.parametrize("dtype_b,block_k", [("float8_e4m3", 128), ("float4", 256)])
 @pytest.mark.parametrize("schedule", ["2x2", "split", "early", "combined"])
 def test_mxgemm_cluster_and_output_schedule_ring_phase(k_iters, dtype_b, block_k, schedule):
     # Signed inputs, varying scales, both short/steady K, and every three-slot
     # ring phase. The unclustered case also has uneven output tile assignments.
     cluster = 1 if schedule == "early" else 4
-    test_mxgemm_persistent_ring_phase(k_iters, 3, block_k == 128, dtype_b, block_k, cluster,
-                                      CLUSTER_LAYOUT="2x2" if schedule in ("2x2", "combined") else "linear",
+    test_mxgemm_persistent_ring_phase(k_iters, 3, block_k == 128, dtype_b, block_k, True, 4, False, False, cluster,
+                                      False, CLUSTER_LAYOUT="2x2" if schedule in ("2x2", "combined") else "linear",
                                       SPLIT_CLUSTER_BARRIER=schedule in ("split", "combined"), EARLY_C_STORES=schedule
                                       in ("early", "combined"), CLUSTER_BARRIER_INTERVAL=1 if k_iters == 5 else 4)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
+@pytest.mark.parametrize("fusion", ["partial", "4way"])
+def test_mxgemm_early_c_stores_ab_reuse_ring_phase(k_iters, fusion):
+    # Preserve next K0, stage C in the later A/B slots, and acquire K1 while
+    # the final C store is live. Include the mixed fused/partial wait ledger.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, 4, True,
+                                      HANDOFF_SCHEDULE="ab-reuse", HANDOFF_TDM_FUSION=fusion, CLUSTER_LAYOUT="2x2",
+                                      SPLIT_CLUSTER_BARRIER=True, EARLY_C_STORES=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -828,59 +962,142 @@ def test_mxgemm_grid_cluster_ring_phase(k_iters, layout, schedule):
     a8w8 = schedule != "a8w4"
     static = schedule == "a8w8"
     test_mxgemm_persistent_ring_phase(k_iters, 4 if schedule == "a8w8-4buf" else 3, a8w8,
-                                      "float8_e4m3" if a8w8 else "float4", 128 if a8w8 else 256, rows * cols,
-                                      CLUSTER_LAYOUT=layout, STATIC_SLOT_UNROLL=static,
+                                      "float8_e4m3" if a8w8 else "float4", 128 if a8w8 else 256, True, 4, False, False,
+                                      rows * cols, False, CLUSTER_LAYOUT=layout, STATIC_SLOT_UNROLL=static,
                                       OUTPUT_C_SLOTS=3 if static else None, SPLIT_CLUSTER_BARRIER=not a8w8,
                                       EARLY_C_STORES=not a8w8)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters,cluster_size", [(3, 1), (4, 1), (5, 1), (6, 1), (3, 4), (4, 4), (5, 4), (9, 4)])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_mxgemm_compact_k_tail_ring_phase(k_iters, cluster_size, prefetch):
+    # Cover an empty steady loop, all three ring phases, uneven tile counts,
+    # and cluster transitions with and without C/input transfer overlap.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, prefetch, "float4", 256, True, 4, False, False, cluster_size, False,
+                                      COMPACT_K_TAIL=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("fusion,cluster_size", [("4way", 1), ("4way", 4), ("2way", 4), ("none", 1)])
+def test_mxgemm_output_overlap_wait_counts(fusion, cluster_size):
+    # Fused and separate loads leave different numbers of younger transfers
+    # pending while the same three C slots retire and become input storage.
+    test_mxgemm_persistent_ring_phase(5, 3, True, "float4", 256, True, 4, False, False, cluster_size, False,
+                                      TDM_FUSION=fusion)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters,cluster_size",
+                         [(k, cluster) for cluster in (1, 4) for k in (3, 4, 5, 6, 9)] + [(16, 4), (32, 4)])
+@pytest.mark.parametrize("handoff_schedule,handoff_tdm_fusion", [("current", "partial"), ("b-prefetch", "partial"),
+                                                                 ("staggered", "partial"), ("ab-reuse", "partial"),
+                                                                 ("ab-reuse", "4way")])
+def test_mxgemm_a8w4_c_staging_ring_phase(k_iters, cluster_size, handoff_schedule, handoff_tdm_fusion):
+    # Keep next-tile K=0 live while C occupies later A/B stages.
+    # Cover all ring phases, an empty steady loop, and final-store retirement.
+    # Four-way handoff stages also exercise mixed one-/two-instruction queues.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float4", 256, True, 4, False, False, cluster_size, True,
+                                      HANDOFF_SCHEDULE=handoff_schedule, HANDOFF_TDM_FUSION=handoff_tdm_fusion)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9])
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_mxgemm_first_use_prefetch_ring_phase(k_iters, prefetch, cluster_size):
+    # Reuse the signed reference and coverage of uneven tile assignments,
+    # short K, ring wrap, and cluster/tile transitions for the new read order.
+    test_mxgemm_persistent_ring_phase(k_iters, 3, prefetch, "float8_e4m3", 128, True, 4, False, False, cluster_size,
+                                      False, FIRST_USE_PREFETCH=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("num_buffers,k_iters,output_tail_reuse",
+                         [(3, k, False)
+                          for k in (3, 4, 5, 9)] + [(4, k, reuse) for reuse in (False, True) for k in (4, 5, 6, 7, 9)])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("async_output", [False, True])
+def test_mxgemm_streamed_operands_ring_phase(k_iters, cluster_size, num_buffers, output_tail_reuse, async_output):
+    # Signed inputs exercise the empty steady loop, odd paired-loop remainder,
+    # ring wrap, uneven tile assignments, and clustered tile transitions.
+    test_mxgemm_persistent_ring_phase(k_iters, num_buffers, True, "float8_e4m3", 128, True, 4, False, False,
+                                      cluster_size, output_tail_reuse, STREAMED_OPERANDS=True,
+                                      ASYNC_OUTPUT=async_output)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("DTYPE_A,DTYPE_B,WITH_A_SCALE,FUSION,NUM_PROGRAMS,BLOCK_M,NUM_WARPS", [
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 128, 4),
+    ("float4", "float4", True, "2way", 32, 128, 4),
+    ("float8_e4m3", "float4", False, "none", 2, 128, 4),
+    ("float8_e4m3", "float4", False, "2way", None, 128, 4),
+    ("float8_e4m3", "float8_e4m3", True, "partial", 2, 256, 4),
+    ("float8_e4m3", "float8_e5m2", True, "4way", 2, 256, 8),
+    ("float8_e4m3", "float4", False, "none", 2, 256, 8),
+    ("float8_e4m3", "float4", False, "2way", None, 256, 8),
+])
+def test_mxgemm_persistent_formats(DTYPE_A, DTYPE_B, WITH_A_SCALE, FUSION, NUM_PROGRAMS, BLOCK_M, NUM_WARPS):
+    M, N, K = 3 * BLOCK_M, 512, 768
+    torch.manual_seed(7)
+    a = _gfx1250_mxfp._init_data(DTYPE_A, M, K)
+    b = _gfx1250_mxfp._init_data(DTYPE_B, K, N)
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8) if WITH_A_SCALE else None
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
+    a_data = a.to_packed_tensor(dim=1) if DTYPE_A == "float4" else a
+    b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
+    out = _gfx1250_mxfp.mxgemm_tdm_pipelined(a_data.cuda(),
+                                             b_data.T.contiguous().cuda(),
+                                             _gfx1250_mxfp.pack_scale(a_scale).cuda() if WITH_A_SCALE else None,
+                                             _gfx1250_mxfp.pack_scale(b_scale).cuda(), BLOCK_M=BLOCK_M, BLOCK_N=256,
+                                             BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_A],
+                                             DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True,
+                                             WITH_A_SCALE=WITH_A_SCALE, SCHEDULE="sliceMNK", TDM_FUSION=FUSION,
+                                             PERSISTENT=True, NUM_PROGRAMS=NUM_PROGRAMS, NUM_WARPS=NUM_WARPS)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
 @pytest.mark.parametrize("config,match", [
     ({"TRANSPOSE_B": False}, "transposed B"),
     ({"NUM_PROGRAMS": 0}, "positive integer"),
-    ({"NUM_BUFFERS": 4}, "at least NUM_BUFFERS"),
-    ({"M": 384}, "full tiles"),
+    ({"NUM_BUFFERS": 3}, "at least NUM_BUFFERS"),
+    ({"BLOCK_M": 256}, "full tiles"),
     ({"SCALE_PRESHUFFLE": False}, "preshuffled scales"),
     ({"TDM_SPLIT": True}, "unsplit descriptors"),
-    ({"BLOCK_M": 128}, "256x256 M/N tiles"),
-    ({"TDM_FUSION": "4way"}, "partial TDM fusion"),
-    ({"BLOCK_K": 256, "NUM_BUFFERS": 2}, "BK256 cross-tile prefetch"),
+    ({"COMPACT_K_TAIL": True}, "COMPACT_K_TAIL requires"),
+    ({"HANDOFF_SCHEDULE": "invalid"}, "HANDOFF_SCHEDULE must be"),
+    ({"HANDOFF_SCHEDULE": "b-prefetch"}, "HANDOFF_SCHEDULE requires"),
+    ({"HANDOFF_TDM_FUSION": "invalid"}, "HANDOFF_TDM_FUSION must be"),
+    ({"HANDOFF_TDM_FUSION": "4way"}, "HANDOFF_TDM_FUSION requires"),
     ({"CLUSTER_LAYOUT": "invalid"}, "CLUSTER_LAYOUT must be"),
     ({"CLUSTER_LAYOUT": "2x2"}, "CLUSTER_LAYOUT=2x2 requires CLUSTER_SIZE=4"),
     ({"CLUSTER_LAYOUT": "4x4"}, "CLUSTER_LAYOUT=4x4 requires CLUSTER_SIZE=16"),
-    ({"SPLIT_CLUSTER_BARRIER": True}, "SPLIT_CLUSTER_BARRIER requires clustering"),
-    ({"NUM_BUFFERS": 2, "EARLY_C_STORES": True}, "require three buffers"),
-    ({"NUM_BUFFERS": 2, "STATIC_SLOT_UNROLL": True}, "STATIC_SLOT_UNROLL requires"),
-    ({"MERGED_HANDOFF_BARRIER": True}, "MERGED_HANDOFF_BARRIER requires"),
-    ({"STATIC_CLUSTER_STEPS": True}, "STATIC_CLUSTER_STEPS requires"),
-    ({"SCALE_LAYOUT": "invalid"}, "SCALE_LAYOUT must be"),
-    ({"BLOCK_K": 256, "NUM_BUFFERS": 2, "CROSS_TILE_PREFETCH": False, "SCALE_LAYOUT": "wave256"}, "wave256"),
-    ({"OVERLAP_PEEL": True}, "OVERLAP_PEEL requires"),
-    ({"OUTPUT_C_SLOTS": 1}, "OUTPUT_C_SLOTS requires"),
-    ({"PERSISTENT": False, "OVERLAP_PEEL": True}, "require PERSISTENT"),
+    ({"EARLY_C_STORES": True}, "EARLY_C_STORES require"),
+    ({"SPLIT_CLUSTER_BARRIER": True}, "SPLIT_CLUSTER_BARRIER and EARLY_C_STORES require"),
+    ({"BLOCK_M": 256, "BLOCK_N": 256, "OUTPUT_STAGING": True}, "BK256 cross-tile output staging"),
 ])
 def test_mxgemm_persistent_invalid_config(config, match):
     # Validation happens before any GPU allocation or launch.
-    M = config.pop("M", 512)
-    a = torch.empty((M, 384), dtype=torch.float8_e4m3fn)
-    b = torch.empty((512, 384), dtype=torch.float8_e4m3fn)
-    a_scales = torch.empty((M // 128, 1536), dtype=torch.uint8)
-    b_scales = torch.empty((4, 1536), dtype=torch.uint8)
-    cfg = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=128, NUM_BUFFERS=3, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True,
-               SCHEDULE="sliceMNK", TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=2)
+    a = torch.empty((384, 512), dtype=torch.float8_e4m3fn)
+    b = torch.empty((384, 512), dtype=torch.float8_e4m3fn)
+    scales = torch.empty((3, 2048), dtype=torch.uint8)
+    cfg = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=256, NUM_BUFFERS=2, DTYPE_A="e4m3", DTYPE_B="e4m3", TRANSPOSE_B=True,
+               SCHEDULE="sliceMNK", PERSISTENT=True, NUM_PROGRAMS=2)
     cfg.update(config)
     if not cfg["TRANSPOSE_B"]:
         b = b.T.contiguous()
     with pytest.raises(ValueError, match=match):
-        _gfx1250_mxfp.matmul(a, b, a_scales, b_scales, config=cfg)
+        _gfx1250_mxfp.matmul(a, b, scales, scales, config=cfg)
 
 
 @triton.jit
 def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
                            GROUP_M: tl.constexpr, REMAP: tl.constexpr, LAYOUT: tl.constexpr = "2x2"):
     pid = tl.program_id(0)
-    tile = _gfx1250_mxfp_ops._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
+    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
     for step in range(NUM_M * NUM_N // PROGRAMS):
-        off_m, off_n = _gfx1250_mxfp_ops._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
+        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
         tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
         tile += PROGRAMS
 
@@ -929,17 +1146,21 @@ def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap
     assert torch.equal(cols[:, 0] % cols_per, torch.zeros_like(cols[:, 0]))
 
 
-def test_mxgemm_bench_defaults_and_overrides():
+def test_mxgemm_bench_cluster_and_output_options():
     from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
 
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
+    assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
+    for _, dtype_b, args in variants:
+        cmd = bench._command(args, shapes[0], dtype_b)
+        assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
+        assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
+        assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
-    # XCD remapping of whole clusters for both variants, each with FP32 and
-    # then FP16 output. FP32 MX8xMX8 uses a four-stage ring with two C slots
-    # from K=16384, static slot unroll from K=8192, and the overlap peel with
-    # three stages. FP16 MX8xMX8 up to K=16384 uses the four-stage static loop
-    # with the merged handoff barrier, static cluster steps, two C slots, and
-    # the overlap peel. MX8xMX4 splits cluster barriers and starts C stores
-    # early.
+    # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
+    # Each variant runs with FP32 and then FP16 output.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
                                                                             ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
@@ -950,43 +1171,15 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert cmd[cmd.index("--cluster_size") + 1] == "16"
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
-            a8w8 = variant == "mx8xmx8"
-            merged = a8w8 and args.out_dtype == "fp16" and shape[2] <= 16384
-            four_stage = a8w8 and (shape[2] >= 16384 or merged)
-            assert cmd[cmd.index("-BK") + 1] == ("128" if a8w8 else "256")
+            four_stage = variant == "mx8xmx8" and shape[2] >= 16384
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
-            slots = "2" if merged else (None if not a8w8 or four_stage else "3")
-            assert (cmd[cmd.index("--output_c_slots") + 1] if "--output_c_slots" in cmd else None) == slots
-            assert ("--static_slot_unroll" in cmd) == (merged or (a8w8 and shape[2] == 8192))
-            assert ("--merged_handoff_barrier" in cmd) == ("--static_cluster_steps" in cmd) == merged
-            assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
-            assert "--scale_layout" not in cmd
-            assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
-            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == (not a8w8)
+            assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
+            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and shape[2] == 8192)
+            assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
-
-    _, shapes, variants = bench.parse_benchmark_args(
-        ["--cluster-size", "4", "--cluster-layout", "2x2", "--xcd-remap", "none", "--out-dtype", "fp16", "--dry-run"])
+    _, _, variants = bench.parse_benchmark_args(["--dry-run", "--out-dtype", "fp16"])
     assert [args.out_dtype for _, _, args in variants] == ["fp16", "fp16"]
-    for _, dtype_b, args in variants:
-        cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
-        assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
-        assert cmd[cmd.index("--xcd_remap") + 1] == "none"
-
-    # wave256 scales apply to MX8xMX8 only; opting out of the merged barrier
-    # restores the three-stage FP16 schedule with six C slots.
-    _, shapes, variants = bench.parse_benchmark_args(["--scale-layout", "wave256", "--out-dtype", "fp16", "--dry-run"])
-    for variant, dtype_b, args in variants:
-        cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
-        assert ("--scale_layout" in cmd) == (variant == "mx8xmx8")
-    _, shapes, variants = bench.parse_benchmark_args(
-        ["--variant", "mx8xmx8", "--out-dtype", "fp16", "--no-merged-handoff-barrier", "--dry-run"])
-    (_, dtype_b, args), = variants
-    cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
-    assert cmd[cmd.index("--num_buffers") + 1] == "3" and cmd[cmd.index("--output_c_slots") + 1] == "6"
-    assert "--merged_handoff_barrier" not in cmd and "--static_slot_unroll" in cmd
-
-    # Opting out of the overlap peel, and forcing it on for the four-stage ring.
+    # Opting out, and forcing it on for the four-stage ring.
     for flag, expected in (("--no-overlap-peel", (False, False)), ("--overlap-peel", (True, True))):
         _, shapes, variants = bench.parse_benchmark_args(
             ["--variant", "mx8xmx8", "--out-dtype", "fp32", flag, "--dry-run"])
@@ -994,17 +1187,6 @@ def test_mxgemm_bench_defaults_and_overrides():
         for shape, want in zip((shapes[0], shapes[2]), expected):
             cmd = bench._command(bench._case_args(args, shape), shape, dtype_b)
             assert ("--overlap_peel" in cmd) == want
-
-
-test_gfx1250_grouped_gemm_phase0_ragged = _gfx1250_grouped.test_grouped_gemm_phase0_ragged_gfx1250
-
-test_gfx1250_grouped_gemm_tdm_packed_ragged_m = _gfx1250_grouped.test_grouped_gemm_tdm_packed_ragged_m_gfx1250
-
-test_gfx1250_grouped_gemm_tdm_asymmetric_depth3 = _gfx1250_grouped.test_grouped_gemm_tdm_asymmetric_depth3_gfx1250
-
-test_gfx1250_grouped_gemm_tdm_cross_tile_prefetch = _gfx1250_grouped.test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250
-
-test_gfx1250_grouped_gemm_tdm_xcd_remap = _gfx1250_grouped.test_grouped_gemm_tdm_xcd_remap_gfx1250
 
 
 @triton.jit

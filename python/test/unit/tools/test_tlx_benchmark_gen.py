@@ -505,3 +505,764 @@ def test_e2e_capture_and_generate(monkeypatch, tmp_path):
     assert "_kernel_args.json" in content
     # Verify it creates the kernel call
     assert "_my_kernel[grid](*kernel_args, **launch_opts)" in content
+
+
+@pytest.fixture
+def mxfp_collector(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    directory = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250"
+
+    def load(name, filename):
+        spec = importlib.util.spec_from_file_location(name, directory / filename)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    monkeypatch.setitem(sys.modules, "bench", load("mxfp_bench", "bench.py"))
+    return load("mxfp_collector", "collect_traces.py")
+
+
+@pytest.fixture
+def mxfp_sensors(mxfp_collector, tmp_path):
+    device = tmp_path / "pci/0000:66:00.0"
+    hwmon = device / "hwmon/hwmon42"
+    hwmon.mkdir(parents=True)
+    for name, value in {
+            "name": "amdgpu", "power1_input": "400000000", "power1_cap": "750000000", "power1_label": "PPT",
+            "freq1_input": "1900000000", "freq1_label": "sclk", "temp2_input": "57000", "temp2_label": "junction"
+    }.items():
+        (hwmon / name).write_text(value + "\n")
+    (device / "power_dpm_force_performance_level").write_text("auto\n")
+    return mxfp_collector.Sensors(device.name, pci_root=device.parent)
+
+
+def test_mxfp_trace_cases_preserve_benchmark_defaults(mxfp_collector):
+    cases = mxfp_collector.make_cases(mxfp_collector.parser().parse_args([]))
+    assert [(case["kernel"], case["shape"]) for case in cases
+            ] == [(kernel, shape)
+                  for shape in ((8192, 8192, 8192), (8192, 8192, 4096), (16384, 16384, 16384), (32768, 32768, 32768))
+                  for kernel in ("persistent", "streamed_operands")]
+    baseline, streamed = cases[:2]
+    assert baseline["config"]["cluster_layout"] == "4x4"
+    assert streamed["config"]["cluster_layout"] == "linear"
+    # Only the persistent schedule uses 4x4 clusters. It unrolls the steady
+    # loop by a three-stage ring with three dedicated C slots at K=8192, keeps
+    # three stages with dynamic slots at K=4096, and switches to a four-stage
+    # ring with two C slots from K=16384. Other options match the persistent
+    # benchmark defaults for each shape.
+    for case in cases:
+        persistent = case["kernel"] == "persistent"
+        k = case["shape"][2]
+        four_stage = persistent and k >= 16384
+        assert ("--static_slot_unroll" in case["application"]) == (persistent and k == 8192)
+        assert ("--output_c_slots" in case["application"]) == (persistent and not four_stage)
+        assert case["config"]["output_c_slots"] == (3 if persistent and not four_stage else None)
+        application = case["application"]
+        assert application[application.index("--num_buffers") + 1] == ("4" if four_stage else "3")
+    application = baseline["application"].copy()
+    layout = application.index("--cluster_layout")
+    del application[layout:layout + 2]
+    application.remove("--static_slot_unroll")
+    slots = application.index("--output_c_slots")
+    assert application[slots + 1] == "3"
+    del application[slots:slots + 2]
+    application[application.index("--cluster_size") + 1] = "4"
+    application[application.index("--cluster_barrier_interval") + 1] = "4"
+    # 4x4 clusters remap whole clusters across XCDs; streamed operands do not.
+    assert application[application.index("--xcd_remap") + 1] == "chunked"
+    application[application.index("--xcd_remap") + 1] = "none"
+    assert streamed["application"] == application[:application.index("--num_programs")] + [
+        "--streamed_operands"
+    ] + application[application.index("--num_programs"):]
+    for case in cases:
+        config = case["config"]
+        assert config["benchmark_num_iters"] == 256
+        assert (config["block_m"], config["block_n"], config["block_k"]) == (256, 256, 128)
+        assert config["num_programs"] == 256
+        expected_cluster = (16, 8) if case["kernel"] == "persistent" else (4, 4)
+        assert (config["cluster_size"], config["cluster_barrier_interval"]) == expected_cluster
+        assert not config["wave_specialized_handoff"]
+
+
+def test_mxfp_trace_device_selection_avoids_double_visibility(mxfp_collector, monkeypatch):
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3,4")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    inherited = mxfp_collector.gpu_environment(None)
+    assert inherited["ROCR_VISIBLE_DEVICES"] == "3,4"
+    assert inherited["HIP_VISIBLE_DEVICES"] == "1"
+    selected = mxfp_collector.gpu_environment("6")
+    assert selected["ROCR_VISIBLE_DEVICES"] == "6"
+    assert "HIP_VISIBLE_DEVICES" not in selected and "CUDA_VISIBLE_DEVICES" not in selected
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == "3,4"
+
+
+def test_mxfp_trace_sensors_record_units_and_identity(mxfp_sensors):
+    sample = mxfp_sensors.read()
+    assert sample["power_w"] == 400
+    assert sample["hwmon42_power1_cap_w"] == 750
+    assert sample["hwmon42_freq1_input_mhz"] == 1900
+    assert sample["hwmon42_temp2_input_c"] == 57
+    assert sample["perf_level"] == "auto"
+    assert not sample["errors"]
+    assert sample["read_end_monotonic_ns"] >= sample["monotonic_ns"]
+    assert mxfp_sensors.fields["hwmon42_freq1_input_mhz"]["label"] == "sclk"
+    assert "0000:66:00.0" in mxfp_sensors.fields[mxfp_sensors.primary_power]["path"]
+
+
+def test_mxfp_trace_power_falls_back_to_readable_average(mxfp_collector, mxfp_sensors):
+    hwmon = mxfp_sensors.device / "hwmon/hwmon42"
+    (hwmon / "power1_input").write_text("N/A\n")
+    (hwmon / "power1_average").write_text("375000000\n")
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    assert sensors.read()["power_w"] == 375
+    (hwmon / "power1_average").write_text("nan\n")
+    with pytest.raises(mxfp_collector.CollectionError, match="cannot read device power"):
+        mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+
+
+@pytest.fixture
+def mxfp_gpu_metrics_table():
+    import struct
+
+    def make(watts=2500, revision=8, kind=2, unit=3, attr_id=3, instances=1):
+        if revision != 9:
+            return struct.pack("<HBB4H", 12, 1, revision, 50, 60, 70, watts)
+        # The v1.9 wire format packs each encoding immediately before its values.
+        # Place array attributes on both sides to exercise variable offsets.
+        before = struct.pack("<Q3H", (2 << 24) | (2 << 20) | 3, 50, 60, 70)
+        power = struct.pack("<Q", (unit << 24) | (kind << 20) | (attr_id << 10) | instances)
+        power += struct.pack("<" + "BbHhIiQq"[kind] * instances, *([watts] * instances))
+        after = struct.pack("<Q2Q", (6 << 20) | (7 << 10) | 2, 123456789, 987654321)
+        body = before + power + after
+        return struct.pack("<HBBi", 8 + len(body), 1, revision, 3) + body
+
+    return make
+
+
+@pytest.mark.parametrize("revision", [4, 5, 6, 7, 8, 9])
+def test_mxfp_trace_gpu_metrics_reads_socket_power(mxfp_collector, mxfp_gpu_metrics_table, revision):
+    assert mxfp_collector.gpu_metrics_power(mxfp_gpu_metrics_table(revision=revision)) == (2500, f"1.{revision}")
+
+
+@pytest.mark.parametrize("kind", [3, 4, 5, 6, 7])
+def test_mxfp_trace_gpu_metrics_dynamic_power_types(mxfp_collector, mxfp_gpu_metrics_table, kind):
+    assert mxfp_collector.gpu_metrics_power(mxfp_gpu_metrics_table(revision=9, kind=kind)) == (2500, "1.9")
+
+
+@pytest.mark.parametrize("condition", [
+    "header",
+    "size",
+    "version",
+    "unavailable_fixed",
+    "unavailable_dynamic",
+    "unit",
+    "instances",
+    "missing_power",
+    "negative",
+    "count",
+    "truncated_attribute",
+    "trailing_bytes",
+])
+def test_mxfp_trace_gpu_metrics_rejects_invalid_tables(mxfp_collector, mxfp_gpu_metrics_table, condition):
+    import struct
+
+    fixed = mxfp_gpu_metrics_table()
+    dynamic = mxfp_gpu_metrics_table(revision=9)
+    tables = {
+        "header": fixed[:3],
+        "size": fixed[:-1],
+        "version": mxfp_gpu_metrics_table(revision=10),
+        "unavailable_fixed": mxfp_gpu_metrics_table(watts=0xffff),
+        "unavailable_dynamic": mxfp_gpu_metrics_table(watts=0xffff, revision=9),
+        "unit": mxfp_gpu_metrics_table(revision=9, unit=2),
+        "instances": mxfp_gpu_metrics_table(revision=9, instances=2),
+        "missing_power": mxfp_gpu_metrics_table(revision=9, attr_id=4),
+        "negative": mxfp_gpu_metrics_table(revision=9, kind=3, watts=-2),
+        "count": dynamic[:4] + struct.pack("<i", 1000) + dynamic[8:],
+        "truncated_attribute": struct.pack("<H",
+                                           len(dynamic) - 1) + dynamic[2:-1],
+        "trailing_bytes": struct.pack("<H",
+                                      len(dynamic) + 1) + dynamic[2:] + b"\0",
+    }
+    with pytest.raises(ValueError):
+        mxfp_collector.gpu_metrics_power(tables[condition])
+
+
+def test_mxfp_trace_gpu_metrics_survives_hwmon_failure_under_load(mxfp_collector, mxfp_sensors, mxfp_gpu_metrics_table,
+                                                                  monkeypatch, tmp_path):
+    from pathlib import Path
+
+    metrics = mxfp_sensors.device / "gpu_metrics"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=400))
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    original_read = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.name == "power1_input":
+            raise OSError(0, "Error")
+        return original_read(path, *args, **kwargs)
+
+    # Idle probing succeeded; only the hwmon power path fails during measurement.
+    monkeypatch.setattr(Path, "read_text", read)
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=2500))
+    samples = [sensors.read(), sensors.read()]
+    for sample in samples:
+        assert sample["power_w"] == 2500
+        assert sample["power_source"] == "gpu_metrics_curr_socket_power_w"
+        assert sample["gpu_metrics_version"] == "1.8"
+        assert sample["errors"]["hwmon42_power1_input_w"] == "[Errno 0] Error"
+    mxfp_collector.write_json(
+        tmp_path / "workload.json",
+        dict(phases=[
+            dict(name="measure", start=dict(monotonic_ns=samples[0]["monotonic_ns"]), end=dict(
+                monotonic_ns=samples[-1]["read_end_monotonic_ns"]))
+        ]))
+    (tmp_path / "telemetry.jsonl").write_text("".join(json.dumps(sample) + "\n" for sample in samples))
+    measured, = mxfp_collector.phase_summary(tmp_path, sensors)
+    assert measured["metrics"]["power_w"] == dict(count=2, mean=2500, min=2500, max=2500)
+    assert measured["power_sources"] == {"gpu_metrics_curr_socket_power_w": 2}
+    diagnostics = json.loads((tmp_path / "telemetry_diagnostics.json").read_text())
+    assert diagnostics["sensor_errors"] == {"hwmon42_power1_input_w: [Errno 0] Error": 2}
+    assert diagnostics["gpu_metrics_versions"] == {"1.8": 2}
+
+
+def test_mxfp_trace_power_fallback_tracks_source_without_stale_samples(mxfp_collector, mxfp_sensors,
+                                                                       mxfp_gpu_metrics_table):
+    metrics = mxfp_sensors.device / "gpu_metrics"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=410))
+    hwmon = mxfp_sensors.device / "hwmon/hwmon42"
+    (hwmon / "power1_average").write_text("375000000\n")
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    assert sensors.read()["power_source"] == "gpu_metrics_curr_socket_power_w"
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=0xffff))
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("hwmon42_power1_input_w", 400)
+    (hwmon / "power1_input").write_text("N/A\n")
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("hwmon42_power1_average_w", 375)
+    (hwmon / "power1_average").write_text("N/A\n")
+    sample = sensors.read()
+    assert sample["power_source"] is None and sample["power_w"] is None
+    assert sample["hwmon42_power1_cap_w"] == 750
+    metrics.write_bytes(mxfp_gpu_metrics_table(watts=2600))
+    sample = sensors.read()
+    assert (sample["power_source"], sample["power_w"]) == ("gpu_metrics_curr_socket_power_w", 2600)
+
+
+def test_mxfp_trace_gpu_metrics_power_without_hwmon(mxfp_collector, mxfp_gpu_metrics_table, tmp_path):
+    device = tmp_path / "0000:66:00.0"
+    device.mkdir()
+    (device / "gpu_metrics").write_bytes(mxfp_gpu_metrics_table(revision=9))
+    sensors = mxfp_collector.Sensors(device.name, pci_root=tmp_path)
+    assert sensors.primary_power == "gpu_metrics_curr_socket_power_w"
+    assert sensors.read()["power_w"] == 2500
+
+
+def test_mxfp_trace_power_summary_excludes_setup_and_boundary_samples(mxfp_collector, mxfp_sensors, tmp_path):
+    mxfp_collector.write_json(
+        tmp_path / "workload.json",
+        dict(phases=[dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300))]))
+    samples = [
+        dict(monotonic_ns=begin, read_end_monotonic_ns=end, power_w=power)
+        for begin, end, power in [(0, 10, 50), (90, 110, 200), (120, 130, 400), (250, 260, 450), (280, 320,
+                                                                                                  200), (350, 360, 50)]
+    ]
+    (tmp_path / "telemetry.jsonl").write_text("".join(json.dumps(sample) + "\n" for sample in samples))
+    summary = mxfp_collector.phase_summary(tmp_path, mxfp_sensors)[0]
+    assert summary["samples"] == 2
+    assert summary["metrics"]["power_w"] == dict(count=2, mean=425, min=400, max=450)
+
+
+@pytest.mark.parametrize("values", [[], [None], [400]])
+def test_mxfp_trace_missing_power_is_a_failure(mxfp_collector, mxfp_sensors, tmp_path, values):
+    mxfp_collector.write_json(
+        tmp_path / "workload.json",
+        dict(phases=[dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300))]))
+    (tmp_path / "telemetry.jsonl").write_text("".join(
+        json.dumps(dict(monotonic_ns=150, read_end_monotonic_ns=160, power_w=value)) + "\n" for value in values))
+    with pytest.raises(mxfp_collector.CollectionError, match="fewer than two valid power") as error:
+        mxfp_collector.phase_summary(tmp_path, mxfp_sensors)
+    summary = json.loads((tmp_path / "telemetry_summary.json").read_text())[0]
+    diagnostics = json.loads((tmp_path / "telemetry_diagnostics.json").read_text())
+    assert summary["samples"] == diagnostics["phases"][0]["complete_read_batches"] == len(values)
+    assert diagnostics["phases"][0]["valid_power_samples"] == sum(value is not None for value in values)
+    assert str(tmp_path / "telemetry_diagnostics.json") in str(error.value)
+
+
+@pytest.mark.parametrize("readings,complete,overlap,errors", [
+    ([(90, 110, 400), (280, 320, 410)], 0, 2, {}),
+    ([(120, 130, None), (140, 150, None)], 2, 2, {"power: Input/output error": 2}),
+    ([(0, 10, 400), (310, 320, 410)], 0, 0, {}),
+    ([], 0, 0, {}),
+])
+def test_mxfp_trace_diagnostics_distinguish_sensor_errors_and_phase_coverage(mxfp_collector, tmp_path, readings,
+                                                                             complete, overlap, errors):
+    workload = dict(phases=[
+        dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300)),
+        dict(name="unfinished", start=dict(monotonic_ns=400))
+    ])
+    samples = [
+        dict(monotonic_ns=begin, read_end_monotonic_ns=end, power_w=power,
+             errors={"power": "Input/output error"} if power is None else {}) for begin, end, power in readings
+    ]
+    report = mxfp_collector.telemetry_diagnostics(tmp_path, workload, samples)
+    assert report["sample_count"] == len(readings)
+    assert report["samples_with_power"] == sum(power is not None for _, _, power in readings)
+    assert report["sensor_errors"] == errors
+    measure = report["phases"][0]
+    assert measure["duration_seconds"] == pytest.approx(200 / 1e9)
+    assert measure["complete_read_batches"] == complete
+    assert measure["valid_power_samples"] == 0
+    assert measure["overlapping_read_batches"] == overlap
+    assert measure["overlapping_power_samples"] == (0 if errors else overlap)
+    assert report["phases"][1] == dict(name="unfinished", status="unfinished")
+    if readings:
+        assert report["first_read_monotonic_ns"] == readings[0][0]
+        assert report["last_read_monotonic_ns"] == readings[-1][1]
+        assert report["read_duration_ms"]["max"] == pytest.approx(max(end - begin for begin, end, _ in readings) / 1e6)
+    else:
+        assert report["first_read_monotonic_ns"] is None
+        assert report["last_read_monotonic_ns"] is None
+        assert report["read_duration_ms"] is None
+
+
+@pytest.mark.parametrize("inspect_stage", [False, True])
+def test_mxfp_trace_inspection_preserves_existing_capture_without_device_access(mxfp_collector, monkeypatch, tmp_path,
+                                                                                capsys, inspect_stage):
+    stage = tmp_path / "case/power"
+    stage.mkdir(parents=True)
+    # Original captures predate telemetry_diagnostics.json and must remain readable.
+    mxfp_collector.write_json(
+        stage / "workload.json",
+        dict(phases=[dict(name="measure", start=dict(monotonic_ns=100), end=dict(monotonic_ns=300))]))
+    sample = dict(monotonic_ns=150, read_end_monotonic_ns=160, power_w=None,
+                  errors={"hwmon42_power1_input_w": "Input/output error"})
+    (stage / "telemetry.jsonl").write_text(json.dumps(sample) + "\n")
+
+    def snapshot():
+        return {
+            str(path.relative_to(tmp_path)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("inspection must not probe a device, load a profiler, or start a workload")
+
+    for name in ("device_info", "command_record", "load_att_helper", "make_cases", "Sensors", "collect"):
+        monkeypatch.setattr(mxfp_collector, name, unexpected_probe)
+    assert mxfp_collector.main(["--inspect", str(stage if inspect_stage else tmp_path)]) == 0
+    report, = json.loads(capsys.readouterr().out)
+    assert report["directory"] == str(stage)
+    assert report["sensor_errors"] == {"hwmon42_power1_input_w: Input/output error": 1}
+    assert report["phases"][0]["complete_read_batches"] == 1
+    assert report["phases"][0]["valid_power_samples"] == 0
+    assert snapshot() == before
+
+
+@pytest.mark.parametrize("existing", ["directory", "archive"])
+def test_mxfp_trace_existing_output_is_preserved(mxfp_collector, monkeypatch, tmp_path, existing):
+    root = tmp_path / "capture"
+    previous = root / "previous.att" if existing == "directory" else tmp_path / "capture.tar.gz"
+    previous.parent.mkdir(exist_ok=True)
+    previous.write_bytes(b"previous trace")
+    args = mxfp_collector.parser().parse_args(["--output", str(root)])
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("should reject existing output before probing or starting a workload")
+
+    monkeypatch.setattr(mxfp_collector, "command_record", unexpected_probe)
+    with pytest.raises(mxfp_collector.CollectionError, match="refusing to overwrite"):
+        mxfp_collector.collect(args, [])
+    assert previous.read_bytes() == b"previous trace"
+
+
+def test_mxfp_trace_workload_numbers_only_target_launches(mxfp_collector, monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    actions = []
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None)))
+    driver = SimpleNamespace(get_empty_cache_for_benchmark=lambda: "cache",
+                             clear_cache=lambda _: actions.append("clear"))
+    monkeypatch.setitem(sys.modules, "triton",
+                        SimpleNamespace(runtime=SimpleNamespace(driver=SimpleNamespace(active=driver))))
+    monkeypatch.setattr(mxfp_collector, "device_info", lambda: dict(arch="gfx1250", bdf="0000:66:00.0"))
+    spec = tmp_path / "spec.json"
+    mxfp_collector.write_json(spec, dict(mode="att", device_bdf="0000:66:00.0", warmup_dispatches=3, benchmark_ms=256))
+
+    def launch():
+        actions.append("launch")
+        return SimpleNamespace(name="test_kernel", metadata=SimpleNamespace(_asdict=lambda: {}),
+                               asm=dict(amdgcn="test assembly", hsaco=b"compiled code"))
+
+    mxfp_collector.profile_workload(launch, spec)
+    assert actions == ["launch", "clear", "launch", "clear", "launch", "clear", "launch"]
+    report = json.loads((tmp_path / "workload.json").read_text())
+    assert report["selected_matching_dispatch"] == 4
+    assert report["kernel_name"] == "test_kernel"
+    assert [phase["name"] for phase in report["phases"]] == ["compile", "warmup", "selected_dispatch"]
+    assert (tmp_path / "kernel.hsaco").read_bytes() == b"compiled code"
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_mxfp_trace_selected_dispatch_matches_decoded_wave(mxfp_collector, tmp_path, filtered):
+    rows = "7,target,10,20\n" if filtered else "2,target,1,2\n4,other,2,3\n5,target,5,6\n7,target,10,20\n"
+    (tmp_path / "trace_kernel_trace.csv").write_text("Dispatch_Id,Kernel_Name,Start_Timestamp,End_Timestamp\n" + rows)
+    decoded = tmp_path / "ui_output_agent_0_dispatch_7"
+    decoded.mkdir()
+    result = mxfp_collector.check_dispatch(tmp_path, "target", 3)
+    assert result["kernel_trace_row"]["dispatch_id"] == "7"
+    decoded.rename(tmp_path / "ui_output_agent_0_dispatch_2")
+    with pytest.raises(mxfp_collector.CollectionError, match="does not match"):
+        mxfp_collector.check_dispatch(tmp_path, "target", 3)
+
+
+def test_mxfp_trace_failed_process_retains_logs(mxfp_collector, mxfp_sensors, tmp_path):
+    import sys
+
+    with pytest.raises(mxfp_collector.CollectionError, match="workload exited 7"):
+        mxfp_collector.run_recorded([sys.executable, "-c", "print('workload failed'); raise SystemExit(7)"], tmp_path,
+                                    os.environ.copy(), mxfp_sensors, 0.01, 5)
+    assert "workload failed" in (tmp_path / "stdout.log").read_text()
+    result = json.loads((tmp_path / "process.json").read_text())
+    assert result["returncode"] == 7
+    assert result["end"]["monotonic_ns"] >= result["start"]["monotonic_ns"]
+    assert (tmp_path / "telemetry.csv").is_file()
+
+
+def test_mxfp_trace_timeout_reaps_child(mxfp_collector, mxfp_sensors, tmp_path):
+    import subprocess
+    import sys
+
+    command = [
+        sys.executable, "-c",
+        "import os, signal; from pathlib import Path; Path('pid').write_text(str(os.getpid())); signal.pause()"
+    ]
+    with pytest.raises(subprocess.TimeoutExpired):
+        mxfp_collector.run_recorded(command, tmp_path, os.environ.copy(), mxfp_sensors, 0.01, 0.3)
+    pid = int((tmp_path / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert "end" in json.loads((tmp_path / "process.json").read_text())
+
+
+@pytest.mark.parametrize("power_source,mode", [("hwmon", "collect"), ("metrics_8", "collect"),
+                                               ("metrics_9", "explicit_package"), ("average", "collect"),
+                                               ("hwmon", "failure"), ("hwmon", "preflight"), ("hwmon", "no_package"),
+                                               ("hwmon", "no_att"), ("hwmon", "archive_failure"),
+                                               ("hwmon", "archive_suffix")])
+def test_mxfp_trace_collection_packages_timing_power_and_decoded_bundle(mxfp_collector, mxfp_sensors,
+                                                                        mxfp_gpu_metrics_table, monkeypatch, tmp_path,
+                                                                        capsys, power_source, mode):
+    import hashlib
+    import sys
+    import tarfile
+    import textwrap
+    from pathlib import Path
+
+    monkeypatch.setenv("MXFP_TEST_PREFLIGHT_FAILURE", str(int(mode == "failure")))
+    failed_input = tmp_path / "input failed during warmup"
+    hwmon = mxfp_sensors.device / "hwmon/hwmon42"
+    if power_source.startswith("metrics_"):
+        (mxfp_sensors.device / "gpu_metrics").write_bytes(
+            mxfp_gpu_metrics_table(watts=425, revision=int(power_source[-1])))
+        expected_source, expected_power = "gpu_metrics_curr_socket_power_w", 425
+    elif power_source == "average":
+        (hwmon / "power1_average").write_text("375000000\n")
+        expected_source, expected_power = "hwmon42_power1_average_w", 375
+    else:
+        expected_source, expected_power = "hwmon42_power1_input_w", 400
+    sensors = mxfp_collector.Sensors(mxfp_sensors.device.name, pci_root=mxfp_sensors.device.parent)
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if power_source != "hwmon" and path == hwmon / "power1_input" and failed_input.exists():
+            raise OSError(0, "Error")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+
+    # Run the collector's actual phase/warmup logic in external CPU processes.
+    # GPU launches, benchmark timing, and decoded profiler output are fixtures.
+    worker = tmp_path / "fixture worker.py"
+    worker.write_text(
+        textwrap.dedent('''\
+        import importlib.util, json, sys, time
+        from pathlib import Path
+        from types import SimpleNamespace
+        spec_path = Path(sys.argv[sys.argv.index('--profile_workload') + 1])
+        spec = json.loads(spec_path.read_text())
+        root = spec_path.parent
+        module_spec = importlib.util.spec_from_file_location('collector', sys.argv[1])
+        collector = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(collector)
+        collector.device_info = lambda: dict(arch='gfx1250', bdf=spec['device_bdf'])
+        sys.modules['torch'] = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None))
+        driver = SimpleNamespace(get_empty_cache_for_benchmark=lambda: None, clear_cache=lambda _: None)
+        kernel_name = sys.argv[2]
+        launch_count = 0
+
+        def launch():
+            global launch_count
+            launch_count += 1
+            return SimpleNamespace(name=kernel_name, metadata=SimpleNamespace(_asdict=lambda: {}),
+                                   asm=dict(amdgcn='fixture assembly ' + kernel_name, hsaco=b'fixture code'))
+
+        def do_bench(fn, warmup, rep):
+            assert warmup == 30 and rep == spec['benchmark_ms'] == 256
+            Path(sys.argv[3]).touch()
+            fn()
+            time.sleep(0.025)
+            return 0.2
+
+        sys.modules['triton'] = SimpleNamespace(runtime=SimpleNamespace(driver=SimpleNamespace(active=driver)),
+                                               testing=SimpleNamespace(do_bench=do_bench))
+        collector.profile_workload(launch, spec_path)
+        (root / 'launch_count.json').write_text(json.dumps(launch_count))
+    '''))
+    profiler = tmp_path / "fixture profiler"
+    profiler.write_text(
+        textwrap.dedent('''\
+        #!/usr/bin/env python3
+        import json, os, sqlite3, subprocess, sys
+        from pathlib import Path
+        if '--help' in sys.argv:
+            print('--att --rocm-root')
+            raise SystemExit(0)
+        if '--device-info-output' in sys.argv:
+            if os.environ['MXFP_TEST_PREFLIGHT_FAILURE'] == '1':
+                print('aqlprofile API table load failed: HSA_STATUS_ERROR', flush=True)
+                raise SystemExit(6)
+            info = Path(sys.argv[sys.argv.index('--device-info-output') + 1])
+            info.write_text(json.dumps(dict(bdf='0000:66:00.0', arch='gfx1250')))
+            raise SystemExit(0)
+        subprocess.run(sys.argv[sys.argv.index('--') + 1:], check=True)
+        root = Path(sys.argv[sys.argv.index('-d') + 1])
+        kernel = sys.argv[sys.argv.index('--kernel-include-regex') + 1]
+        selected, = json.loads(sys.argv[sys.argv.index('--kernel-iteration-range') + 1])
+        spec_path = Path(sys.argv[sys.argv.index('--profile_workload') + 1])
+        count = json.loads((spec_path.parent / 'launch_count.json').read_text())
+        report = json.loads((spec_path.parent / 'workload.json').read_text())
+        assert count == report['selected_matching_dispatch'] == selected == 1025
+        dispatch_id = 2 * selected
+        # Match rocprofv3's default: the database alone, without kernel CSVs.
+        formats = ['rocpd']
+        if '--output-format' in sys.argv:
+            formats = []
+            for value in sys.argv[sys.argv.index('--output-format') + 1:]:
+                if value.startswith('-'):
+                    break
+                formats.append(value)
+        if 'rocpd' in formats:
+            with sqlite3.connect(root / 'fixture_results.db') as db:
+                db.execute('CREATE TABLE fixture (value INTEGER)')
+        (root / f'fixture_shader_engine_0_{dispatch_id}.att').write_bytes(b'fixture trace')
+        (root / 'fixture_gfx1250_code_object_id_1.out').write_bytes(b'fixture code')
+        (root / f'stats_ui_output_agent_0_dispatch_{dispatch_id}.csv').write_text('field\\nvalue\\n')
+        rows = ''.join(f'{2*i+1},cache_clear\\n{2*i+2},{kernel}\\n' for i in range(selected))
+        if 'csv' in formats:
+            (root / 'fixture_kernel_trace.csv').write_text('Dispatch_Id,Kernel_Name\\n' + rows)
+        ui = root / f'ui_output_agent_0_dispatch_{dispatch_id}'
+        ui.mkdir()
+        for name in ('code.json', 'filenames.json', 'occupancy.json', 'wstates0.json', 'se0_sm0_sl0_wv0.json'):
+            (ui / name).write_text(json.dumps({'fixture': True}))
+    '''))
+    profiler.chmod(0o755)
+    decoder = tmp_path / "fixture decoder"
+    decoder.mkdir()
+    (decoder / "librocprof-trace-decoder.so").touch()
+    root = tmp_path / "collection with spaces"
+    archive = root.with_name(root.name + ".tar.gz")
+    mode_options = dict(preflight=["--preflight-only"], no_package=["--no-package"], no_att=["--no-att"],
+                        explicit_package=["--package"])
+    # Keep packaging coverage fixed as the default benchmark sweep grows.
+    args = mxfp_collector.parser().parse_args([
+        "--output",
+        str(archive if mode == "archive_suffix" else root), "--profiler",
+        str(profiler), "--decoder-dir",
+        str(decoder), "--sample-ms", "2", *mode_options.get(mode, []), "--warmup-seconds", "0.075",
+        "--duration-seconds", "0.075", "--", "--case", "8192,8192,8192", "--case", "8192,8192,4096"
+    ])
+    cases = mxfp_collector.make_cases(args)
+    assert len(cases) == 4
+    for case in cases:
+        case["application"] = [
+            sys.executable,
+            str(worker), mxfp_collector.__file__, mxfp_collector.KERNEL_NAMES[case["kernel"]],
+            str(failed_input)
+        ]
+    monkeypatch.setattr(mxfp_collector, "Sensors", lambda bdf: sensors)
+
+    def record(command, **kwargs):
+        output = dict(bdf="0000:66:00.0", arch="gfx1250") if "--device-info" in command else {}
+        return dict(command=command, returncode=0, stdout=json.dumps(output), stderr="")
+
+    monkeypatch.setattr(mxfp_collector, "command_record", record)
+    if mode == "failure":
+        with pytest.raises(mxfp_collector.CollectionError, match="initialization failed before benchmarking"):
+            mxfp_collector.collect(args, cases)
+        manifest = json.loads((root / "manifest.json").read_text())
+        assert manifest["status"] == "failed" and manifest["cases"] == []
+        report = json.loads((root / "preflight/preflight.json").read_text())
+        assert report["status"] == "failed" and report["loader_logs"]
+        assert "aqlprofile API table load failed" in (root / "preflight/stdout.log").read_text()
+        assert not list(root.rglob("workload_spec.json"))
+        assert not root.with_name(root.name + ".tar.gz").exists()
+        return
+    if mode == "archive_failure":
+
+        def failed_write(*args, **kwargs):
+            raise OSError("archive disk full")
+
+        monkeypatch.setattr(tarfile.TarFile, "add", failed_write)
+        with pytest.raises(OSError, match="archive disk full"):
+            mxfp_collector.collect(args, cases)
+        assert json.loads((root / "manifest.json").read_text())["status"] == "complete"
+        assert len(list(root.rglob("*.att"))) == 4
+        assert not archive.exists()
+        assert not list(tmp_path.glob(".collection with spaces.tar.gz-*"))
+        assert "capture retained" in capsys.readouterr().err
+        return
+    mxfp_collector.collect(args, cases)
+    if mode == "preflight":
+        manifest = json.loads((root / "manifest.json").read_text())
+        assert manifest["status"] == "preflight_complete" and manifest["cases"] == []
+        assert manifest["preflight"]["status"] == "complete"
+        assert not list(root.rglob("workload_spec.json"))
+        assert not archive.exists()
+        return
+    if mode == "no_package":
+        assert root.is_dir() and not archive.exists()
+        names = [str(path.relative_to(root)) for path in root.rglob("*")]
+    else:
+        assert not root.exists()
+        assert list(tmp_path.glob("collection with spaces*")) == [archive]
+        assert f"SHA-256: {hashlib.sha256(archive.read_bytes()).hexdigest()}" in capsys.readouterr().out
+        with tarfile.open(archive) as bundle:
+            names = bundle.getnames()
+            bundle.extractall(tmp_path / "unpacked", filter="data")
+        root = tmp_path / "unpacked" / root.name
+        if args.att:
+            assert mxfp_collector.load_att_helper().validate_bundle(root)["valid"]
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    if args.att:
+        assert manifest["preflight"]["status"] == "complete"
+    assert manifest["power_sensor_priority"] == sensors.power_candidates
+    assert len(manifest["cases"]) == 4
+    for case in manifest["cases"]:
+        measured = next(p for p in case["runs"]["power"]["telemetry"] if p["name"] == "measure")
+        assert measured["metrics"]["power_w"]["mean"] == expected_power
+        assert measured["power_sources"] == {expected_source: measured["samples"]}
+        assert measured["samples"] >= 2
+        workload = case["runs"]["power"]["workload"]
+        assert [p["name"] for p in workload["phases"]] == ["compile", "warmup", "measure"]
+        assert len(workload["benchmark_samples"]) >= 2
+        assert workload["median_ms"] == 0.2
+        if args.att:
+            assert case["runs"]["att"]["validation"]["valid"]
+            assert case["runs"]["att"]["dispatch"]["kernel_trace_row"]["dispatch_id"] == "2050"
+            assert case["runs"]["att"]["dispatch"]["matching_dispatch"] == 1025
+        if power_source != "hwmon":
+            diagnostics = json.loads((root / Path(case["root"]).name / "power/telemetry_diagnostics.json").read_text())
+            assert diagnostics["sensor_errors"]["hwmon42_power1_input_w: [Errno 0] Error"] > 0
+    assert (root / "summary.csv").is_file()
+    assert expected_source in (root / "summary.csv").read_text()
+    assert sum(name.endswith("/power/telemetry.csv") for name in names) == 4
+    assert sum(name.endswith("/att/trace/fixture_shader_engine_0_2050.att") for name in names) == (4 if args.att else 0)
+
+
+def test_mxfp_trace_profiler_prefers_workload_runtime(mxfp_collector, monkeypatch, tmp_path):
+    helper = mxfp_collector.load_att_helper()
+    for variable in ("AMD_ROCPROFV3", "TLX_ROCPROFV3"):
+        monkeypatch.delenv(variable, raising=False)
+    profiler = tmp_path / "python-rocm-sdk/bin/rocprofv3"
+    profiler.parent.mkdir(parents=True)
+    profiler.write_text("#!/bin/sh\nprintf '%s\\n' '--att'\n")
+    profiler.chmod(0o755)
+    runtime = tmp_path / "python-rocm-sdk/lib/libamdhip64.so.7"
+    runtime.parent.mkdir()
+    runtime.touch()
+    selected, _ = helper.find_profiler(runtime_library=str(runtime))
+    assert selected == profiler
+
+
+@pytest.mark.parametrize("suffix", ["", "_linux_x86_64"])
+@pytest.mark.parametrize("devel_runtime", ["hardlink", "symlink", "missing", "stale"])
+def test_mxfp_trace_profiler_prefers_matching_devel_sdk(mxfp_collector, monkeypatch, tmp_path, suffix, devel_runtime):
+    helper = mxfp_collector.load_att_helper()
+    for variable in ("AMD_ROCPROFV3", "TLX_ROCPROFV3", "ROCPROF_ATT_LIBRARY_PATH"):
+        monkeypatch.delenv(variable, raising=False)
+    core = tmp_path / ("_rocm_sdk_core" + suffix)
+    devel = tmp_path / ("_rocm_sdk_devel" + suffix)
+    for sdk in (core, devel):
+        (sdk / "bin").mkdir(parents=True)
+        (sdk / "lib").mkdir()
+        profiler = sdk / "bin/rocprofv3"
+        profiler.write_text("#!/bin/sh\nprintf '%s\\n' '--att'\n")
+        profiler.chmod(0o755)
+        (sdk / "lib/librocprof-trace-decoder.so").touch()
+    runtime = core / "lib/libamdhip64.so.7"
+    runtime.write_bytes(b"workload runtime")
+    devel_hip = devel / "lib" / runtime.name
+    if devel_runtime == "hardlink":
+        devel_hip.hardlink_to(runtime)
+    elif devel_runtime == "symlink":
+        devel_hip.symlink_to(runtime)
+    elif devel_runtime == "stale":
+        devel_hip.write_bytes(b"previous runtime")
+
+    expected = devel if devel_runtime in ("hardlink", "symlink") else core
+    capability = helper.probe(None, None, str(runtime))
+    assert capability["profiler"] == str(expected / "bin/rocprofv3")
+    assert capability["decoder_directory"] == str(expected / "lib")
+    # An explicit profiler retains priority over the matching devel tree.
+    explicit = helper.probe(str(core / "bin/rocprofv3"), None, str(runtime))
+    assert explicit["profiler"] == str(core / "bin/rocprofv3")
+    assert explicit["decoder_directory"] == str(core / "lib")
+
+
+def test_mxfp_trace_explicit_broken_profiler_does_not_fallback(mxfp_collector, tmp_path):
+    helper = mxfp_collector.load_att_helper()
+    broken = tmp_path / "broken-profiler"
+    broken.write_text("#!/bin/sh\nprintf '%s\\n' '--att option failed'\nexit 1\n")
+    broken.chmod(0o755)
+    with pytest.raises(helper.AttError, match="no ATT-capable rocprofv3"):
+        helper.find_profiler(str(broken))
+    with pytest.raises(helper.AttError, match="no ATT decoder"):
+        helper.find_decoder(broken, str(tmp_path / "missing-decoder"))
+
+
+@pytest.mark.parametrize("changed", ["hip_library", "runtime_libraries"])
+def test_mxfp_trace_preflight_rejects_runtime_change(mxfp_collector, tmp_path, changed):
+    import sys
+    from types import SimpleNamespace
+
+    baseline = dict(bdf="0000:66:00.0", arch="gfx1250", hip_library="/runtime/libamdhip64.so.7",
+                    runtime_libraries=["/runtime/libhsa-runtime64.so.1"])
+    profiled = {
+        **baseline, changed:
+        "/other/libamdhip64.so.7" if changed == "hip_library" else ["/other/libhsa-runtime64.so.1"]
+    }
+
+    def command(capability, application, output):
+        path = application[application.index("--device-info-output") + 1]
+        return [
+            sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+            path,
+            json.dumps(profiled)
+        ]
+
+    helper = SimpleNamespace(runtime_check_command=command)
+    with pytest.raises(mxfp_collector.CollectionError, match="initialization failed before benchmarking"):
+        mxfp_collector.profiler_preflight(helper, {}, tmp_path, os.environ.copy(), baseline, 5)
+    report = json.loads((tmp_path / "preflight/preflight.json").read_text())
+    assert report["status"] == "failed"
+    assert "profiling changed" in report["error"]

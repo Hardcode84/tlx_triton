@@ -146,7 +146,8 @@ void init_triton_tlx_ir(py::module_ &m) {
               memDescType = ttg::MemDescType::get(
                   localAllocShape.drop_front(), localAllocType.getElementType(),
                   localAllocType.getEncoding(), localAllocType.getMemorySpace(),
-                  /*mutableMemory=*/localAllocType.getMutableMemory());
+                  /*mutableMemory=*/localAllocType.getMutableMemory(),
+                  localAllocType.getAllocShape().drop_front());
             }
             return self.create<ttg::MemDescIndexOp>(memDescType, localAlloc,
                                                     bufferIdx);
@@ -167,7 +168,7 @@ void init_triton_tlx_ir(py::module_ &m) {
                  newShape, localAllocType.getElementType(),
                  localAllocType.getEncoding(), localAllocType.getMemorySpace(),
                  /*mutableMemory=*/localAllocType.getMutableMemory(),
-                 localAllocShape);
+                 localAllocType.getAllocShape());
 
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
@@ -176,6 +177,7 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value localAlloc,
               std::vector<Value> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
+             localAlloc = materializeConcreteMemDesc(self, localAlloc);
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              if (localAllocShape.size() != offsets.size() ||
@@ -1339,11 +1341,13 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_async_tdm_copy_local_to_global",
           [](TritonOpBuilder &self, Value desc, Value src,
-             std::optional<Value> barrier) {
-            self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                desc, src, barrier.value_or(Value()));
+             std::optional<Value> barrier,
+             tt::CacheModifier cacheModifier) -> Value {
+            return self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
+                desc, src, barrier.value_or(Value()), cacheModifier);
           },
-          py::arg("desc"), py::arg("src"), py::arg("barrier").none())
+          py::arg("desc"), py::arg("src"), py::arg("barrier").none(),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def(
           "create_update_tensor_descriptor",
           [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
@@ -1703,6 +1707,19 @@ void init_triton_tlx_ir(py::module_ &m) {
           py::arg("src"), py::arg("dst"), py::arg("size"),
           py::arg("store_reduce") = tt::DescriptorReduceKind::NONE,
           py::arg("store_reduce_signed") = false)
+      .def(
+          "create_async_amd_store",
+          [](TritonOpBuilder &self, Value src, Value dst,
+             std::optional<Value> mask, CacheModifier cacheModifier,
+             EvictionPolicy evictionPolicy) -> mlir::Value {
+            return self.create<amdgpu::AsyncCopyLocalToGlobalOp>(
+                src, dst, mask.value_or(Value()),
+                buildCachePolicy(self.getBuilder(), cacheModifier,
+                                 evictionPolicy),
+                /*contiguity=*/1);
+          },
+          py::arg("src"), py::arg("dst"), py::arg("mask").none(),
+          py::arg("cacheModifier"), py::arg("evictionPolicy"))
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);

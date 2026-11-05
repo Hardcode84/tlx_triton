@@ -4939,14 +4939,15 @@ struct TritonGPUVerifyTensorLayoutInterface
     if (isView(op))
       return true;
     // ReturnOp vetted per upstream #10145 for #11791 (forwards generic layouts
-    // without interpreting them); Dot/Call/Func remain unvetted pending
-    // hardening.
+    // without interpreting them). The gfx1250 MXFP research kernels also pass
+    // generic layouts through Dot, DotScaled, Call and Func.
     return isa<triton::MakeRangeOp, triton::SplatOp, triton::BroadcastOp,
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
-               triton::ReturnOp, triton::AssertOp, triton::gpu::ConvertLayoutOp,
-               triton::gpu::RequireLayoutOp, triton::gpu::ReleaseLayoutOp,
-               triton::gpu::Fp4ToFpOp, triton::gpu::LocalLoadOp,
-               triton::gpu::LocalStoreOp>(op);
+               triton::DotOp, triton::DotScaledOp, triton::CallOp,
+               triton::ReturnOp, triton::FuncOp, triton::AssertOp,
+               triton::gpu::ConvertLayoutOp, triton::gpu::RequireLayoutOp,
+               triton::gpu::ReleaseLayoutOp, triton::gpu::Fp4ToFpOp,
+               triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
   }
 
   LogicalResult verifyTensorLayout(

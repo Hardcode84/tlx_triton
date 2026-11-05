@@ -1514,22 +1514,24 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
-@pytest.mark.parametrize("dtype_b,block_k,buffers,k_iters,cross_tile_prefetch", [
-    ("e4m3", 128, 2, 3, True),
-    ("e4m3", 128, 3, 4, True),
-    ("e4m3", 128, 3, 5, True),
-    ("e4m3", 128, 3, 8, False),
-    ("e4m3", 128, 4, 4, True),
-    ("e4m3", 128, 4, 5, True),
-    ("e4m3", 256, 2, 2, False),
-    ("e4m3", 256, 2, 3, False),
-    ("e2m1", 256, 2, 3, False),
-    ("e2m1", 256, 3, 3, True),
-    ("e2m1", 256, 3, 4, False),
-])
+@pytest.mark.parametrize("dtype_b", ["e4m3", "e2m1"])
+@pytest.mark.parametrize(
+    "buffers,k_iters,fusion,with_a_scale,cross_tile_prefetch,output_staging,block_k",
+    [(2, 3, "partial", True, True, False, 128), (3, 4, "partial", True, True, False, 128),
+     (4, 5, "partial", True, True, False, 128), (4, 4, "partial", True, True, False, 128),
+     (3, 4, "4way", True, True, False, 128), (4, 5, "none", False, False, False, 128),
+     (3, 4, "partial", True, True, True, 128), (2, 3, "none", False, False, True, 128),
+     (3, 3, "4way", True, True, True, 128), (3, 5, "partial", True, True, True, 128),
+     (2, 2, "partial", True, True, True, 128), (3, 8, "partial", True, False, True, 128),
+     (2, 2, "partial", True, False, True, 256), (2, 3, "partial", True, False, True, 256),
+     (2, 5, "none", False, False, True, 256), (3, 3, "4way", True, False, True, 256),
+     (3, 4, "partial", True, False, True, 256)],
+)
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-def test_amd_mxfp_persistent_short_k_stages(dtype_b, block_k, buffers, k_iters, cross_tile_prefetch):
-    _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, block_k)
+def test_amd_mxfp_persistent_short_k_stages(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch,
+                                            output_staging, block_k):
+    _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch, output_staging,
+                               block_k)
 
 
 @pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
@@ -1538,45 +1540,54 @@ def test_amd_mxfp_persistent_short_k_stages(dtype_b, block_k, buffers, k_iters, 
 def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
     # Seventeen programs exercise both uneven XCD ranges and chunked tails;
     # nine M tiles with group-M=8 also exercise the final short M group.
-    _check_amd_mxfp_persistent(dtype_b, 3, 5, block_k == 128, block_k, M=2304, N=768,
+    _check_amd_mxfp_persistent(dtype_b, 3, 5, "partial", True, block_k == 128, True, block_k, M=2304, N=768,
                                extra_config=dict(NUM_PROGRAMS=17, GROUP_SIZE_M=8, XCD_REMAP=mode))
 
 
 @pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
 @pytest.mark.parametrize("k_iters", [3, 5])
-@pytest.mark.parametrize("cluster_size,multicast,group_m", [(2, True, 8), (4, True, 4), (4, True, 8), (4, False, 4)])
-@pytest.mark.parametrize("remap_mode", ["none", "chunked"])
+@pytest.mark.parametrize("cluster_size,multicast,group_m,fusion", [
+    (2, True, 8, "partial"),
+    (4, True, 4, "partial"),
+    (4, True, 8, "partial"),
+    (4, False, 4, "partial"),
+    (4, True, 4, "2way"),
+    (4, True, 4, "4way"),
+])
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, remap_mode):
+@pytest.mark.parametrize("remap_mode", ["none", "chunked"])
+def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, fusion, remap_mode):
     # Distinct data/scales catch wrong recipients. Two tiles/program exercise
     # cross-tile prefetch (BK128) and reusing A's LDS for C (BK256). K=3 has no
     # steady loop; K=5 rotates the three-slot ring at the tile boundary.
     _check_amd_mxfp_persistent(
-        dtype_b, 3, k_iters, block_k == 128, block_k, M=2048, N=1024,
+        dtype_b, 3, k_iters, fusion, True, block_k == 128, True, block_k, M=2048, N=1024,
         extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=cluster_size,
-                          CLUSTER_MULTICAST=multicast))
+                          CLUSTER_MULTICAST=multicast, SCHED_MODE_2=True))
 
 
 @pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
 @pytest.mark.parametrize("k_iters", [3, 10])
-@pytest.mark.parametrize("interval,remap_mode,group_m,multicast", [
-    (0, "none", 8, True),
-    (0, "chunked", 4, True),
-    (0, "none", 8, False),
-    (4, "none", 4, True),
-    (3, "chunked", 4, True),
+@pytest.mark.parametrize("interval,remap_mode,group_m,fusion,multicast", [
+    (0, "none", 8, "partial", True),
+    (0, "chunked", 4, "partial", True),
+    (0, "none", 8, "partial", False),
+    (4, "none", 4, "partial", True),
+    (3, "chunked", 4, "4way", True),
 ])
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
-def test_amd_mxfp_persistent_cluster_barrier_interval(dtype_b, block_k, k_iters, interval, remap_mode, group_m,
+def test_amd_mxfp_persistent_cluster_barrier_interval(dtype_b, block_k, k_iters, interval, remap_mode, group_m, fusion,
                                                       multicast):
     _check_amd_mxfp_persistent(
-        dtype_b, 3, k_iters, block_k == 128, block_k, M=2048, N=1024,
+        dtype_b, 3, k_iters, fusion, True, block_k == 128, True, block_k, M=2048, N=1024,
         extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=4,
                           CLUSTER_MULTICAST=multicast, CLUSTER_BARRIER_INTERVAL=interval))
 
 
-def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, block_k, M=768, N=512,
-                               extra_config=None):
+def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, fusion, with_a_scale, cross_tile_prefetch, output_staging,
+                               block_k, M=768, N=512, extra_config=None):
+    if output_staging and dtype_b != "e2m1" and buffers > (3 if block_k == 128 else 2):
+        pytest.skip("FP8 B input rings leave insufficient LDS for this output staging configuration")
     # Three output tiles per program, including a short final M group. Exercise
     # both an empty steady loop and a K count that rotates the ring's phase.
     torch.manual_seed(123)
@@ -1590,15 +1601,18 @@ def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, b
         b_ref = b.float()
     a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
     b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
-    a_ref = a.float() * _mxfp_e8m0_to_float32(a_scale).repeat_interleave(32, dim=1)
+    a_ref = a.float()
+    if with_a_scale:
+        a_ref *= _mxfp_e8m0_to_float32(a_scale).repeat_interleave(32, dim=1)
     b_ref *= _mxfp_e8m0_to_float32(b_scale).repeat_interleave(32, dim=1)
     ref = a_ref @ b_ref.T
     config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b,
-                  TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=2,
-                  GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch)
+                  TRANSPOSE_B=True, WITH_A_SCALE=with_a_scale, SCHEDULE="sliceMNK", TDM_FUSION=fusion, PERSISTENT=True,
+                  NUM_PROGRAMS=2, GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch,
+                  OUTPUT_STAGING=output_staging)
     config.update(extra_config or {})
     out = _amd_mxfp_gemm_tdm_pipelined(a.to(DEVICE), b.to(DEVICE),
-                                       _amd_mxfp_pack_scale(a_scale).to(DEVICE),
+                                       _amd_mxfp_pack_scale(a_scale).to(DEVICE) if with_a_scale else None,
                                        _amd_mxfp_pack_scale(b_scale).to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 

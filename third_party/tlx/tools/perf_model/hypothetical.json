@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "name": "Synthetic example; not a hardware calibration",
+    "purpose": "Exercise the graph, clock conversions, finite queues and scheduler. These numbers are invented."
+  },
+  "parameters": {
+    "shader_period_ps": 1000,
+    "gfx_period_ps": 1000,
+    "fabric_period_ps": 1250,
+    "memory_period_ps": 1000,
+    "ds_decode_native": 8,
+    "tdm_copy_fifo_depth": {
+      "value": 4,
+      "unit": "returned packets / CU",
+      "kind": "hypothetical",
+      "source": "invented capacity; packet size and downstream release are separate scenario assumptions"
+    },
+    "tdm_copy_fifo_cycles": {
+      "value": 1,
+      "unit": "shader cycles",
+      "kind": "hypothetical",
+      "source": "invented part of tcp_output_cycles spent holding a FIFO entry before array service"
+    },
+    "lds_outstanding": {
+      "value": 32,
+      "unit": "instructions / wave",
+      "kind": "hypothetical",
+      "source": "invented completion-credit capacity; independent of scheduler depth and counter encoding"
+    },
+    "lds_residency_capacity": {
+      "value": 655360,
+      "unit": "bytes / CU",
+      "kind": "hypothetical",
+      "source": "invented aggregate capacity; not inferred from a per-workgroup launch limit"
+    },
+    "ds_scheduler_native": 2,
+    "ds_ram_native": 2,
+    "ds_read_output_native": 2,
+    "ds_return_native": 4,
+    "sp_bypass_native": 2,
+    "ta_native": 8,
+    "tcp_input_native": 8,
+    "tcp_output_native": 8,
+    "l1_input_native": 10,
+    "tcx_request_native": 12,
+    "tcx_return_native": 12,
+    "df_request_native": 12,
+    "df_return_native": 12,
+    "cache_input_native": 8,
+    "cache_output_native": 8,
+    "mc_read_request_native": 64,
+    "mc_read_return_native": 64,
+    "mc_write_request_native": 32,
+    "mc_write_return_native": 32,
+    "dram_activate_native": 16,
+    "dram_sequence_native": 8,
+    "memory_cycles_per_32bytes": 1,
+    "array_port_width": 256,
+    "return_link_width": 256,
+    "store_link_width": 128,
+    "cache_link_width": 256,
+    "memory_channels": 64,
+    "active_cus": 32,
+    "barrier_cycles": 4,
+    "tdm_command_ii": 1,
+    "address_vgprs": 24,
+    "lds_padding": 1.0625
+  }
+}

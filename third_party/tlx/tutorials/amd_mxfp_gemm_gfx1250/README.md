@@ -1,181 +1,555 @@
 # gfx1250 MXFP GEMM
 
-This directory contains TLX MXFP GEMM kernels for AMD gfx1250:
-`C = (A * a_scale) @ (B * b_scale)^T` with E8M0 block scales (one per 32 K
-elements), FP32 accumulation, and FP32 or FP16 output.
+This directory contains the FP8/FP4 TDM-pipelined GEMM tutorial and a persistent
+MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
 
-- [`amd_mxfp_gemm_tdm_pipelined.py`](amd_mxfp_gemm_tdm_pipelined.py): the
-  non-persistent kernel, the config-based `matmul` API, the
-  `mxgemm_tdm_pipelined` API, and a single-shape command line.
-- The persistent kernel, the device helpers it shares with the non-persistent
-  kernel, and `pack_scale` live in
-  [`ops/kernels/mm_mxfp8/gfx1250.py`](../../ops/kernels/mm_mxfp8/gfx1250.py),
-  which backs `tlx.ops.mm_mxfp8` on gfx1250; the tutorial imports them.
-- [`bench.py`](bench.py): a multi-shape benchmark of the persistent kernel
-  that runs each case in a separate process.
+See [WRITEUP.md](WRITEUP.md) for an overview of the kernel design,
+configuration, performance, and bottlenecks, and [HANDOFF.md](HANDOFF.md)
+for the performance investigation checkpoint, measured results, toolchain
+caveats, and next validation steps.
 
-Two kernels are provided:
+- `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
+  `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
+- `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
+- `collect_traces.py`: real-device instruction traces, eager timings, and
+  timestamped power, clocks, temperatures, and power limits.
+- `amd_mxfp_gemm_operand_pipeline.py`: experimental four-wave A8W8 kernel
+  with operand prefetch across K steps and FP32 output.
+- `amd_mxfp_gemm_operand_pipeline_paired.py`: two K256 input stages feeding
+  native K128 computation, with partitioned input storage and cache prefetch.
+- [`../../tools/perf_model/`](../../tools/perf_model/README.md): generic resource,
+  dependency, and buffer-overlap model with an MXFP work-graph generator.
+- [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
+  assembly reproduction with FP32 output and a standalone HIP benchmark.
 
-- `mxgemm_tdm_pipelined_kernel` follows the Gluon MXFP GEMM example: one
-  output tile per program, FP8 or FP4 A and B, optional A scales, baseline
-  or sliced K/N/MNK schedules, and none/2way/4way/partial TDM fusion.
-- `mxgemm_tdm_persistent_kernel` is a persistent kernel for 256x256 output
-  tiles with FP8 E4M3 A and FP8 E4M3 (A8W8) or FP4 E2M1 (A8W4) B. The rest
-  of this document describes it.
+The benchmark runs both variants at M=N=8192 with K=8192 and K=4096,
+and at 16384 and 32768 cubed, for eight runs by default:
 
-## Persistent kernel design
+| Variant | Activations | Weights |
+| --- | --- | --- |
+| `mx8xmx8` | FP8 E4M3 | FP8 E4M3 |
+| `mx8xmx4` | FP8 E4M3 | FP4 E2M1 |
 
-**Work split.** Each program walks a sequence of output tiles in group-M
-order. Four waves, one per SIMD, split a 256x256 tile 2x2, so each wave
-keeps a 128x128 FP32 accumulator in registers and issues
-`v_wmma_scale_f32_16x16x128_f8f6f4` for its four 64x64 quadrants. A8W8 uses
-K blocks of 128 (BK128); A8W4 uses BK256.
+Both use E8M0 scales, FP32 output, 256x256 M/N tiles, three buffers, partial TDM
+fusion, persistent scheduling, and output staging. MX8xMX8 uses BK128 with
+cross-tile prefetch; MX8xMX4 uses BK256 with cross-tile prefetch disabled by
+default and reuses the A ring for output. The summary and CSV identify each
+variant and its configuration.
 
-**Input ring.** A, B, and both scale tensors stream into LDS through a ring
-of `NUM_BUFFERS` TDM stages. Loads use partial fusion: A data and its
-scales are issued by waves 0 and 2, B data and its scales by waves 1 and
-3, so each wave issues two TDM instructions per stage. Each K step
+Both variants default to 256 persistent programs (capped by tile count),
+group-M 8, chunked XCD remapping of whole clusters (eight XCDs, chunk two;
+2-4% faster at 16384 and 32768 cubed), and 16-workgroup multicast in a 4x4 tile layout
+with a cluster barrier every eight input K blocks: each A tile is shared by
+the four workgroups of its cluster row and each B tile by the four of its
+column, halving the unique input each CU loads per K step compared with the
+previous 2x2 clusters. MX8xMX8 also switches to a four-stage input ring with
+two C slots for K >= 16384. On gfx1250 this is 3-6% faster than 2x2 clusters
+for MX8xMX4 and 5-12% faster for MX8xMX8. Eager timing repeats 256 ms batches: 1 s of warmup, then the median
+batch over 2 s (`--warmup-seconds`, `--duration-seconds`). A single batch from
+a fresh process overstates gfx1250 kernel times because of a few slow first
+launches. The summary prints the AMD code generator revision.
 
-1. waits at a workgroup barrier until all waves have read the slot to
-   refill,
-2. refills that slot with a stage `NUM_BUFFERS` steps ahead,
-3. waits for the next stage's TDM transfers (`s_wait_tensorcnt`),
-4. waits at a workgroup barrier until the stage is visible to all waves.
+The default MX8xMX8 kernel handles its final three K stages in one loop.
+It carries the physical ring slot across the tail and selects the required
+immediate wait counts as pending transfers drain. This limits the tail's
+code footprint while retaining cross-tile prefetch and native K128 WMMAs.
 
-Matrix instructions of the current step are scheduled across this
-sequence, and operand reads for the next step start as soon as its stage
-is visible. Scales are read with the payloads into the WMMA scale
-operands.
+As the tail retires input slots, it fills them with the next tile's A/B and
+scales. The two dedicated C slots can start their first output chunks while
+those inputs remain in flight. Output waits begin with the third chunk,
+when a C slot is reused, and leave the other chunk in flight. The current
+tile's input waits retire any previous tile's C stores before this output
+phase, so there is no need to drain incoming A/B before the first C chunk.
 
-**Tile transition.** With cross-tile prefetch (A8W8), the last
-`NUM_BUFFERS` K steps of a tile refill each freed slot with the next tile's
-inputs, so the next tile's data is in flight while the current tile
-finishes. The C epilogue converts the accumulators to the output type,
-writes them to LDS in 64-row chunks, and stores each chunk with a TDM
-store:
+`--static-slot-unroll` (`STATIC_SLOT_UNROLL=True`) unrolls the MX8xMX8
+steady loop by its three-slot ring. Each step then reads a loop-invariant
+slot, so LDS operand addresses and the loop-carried operand copies move out
+of the loop, removing most ALU dependency waits. Static code grows by about
+a third. On hardware with the pinned AMDGPU codegen it is 1.2% faster at
+8192 cubed but 1.8% slower at K=4096. `bench.py` therefore enables it for
+MX8xMX8 cases with K >= 8192; the kernel and `matmul` default remains off.
+The unrolled schedule also peels each tile's first K step, so its WMMAs take
+the zero accumulator as an inline constant instead of zeroing 512 VGPRs.
 
-- A8W8 stages C through dedicated LDS slots (`OUTPUT_C_SLOTS`). A chunk
-  waits only when its slot's previous TDM store is still pending.
-- A8W4 stages C in A input stages it no longer reads, keeping the A slot
-  pitch so retiring a C slot frees exactly one input stage. Without
-  cross-tile prefetch, each tile is primed after its C stores.
+`--overlap-peel` (`OVERLAP_PEEL=True`) runs each next tile's first K step
+inside the current tile's FP32 output epilogue. After a C quadrant is staged,
+its registers take that quadrant's next-tile WMMAs, which run during later
+output-slot waits; the next tile enters its K loop at step 1. The next tile's
+first ring refill is issued before the last C chunks: TDM operations complete
+in order, so it may precede only as many chunks as there are C slots. It works
+with the static and dynamic loops and with three or four buffers. On hardware
+it is 0.2% faster at 8192 cubed and 1.2% faster at K=4096; the power-bound
+four-stage ring used for K >= 16384 is unchanged. `bench.py` enables it for
+three-buffer MX8xMX8; the kernel and `matmul` default remains off. See
+[HANDOFF.md](HANDOFF.md).
 
-**Clusters.** `CLUSTER_SIZE` workgroups form a cluster whose matching TDM
-loads are multicast. A grid layout `RxC` maps a cluster onto R M tiles by
-C N tiles, so each A tile is loaded once for C workgroups and each B tile
-once for R. A cluster barrier every `CLUSTER_BARRIER_INTERVAL` K blocks
-keeps the members' requests close enough to merge; each workgroup's own
-waits protect its LDS, so the barrier is not needed for correctness.
-`XCD_REMAP` permutes whole clusters across XCDs so that clusters on one XCD
-share inputs.
+`--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
+FP32 output staging slots (kernel default two). `bench.py` uses three for
+three-buffer MX8xMX8, which keeps more C stores in flight at each tile
+transition: 1.5% faster at 8192 cubed and 1.8% faster at K=4096 on hardware.
+See [HANDOFF.md](HANDOFF.md#hardware-ab).
 
-**A8W8 options.**
-
-- `STATIC_SLOT_UNROLL` unrolls the three- or four-stage steady loop by the
-  ring depth, so every step reads a loop-invariant LDS slot and operand
-  addresses leave the loop. Each tile's first step is peeled so its WMMAs
-  read zero accumulators as an inline constant. The A and B slots are then
-  split into 64-row pieces that alternate between two LDS partitions,
-  reducing contention among the waves that read one operand subtile.
-- `OVERLAP_PEEL` runs each next tile's first K step inside the current
-  tile's C epilogue: after a C quadrant is staged, its registers take that
-  quadrant's next-tile WMMAs, which execute while later C chunks wait for
-  slots. The next tile's first refill is issued before the last C chunks,
-  because TDM operations complete in order.
-- Without the static unroll, the three-stage loop reads each operand's
-  scale before its payload, so each quadrant waits only for its own LDS
-  reads.
-- A four-stage ring uses two smaller C slots (64x64 for FP32, 64x128 for
-  FP16) and a grouped operand prefetch.
-- `MERGED_HANDOFF_BARRIER` (four-stage static loop) replaces the K step's
-  two workgroup barriers with one, split around register-only work. Each
-  step reads both second halves of its slot during the C00 WMMAs, waits for
-  its share of the next stage, signals (`tlx.named_barrier_arrive`, which
-  lowers to `s_barrier_signal`), runs the C01 WMMAs, waits
-  (`tlx.named_barrier_wait`, `s_barrier_wait`), then refills the slot and
-  reads the next stage across the C10 and C11 WMMAs. The one rendezvous
-  orders the slot's last reads before its refill and publishes the next
-  stage to every wave, so the operand reads are relaxed and Membar adds no
-  barriers of its own.
-- `STATIC_CLUSTER_STEPS` drops the run-time cluster-rendezvous test from the
-  unrolled steps that can never refill a rendezvous stage.
-- `SCALE_LAYOUT="wave256"` uses a second preshuffled scale format
-  (`pack_scale(x, layout="wave256")`): one row per 256 M/N rows, ordered per
-  K128 step as `[row bit 5][row % 32][row bit 7][row bit 6][4 K]`, so each
-  lane's 16 bytes are the four scale dwords its wave needs for both 128-row
-  quadrants. The merged step reads each operand's scales with one
-  `ds_load_b128` and splits the quadrants in registers; the other schedules
-  read one quadrant per `ds_load_b64`. The default `block128` format stores
-  one row per 128 rows.
-
-**A8W4 options.** `SPLIT_CLUSTER_BARRIER` signals the periodic cluster
-rendezvous before independent matrix work and waits just before the
-refill. `EARLY_C_STORES` interleaves the final quadrant dots with C stores.
-
-**FP16 output** rounds the FP32 accumulators once in registers before
-staging, halving C's LDS, TDM, and memory traffic. C buffers that alias
-input slots hold twice the rows at the same pitch.
-
-## Requirements
-
-The persistent kernel requires FP8 E4M3 A with A scales, transposed B
-(`[N, K]`), scales preshuffled with `pack_scale` (`wave256` only for A8W8
-BK128), partial TDM fusion, and
-full 256x256 output tiles with at least `NUM_BUFFERS` K blocks. A8W8 uses
-two to four BK128 stages; A8W4 uses three BK256 stages (FP8 B with BK256
-uses two). Clustering requires GROUP_SIZE_M 4 or 8, full M groups, and a
-program count divisible by 16 that divides the output tile count.
-`mxgemm_tdm_pipelined` validates these constraints before launching.
-
-## Benchmark
+`--out-dtype fp16` (`OUT_DTYPE="fp16"`) writes FP16 C for every variant: the
+FP32 accumulators are rounded once (round to nearest even) in registers before
+staging, which halves C's LDS, TDM, and memory traffic. C buffers that alias
+input ring slots keep the input slot pitch (FP16 slots hold twice the rows);
+only `--async-output` rejects FP16. `bench.py` runs every case with FP32 and
+then FP16 output by default (repeat `--out-dtype` to choose). With FP16, it
+uses six 64x128 C slots for three-buffer MX8xMX8, and the four-buffer ring
+defaults to two 64x128 slots. On hardware against FP32 output, MX8xMX8: 8192^3 -4.4%,
+8192^2x4096 -6.7%, 16384^3 -3.7%; MX8xMX4: -4.7%, -8.7%, -2.6%. The final
+`bench.py` table lists the output type. See [HANDOFF.md](HANDOFF.md).
 
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4 -M 8192 -N 8192 -K 4096
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
 python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
 ```
 
-By default both variants run at 8192x8192x4096, 8192x8192x8192,
-16384x16384x16384, and 32768x32768x32768, first with FP32 and then with FP16
-output, with this configuration:
+Two independent A8W4 options test startup and persistent tile handoff:
 
-| Setting | `mx8xmx8` (A8W8) | `mx8xmx4` (A8W4) |
-| --- | --- | --- |
-| B format, BK | FP8 E4M3, 128 | FP4 E2M1, 256 |
-| Input ring | FP32: 3 stages, 4 for K >= 16384; FP16: 4 stages | 3 stages |
-| C staging | FP32: 3 dedicated slots, 2 with four stages; FP16: 2 slots | retired A stages |
-| Cross-tile prefetch | on | off |
-| Static slot unroll | FP32: three stages with K >= 8192; FP16: K <= 16384 | off |
-| Merged handoff barrier, static cluster steps | FP16 with K <= 16384 | off |
-| Overlap peel | FP32: three stages; FP16: K <= 16384 | off |
-| Scale layout | block128 (`--scale-layout wave256` to change) | block128 |
-| Split cluster barrier, early C stores | off | on |
-| Clusters | 16 workgroups, 4x4 layout, multicast, barrier every 8 K blocks | same |
-| Program order | group-M 8, chunked XCD remap (8 XCDs, chunk 2) | same |
-| Programs | 256, capped by the tile count | same |
+- `--compact-k-tail` uses one loop body for the final three K256 stages,
+  reducing the static code footprint. It selects E4M3 x E2M1 with three
+  buffers, four waves, partial fusion, and staged FP32 output.
+- `--variant mx8xmx4 --cross-tile-prefetch` starts each next-tile A/B load
+  after the C transfer using its input slot retires. The three C slots use
+  the same physical stride as A, so each can be retired independently.
+  The last C uses retire in slot order 1, 2, 0; counted waits leave younger
+  input transfers in flight while the remaining C transfers complete.
 
-Each option can be overridden (`--help`). Timing repeats eager batches of
-`--benchmark-num-iters` milliseconds: batches run for `--warmup-seconds`,
-then the median batch over `--duration-seconds` is reported. The device
-clock depends on load, so keep the timing settings fixed when comparing
-configurations. The summary prints the AMD code generator revision. The
-kernels are tuned with the AMDGPU code generator pinned in
-`cmake/amd-llvm-info.json`. Builds with `cmake/meta-llvm-info.json` compile
-the code generator against the core LLVM instead; set
-`TRITON_AMD_CODEGEN_PATH` to the pinned library to use it.
-
-The standalone command line runs one shape, for example the A8W8 default at
-8192 cubed:
+Compare the baseline, each option separately, and their combination:
 
 ```bash
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/amd_mxfp_gemm_tdm_pipelined.py \
-  -M 8192 -N 8192 -K 8192 -BK 128 --dtype_b float8_e4m3 --num_buffers 3 --persistent \
-  --cluster_size 16 --cluster_layout 4x4 --cluster_barrier_interval 8 --xcd_remap chunked \
-  --static_slot_unroll --overlap_peel --output_c_slots 3 --num_programs 256
+mxfp_bench=third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --csv a8w4-baseline.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --compact-k-tail --csv a8w4-compact.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --cross-tile-prefetch --csv a8w4-handoff.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --compact-k-tail --cross-tile-prefetch --csv a8w4-both.csv
 ```
 
-Compile checks live in `python/test/unit/language/test_tlx_codegen.py`;
-gfx1250 runtime checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`
-and `third_party/tlx/tutorials/testing/test_correctness.py`.
+Both options retain FP32 output and the input packing. The standalone tail
+flag is `--compact_k_tail`; the Python API and `matmul` configuration use
+`COMPACT_K_TAIL=True`. The summary and CSV record both options. They remain
+opt-in until repeated hardware comparisons establish a benefit.
+
+For A8W4, `--output-tail-reuse --cross-tile-prefetch` keeps the next tile's
+first A/B stage prefetched and uses the other two A stages as separate
+128x128 FP32 C slots. Indexing A before aliasing preserves its physical ring
+pitch while allowing C's own row padding. The four output transfers still
+use `ds_store_b128` to fill LDS.
+
+The first two C fills do not wait for incoming A/B transfers. The next two
+wait only before reusing a C slot, and both stores remain in flight across
+the tile boundary. The next tile executes its first 48 WMMAs per wave before
+retiring the first C slot and refilling input stage 1. A second counted wait
+retires the other C slot while stage 1's A/B transfers remain in flight, then
+issues stage 2. The ordinary K loop handles this entry without duplicating
+its compute body. Final kernel completion still drains outstanding stores.
+
+Compare this opt-in schedule with the baseline at both default K lengths:
+
+```bash
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --csv a8w4-baseline.csv
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --cross-tile-prefetch \
+  --output-tail-reuse --csv a8w4-c-staging.csv
+```
+
+Use three buffers, four waves, partial fusion, and staged FP32 output.
+This variant cannot be combined with `--compact-k-tail`. The standalone
+flag is `--output_tail_reuse`; the Python configuration uses
+`OUTPUT_TAIL_REUSE=True` with `CROSS_TILE_PREFETCH=True`.
+
+To distinguish startup from a cost paid on every output tile, vary K and
+M/N independently. At 256 programs, square M/N sizes 4096, 8192, and 16384
+give one, four, and sixteen tiles per program. Increasing M/N at fixed K
+amortizes a one-time startup cost but retains the per-tile output work.
+Increasing K at fixed M/N amortizes the per-tile handoff and epilogue too.
+For example, apply the same option combinations to this sweep:
+
+```bash
+gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --num-programs 256 \
+  --case 4096,4096,8192 --case 8192,8192,8192 --case 16384,16384,8192 \
+  --case 8192,8192,4096 --case 8192,8192,16384 --csv a8w4-scaling.csv
+```
+
+Interleave repeated baseline and candidate runs using the same timing mode.
+Eager timing clears the cache before measured launches; switching to graph
+timing changes both launch behavior and cache conditions. For an A8W4 trace,
+pass `--kernels persistent -- --variant mx8xmx4` to the collector below;
+append the same candidate flags after `--`.
+
+To collect hardware evidence for the persistent and streamed A8W8 schedules,
+run the collector on an idle gfx1250 device in the same Python environment:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --output /tmp/mxfp-hardware-01.tar.gz
+```
+
+This compares both schedules at M=N=8192 and K=8192/4096, placing each
+baseline next to its candidate. Each case repeats the ordinary eager
+benchmark for 10 seconds of warmup and 5 seconds of measurement. Individual
+timing batches retain `bench.py`'s 256 ms budget and cache-clearing behavior.
+The power sampler polls the selected device's hwmon sensors every 100 ms.
+Sampling records watts, available clocks and temperatures, the power cap,
+utilization, and performance level, with wall-clock, monotonic, and raw
+monotonic timestamps. The manifest maps every sensor to its source and unit.
+
+ATT collection runs separately, with 1024 matching warmup launches followed
+by one traced launch. Its selected dispatch is **1025, one-based**; the
+collector checks the adjacent kernel trace against the decoded dispatch.
+Cache clearing precedes that launch, matching the eager timing path. The
+default trace selects CU 0, shader-engine mask `0x1`, and SIMD mask `0xF`;
+`--target-cu`, `--shader-engine-mask`, `--simd-select`, and `--activity`
+override these. Activity defaults to the profiler's architecture defaults.
+
+The selected ROCm installation must provide an ATT-capable `rocprofv3` and
+its matching trace decoder. Use `--profiler /path/to/rocprofv3` and
+`--decoder-dir /path/to/decoder/lib` to select them explicitly. Collection
+succeeds only after validating the raw trace, code objects, decoded UI files,
+and results database. The compiled assembly must also match between the
+timing and ATT processes.
+
+Successful collection produces one `.tar.gz` archive; `--output` accepts
+either its full name or a path with `.tar.gz` omitted. The archive contains
+`summary.csv` with timing and measured device power;
+`manifest.json` with device identity, configuration, versions, and commands;
+and a source snapshot. Each case has `power/` and `att/` directories with
+`telemetry.csv`, `telemetry.jsonl`, `telemetry_summary.json`, `workload.json`,
+logs, generated assembly, and the compiled code object. The viewer bundle is
+under `att/trace/`. Available AMD SMI snapshots retain per-domain clocks and
+throttle counters before and after each process. The collector prints the
+archive's SHA-256 digest and removes the work directory only after the
+archive is complete. `--no-package` keeps an unpacked directory instead.
+Preflight-only checks and failed collection or packaging attempts retain
+their directories for diagnosis. Existing non-empty output directories and
+archives are rejected before benchmarking.
+
+Unpack a completed capture for inspection:
+
+```bash
+tar -xzf /tmp/mxfp-hardware-01.tar.gz -C /tmp
+```
+
+Package an existing capture without accessing the GPU:
+
+```bash
+python3 third_party/tlx/tools/agents/skills/amd-att-trace/scripts/att_trace.py \
+  package /tmp/mxfp-existing-capture
+```
+
+The standalone packaging command validates the ATT bundle, creates a sibling
+`.tar.gz` archive, and retains the original directory. Use it when a capture
+was collected with `--no-package` or an older collector.
+
+Power describes the repeated benchmark workload, including its cache clears
+and host launch gaps. The summary averages the valid samples wholly inside
+the measurement phase. Sensor averaging and update periods are controlled by
+the driver; polling at 100 ms does not give per-dispatch power resolution.
+The ATT run has its own power series and timing windows. GPU limits and clocks
+are read without changing device settings. Existing GPU visibility is
+preserved; `--gpu INDEX_OR_UUID` explicitly selects a physical ROCr device.
+The sampler uses the PCI address reported by HIP to select its sensors.
+
+Before benchmarking, collection checks profiler initialization in the same
+Python environment as the workload and verifies that HIP and ROCr still load
+from the same paths. Profiler discovery prefers the installation containing
+the workload's HIP library. Explicit `--profiler` and `--decoder-dir` choices
+must be usable; they do not silently fall back to another installation.
+The `preflight/` directory retains the initialization log, loaded library
+paths, and dynamic-loader diagnostics, including when initialization aborts.
+
+For ROCm Python wheels built with TheRock, install the matching `rocm[devel]`
+package and run `python3 -m rocm_sdk init`. Discovery prefers this expanded
+SDK when its HIP library is linked to the workload's loaded HIP. The devel
+tree supplies the unversioned AQLProfile library name that ROCr may require
+and that can be absent from the core wheel.
+
+To check this setup without running the benchmarks:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --preflight-only --output /tmp/mxfp-profiler-check
+```
+
+Power sampling prefers `gpu_metrics` socket power in watts, supporting table
+versions 1.4 through 1.9. If that reading is unavailable, each sample tries hwmon
+`power1_input`, then `power1_average`. Unavailable readings remain missing.
+Every sample records `power_source` and `gpu_metrics_version`; phase summaries
+and `summary.csv` include source counts so a fallback to averaged power is
+visible. Raw sensor errors are retained even when another source succeeds.
+
+Preview the cases without accessing a GPU, select one shape, or collect
+timing and power when a decoder is unavailable:
+
+```bash
+python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py --dry-run
+
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --output /tmp/mxfp-k4096 -- --case 8192,8192,4096
+
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --no-att --output /tmp/mxfp-power --duration-seconds 10
+```
+
+Options after `--` use the benchmark's argument validation. For example,
+`--kernels persistent -- --variant mx8xmx4` profiles the A8W4 baseline.
+The streamed schedule supports A8W8. Use `--warmup-seconds`,
+`--duration-seconds`, `--warmup-dispatches`, and `--sample-ms` to adjust
+collection lengths and sampling. These diagnostic runs do not perform
+numerical correctness checks.
+
+If power validation fails, inspect the saved capture without rerunning the
+workload or accessing the device:
+
+```bash
+python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+  --inspect /tmp/mxfp-hardware-01
+```
+
+The report includes total and valid readings, power sources, sensor errors,
+read-batch durations, and counts both inside and overlapping each workload phase.
+Collection also saves `telemetry_diagnostics.json` and
+`telemetry_summary.json` before reporting insufficient power samples.
+
+Use `--first-use-prefetch` to test the model-derived operand schedule:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --first-use-prefetch --csv mxfp-first-use.csv
+```
+
+This selects persistent E4M3 x E4M3 with three BK128 buffers, four waves,
+and dedicated FP32 output staging. The C00/C10/C01/C11 compute order lets the
+final two quadrants cover the next stage's operand loads after the C10 refill.
+B1 stays in the current iteration. C01 places four LDS reads between pairs
+of WMMAs, spreading next A0/B0 reads across its matrix windows. C11 covers
+next A1 reads, and C00 covers current B1 reads.
+
+Two K iterations rotate the operand register sets, eliminating the payload
+copies needed by a single-step loop backedge. Packed 32-bit loop carries
+preserve the native FP8 layout. The last K step uses the same loop, keeping
+the even benchmark shapes at two static compute bodies. Its lookahead fills
+the next tile's LDS stages; the final prefetched register operands are unused.
+Global packing and scale packing are the same as the default kernel. Both
+default K shapes run with the usual 256 ms timing budget.
+The standalone flag is `--first_use_prefetch`; the API and `matmul`
+configuration use `FIRST_USE_PREFETCH=True`. Compare it with
+`--variant mx8xmx8` using interleaved runs on the target hardware before
+selecting a default. This is an opt-in scheduling experiment; fewer loop
+instructions or shorter matrix phases alone do not establish a complete
+dispatch speedup.
+
+Use `--output-tail-reuse` to test output staging in the retired third A/B
+input stage:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --output-tail-reuse --csv mxfp-output-reuse.csv
+```
+
+This selects persistent E4M3 x E4M3 with three BK128 buffers and four waves.
+Two next-tile input stages remain prefetched while the third A/B stage holds
+two 64x128 FP32 output panels. After the output stores complete, that stage
+is refilled before its next consumer. The output views retain the input
+ring's physical slot stride across tile boundaries. This removes the separate
+output allocation while retaining b128 stores and eight output transfers per
+tile; the tradeoff is later prefetch of the third next-tile stage.
+The standalone flag is `--output_tail_reuse`; the API and `matmul`
+configuration use `OUTPUT_TAIL_REUSE=True`. The saved benchmark defaults
+remain available without this flag.
+
+Use `--operand-pipeline` to test the four-wave operand pipeline:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline --csv mxfp-operands.csv
+```
+
+This selects nonpersistent E4M3 x E4M3, 256x256x128 tiles, four payload/scale
+buffers, and four waves. Both default K shapes run with a 256 ms timing budget.
+The kernel retains one rolling A register set, one extra 64-row A fragment,
+and two B register sets. Next-stage operands load while current-stage matrix
+instructions execute. A two-step K loop rotates the register banks without
+bulk operand copies. A and B scales share the payload ring's four-slot lifetime,
+avoiding a separate scale-reuse synchronization point. The 64x64 subtiles keep
+scales in the matrix layout; payload reads and FP32 output stores use b128.
+
+The path requires full M/N tiles and K >= 512 divisible by 256. It is available
+as an explicit experiment for hardware comparison; benchmark defaults remain
+the selected persistent configurations. To compare with the existing four-wave
+kernel at the same tile and input-ring depth:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --variant mx8xmx8 --no-persistent --cluster-size 1 --num-buffers 4 \
+  --no-output-staging --csv mxfp-baseline.csv
+```
+
+The standalone flag is `--operand_pipeline`; the Python API and `matmul`
+configuration use `OPERAND_PIPELINE=True`, with four waves, partial fusion,
+and staged output. The summary and CSV identify the kernel as `operand_pipeline`.
+
+Add `-BK 256` to transfer two native K128 steps in each batch:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --csv mxfp-paired.csv
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --l2-prefetch-distance -1 --csv mxfp-paired-no-prefetch.csv
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --operand-pipeline -BK 256 --l2-prefetch-distance 2 --csv mxfp-paired-prefetch-2.csv
+```
+
+This selects two payload/scale buffers. Partitioned input storage separates
+simultaneous read streams. The kernel reads the high K128 half early, refills
+the retired input stage, and computes two high-half rows before waiting for
+the next batch. It then reads A0 and all B fragments first, since the next
+step uses them in its first row. Scheduling groups place address preparation
+and LDS reads between independent matrix instructions. FP32 output uses
+padded storage, b128 stores, and one TDM transfer.
+
+The default cache-prefetch distance for this experiment is one input batch;
+two gives more lookahead with the same LDS capacity, and -1 disables it.
+Prefetch uses fixed descriptors and clamps the K index to the last valid
+batch, including short K and the tail. The standalone/API settings are
+`BLOCK_K=256`, `NUM_BUFFERS=2`, and `L2_PREFETCH_DISTANCE=1` (or 2/-1).
+The original operand path uses `BLOCK_K=128`, `NUM_BUFFERS=4`, and
+`L2_PREFETCH_DISTANCE=-1`. Persistent benchmark defaults remain unchanged.
+
+Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
+
+```bash
+gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --variant mx8xmx8 --register-pipeline --sched-mode-2 --csv mxfp-register.csv
+```
+
+This selects 256x256x256 tiles, two input buffers, and four waves. Each K256
+input stage supplies two K128 register stages, with upcoming operand reads
+interleaved with independent matrix work. After the refill, three quadrants
+provide 48 WMMAs per wave to cover the next operand reads. The register
+pipeline uses cluster rendezvous points to align multicast requests; local
+TDM barriers still protect the input slots. Four 256x64 FP32 output panels
+reuse the free A/B input stage while one stage of the next output tile stays
+prefetched. It requires FP8 A and B, both scales, partial TDM fusion, and
+output staging. The existing benchmark defaults remain available for paired
+hardware comparisons. `--no-cross-tile-prefetch` disables the tile prefetch
+while retaining the register pipeline and output panels.
+
+The standalone flag is `--register_pipeline`; the Python API and `matmul`
+configuration use `REGISTER_PIPELINE=True`. Specify the required BK256 and
+two buffers when using those interfaces. The summary and CSV record
+`register_pipeline`.
+
+Use `--sched-mode-2` to enable the persistent kernel's hardware WMMA queuing
+setting (`SCHED_MODE[2]`). It is disabled by default; `--no-sched-mode-2`
+selects the default behavior. The summary and CSV record `sched_mode_2`.
+For example, compare the same sweep with the setting off and on:
+
+```bash
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --no-sched-mode-2 --csv sched-off.csv
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --sched-mode-2 --csv sched-on.csv
+```
+
+The standalone tutorial accepts `--persistent --sched_mode_2`; the Python
+API and `matmul` configuration use `SCHED_MODE_2=True`.
+
+Persistent program ordering is selectable with `--xcd-remap none|balanced|chunked`,
+using `--num-xcds` (default 8) and `--xcd-chunk` (default 2). Remapping defaults
+to `none`. Balanced mode assigns each logical XCD a contiguous range; chunked
+mode groups small runs of tiles and leaves an incomplete final chunk unchanged.
+
+Use `--cluster-size 2|4|8|16` with `--xcd-remap none|chunked` to multicast
+inputs across independent workgroups. The benchmark defaults to cluster size
+16 with `--cluster-layout 4x4`; use `--cluster-size 1` to disable clustering.
+Grid layouts `RxC` (`2x2`, `4x2`, `2x4`, `4x4`, `8x2`, `2x8`) place R M tiles by
+C N tiles in a cluster of R*C workgroups and require a group-M divisible by R
+and N tiles divisible by C. XCD remapping permutes whole clusters. Data and their
+E8M0 scales use the same recipient masks. Without remapping, a cluster shares
+B and its scales across consecutive M tiles, for either `--group-m 4` or
+`--group-m 8`. With chunked remapping, a two-workgroup cluster shares B and
+its scales; a four-workgroup cluster with `--group-m 4` shares both A and B
+across a two-by-two output region, while `--group-m 8` shares B and its scales
+across four M tiles. `--no-cluster-multicast` keeps cluster synchronization
+with independent loads, for comparison.
+
+Cluster barriers are optional for AMD multicast. Only workgroups that have
+issued matching requests receive a combined load; late requests receive a
+separate load after timeout. `--cluster-barrier-interval N` aligns requests
+every N input K blocks, restarting at K=0 of each output tile. The benchmark
+default is 4; the standalone tutorial and Python API default to 1.
+Set it to 0 to remove **all** cluster barriers, including the exit
+barrier. Local workgroup synchronization and TDM completion waits still
+protect each workgroup's LDS. Positive intervals retain an exit barrier.
+
+```bash
+# Multicast with no cluster synchronization.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
+  --cluster-barrier-interval 0
+
+# Selected benchmark defaults: align requests every four input K blocks.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
+  --cluster-barrier-interval 4
+```
+
+Use interval 1 for the original per-load synchronization. Add
+`--no-cluster-multicast` at any interval to compare independent loads with
+the same synchronization cadence.
+
+```bash
+# Remapping alone, with the current per-variant tile defaults.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --cluster-size 1 --xcd-remap balanced
+
+# Multicast with the original tile ordering.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256
+
+# Same ordering and cluster synchronization, without shared loads.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 --no-cluster-multicast
+
+# Four-workgroup sharing of A/B and scales.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256
+
+# Same workgroup mapping and barriers, with multicast disabled.
+python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+  --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256 --no-cluster-multicast
+```
+
+Clustering supports no remapping, or chunked remapping with eight XCDs and
+chunk size two. Both require group-M of four or eight, full M groups,
+an even number of N tiles, both
+scales, and partial/two-way/four-way TDM fusion. The actual program count
+must be divisible by 16 and divide the output tile count, keeping all cluster
+members on the same loop boundaries. Override `--num-programs` to select
+a different count satisfying these conditions. The count includes all
+workgroups, not clusters. Both BK128's separate output staging and BK256's
+reuse of A for output are supported. Cluster barriers align requests to
+improve sharing; they are not required for multicast correctness.
+
+The summary and CSV record the remapping and cluster configuration. Standalone
+flags use underscores (`--xcd_remap`, `--num_xcds`, `--xcd_chunk`, `--cluster_size`,
+`--cluster_multicast`); Python API/config keys are `XCD_REMAP`, `NUM_XCDS`,
+`XCD_CHUNK`, `CLUSTER_SIZE`, and `CLUSTER_MULTICAST`.
+The barrier interval uses standalone flag `--cluster_barrier_interval` and
+Python API/config key `CLUSTER_BARRIER_INTERVAL`; the summary and CSV record it.
+
+Use repeatable `--variant` options to select variants. `--dtype-a float8_e5m2`
+changes activations for the selected variants. Alternatively, `--dtype-b`
+selects a single weight dtype (`float8_e4m3`, `float8_e5m2`, or `float4`) and
+cannot be combined with `--variant`. Three buffers with 256x256x256 tiles are
+supported for `mx8xmx4`; `mx8xmx8` exceeds LDS capacity with that configuration.
+
+For one dispatch per shape/variant, use `--benchmark-mode none
+--output-dir <directory>` to keep each run's artifacts in a fresh subdirectory
+whose name includes the variant. This mode leaves timing fields blank. Both
+scripts provide `--help` for configuration options.
+
+Compile checks live in `python/test/unit/language/test_tlx_codegen.py`; gfx1250
+runtime checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`.
