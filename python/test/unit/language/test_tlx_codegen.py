@@ -7833,6 +7833,46 @@ def test_gfx1250_mxgemm_wave_specialized_handoff_separates_queues(k, cluster_siz
     assert 'constraints = "=s,n"' not in ttgir
 
 
+def _gfx1250_steady_loop(asm):
+    # The innermost loop with WMMAs, a TDM refill and its tensor wait.
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if (sum("v_wmma" in inst for inst in body) >= 64 and any("tensor_load_to_lds" in inst for inst in body)
+                    and any("s_wait_tensorcnt" in inst for inst in body)):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    return min(loops, key=len)
+
+
+@pytest.mark.parametrize("buffers", [3, 4])
+def test_gfx1250_mxgemm_merged_handoff_barrier_drops_one_barrier(buffers):
+    # The merged handoff waits for the next slot before the refill and keeps a
+    # single workgroup rendezvous per static K step instead of a release and
+    # an acquire barrier. Four stages use two C slots to fit LDS.
+    def compile_variant(merged):
+        return _compile_gfx1250_mxgemm_persistent("e4m3", buffers, 128, K=8192, CLUSTER_SIZE=16, CLUSTER_LAYOUT="4x4",
+                                                  CLUSTER_BARRIER_INTERVAL=8, STATIC_SLOT_UNROLL=True,
+                                                  OVERLAP_PEEL=True, OUTPUT_C_SLOTS=3 if buffers == 3 else 2,
+                                                  MERGED_HANDOFF_BARRIER=merged)
+
+    counts = []
+    for merged in (False, True):
+        compiled = compile_variant(merged)
+        asm = compiled.asm["amdgcn"]
+        assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+        assert compiled.metadata.shared <= 320 * 1024
+        body = _gfx1250_steady_loop(asm)
+        steps = sum("v_wmma" in inst for inst in body) // 64
+        assert steps == buffers
+        counts.append(sum(bool(re.match(r"\s+s_barrier_signal -1", inst)) for inst in body))
+    assert counts[1] == counts[0] - buffers
+
+
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("k, output_c_slots", [(8192, None), (4096, None), (4096, 3), (16384, 3)])
 def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size, k, output_c_slots):
