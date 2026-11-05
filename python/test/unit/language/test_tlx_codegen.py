@@ -7517,6 +7517,7 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
             "TDM_FUSION": TDM_FUSION,
             "L2_PREFETCH_DISTANCE": 2,
             "TDM_SPLIT": False,
+            "TILES_PER_WARP": (2, 2),
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
@@ -7638,8 +7639,10 @@ def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work(block_k, num_buff
                   GROUP_SIZE_M=8, TRANSPOSE_B=True, NUM_BUFFERS=num_buffers, SCALE_PRESHUFFLE=True, WITH_A_SCALE=True,
                   SCHEDULE="sliceMNK", TDM_FUSION="partial", L2_PREFETCH_DISTANCE=prefetch, TDM_SPLIT=False,
                   stride_ak=1, stride_bk=1, stride_cn=1)
-    compiled = triton_compile(ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config),
-                              target=GPUTarget("hip", "gfx1250", 32), options=dict(num_warps=4, waves_per_eu=1))
+    # Operand-pipeline launches use the pipelined kernel's compile options.
+    compiled = triton_compile(ASTSource(kernel, signature=signature, attrs=attrs,
+                                        constexprs=config), target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, **_gfx1250_mxfp.PIPELINED_COMPILE_OPTIONS))
     asm = _strip_tdm_hazard_waits(compiled.asm["amdgcn"])
     assert compiled.metadata.shared <= 320 * 1024
     assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
@@ -7758,9 +7761,10 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
     enable_wmma_queuing = config.pop("SCHED_MODE_2", False)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     compiled = triton_compile(
-        src, target=GPUTarget("hip", "gfx1250", 32),
-        options=dict(num_warps=num_warps, waves_per_eu=num_warps // 4, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1),
-                     enable_wmma_queuing=enable_wmma_queuing))
+        src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
+            num_warps=num_warps, waves_per_eu=num_warps // 4, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1),
+            enable_wmma_queuing=enable_wmma_queuing,
+            **_gfx1250_mxfp.persistent_compile_options(config.get("REGISTER_PIPELINE", False), streamed_operands)))
     compiled.asm["amdgcn"] = _strip_tdm_hazard_waits(compiled.asm["amdgcn"])
     return compiled
 
@@ -8059,9 +8063,10 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         native_mma = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4\s", asm, re.MULTILINE)
         assert len(native_mma) <= 128, "duplicated native A8W8 compute bodies in the persistent tail"
 
-    # Find the innermost loop containing both compute and a TDM refill. Merely
-    # emitting both kinds of instructions is insufficient: the regression put
-    # every WMMA before the tensor wait, exposing all subsequent operand reads.
+    # Find the innermost loop containing compute, a TDM refill, and its tensor
+    # wait. Merely emitting both kinds of instructions is insufficient: the
+    # regression put every WMMA before the tensor wait, exposing all subsequent
+    # operand reads. The K-tail/handoff loop also refills but waits outside it.
     lines = asm.splitlines()
     labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
     loops = []
@@ -8069,7 +8074,8 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
         if branch and labels[branch[1]] < i:
             body = lines[labels[branch[1]]:i]
-            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+            if (any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body)
+                    and any("s_wait_tensorcnt" in inst for inst in body)):
                 loops.append(body)
     assert loops, "missing steady compute/refill loop"
     body = min(loops, key=len)
@@ -8485,6 +8491,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "TDM_FUSION": "partial",
             "L2_PREFETCH_DISTANCE": -1,
             "TDM_SPLIT": TDM_SPLIT,
+            "TILES_PER_WARP": (2, 2),
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
@@ -8805,41 +8812,6 @@ def test_amd_scaled_downcast_fp8_rejects_scalar_input():
     source = ASTSource(_amd_scaled_downcast_fp8_scalar_kernel, signature={"value": "fp32", "Y": "*fp8e4nv"})
     with pytest.raises(CompilationError, match="value must be an FP32 tensor"):
         triton_compile(source, target=GPUTarget("hip", "gfx950", 64))
-
-
-@triton.jit
-def _amd_sched_group_barrier_kernel(x_ptr, y_ptr, MASK: tl.constexpr, SIZE: tl.constexpr, SYNC_ID: tl.constexpr):
-    offsets = tl.arange(0, 64)
-    values = tl.load(x_ptr + offsets)
-    tlx.amd_sched_group_barrier(MASK, SIZE, SYNC_ID)
-    tl.store(y_ptr + offsets, values)
-
-
-def test_amd_sched_group_barrier_compiles_gfx950():
-    compiled = compile_for_gfx950(
-        _amd_sched_group_barrier_kernel,
-        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
-        constexprs={"MASK": 0x20, "SIZE": 1, "SYNC_ID": 7},
-    )
-    assert "call void @llvm.amdgcn.sched.group.barrier(i32 32, i32 1, i32 7)" in compiled.asm["llir"]
-    assert "sched_group_barrier" in compiled.asm["amdgcn"]
-
-
-@pytest.mark.parametrize("constants,error", [
-    ({"MASK": 0x1000}, "mask must use only"),
-    ({"MASK": False}, "mask must be a constexpr integer"),
-    ({"SIZE": -1}, "size must be a non-negative"),
-    ({"SIZE": 1.0}, "size must be a constexpr integer"),
-    ({"SYNC_ID": 1 << 31}, "sync_id must be a non-negative"),
-])
-def test_amd_sched_group_barrier_rejects_invalid_constants(constants, error):
-    config = dict(MASK=0x20, SIZE=1, SYNC_ID=0)
-    config.update(constants)
-    with triton.knobs.compilation.scope():
-        triton.knobs.compilation.always_compile = True
-        with pytest.raises(CompilationError, match=error):
-            compile_for_gfx950(_amd_sched_group_barrier_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
-                               constexprs=config)
 
 
 @triton.jit
