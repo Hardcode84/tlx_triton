@@ -2850,6 +2850,52 @@ fills the window but is slower. Four stages and two FP16 C slots use
 and the merged barrier for FP16 MX8xMX8 below K=16384. FP32 output and
 K >= 16384 keep their previous defaults.
 
+
+### Interleaved C fill in the overlapped peel (2026-11-05): neutral
+
+`INTERLEAVE_C_FILL` (opt-in, `--interleave_c_fill {1,2}`) changes only
+the `OVERLAP_PEEL` epilogue: each quadrant is converted to the C type
+before its region, so its next-tile K0 dot can reuse the accumulator
+registers while the converted chunks are staged. The C fill, its TDM store,
+and that dot then share one scheduling region.
+
+- Mode 1 alternates each chunk's eight `ds_store_b128` with eight WMMAs
+  before the fill barrier. q0 issues all remaining K0 operand reads (`nb01`,
+  `na10`), so none drain at a slot-reuse barrier.
+- Mode 2 issues each chunk as a write burst, the fill barrier, the TDM store,
+  and then eight WMMAs to cover the store before the next slot-reuse wait.
+  q0 reads the remaining operands between its two chunks, because the fill
+  barrier fences LDS reads. The next-tile refill gets its own VMEM group.
+  The VMEM-write mask (`0x40`) does not match `tensor_store_from_lds`; the
+  generic VMEM mask (`0x10`) does.
+
+The asm for both modes has the intended shape in all eight chunks: 929
+VGPRs, 321,768 B LDS, no scratch, and an unchanged steady loop (mode 2 has
+four extra `s_set_vgpr_msb`). The FFM ring-phase test passes (3/4 buffers,
+FP16/FP32, clusters 1/4).
+
+Hardware, FP16 bench default (four stages, static, merged), interleaved
+rounds, after FP32-reference checks:
+
+| Variant | 8192³ | 8192²×4096 |
+| --- | ---: | ---: |
+| Mode 1, first run | -0.08% | +2.0% |
+| Mode 1, repeat | +0.04% | +0.09% |
+| Mode 2 | +0.11% | +0.11% |
+
+The first 4096 run's baseline was 0.0778 ms; in the repeat all three
+kernels ran at 0.0802 ms. Run-to-run drift is larger than any variant
+difference, so both modes are neutral. ATT was not collected: the shared
+GPU lock stayed busy for more than 30 minutes.
+
+Rearranging work inside the C-store window does not change the transition
+time. This matches the 2026-10-24 epilogue study: the window is bound by the
+two-slot TDM store chain (slot reuse needs the store issued one chunk
+earlier to complete) and device-wide drain, not by the LDS fill or by WMMA
+placement. Further gains need more output bytes in flight, so more
+or larger C slots (no LDS left with four stages), or C stores spread
+across the next tile's K loop.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

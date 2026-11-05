@@ -2221,6 +2221,7 @@ def mxgemm_tdm_persistent_kernel(
     LDS_PARTITIONED_AB: tl.constexpr = None,
     OVERLAP_PEEL: tl.constexpr = False,
     MERGED_HANDOFF_BARRIER: tl.constexpr = False,
+    INTERLEAVE_C_FILL: tl.constexpr = 0,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
@@ -3290,6 +3291,9 @@ def mxgemm_tdm_persistent_kernel(
                                  "OVERLAP_PEEL requires dedicated 64-row C staging slots")
                 C_PARTS: tl.constexpr = 2 * ((BLOCK_N // 2) // C_COLS)
                 C_CHUNKS: tl.constexpr = 4 * C_PARTS
+                # b128 LDS writes per lane for one quadrant's chunks.
+                C_WRITES: tl.constexpr = C_PARTS * 64 * C_COLS * tlx.dtype_of(c_ptr).primitive_bitwidth // (8 * 16 *
+                                                                                                            128)
                 # Refill stage 0's slot with next-tile stage NUM_BUFFERS after
                 # its last read (end of quadrant 1) and as early as possible.
                 # TDM operations complete in order, so the refill may precede
@@ -3305,30 +3309,87 @@ def mxgemm_tdm_persistent_kernel(
                     nb00, nsb00 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
                     for q in tl.static_range(4):
                         acc = c00 if q == 0 else (c01 if q == 1 else (c10 if q == 2 else c11))
-                        _mxgemm_overlap_store(c_ptr, acc, off_m + (q // 2) * (BLOCK_M // 2),
-                                              off_n + (q % 2) * (BLOCK_N // 2), stride_cm, output_buf, C_SLOTS, q,
-                                              C_COLS, REFILL_CHUNK, LOADS, a_desc, b_desc, as_desc, bs_desc, a_buf,
-                                              b_buf, as_buf, bs_buf, next_m, next_n, n_phase, BLOCK_K, DA, DB,
-                                              NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
-                                              GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT)
-                        tlx.amd_sched_barrier()
+                        if INTERLEAVE_C_FILL:
+                            # Convert the whole quadrant first so its next-tile
+                            # WMMAs can take the accumulator registers while
+                            # the converted chunks are still being staged.
+                            acc = tlx.require_amd_wmma_layout(acc, warp_bases=((0, 2), (2, 0)),
+                                                              reg_bases=((0, 1), (1, 0)),
+                                                              instr_shape=(16, 16, 128)).to(tlx.dtype_of(c_ptr))
+                            tlx.amd_sched_barrier()
+                            # Read the remaining next-tile operands ahead of the
+                            # first fill so their LDS latency hides under q0's
+                            # WMMAs instead of behind a slot-reuse barrier.
+                            if q == 0 and INTERLEAVE_C_FILL == 1:
+                                nb01, nsb01 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 1, BLOCK_N, BLOCK_K, DB,
+                                                                   NUM_BUFFERS)
+                                na10, nsa10 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 1, 0, BLOCK_M, BLOCK_K, DA,
+                                                                   NUM_BUFFERS, WITH_A_SCALE)
+                        if q == 0 and INTERLEAVE_C_FILL == 2:
+                            # The fill barrier fences LDS reads, so read the
+                            # remaining operands after the first chunk's TDM
+                            # store, under the WMMAs that cover it.
+                            tl.static_assert(REFILL_CHUNK >= C_PARTS)
+                            _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, output_buf, 64,
+                                                     C_SLOTS, 0, C_COLS, True, PART_END=1)
+                            nb01, nsb01 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 1, BLOCK_N, BLOCK_K, DB,
+                                                               NUM_BUFFERS)
+                            na10, nsa10 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 1, 0, BLOCK_M, BLOCK_K, DA,
+                                                               NUM_BUFFERS, WITH_A_SCALE)
+                            _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, output_buf, 64,
+                                                     C_SLOTS, 0, C_COLS, True, PART_BEGIN=1)
+                        else:
+                            _mxgemm_overlap_store(c_ptr, acc, off_m + (q // 2) * (BLOCK_M // 2),
+                                                  off_n + (q % 2) * (BLOCK_N // 2), stride_cm, output_buf, C_SLOTS, q,
+                                                  C_COLS, REFILL_CHUNK, LOADS, a_desc, b_desc, as_desc, bs_desc, a_buf,
+                                                  b_buf, as_buf, bs_buf, next_m, next_n, n_phase, BLOCK_K, DA, DB,
+                                                  NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, CLUSTER_SIZE,
+                                                  CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
+                                                  CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT)
+                        if not INTERLEAVE_C_FILL:
+                            tlx.amd_sched_barrier()
                         zero = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
                         if q == 0:
                             c00 = _mxgemm_native_dot(na00, nsa00, DTYPE_A, nb00, nsb00, DTYPE_B, zero,
                                                      tiles_per_warp=[2, 2])
-                            nb01, nsb01 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 1, BLOCK_N, BLOCK_K, DB,
-                                                               NUM_BUFFERS)
+                            if not INTERLEAVE_C_FILL:
+                                nb01, nsb01 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 1, BLOCK_N, BLOCK_K, DB,
+                                                                   NUM_BUFFERS)
                         elif q == 1:
                             c01 = _mxgemm_native_dot(na00, nsa00, DTYPE_A, nb01, nsb01, DTYPE_B, zero,
                                                      tiles_per_warp=[2, 2])
-                            na10, nsa10 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 1, 0, BLOCK_M, BLOCK_K, DA,
-                                                               NUM_BUFFERS, WITH_A_SCALE)
+                            if not INTERLEAVE_C_FILL:
+                                na10, nsa10 = _mxgemm_persistent_a(a_buf, as_buf, n_phase, 1, 0, BLOCK_M, BLOCK_K, DA,
+                                                                   NUM_BUFFERS, WITH_A_SCALE)
                         elif q == 2:
                             c10 = _mxgemm_native_dot(na10, nsa10, DTYPE_A, nb00, nsb00, DTYPE_B, zero,
                                                      tiles_per_warp=[2, 2])
                         else:
                             c11 = _mxgemm_native_dot(na10, nsa10, DTYPE_A, nb01, nsb01, DTYPE_B, zero,
                                                      tiles_per_warp=[2, 2])
+                        if INTERLEAVE_C_FILL == 1:
+                            # Alternate this quadrant's C-slot LDS writes with
+                            # its 16 next-tile WMMAs, so each chunk's fill drains
+                            # under matrix work before its fill barrier.
+                            for _ in tl.static_range(16):
+                                if q == 0:
+                                    tlx.amd_sched_group_barrier(0x100, 3, 501)
+                                tlx.amd_sched_group_barrier(0x200, C_WRITES // 16, 501)
+                                tlx.amd_sched_group_barrier(0x8, 1, 501)
+                        elif INTERLEAVE_C_FILL == 2:
+                            # Issue each chunk's fill as a burst and its TDM
+                            # store as soon as the fill barrier allows, then
+                            # cover that store's latency with a share of the
+                            # quadrant's WMMAs before the next slot-reuse wait.
+                            for part in tl.static_range(C_PARTS):
+                                if q * C_PARTS + part == REFILL_CHUNK:
+                                    tlx.amd_sched_group_barrier(0x10, LOADS, 502)
+                                tlx.amd_sched_group_barrier(0x200, C_WRITES // C_PARTS, 502)
+                                tlx.amd_sched_group_barrier(0x10, 1, 502)
+                                for _ in tl.static_range(16 // C_PARTS):
+                                    tlx.amd_sched_group_barrier(0x8, 1, 502)
+                                    if q == 0 and part == 0:
+                                        tlx.amd_sched_group_barrier(0x100, 6, 502)
                         tlx.amd_sched_barrier()
                     # Acquire stage 1: stages 2..NUM_BUFFERS-1, every C chunk,
                     # and the refill are younger.
@@ -3621,6 +3682,7 @@ def mxgemm_tdm_pipelined(
         LDS_PARTITIONED_AB: int | None = None,
         OVERLAP_PEEL: bool = False,
         MERGED_HANDOFF_BARRIER: bool = False,
+        INTERLEAVE_C_FILL: int = 0,
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
@@ -3673,6 +3735,11 @@ def mxgemm_tdm_pipelined(
     chunks rather than after all of them. It requires the persistent BK128
     schedule with dedicated output staging and cross-tile prefetch, and works
     with and without ``STATIC_SLOT_UNROLL`` and with three or four buffers.
+
+    ``INTERLEAVE_C_FILL`` schedules each overlapped quadrant's C fill and TDM
+    stores in one region with its next-tile WMMAs: 1 alternates the LDS
+    writes with WMMAs; 2 issues each chunk's writes and TDM store, then
+    WMMAs. It requires ``OVERLAP_PEEL``; 0 keeps the per-quadrant order.
 
     ``PERSISTENT`` requires transposed B, preshuffled scales, unsplit descriptors,
     128/256 M, N, and K tiles, two to four buffers, and L2 prefetch disabled.
@@ -3834,6 +3901,10 @@ def mxgemm_tdm_pipelined(
                          "four warps, and dedicated output staging without other operand schedules")
     if MERGED_HANDOFF_BARRIER and not STATIC_SLOT_UNROLL:
         raise ValueError("MERGED_HANDOFF_BARRIER requires STATIC_SLOT_UNROLL")
+    if INTERLEAVE_C_FILL not in (0, 1, 2):
+        raise ValueError("INTERLEAVE_C_FILL must be 0, 1 or 2")
+    if INTERLEAVE_C_FILL and not OVERLAP_PEEL:
+        raise ValueError("INTERLEAVE_C_FILL requires OVERLAP_PEEL")
     if OVERLAP_PEEL and not (
             PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and BLOCK_K == 128 and NUM_WARPS == 4
             and K // BLOCK_K > NUM_BUFFERS and HANDOFF_SCHEDULE == "current"
@@ -4018,6 +4089,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["OVERLAP_PEEL"] = True
     if MERGED_HANDOFF_BARRIER:
         persistent_options["MERGED_HANDOFF_BARRIER"] = True
+    if INTERLEAVE_C_FILL:
+        persistent_options["INTERLEAVE_C_FILL"] = int(INTERLEAVE_C_FILL)
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -4201,7 +4274,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                            "DYNAMIC_SCALES_FIRST",
                                            True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"),
             OVERLAP_PEEL=cfg.get("OVERLAP_PEEL", False), OUT_DTYPE=cfg.get("OUT_DTYPE", "fp32"), TILES_PER_WARP=cfg.get(
-                "TILES_PER_WARP", (2, 2)), MERGED_HANDOFF_BARRIER=cfg.get("MERGED_HANDOFF_BARRIER", False))
+                "TILES_PER_WARP",
+                (2, 2)), MERGED_HANDOFF_BARRIER=cfg.get("MERGED_HANDOFF_BARRIER",
+                                                        False), INTERLEAVE_C_FILL=cfg.get("INTERLEAVE_C_FILL", 0))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -4302,6 +4377,10 @@ if __name__ == "__main__":
         "(default: 64 with --static_slot_unroll, else 0)")
     parser.add_argument("--merged_handoff_barrier", action="store_true",
                         help="one workgroup barrier per static-slot K step, with relaxed operand loads")
+    parser.add_argument(
+        "--interleave_c_fill", type=int, choices=(0, 1, 2), default=0,
+        help="overlapped C fill schedule: 1 alternates each chunk's LDS writes with next-tile WMMAs; "
+        "2 issues each chunk's writes and TDM store, then WMMAs")
     parser.add_argument("--overlap_peel", action="store_true",
                         help="run each next tile's first K step inside the A8W8 BK128 output epilogue")
     parser.add_argument("--out_dtype", choices=tuple(_OUT_DTYPES), default="fp32",
@@ -4436,6 +4515,7 @@ if __name__ == "__main__":
         LDS_PARTITIONED_AB=args.lds_partitioned_ab,
         OVERLAP_PEEL=args.overlap_peel,
         MERGED_HANDOFF_BARRIER=args.merged_handoff_barrier,
+        INTERLEAVE_C_FILL=args.interleave_c_fill,
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
