@@ -3497,6 +3497,12 @@ def _mxfp_timed_batches(batch: Callable[[], float], warmup_seconds: float, durat
 
 _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 
+# Compile options for every mxgemm_tdm_pipelined_kernel launch. gfx1250's
+# va_vdst anti-hints raise VGPR pressure; with BK256 FP8 B tiles they push the
+# kernel past the register file and into scratch spills.
+# WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) put scratch accesses in the steady K loop.
+PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False, "llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
+
 
 def mxgemm_tdm_pipelined(
     a: torch.Tensor,
@@ -3995,6 +4001,7 @@ def mxgemm_tdm_pipelined(
             TDM_SPLIT=TDM_SPLIT,
             num_warps=4,
             waves_per_eu=1,
+            **PIPELINED_COMPILE_OPTIONS,
         )
 
     if callable(BENCHMARK):
@@ -4163,6 +4170,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE", -1),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
+        **PIPELINED_COMPILE_OPTIONS,
     )
     return c
 
