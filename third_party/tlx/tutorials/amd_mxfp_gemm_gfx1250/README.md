@@ -83,6 +83,24 @@ four-stage ring used for K >= 16384 is unchanged. `bench.py` enables it for
 three-buffer MX8xMX8; the kernel and `matmul` default remains off. See
 [HANDOFF.md](HANDOFF.md).
 
+`--merged-handoff-barrier` (`MERGED_HANDOFF_BARRIER=True`, requires
+`--static-slot-unroll`) keeps one workgroup barrier per static K step instead
+of a release barrier before the TDM refill and an acquire barrier after the
+next-slot wait. Each wave waits for its next-slot input before the refill,
+the barrier then orders the slot's last reads before the refill and makes
+every wave's next-slot input visible, and the operand loads are relaxed so
+Membar adds neither barrier back. The refill now waits for the next slot and
+the slowest wave, so it needs a deep enough ring. The static loop also
+supports four buffers. With FP16 output a four-stage ring and two C slots fit
+LDS (321,768 bytes), and `bench.py` uses four stages, static slots, the
+overlap peel, and the merged barrier for FP16 MX8xMX8 below K=16384. On
+gfx1250 that is 1.6% faster at 8192 cubed and 2.2% faster at 8192^2x4096
+than the three-stage default. With three stages the merged barrier is 23%
+slower (TDM waits rise from 40 to 128 cycles per K step), and at K >= 16384
+the four-stage static loop is slower with or without it (16384 cubed +0.2 to
++0.8%, 32768 cubed +1.5 to +7.6%), so those cases keep their defaults. See
+[HANDOFF.md](HANDOFF.md).
+
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
 FP32 output staging slots (kernel default two). `bench.py` uses three for
 three-buffer MX8xMX8, which keeps more C stores in flight at each tile

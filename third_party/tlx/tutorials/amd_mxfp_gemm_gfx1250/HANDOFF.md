@@ -2795,6 +2795,61 @@ per-instruction gaps, patch, ship, hardware log):
 `/home/ibutygin/tlx/perf-data/mxfp-addr-scan-20261025.tar.gz` (SHA256
 `54bc799e1a807072497c860eb97552362181e398a6e38cb97b6fea49d56f7cf9`).
 
+### Merged handoff barrier and four-stage static ring (2026-11-05)
+
+Branch rebased on `main` `fa6bf57d99` with the `ba034c2f` AMD codegen
+(facebookexperimental PR #4734). Kernels were compiled locally through the
+JIT path (same specialization as `bench.py`) and run on the remote host from
+their code objects; all timings are interleaved rounds of `bench.py`-style
+sustained timing at the 2,500 W cap, after FP32-reference checks on the
+device. Archive of the starting profile:
+`/home/ibutygin/tlx/perf-data/mxfp-a8w8-f16-8k-profile-20261105.tar.gz`
+(SHA256 `846574128f5d8f46998282e9a17d7f79d7e968de93968b7f6f125e57083a2ab7`).
+
+Starting point, A8W8 FP16 8192³ bench default: 0.1490 ms (7,379 TFLOPS) at
+~1,747 MHz. ATT (16 SEs, one wave each): 249k cycles per wave, steady loop
+86%, 887 cycles per K128 step (median 822; floor 512): LDS reads 222
+(`ds_load` 147, `s_wait_dscnt` 86), workgroup barrier 104, TDM wait 40,
+cluster barrier 35, SALU 24. Non-steady time ~35k cycles per wave (four
+tiles). The gluon A8W8 tutorial (non-persistent, 4x4 clusters, four-stage
+ring, one split barrier per step with relaxed loads) runs its steady loop at
+680-700 cycles per K128.
+
+`MERGED_HANDOFF_BARRIER` waits for the next slot before the refill and keeps
+one workgroup barrier per static step (relaxed `local_load`s, explicit
+`tl.debug_barrier()` next to the refill so register-only WMMAs can fill its
+window; five do). Results:
+
+| Variant (FP16 out) | Shape | vs current default |
+| --- | --- | ---: |
+| Merged, three stages | 8192³ | +23.3% (+36% cycles) |
+| Four stages, dynamic slots, 2 C slots | 8192³ | +0.4% |
+| Four stages, static slots | 8192³ | -1.0% |
+| Four stages, static, merged | 8192³ | **-1.6%** (repeat -1.6%) |
+| … with grouped prefetch off (5-WMMA window) | 8192³ | +0.5% vs merged |
+| … with cluster barrier interval 16 | 8192³ | +3.6% vs merged |
+| Four stages, static, no merge, grouped prefetch off | 8192³ | +0.2% vs merged |
+| Four stages, static, merged | 8192²×4096 | **-2.2%** |
+| Four stages, static, merged | 16384³ | +0.8% |
+| Four stages, static | 16384³ | +0.2% |
+| Four stages, static, merged | 32768³ | +7.6% |
+| Four stages, static | 32768³ | +1.5% |
+
+ATT of the three-stage merged kernel: 1,076 cycles per step (TDM wait 40 ->
+128, cluster barrier 35 -> 138, workgroup barrier 104 -> 138; LDS 222 ->
+184). Waiting for the next slot before the refill makes the refill depend on
+input arrival and the slowest wave, which shortens the ring's lead; the
+fourth stage restores it at K <= 8192. At K >= 16384 (memory-latency bound)
+even four stages do not cover it. With four stages, grouped prefetch uses
+`sched_group_barrier`s, which disable LLVM's barrier-latency mutation, so the
+merged barrier has no WMMAs in its window; turning grouped prefetch off
+fills the window but is slower. Four stages and two FP16 C slots use
+321,768 bytes of LDS; FP32 C slots do not fit.
+
+`bench.py` now uses four stages, static slots, two C slots, the overlap peel,
+and the merged barrier for FP16 MX8xMX8 below K=16384. FP32 output and
+K >= 16384 keep their previous defaults.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
