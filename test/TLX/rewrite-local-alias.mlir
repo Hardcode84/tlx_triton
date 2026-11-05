@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --tlx-rewrite-local-alias %s| FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-rewrite-local-alias -verify-diagnostics %s | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -109,6 +109,47 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.th
     // CHECK: ttg.memdesc_reinterpret %[[BACKING]]
     // CHECK-SAME: -> !ttg.memdesc<1x256x16xbf16
     %1 = tlx.local_alias %0 : !ttg.memdesc<1x256x16xbf16, #plain_shared, #smem, mutable> -> !ttg.memdesc<1x256x16xbf16, #padded_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Reinterpret one retired input stage without changing the ring's physical
+// pitch. C's internal row padding need not match A's stage-to-stage spacing.
+#a = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [256, 256]}>
+#c = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [128, 128]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @indexed_padded_stage_alias
+  tt.func @indexed_padded_stage_alias(%slot: i32) {
+    // CHECK: %[[A:.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x256x256xi8
+    %a = ttg.local_alloc : () -> !ttg.memdesc<3x256x256xi8, #a, #smem, mutable>
+    // CHECK: %[[STAGE:.*]] = ttg.memdesc_index %[[A]][%arg0]
+    %stage = ttg.memdesc_index %a[%slot] : !ttg.memdesc<3x256x256xi8, #a, #smem, mutable> -> !ttg.memdesc<256x256xi8, #a, #smem, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[STAGE]] {tlx.storage_alias_view}
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf32
+    %c = tlx.local_alias %stage : !ttg.memdesc<256x256xi8, #a, #smem, mutable> -> !ttg.memdesc<1x128x128xf32, #c, #smem, mutable>
+    // A chain remains relative to the indexed stage, not the parent ring.
+    // CHECK: ttg.memdesc_reinterpret %[[STAGE]] {tlx.storage_alias_view}
+    %again = tlx.local_alias %c : !ttg.memdesc<1x128x128xf32, #c, #smem, mutable> -> !ttg.memdesc<1x128x128xf32, #c, #smem, mutable>
+    // CHECK-NOT: tlx.local_alias
+    tt.return
+  }
+}
+
+// -----
+
+// Equal logical byte counts do not permit crossing the physical stage end.
+#a = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [256, 256]}>
+#c = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [128, 128]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @indexed_stage_cannot_grow(%slot: i32) {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<3x256x256xi8, #a, #smem, mutable>
+    %stage = ttg.memdesc_index %a[%slot] : !ttg.memdesc<3x256x256xi8, #a, #smem, mutable> -> !ttg.memdesc<256x256xi8, #a, #smem, mutable>
+    // expected-error @+1 {{LocalAliasOp cannot grow an indexed buffer}}
+    %c = tlx.local_alias %stage : !ttg.memdesc<256x256xi8, #a, #smem, mutable> -> !ttg.memdesc<1x128x128xf32, #c, #smem, mutable>
     tt.return
   }
 }
