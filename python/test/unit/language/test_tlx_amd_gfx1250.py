@@ -737,7 +737,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
                                       SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
                                       WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32"):
+                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -759,18 +759,20 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         a.cuda(),
         b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
-            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
-            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
-            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
-            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
-            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
-            WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF, STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL,
-            OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL, OUT_DTYPE=OUT_DTYPE))
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
+        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
+                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
+                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
+                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+                    OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+                    STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+                    HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION,
+                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
+                    EARLY_C_STORES=EARLY_C_STORES, WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF,
+                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
+                    OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -787,6 +789,24 @@ def test_mxgemm_static_slot_unroll_ring_phase(k_iters, cluster_size):
     # unroll, and every starting slot across uneven tile assignments.
     test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 10, 13])
+@pytest.mark.parametrize("buffers", [3, 4])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("overlap_peel,out_dtype", [(False, "fp32"), (True, "fp16")])
+def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, buffers, cluster_size, overlap_peel, out_dtype):
+    # One relaxed-load rendezvous per static K step must still order each
+    # slot's reads before its refill and publish every wave's next slot,
+    # across ring wrap, tile handoffs and periodic cluster synchronization,
+    # with the three-stage ring and the four-stage ring (two C slots).
+    if k_iters < buffers or (overlap_peel and k_iters <= buffers):
+        pytest.skip("needs at least one K tile per buffer, and more for OVERLAP_PEEL")
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, True, 4, False, False, cluster_size,
+                                      False, CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3 if buffers == 3 else 2,
+                                      OVERLAP_PEEL=overlap_peel, OUT_DTYPE=out_dtype, MERGED_HANDOFF_BARRIER=True)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -1173,10 +1193,16 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
             four_stage = variant == "mx8xmx8" and shape[2] >= 16384
-            assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
+            # FP16 below K=16384 uses a four-stage static-slot ring with two C
+            # slots, the overlap peel, and one merged handoff barrier per step.
+            merged = variant == "mx8xmx8" and shape[2] < 16384 and args.out_dtype == "fp16"
+            assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage or merged else "3")
             assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
-            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and shape[2] == 8192)
+            if merged:
+                assert cmd[cmd.index("--output_c_slots") + 1] == "2"
+            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and (shape[2] == 8192 or merged))
             assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
+            assert ("--merged_handoff_barrier" in cmd) == merged
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
     _, _, variants = bench.parse_benchmark_args(["--dry-run", "--out-dtype", "fp16"])
     assert [args.out_dtype for _, _, args in variants] == ["fp16", "fp16"]
