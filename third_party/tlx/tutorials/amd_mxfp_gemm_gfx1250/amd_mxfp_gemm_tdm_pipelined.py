@@ -785,36 +785,37 @@ def _mxgemm_load_b_operand_split(
 
 @triton.jit
 def mxgemm_tdm_pipelined_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    a_scale,
-    b_scale,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_scale,
-    DTYPE_A: tl.constexpr,
-    DTYPE_B: tl.constexpr,
-    SCALE_BLOCK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    TRANSPOSE_B: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
-    SCALE_PRESHUFFLE: tl.constexpr = True,
-    WITH_A_SCALE: tl.constexpr = True,
-    SCHEDULE: tl.constexpr = "baseline",
-    TDM_FUSION: tl.constexpr = "none",
-    L2_PREFETCH_DISTANCE: tl.constexpr = -1,
-    TDM_SPLIT: tl.constexpr = False,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        a_scale,
+        b_scale,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_scale,
+        DTYPE_A: tl.constexpr,
+        DTYPE_B: tl.constexpr,
+        SCALE_BLOCK: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+        TRANSPOSE_B: tl.constexpr,
+        NUM_BUFFERS: tl.constexpr,
+        SCALE_PRESHUFFLE: tl.constexpr = True,
+        WITH_A_SCALE: tl.constexpr = True,
+        SCHEDULE: tl.constexpr = "baseline",
+        TDM_FUSION: tl.constexpr = "none",
+        L2_PREFETCH_DISTANCE: tl.constexpr = -1,
+        TDM_SPLIT: tl.constexpr = False,
+        TILES_PER_WARP: tl.constexpr = (2, 2),
 ):
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
@@ -1130,7 +1131,7 @@ def mxgemm_tdm_pipelined_kernel(
                 # Make the short stage's refill predicate available before its math.
                 pred_load = i + 1 - epilogue_lb
                 pred_load = (pred_load >> 31) & 1
-            c00 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b00, scale_b00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+            c00 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b00, scale_b00, DTYPE_B, c00, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 b01, scale_b01 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 0, 1, BLOCK_N,
                                                               BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1153,7 +1154,7 @@ def mxgemm_tdm_pipelined_kernel(
                 _mxgemm_issue_l2_prefetches(a_desc, b_desc, a_scale_desc, b_scale_desc, load_idx, always,
                                             L2_PREFETCH_DISTANCE, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
                                             BLOCK_K_SCALE_PRESHUFFLED, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c01 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b01, scale_b01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+            c01 = tlx.dot_scaled(a00, scale_a00, DTYPE_A, b01, scale_b01, DTYPE_B, c01, tiles_per_warp=TILES_PER_WARP)
             if TDM_SPLIT:
                 a10, scale_a10 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 0, BLOCK_M,
                                                               BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1165,7 +1166,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                         DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
                                                         SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
                                                         SCALE_PRESHUFFLE, WITH_A_SCALE)
-            c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+            c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=TILES_PER_WARP)
             if NUM_SUBTILES_K == 2:
                 if TDM_SPLIT:
                     b10, scale_b10 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N,
@@ -1179,7 +1180,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                             BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
                                                             NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                             SCALE_PRESHUFFLE)
-            c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+            c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=TILES_PER_WARP)
             if NUM_SUBTILES_K == 2:
                 if TDM_SPLIT:
                     a01, scale_a01 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M,
@@ -1193,7 +1194,8 @@ def mxgemm_tdm_pipelined_kernel(
                                                             BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
                                                             NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
                                                             WITH_A_SCALE)
-                c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+                c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00,
+                                     tiles_per_warp=TILES_PER_WARP)
                 if TDM_SPLIT:
                     b11, scale_b11 = _mxgemm_load_b_operand_split(b0_buf, b1_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N,
                                                                   BLOCK_K, DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1206,7 +1208,8 @@ def mxgemm_tdm_pipelined_kernel(
                                                             BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
                                                             NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                             SCALE_PRESHUFFLE)
-                c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+                c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01,
+                                     tiles_per_warp=TILES_PER_WARP)
                 if TDM_SPLIT:
                     a11, scale_a11 = _mxgemm_load_a_operand_split(a0_buf, a1_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M,
                                                                   BLOCK_K, DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
@@ -1221,8 +1224,10 @@ def mxgemm_tdm_pipelined_kernel(
                                                             WITH_A_SCALE)
             wmma_idx += 1
             if NUM_SUBTILES_K == 2:
-                c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10, tiles_per_warp=[2, 2])
-                c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10,
+                                     tiles_per_warp=TILES_PER_WARP)
+                c11 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b11, scale_b11, DTYPE_B, c11,
+                                     tiles_per_warp=TILES_PER_WARP)
                 pred_load = i + 1 - epilogue_lb
                 pred_load = (pred_load >> 31) & 1
             if TDM_SPLIT:
@@ -1298,8 +1303,8 @@ def mxgemm_tdm_pipelined_kernel(
                                                       DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
                                                       TRANSPOSE_B, SCALE_PRESHUFFLE)
-                c0 = tlx.dot_scaled(a, scale_a, DTYPE_A, b0, scale_b0, DTYPE_B, c0, tiles_per_warp=[2, 2])
-                c1 = tlx.dot_scaled(a, scale_a, DTYPE_A, b1, scale_b1, DTYPE_B, c1, tiles_per_warp=[2, 2])
+                c0 = tlx.dot_scaled(a, scale_a, DTYPE_A, b0, scale_b0, DTYPE_B, c0, tiles_per_warp=TILES_PER_WARP)
+                c1 = tlx.dot_scaled(a, scale_a, DTYPE_A, b1, scale_b1, DTYPE_B, c1, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
         acc = tl.join(c0, c1).permute(0, 2, 1).reshape((BLOCK_M, BLOCK_N))
         acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
@@ -1331,7 +1336,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                     SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
                                                     NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                     SCALE_PRESHUFFLE)
-                acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=[2, 2])
+                acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
         acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
                                           instr_shape=STORE_INSTR_SHAPE)
@@ -3495,6 +3500,17 @@ def _mxfp_timed_batches(batch: Callable[[], float], warmup_seconds: float, durat
     return statistics.median(samples), len(samples)
 
 
+def _validate_tiles_per_warp(tiles_per_warp):
+    tiles_per_warp = tuple(tiles_per_warp)
+    if len(tiles_per_warp) != 2:
+        raise ValueError("TILES_PER_WARP requires two entries")
+    if any(not isinstance(tile, int) or isinstance(tile, bool) or tile <= 0 for tile in tiles_per_warp):
+        raise ValueError("TILES_PER_WARP entries must be positive integers")
+    if any(tile & (tile - 1) for tile in tiles_per_warp):
+        raise ValueError("TILES_PER_WARP entries must be powers of two")
+    return tiles_per_warp
+
+
 _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 
 # Compile options for every mxgemm_tdm_pipelined_kernel launch. gfx1250's
@@ -3504,64 +3520,77 @@ _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False, "llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
 
 
+def persistent_compile_options(register_pipeline: bool = False, streamed_operands: bool = False) -> dict:
+    """Compile options for a persistent launch.
+
+    WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make the
+    register-pipelined and streamed-operand kernels spill in the steady K loop.
+    The default schedules keep the hints.
+    """
+    if register_pipeline or streamed_operands:
+        return {"llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
+    return {}
+
+
 def mxgemm_tdm_pipelined(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    BLOCK_M: int = 128,
-    BLOCK_N: int = 128,
-    BLOCK_K: int = 128,
-    TRANSPOSE_B: bool = False,
-    NUM_BUFFERS: int = 2,
-    DTYPE_A: str = "e5m2",
-    DTYPE_B: str = "e5m2",
-    SCALE_PRESHUFFLE: bool = True,
-    WITH_A_SCALE: bool = True,
-    SCHEDULE: str = "baseline",
-    L2_PREFETCH_DISTANCE: int = -1,
-    M: int | None = None,
-    N: int | None = None,
-    K: int | None = None,
-    TDM_FUSION: str = "none",
-    TDM_SPLIT: bool = False,
-    GROUP_SIZE_M: int = 8,
-    BENCHMARK: str | Callable | None = None,
-    BENCHMARK_NUM_ITERS: int = 32,
-    BENCHMARK_WARMUP_SECONDS: float = 0.0,
-    BENCHMARK_DURATION_SECONDS: float = 0.0,
-    PERSISTENT: bool = False,
-    NUM_PROGRAMS: int | None = None,
-    CROSS_TILE_PREFETCH: bool = True,
-    OUTPUT_STAGING: bool = False,
-    SCHED_MODE_2: bool = False,
-    XCD_REMAP: str = "none",
-    NUM_XCDS: int = 8,
-    XCD_CHUNK: int = 2,
-    CLUSTER_SIZE: int = 1,
-    CLUSTER_MULTICAST: bool = True,
-    CLUSTER_BARRIER_INTERVAL: int = 1,
-    NUM_WARPS: int = 4,
-    REGISTER_PIPELINE: bool = False,
-    WARP_PIPELINE: bool = False,
-    OPERAND_PIPELINE: bool = False,
-    OUTPUT_TAIL_REUSE: bool = False,
-    FIRST_USE_PREFETCH: bool = False,
-    STREAMED_OPERANDS: bool = False,
-    ASYNC_OUTPUT: bool = False,
-    COMPACT_K_TAIL: bool = False,
-    HANDOFF_SCHEDULE: str = "current",
-    HANDOFF_TDM_FUSION: str = "partial",
-    CLUSTER_LAYOUT: str = "linear",
-    SPLIT_CLUSTER_BARRIER: bool = False,
-    EARLY_C_STORES: bool = False,
-    WAVE_SPECIALIZED_HANDOFF: bool = False,
-    STATIC_SLOT_UNROLL: bool = False,
-    OUTPUT_C_SLOTS: int | None = None,
-    DYNAMIC_SCALES_FIRST: bool = True,
-    LDS_PARTITIONED_AB: int | None = None,
-    OVERLAP_PEEL: bool = False,
-    OUT_DTYPE: str = "fp32",
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        BLOCK_M: int = 128,
+        BLOCK_N: int = 128,
+        BLOCK_K: int = 128,
+        TRANSPOSE_B: bool = False,
+        NUM_BUFFERS: int = 2,
+        DTYPE_A: str = "e5m2",
+        DTYPE_B: str = "e5m2",
+        SCALE_PRESHUFFLE: bool = True,
+        WITH_A_SCALE: bool = True,
+        SCHEDULE: str = "baseline",
+        L2_PREFETCH_DISTANCE: int = -1,
+        M: int | None = None,
+        N: int | None = None,
+        K: int | None = None,
+        TDM_FUSION: str = "none",
+        TDM_SPLIT: bool = False,
+        GROUP_SIZE_M: int = 8,
+        BENCHMARK: str | Callable | None = None,
+        BENCHMARK_NUM_ITERS: int = 32,
+        BENCHMARK_WARMUP_SECONDS: float = 0.0,
+        BENCHMARK_DURATION_SECONDS: float = 0.0,
+        PERSISTENT: bool = False,
+        NUM_PROGRAMS: int | None = None,
+        CROSS_TILE_PREFETCH: bool = True,
+        OUTPUT_STAGING: bool = False,
+        SCHED_MODE_2: bool = False,
+        XCD_REMAP: str = "none",
+        NUM_XCDS: int = 8,
+        XCD_CHUNK: int = 2,
+        CLUSTER_SIZE: int = 1,
+        CLUSTER_MULTICAST: bool = True,
+        CLUSTER_BARRIER_INTERVAL: int = 1,
+        NUM_WARPS: int = 4,
+        REGISTER_PIPELINE: bool = False,
+        WARP_PIPELINE: bool = False,
+        OPERAND_PIPELINE: bool = False,
+        OUTPUT_TAIL_REUSE: bool = False,
+        FIRST_USE_PREFETCH: bool = False,
+        STREAMED_OPERANDS: bool = False,
+        ASYNC_OUTPUT: bool = False,
+        COMPACT_K_TAIL: bool = False,
+        HANDOFF_SCHEDULE: str = "current",
+        HANDOFF_TDM_FUSION: str = "partial",
+        CLUSTER_LAYOUT: str = "linear",
+        SPLIT_CLUSTER_BARRIER: bool = False,
+        EARLY_C_STORES: bool = False,
+        WAVE_SPECIALIZED_HANDOFF: bool = False,
+        STATIC_SLOT_UNROLL: bool = False,
+        OUTPUT_C_SLOTS: int | None = None,
+        DYNAMIC_SCALES_FIRST: bool = True,
+        LDS_PARTITIONED_AB: int | None = None,
+        OVERLAP_PEEL: bool = False,
+        OUT_DTYPE: str = "fp32",
+        TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with persistent full-tile sliceMNK scheduling.
 
@@ -3910,6 +3939,9 @@ def mxgemm_tdm_pipelined(
                 raise ValueError("BK256 output staging requires 2 buffers, or 3 buffers with FP4 B")
         else:
             raise ValueError("output staging requires BK128 or BK256")
+    TILES_PER_WARP = _validate_tiles_per_warp(TILES_PER_WARP)
+    if (PERSISTENT or OPERAND_PIPELINE or WARP_PIPELINE) and TILES_PER_WARP != (2, 2):
+        raise ValueError("TILES_PER_WARP applies only to the non-persistent pipelined kernel")
     if PERSISTENT:
         assert K == a.shape[1] * (2 if DTYPE_A == "e2m1" else 1)
         NUM_PROGRAMS = _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
@@ -3966,7 +3998,8 @@ def mxgemm_tdm_pipelined(
                 FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
-                ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=SCHED_MODE_2, **persistent_options)
+                ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=SCHED_MODE_2, **persistent_options,
+                **persistent_compile_options(REGISTER_PIPELINE, STREAMED_OPERANDS))
         kernel = mxgemm_tdm_operand_pipeline_kernel if OPERAND_PIPELINE else mxgemm_tdm_pipelined_kernel
         return kernel[grid](
             a,
@@ -4001,6 +4034,7 @@ def mxgemm_tdm_pipelined(
             TDM_SPLIT=TDM_SPLIT,
             num_warps=4,
             waves_per_eu=1,
+            **({} if OPERAND_PIPELINE else {"TILES_PER_WARP": TILES_PER_WARP}),
             **PIPELINED_COMPILE_OPTIONS,
         )
 
@@ -4031,6 +4065,7 @@ _DEFAULT_CONFIG = {
     "TRANSPOSE_B": False,
     "num_warps": 4,
     "waves_per_eu": 1,
+    "TILES_PER_WARP": (2, 2),
 }
 
 
@@ -4123,13 +4158,15 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(
                     "FIRST_USE_PREFETCH",
-                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS", False), ASYNC_OUTPUT=cfg.get(
-                        "ASYNC_OUTPUT",
-                        False), STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
-                                                           False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"),
-            DYNAMIC_SCALES_FIRST=cfg.get("DYNAMIC_SCALES_FIRST",
-                                         True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"), OVERLAP_PEEL=cfg.get(
-                                             "OVERLAP_PEEL", False), OUT_DTYPE=cfg.get("OUT_DTYPE", "fp32"))
+                    False), STREAMED_OPERANDS=cfg.get("STREAMED_OPERANDS",
+                                                      False), ASYNC_OUTPUT=cfg.get("ASYNC_OUTPUT", False),
+            STATIC_SLOT_UNROLL=cfg.get("STATIC_SLOT_UNROLL",
+                                       False), OUTPUT_C_SLOTS=cfg.get("OUTPUT_C_SLOTS"), DYNAMIC_SCALES_FIRST=cfg.get(
+                                           "DYNAMIC_SCALES_FIRST",
+                                           True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"),
+            OVERLAP_PEEL=cfg.get("OVERLAP_PEEL",
+                                 False), OUT_DTYPE=cfg.get("OUT_DTYPE",
+                                                           "fp32"), TILES_PER_WARP=cfg.get("TILES_PER_WARP", (2, 2)))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -4168,6 +4205,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
         TDM_FUSION=cfg.get("TDM_FUSION", "none"),
         TDM_SPLIT=cfg.get("TDM_SPLIT", False),
         L2_PREFETCH_DISTANCE=cfg.get("L2_PREFETCH_DISTANCE", -1),
+        TILES_PER_WARP=_validate_tiles_per_warp(cfg.get("TILES_PER_WARP", (2, 2))),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
         **PIPELINED_COMPILE_OPTIONS,
@@ -4262,6 +4300,8 @@ if __name__ == "__main__":
                         help="repeat timing batches for this long before measuring")
     parser.add_argument("--benchmark_duration_seconds", type=float, default=0.0,
                         help="report the median timing batch over this period (0: one batch)")
+    parser.add_argument("--tiles_per_warp", nargs=2, type=int, choices=(1, 2), default=(2, 2), metavar=("M", "N"),
+                        help="WMMA tiles per warp in M and N for the non-persistent kernel (default: 2 2)")
     parser.add_argument("--benchmark_num_iters", type=int, default=32,
                         help="timing repetition budget in milliseconds (not an iteration count)")
     parser.add_argument("--seed", type=int, default=0)
@@ -4361,4 +4401,5 @@ if __name__ == "__main__":
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
+        TILES_PER_WARP=tuple(args.tiles_per_warp),
     )

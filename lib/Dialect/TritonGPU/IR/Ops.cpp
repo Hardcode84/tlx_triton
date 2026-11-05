@@ -1531,7 +1531,13 @@ LogicalResult MemDescIndexOp::verify() {
   auto layoutAllocShape =
       dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
   bool hasPow2AllocView = isNpotPow2AllocView(srcTy);
-  if (layoutAllocShape != layoutShape && !hasPow2AllocView) {
+  // Indexing the buffer dimension of a shared ring may select a stage of a
+  // subsliced ring. The stage keeps the ring's per-stage allocation shape so
+  // that the index advances by the full (padded) stage stride.
+  bool indexesSharedRing = isa<SharedEncodingTrait>(srcTy.getEncoding()) &&
+                           layoutShape.size() + 1 == srcTy.getRank();
+  if (layoutAllocShape != layoutShape && !hasPow2AllocView &&
+      !indexesSharedRing) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1546,8 +1552,9 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  if (dstTy.getAllocShape() !=
-      (hasPow2AllocView ? layoutAllocShape : dstTy.getShape())) {
+  if (dstTy.getAllocShape() != (hasPow2AllocView || indexesSharedRing
+                                    ? layoutAllocShape
+                                    : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 
