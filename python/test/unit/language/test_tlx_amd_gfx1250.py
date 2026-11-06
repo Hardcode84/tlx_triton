@@ -812,13 +812,13 @@ def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, buffers, cluster_size
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("k_iters", [5, 6, 7, 9, 13])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("mode", [1, 2, 3, 4])
+@pytest.mark.parametrize("mode", [1, 3, 4])
 def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode):
     # The merged four-stage refill overlaps C10 (mode 1) or follows a split
-    # rendezvous that brackets C10 (inline asm in mode 2; an LLVM IR rewrite of
-    # two ordinary barriers in mode 3) or C01 (mode 4, which reads both second
-    # halves during C00 and the next slot across C10 and C11). Cover ring wrap, short steady
-    # loops, tile handoffs, and multicast clusters.
+    # workgroup barrier (tlx.named_barrier_arrive / named_barrier_wait) that
+    # brackets C10 (mode 3) or C01 (mode 4, which reads both second halves
+    # during C00 and the next slot across C10 and C11). Cover ring wrap, short
+    # steady loops, tile handoffs, and multicast clusters.
     test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
                                       OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, OUT_DTYPE="fp16",

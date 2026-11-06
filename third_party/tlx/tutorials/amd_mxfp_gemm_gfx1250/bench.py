@@ -490,7 +490,7 @@ def parse_benchmark_args(argv=None):
         help="one workgroup barrier per static-slot K step with relaxed operand loads "
         f"(default: four-stage FP16 MX8xMX8 below K={FOUR_BUFFER_MIN_K}; requires --static-slot-unroll)")
     parser.add_argument(
-        "--refill-overlap", type=int, choices=(0, 1, 2, 3, 4), default=None,
+        "--refill-overlap", type=int, choices=(0, 1, 3, 4), default=None,
         help="merged four-stage step schedule: 4 splits the handoff barrier around the C01 WMMAs and refills "
         "across C10/C11; 0 keeps one plain merged barrier (default: 4 where the merged barrier is the default)")
     parser.add_argument(

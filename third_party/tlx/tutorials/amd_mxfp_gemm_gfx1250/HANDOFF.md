@@ -3098,7 +3098,8 @@ wait pass, not the kernel.
 
 **Refill overlap (`REFILL_OVERLAP`, `--refill_overlap`).** Mode 1
 interleaves the refill's descriptor SALU and TDM issue with the first C10
-WMMAs (sched groups). Mode 2 splits the step barrier with inline asm
+WMMAs (sched groups). Mode 2 (removed; superseded by modes 3 and 4) split
+the step barrier with inline asm
 (`s_wait_tensorcnt 4; s_wait_dscnt 0; s_barrier_signal -1`, C10 WMMAs,
 `s_barrier_wait -1`) and overlaps the refill and both next-slot reads with
 C11. Membar does not recognize the asm as a barrier: an explicit
@@ -3159,8 +3160,23 @@ every 32 K steps. The v14 tutorial gets its split from two ordinary
 barriers that an LLVM-IR stage hook rewrites into `s_barrier_signal` /
 `s_barrier_wait`, so Membar and alias analysis still see full barriers.
 
-`REFILL_OVERLAP` modes 3 and 4 use that IR rewrite
-(`_mxgemm_install_split_lowering`, active only when requested):
+`REFILL_OVERLAP` modes 3 and 4 first used that IR rewrite. They now use
+explicit split-barrier ops (2026-11-06): on AMD,
+`tlx.named_barrier_arrive(0, num_warps * 32)` /
+`tlx.named_barrier_wait(0, ...)` build `amdg.workgroup_barrier_signal` /
+`amdg.workgroup_barrier_wait`, which lower to a workgroup release fence plus
+`s_barrier_signal -1` and `s_barrier_wait -1` plus an acquire fence (the
+same LDS-only MMRA tag as `ttg.barrier local`). The verifier requires the
+wait in the same block with no shared-memory access, region op, or other
+barrier in between. AMD Membar (`AMDMembarAnalysis`) treats both halves as
+workgroup barriers, and the generic "later sync point" scan after an async
+wait now uses the analysis's virtual `getBarrierStages`, so the TDM wait
+right before the signal defers to it instead of getting its own barrier
+(the mode 2 failure). Membar aborts if it would need a barrier inside the
+window. Mode 2 and the IR hook are removed. Mode 4 asm against the hook
+build (8k and 4k): same instruction inventory and steady-loop order, minus
+the hook's marker `s_mov` per step; one step issues the wait three SALU
+address ops earlier.
 
 - Mode 3: TDM wait, barrier (signal), the 16 C10 WMMAs, barrier (wait),
   then the refill and both next-slot reads across C11 (16 WMMAs).
