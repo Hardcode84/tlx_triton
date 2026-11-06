@@ -56,8 +56,10 @@ slots, the overlap peel, and one merged handoff barrier per K step
 (--merged-handoff-barrier; 1.6-2.2% faster on gfx1250), split around the C01
 WMMAs with the refill and next-slot reads across C10/C11 (--refill-overlap 4;
 a further 1.3-2.2%). At K=16384 it also L2-prefetches the input stage four
-steps past the refill (--l2-lookahead 4; 1.3%). FP16 at K=32768 keeps the
-dynamic four-stage ring.
+steps past the refill (--l2-lookahead 4; 1.3%). That loop tests the cluster
+rendezvous only in the one unrolled step of four that can hit it
+(--static-cluster-steps; 0.4-0.7%). FP16 at K=32768 keeps the dynamic
+four-stage ring.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -198,6 +200,9 @@ MERGED_FP16_MAX_K = 16384
 # share (16384^3 -1.3%; 8192^3 +2%).
 SPLIT_L2_LOOKAHEAD_MIN_K = 16384
 SPLIT_L2_LOOKAHEAD = 4
+# In that four-stage static loop only one of the four unrolled steps can hit
+# the every-eight-steps cluster rendezvous; the others drop the run-time test
+# (static cluster steps: 8192^3 -0.7%, 16384^3 -0.4% on gfx1250).
 
 
 def _supports_static_slot_unroll(args, dtype_b):
@@ -293,6 +298,8 @@ def _case_args(args, case):
             resolved.overlap_peel = True
         if (resolved.l2_lookahead is None and resolved.refill_overlap == 4 and case[2] >= SPLIT_L2_LOOKAHEAD_MIN_K):
             resolved.l2_lookahead = SPLIT_L2_LOOKAHEAD
+        if resolved.static_cluster_steps is None:
+            resolved.static_cluster_steps = True
         return resolved
     if case[2] >= FOUR_BUFFER_MIN_K:
         resolved = argparse.Namespace(**vars(args))
@@ -392,6 +399,8 @@ def _command(args, case, dtype_b):
         command.extend(["--refill_overlap", str(args.refill_overlap)])
     if args.l2_lookahead:
         command.extend(["--l2_lookahead", str(args.l2_lookahead), "--l2_lookahead_split"])
+    if args.static_cluster_steps:
+        command.append("--static_cluster_steps")
     if args.out_dtype != "fp32":
         command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
@@ -507,6 +516,10 @@ def parse_benchmark_args(argv=None):
         "--refill-overlap", type=int, choices=(0, 1, 3, 4), default=None,
         help="merged four-stage step schedule: 4 splits the handoff barrier around the C01 WMMAs and refills "
         "across C10/C11; 0 keeps one plain merged barrier (default: 4 where the merged barrier is the default)")
+    parser.add_argument(
+        "--static-cluster-steps", action=argparse.BooleanOptionalAction, default=None,
+        help="static-slot loop: test the cluster rendezvous only in unrolled steps that can hit it "
+        "(default: on for the four-stage FP16 static loop; requires --static-slot-unroll)")
     parser.add_argument(
         "--l2-lookahead", type=int, default=None,
         help="refill overlap mode 4: branch-free L2 prefetch of the input stage this many steps past the TDM "
@@ -680,6 +693,8 @@ def parse_benchmark_args(argv=None):
             parser.error("--merged-handoff-barrier requires --static-slot-unroll")
         if run_args.refill_overlap and not (run_args.merged_handoff_barrier and run_args.num_buffers == 4):
             parser.error("--refill-overlap requires --merged-handoff-barrier with four buffers")
+        if run_args.static_cluster_steps and not run_args.static_slot_unroll:
+            parser.error("--static-cluster-steps requires --static-slot-unroll")
         if run_args.l2_lookahead and not (run_args.refill_overlap == 4 and run_args.cluster_size > 1
                                           and run_args.cluster_layout in ("2x2", "4x4")):
             parser.error("--l2-lookahead requires --refill-overlap 4 with a 2x2 or 4x4 cluster")
@@ -861,9 +876,10 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
-            output_c_slots=run_args.output_c_slots or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier),
-            refill_overlap=run_args.refill_overlap or 0, l2_lookahead=run_args.l2_lookahead or 0,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
+                                                                     dtype_b), output_c_slots=run_args.output_c_slots
+            or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier), refill_overlap=run_args.refill_overlap
+            or 0, l2_lookahead=run_args.l2_lookahead or 0, static_cluster_steps=bool(run_args.static_cluster_steps),
             dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
@@ -903,6 +919,7 @@ def main():
             f"overlap_peel={'auto' if run_args.overlap_peel is None else run_args.overlap_peel}, "
             f"refill_overlap={'auto' if run_args.refill_overlap is None else run_args.refill_overlap}, "
             f"l2_lookahead={'auto' if run_args.l2_lookahead is None else run_args.l2_lookahead}, "
+            f"static_cluster_steps={'auto' if run_args.static_cluster_steps is None else run_args.static_cluster_steps}, "
             f"output_c_slots={run_args.output_c_slots or 2}, "
             f"out_dtype={run_args.out_dtype}, "
             f"dynamic_scales_first={run_args.dynamic_scales_first}, "

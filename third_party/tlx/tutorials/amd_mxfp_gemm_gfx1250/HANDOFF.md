@@ -3277,6 +3277,28 @@ policy on the fused/unfused TDM load ops. Archive:
 `/home/ibutygin/tlx/perf-data/mxfp-cache-hints-20261106.tar.gz` (SHA256
 `b2f25825ca74a94a5940aad3f80c074b6193a31a8b9046b5da1728fd325df04e`).
 
+### Static cluster steps on the mode 4 loop (2026-11-06): adopted for FP16
+
+`STATIC_CLUSTER_STEPS` was neutral on the merged four-stage loop before
+refill overlap mode 4 (see "Scalar and vector work"). On the current FP16
+default it removes 19 SALU and 13 sync/branch instructions per four-step
+iteration (967 -> 949 instructions, +13 `s_set_vgpr_msb`, VGPRs 908 -> 929,
+SGPR spills unchanged). Device, `bench.py` default commands, four
+alternating rounds (TFLOPS change per round):
+
+| Case | Paired change | Mean |
+| --- | --- | ---: |
+| 8192³ FP16 | +0.79, +0.62, +0.76, +0.76% | +0.73% |
+| 16384³ FP16 | +0.55, +0.25, +0.41, +0.39% | +0.40% |
+| 8192²x4096 FP16 | +0.26, -1.47, +1.71, +2.36% | +0.71% (noisy) |
+| 8192³ FP32 (three stages, identical code) | +0.03, -1.82, +0.13, +0.31% | -0.34% (noise) |
+
+With three stages every unrolled step can hit the rendezvous (gcd(3, 8) = 1),
+so the option changes nothing there. `bench.py` now enables it
+(`--static-cluster-steps`) wherever it picks the four-stage FP16 static
+loop. The FFM refill-overlap test covers mode 4 with it, with and without
+the L2 lookahead.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
