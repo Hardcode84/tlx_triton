@@ -3299,6 +3299,36 @@ so the option changes nothing there. `bench.py` now enables it
 loop. The FFM refill-overlap test covers mode 4 with it, with and without
 the L2 lookahead.
 
+### Late L2 prefetch before the step barriers (2026-11-06): slower
+
+Idea: prefetch the lines of the stage the step's refill loads (distance 0)
+just before the barriers that precede it, so L2 starts fetching while the
+waves wait (mode 4 sequence: TDM wait, signal, 16 C01 WMMAs, wait, every
+eighth step `cluster_barrier()`, refill). Temporary `LATE_L2_PREFETCH`,
+branch-free split prefetch (each cluster CTA covers its share of the rows):
+1 = every step before the TDM wait and signal; 2 = rendezvous steps only,
+before the signal, both stages of the 256-byte line pair; 3 = rendezvous
+steps only, after the split wait, right before the cluster barrier. With
+static cluster steps only one unrolled step of four carries 2 or 3 (loop
++29, +31, +3 instructions per iteration). Device, `bench.py` FP16
+defaults, four alternating rounds, mean change against no late prefetch:
+
+| Case | 1 every step | 2 rendezvous, before signal | 3 rendezvous, before cluster barrier |
+| --- | ---: | ---: | ---: |
+| 8192²x4096 | -3.9% | -1.8% | -0.7% |
+| 8192³ | -3.4% | -1.3% | -1.1% |
+| 16384³ (with lookahead 4) | -15.1% | -1.8% | -8.4% |
+| 16384³ without lookahead | | -0.8% vs no lookahead (-2.9% vs default) | |
+
+Every placement loses, even issued once per eight steps. The refill already
+has about three steps of slack in the four-stage ring, so an earlier start
+cannot shorten an exposed wait; the extra requests (and the helper's
+`depctr_vm_vsrc` wait) only add L2/TA traffic next to the TDM refill and
+delay the rendezvous. Stacked on the lookahead stream at 16384³ they cost
+up to 15%. Archive (patch, logs, asm):
+`/home/ibutygin/tlx/perf-data/mxfp-late-l2-20261106.tar.gz` (SHA256
+`f52bcddb5f3b7979d4559ad11d0789260af294307e08ef713e19e44c3f21a304`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
