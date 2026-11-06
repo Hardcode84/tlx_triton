@@ -114,7 +114,11 @@ four-stage ring, and `--l2-lookahead 4` (`L2_LOOKAHEAD=4` with
 `L2_LOOKAHEAD_SPLIT`) adds another 1.3%: each step L2-prefetches the input
 stage four steps past the refill, branch-free, with every cluster CTA
 covering its share of the shared A and B rows. `bench.py` enables it from
-K=16384; it is 2% slower at 8192 cubed. Modes 1 and 3 are experimental schedule variants (see
+K=16384; it is 2% slower at 8192 cubed. In that four-stage static loop only one
+unrolled step of four can hit the cluster rendezvous (every eight K steps),
+so `bench.py` passes `--static-cluster-steps` (`STATIC_CLUSTER_STEPS`) to drop
+the run-time test from the other three: 0.7% faster at 8192 cubed and 0.4%
+at 16384 cubed. Modes 1 and 3 are experimental schedule variants (see
 [HANDOFF.md](HANDOFF.md)).
 
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
