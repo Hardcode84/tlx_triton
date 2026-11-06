@@ -2495,4 +2495,47 @@ Type TDMPrefetchOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
 
+// A split workgroup barrier is valid only as an adjacent signal/wait pair in
+// one block with no shared-memory access in between: Membar treats the wait
+// as the barrier, so it cannot see accesses between the two.
+static LogicalResult
+verifySplitWorkgroupBarrier(WorkgroupBarrierSignalOp signal) {
+  for (Operation *op = signal->getNextNode(); op; op = op->getNextNode()) {
+    if (isa<WorkgroupBarrierWaitOp>(op))
+      return success();
+    if (isa<WorkgroupBarrierSignalOp>(op))
+      return signal.emitOpError("is followed by another signal before its "
+                                "amdg.workgroup_barrier_wait");
+    if (isa<triton::gpu::BarrierOp>(op) || op->getNumRegions() > 0)
+      return signal.emitOpError("cannot enclose barriers or region operations "
+                                "before its amdg.workgroup_barrier_wait");
+    if (auto iface = dyn_cast<MemoryEffectOpInterface>(op)) {
+      SmallVector<MemoryEffects::EffectInstance> effects;
+      iface.getEffects(effects);
+      for (auto &effect : effects)
+        if (isa<triton::gpu::SharedMemory>(effect.getResource()))
+          return signal.emitOpError("cannot enclose shared-memory accesses "
+                                    "before its amdg.workgroup_barrier_wait");
+    }
+  }
+  return signal.emitOpError(
+      "must be followed by amdg.workgroup_barrier_wait in the same block");
+}
+
+LogicalResult WorkgroupBarrierSignalOp::verify() {
+  return verifySplitWorkgroupBarrier(*this);
+}
+
+LogicalResult WorkgroupBarrierWaitOp::verify() {
+  for (Operation *op = getOperation()->getPrevNode(); op;
+       op = op->getPrevNode()) {
+    if (isa<WorkgroupBarrierSignalOp>(op))
+      return success();
+    if (isa<WorkgroupBarrierWaitOp>(op))
+      break;
+  }
+  return emitOpError(
+      "must follow an amdg.workgroup_barrier_signal in the same block");
+}
+
 } // namespace mlir::triton::amdgpu
