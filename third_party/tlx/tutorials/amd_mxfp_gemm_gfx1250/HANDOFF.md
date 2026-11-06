@@ -3042,6 +3042,45 @@ Archive (knob patch, ships, hardware log, ATT bundles, phase reports):
 `/home/ibutygin/tlx/perf-data/mxfp-l2-lookahead-20261105.tar.gz` (SHA256
 `ac634a2b80fd1afcf86fc2ae1385469ee0be89efc5e3a0184a55fde3ea7152db`).
 
+
+### Scalar and vector work in the four-stage K loop (2026-11-06)
+
+Steady loop of the FP16 8192³ default (four static steps per iteration,
+1,088 instructions): per K step 64 WMMAs, 68 LDS ops, 25 waits/barriers/TDM,
+20 SALU, 4.2 VALU, and 90.5 `s_set_vgpr_msb`. Per iteration:
+
+| Work | Count | Needed? |
+| --- | ---: | --- |
+| Fused TDM group-0 quad assembly (`s_mov_b64` x14, `s_mov_b32` x22) | 36 | ~10-12: each load copies the whole base quad with two `s_mov_b64`, then overwrites three dwords |
+| Zero-register restores (`s_mov_b32 sN, s29`) | 14 | No: SGPR pressure (105/106) reuses the zero descriptor dwords as temporaries |
+| `k % 8` cluster test (`s_add_co`, `s_and 7`, branch per step) | 12 | Mostly no: with four steps per iteration only one unrolled step can hit k % 8 == 0 |
+| Global address advances (`s_add_nc_u64`, `s_lshl`) | 10 | Yes |
+| Loop control | 3 | Yes |
+| LDS operand addresses (`v_add3_u32`, `v_add_nc_u32`) | 17 VALU | Loop-invariant (static slots); recomputed each iteration, plus most of 26 `s_wait_alu` |
+
+**Static cluster steps (`STATIC_CLUSTER_STEPS`, `--static_cluster_steps`).**
+The unrolled loop starts at PEEL and steps by NUM_BUFFERS, so step j can hit
+a rendezvous only if gcd(NUM_BUFFERS, interval) divides PEEL + j +
+NUM_BUFFERS; other steps drop the run-time test. Loop SALU 80 -> 61 per
+iteration (tests 12 -> 2, zero restores 14 -> 8), 1,088 -> 1,055
+instructions, VGPRs 929 -> 940. FFM ring-phase test passes (intervals 2/4/8,
+3/4 buffers, 6-21 K steps). Hardware (four rounds, FP32-reference checks):
+8192³ -0.23% (pairs -0.12 to -0.31), 8192²x4096 +0.28% (pairs +0.13 to
++0.35). Neutral overall; kept opt-in.
+
+**Descriptor quad copies (LLVM-IR overrides).** Rewriting each group-0
+build as a shuffle with the 64-bit address, or as a fresh build from
+scalars (`poison` base, dword 0 extracted), produced identical machine code:
+the DAG combiner restores the insert-into-base-vector form and the
+coalescer emits the same whole-quad copies. Removing them needs an AMDGPU
+backend change (REG_SEQUENCE / copy coalescing) in the pinned codegen; at
+most ~25 SALU per iteration, likely under 0.1%.
+
+Not pursued: hoisting the LDS address VALU (measured +0.45% on the
+three-stage kernel in 2026-10: it shifts VGPR pressure and the schedule)
+and `s_set_vgpr_msb` (bank-aware allocation is an LLVM change; cost
+untraced).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

@@ -1468,7 +1468,10 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
                             CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr,
                             CLUSTER_BARRIER_INTERVAL: tl.constexpr, REGISTER_PIPELINE: tl.constexpr = False,
                             CLUSTER_LAYOUT: tl.constexpr = "linear", SPLIT_CLUSTER_BARRIER: tl.constexpr = False,
-                            HANDOFF_INPUT_WAVES: tl.constexpr = False, PRE_ISSUE_WAIT: tl.constexpr = -1):
+                            HANDOFF_INPUT_WAVES: tl.constexpr = False, PRE_ISSUE_WAIT: tl.constexpr = -1,
+                            CLUSTER_STEP: tl.constexpr = None):
+    # CLUSTER_STEP: None tests k % CLUSTER_BARRIER_INTERVAL at run time;
+    # False when the caller proves k can never be a rendezvous step.
     # Keep the K coordinate independent of the LDS ring slot. Adding (k - slot)
     # here and slot in the loader hides the invariant per-wave global base
     # from LLVM and repeats descriptor address work inside the K loop.
@@ -1499,7 +1502,7 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
                 tlx.amd_cluster_wait()
             else:
                 tlx.cluster_barrier()
-        elif CLUSTER_BARRIER_INTERVAL > 1:
+        elif CLUSTER_BARRIER_INTERVAL > 1 and (CLUSTER_STEP is None or CLUSTER_STEP):
             if k % CLUSTER_BARRIER_INTERVAL == 0:
                 if SPLIT_CLUSTER_BARRIER:
                     tlx.amd_cluster_wait()
@@ -1719,6 +1722,13 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
     return c00, c01, a10, sa10, b01, sb01
 
 
+@triton.constexpr_function
+def _mxgemm_can_be_cluster_step(k0, step, interval):
+    # Can k = k0 + step * n be a multiple of interval for some n >= 0?
+    import math
+    return (k0 % math.gcd(step, interval)) == 0
+
+
 @triton.jit
 def _mxgemm_lookahead_l2_prefetch(a_desc, b_desc, as_desc, bs_desc, off_m, off_n, pk, K_ITERS: tl.constexpr,
                                   BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr, CLUSTER_SIZE: tl.constexpr,
@@ -1839,7 +1849,7 @@ def _mxgemm_defer_bottom_k_step(
         REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr,
         MERGED_BARRIER: tl.constexpr = False, L2_LOOKAHEAD: tl.constexpr = 0, K_ITERS: tl.constexpr = 0,
         L2_LOOKAHEAD_SCALES: tl.constexpr = False, L2_LOOKAHEAD_SPLIT: tl.constexpr = False, l2_a_ptr=None,
-        l2_b_ptr=None, L2_STRIDE_A: tl.constexpr = 0, L2_STRIDE_B: tl.constexpr = 0):
+        l2_b_ptr=None, L2_STRIDE_A: tl.constexpr = 0, L2_STRIDE_B: tl.constexpr = 0, CLUSTER_STEP: tl.constexpr = None):
     # One steady BK128 step of the deferred-bottom schedule. This matches the
     # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
     # Pin every dot to the output store's native WMMA layout. A peeled step
@@ -1861,7 +1871,7 @@ def _mxgemm_defer_bottom_k_step(
                             slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
                             GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE,
                             CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
-                            PRE_ISSUE_WAIT=(BUFFERS - 2) * LOADS if MERGED_BARRIER else -1)
+                            PRE_ISSUE_WAIT=(BUFFERS - 2) * LOADS if MERGED_BARRIER else -1, CLUSTER_STEP=CLUSTER_STEP)
     if not MERGED_BARRIER:
         tlx.async_amd_descriptor_wait((BUFFERS - 1) * LOADS)
     a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
@@ -2345,6 +2355,7 @@ def mxgemm_tdm_persistent_kernel(
     L2_LOOKAHEAD: tl.constexpr = 0,
     L2_LOOKAHEAD_SCALES: tl.constexpr = False,
     L2_LOOKAHEAD_SPLIT: tl.constexpr = False,
+    STATIC_CLUSTER_STEPS: tl.constexpr = False,
     probe_ptr=None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
@@ -2970,6 +2981,8 @@ def mxgemm_tdm_persistent_kernel(
                 UNROLLED_END: tl.constexpr = PEEL + REST - REST % NUM_BUFFERS
                 for i in tl.range(PEEL, UNROLLED_END, NUM_BUFFERS):
                     for j in tl.static_range(NUM_BUFFERS):
+                        # Step j refills stage i + j + NUM_BUFFERS with i = PEEL (mod NUM_BUFFERS):
+                        # only some unrolled steps can hit a cluster rendezvous.
                         c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                             c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
                             as_buf, bs_buf, off_m, off_n, i + j, slots[(PEEL + j) % NUM_BUFFERS],
@@ -2979,7 +2992,9 @@ def mxgemm_tdm_persistent_kernel(
                             REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF,
                             L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
                             L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr,
-                            L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn)
+                            L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn, CLUSTER_STEP=_mxgemm_can_be_cluster_step(
+                                PEEL + j +
+                                NUM_BUFFERS, NUM_BUFFERS, CLUSTER_BARRIER_INTERVAL) if STATIC_CLUSTER_STEPS else None)
                 for j in tl.static_range(REST % NUM_BUFFERS):
                     c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                         c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
@@ -3827,6 +3842,7 @@ def mxgemm_tdm_pipelined(
         L2_LOOKAHEAD_SCALES: bool = False,
         L2_LOOKAHEAD_SPLIT: bool = False,
         CYCLE_PROBE: bool = False,
+        STATIC_CLUSTER_STEPS: bool = False,
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
@@ -4244,6 +4260,8 @@ def mxgemm_tdm_pipelined(
         persistent_options["L2_LOOKAHEAD"] = int(L2_LOOKAHEAD)
         persistent_options["L2_LOOKAHEAD_SCALES"] = bool(L2_LOOKAHEAD_SCALES)
         persistent_options["L2_LOOKAHEAD_SPLIT"] = bool(L2_LOOKAHEAD_SPLIT)
+    if STATIC_CLUSTER_STEPS:
+        persistent_options["STATIC_CLUSTER_STEPS"] = True
     if CYCLE_PROBE:
         if not PERSISTENT:
             raise ValueError("CYCLE_PROBE requires the persistent kernel")
@@ -4436,8 +4454,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                 (2, 2)), MERGED_HANDOFF_BARRIER=cfg.get("MERGED_HANDOFF_BARRIER", False), INTERLEAVE_C_FILL=cfg.get(
                     "INTERLEAVE_C_FILL", 0), L2_LOOKAHEAD=cfg.get("L2_LOOKAHEAD", 0), L2_LOOKAHEAD_SCALES=cfg.get(
                         "L2_LOOKAHEAD_SCALES",
-                        False), L2_LOOKAHEAD_SPLIT=cfg.get("L2_LOOKAHEAD_SPLIT",
-                                                           False), CYCLE_PROBE=cfg.get("CYCLE_PROBE", False))
+                        False), L2_LOOKAHEAD_SPLIT=cfg.get("L2_LOOKAHEAD_SPLIT", False), CYCLE_PROBE=cfg.get(
+                            "CYCLE_PROBE", False), STATIC_CLUSTER_STEPS=cfg.get("STATIC_CLUSTER_STEPS", False))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -4543,6 +4561,8 @@ if __name__ == "__main__":
         help="static-slot BK128: L2-prefetch the input stage this many steps past the TDM refill "
         "(an extra ring stage without an LDS slot)")
     parser.add_argument("--l2_lookahead_scales", action="store_true", help="also L2-prefetch the lookahead scales")
+    parser.add_argument("--static_cluster_steps", action="store_true",
+                        help="static-slot loop: test the cluster rendezvous only in unrolled steps that can hit it")
     parser.add_argument("--cycle_probe", action="store_true",
                         help="EXPERIMENT: record per-wave shader cycles and realtime at kernel start and end")
     parser.add_argument("--l2_lookahead_split", action="store_true",
@@ -4690,6 +4710,7 @@ if __name__ == "__main__":
         L2_LOOKAHEAD_SCALES=args.l2_lookahead_scales,
         L2_LOOKAHEAD_SPLIT=args.l2_lookahead_split,
         CYCLE_PROBE=args.cycle_probe,
+        STATIC_CLUSTER_STEPS=args.static_cluster_steps,
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
