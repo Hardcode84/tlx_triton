@@ -815,20 +815,24 @@ def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, buffers, cluster_size
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("mode", [1, 3, 4])
 @pytest.mark.parametrize("l2_lookahead", [0, 4])
-def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode, l2_lookahead):
+@pytest.mark.parametrize("static_cluster_steps", [False, True])
+def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode, l2_lookahead, static_cluster_steps):
     # The merged four-stage refill overlaps C10 (mode 1) or follows a split
     # workgroup barrier (tlx.named_barrier_arrive / named_barrier_wait) that
     # brackets C10 (mode 3) or C01 (mode 4, which reads both second halves
     # during C00 and the next slot across C10 and C11). Cover ring wrap, short
     # steady loops, tile handoffs, and multicast clusters. Mode 4 also takes
-    # the branch-free split L2 lookahead, whose stages past K clamp to the last.
+    # the branch-free split L2 lookahead, whose stages past K clamp to the last,
+    # and static cluster steps (one unrolled step of four tests the rendezvous).
     if l2_lookahead and (mode != 4 or cluster_size == 1):
         pytest.skip("the split L2 lookahead is used with refill overlap mode 4 and 2x2/4x4 clusters")
+    if static_cluster_steps and (mode != 4 or cluster_size == 1):
+        pytest.skip("static cluster steps are used with refill overlap mode 4 and clusters")
     test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
                                       OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, OUT_DTYPE="fp16",
                                       MERGED_HANDOFF_BARRIER=True, REFILL_OVERLAP=mode, L2_LOOKAHEAD=l2_lookahead,
-                                      L2_LOOKAHEAD_SPLIT=bool(l2_lookahead))
+                                      L2_LOOKAHEAD_SPLIT=bool(l2_lookahead), STATIC_CLUSTER_STEPS=static_cluster_steps)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
