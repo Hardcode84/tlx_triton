@@ -3248,6 +3248,35 @@ Archive (sweep scripts, logs, ships):
 `/home/ibutygin/tlx/perf-data/mxfp-realign-20261106.tar.gz` (SHA256
 `5f194b78f8d5dce26773bb4df53fef0761488810079e4354c547627944636a1d`).
 
+### Cache hints on C stores and A/B loads, current defaults (2026-11-06): no gain
+
+Repeat of the 2026-10-23 C-store test on the current `bench.py` defaults
+(FP16 mode 4 / L2 lookahead, FP32 three- and four-stage), plus A/B load
+hints. Temporary environment knobs (reverted) set `cache_modifier` on every
+C TDM store and on the partial-fusion loads: one fused A+B payload op and
+one fused scale op per stage, so A and B share a hint. Per-operand load
+hints cannot be expressed in the fused op (the cache bits are an immediate
+of each wave's instruction, and the rank-3 A descriptor cannot fuse with its
+rank-2 scales); they need a cache argument on the unfused TDM load binding.
+asm: `.cs` gives `th:TH_STORE_NT` / `th:TH_LOAD_NT`. Full A8W8 bench, two
+alternating rounds, change in mean TFLOPS against no hint:
+
+| Case | C `.cs` | C `.wt` | A+B `.cs` | A+B+scales `.cs` | all `.cs` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192²x4096 FP32 / FP16 | +0.44 / +0.09% | +0.04 / +0.30% | -6.2 / -5.3% | -7.6 / -7.2% | -10.2 / -9.7% |
+| 8192³ FP32 / FP16 | +0.02 / -0.03% | -0.02 / -0.10% | -9.0 / -6.7% | -9.0 / -7.3% | -9.1 / -6.9% |
+| 16384³ FP32 / FP16 | +0.13 / -0.02% | +0.08 / -0.02% | -1.8 / -0.3% | -2.2 / -0.4% | -2.2 / -0.6% |
+| 32768³ FP32 / FP16 | -0.9 / -1.3% | +0.3 / -4.1% | -8.7 / -9.1% | -9.4 / -11.8% | -8.8 / -10.2% |
+
+C-store hints stay within noise (32768³ rounds differ by up to 6%). Non-temporal
+A/B loads cost 2-12%: the A/B tiles are re-read by other workgroups and later
+tiles through L2, so inserting them at low priority loses that reuse. The
+opposite hint (high-temporal, `evict_last`) is the remaining load-side
+experiment; the TDM ops carry only a cache modifier, so it needs an eviction
+policy on the fused/unfused TDM load ops. Archive:
+`/home/ibutygin/tlx/perf-data/mxfp-cache-hints-20261106.tar.gz` (SHA256
+`b2f25825ca74a94a5940aad3f80c074b6193a31a8b9046b5da1728fd325df04e`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
