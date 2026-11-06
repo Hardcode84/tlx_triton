@@ -3207,6 +3207,47 @@ Archive (traces, logs, ships, patch):
 `/home/ibutygin/tlx/perf-data/mxfp-split-refill-20261106.tar.gz` (SHA256
 `9e1dc69faea57237e5e534c59f7f99e1e91b9debac8411e820e6f33ab5934d49`).
 
+### Large-shape A8W8 realignment (2026-11-06)
+
+After the FP16 split refill, a fresh `bench.py` run had 16384³ and 32768³
+FP16 A8W8 slower than 8192³ (7,499 and 7,285 vs 7,722 TFLOPS). Device sweeps
+(each config twice in alternating order; TFLOPS):
+
+| Case | Dynamic 4-stage (old default) | Mode 4 | Mode 4 + split L2 lookahead 4 |
+| --- | ---: | ---: | ---: |
+| FP16 16384³ | 7,518-7,547 | 7,602-7,617 | **7,704-7,727** |
+| FP16 32768³ | **7,052-7,324** | 6,534-6,763 | 6,556-6,828 (distance 8: 6,748-7,033) |
+| FP16 8192³ | - | **7,672-7,734** | 7,546-7,591 |
+
+- Mode 4 skipped the L2 lookahead (its step returns before the lookahead
+  code). It now takes the branch-free split lookahead
+  (`_mxgemm_split_l2_prefetch`), placed before the C11 WMMAs; the mode 4
+  four-stage ring with a 4x4 cluster only. One prefetch per step, about 2.5
+  SALU and 1 VALU per step, and +2 VGPRs (910). FFM ring-phase test covers
+  it (cluster 4, K5-K13). The branchy single-CTA lookahead hurts every case.
+- Without refill overlap, the merged static loop gains 1-2.6% from the split
+  lookahead (16384³ 7,575 vs 7,485; 32768³ 6,978 vs 6,793).
+- Three-stage static loops lose 6-15% at both sizes, FP32 and FP16.
+- Tile order around the best configs (one change each): group-M 4 -2 to -6%;
+  2x2 clusters -8 to -12%; no XCD remap -1 to -4%; cluster barrier every 4
+  -1 to -2%; every 16 +0.7% at 16384³ FP32, neutral at 16384³ FP16, -7 to
+  -30% at 32768³; XCD chunk 1 or 4 within noise. The persistent kernel
+  rejects `l2_prefetch_distance`. No change.
+- FP32 is already aligned (16384³ 7,262, 32768³ 7,043-7,200 vs 8192³ 7,100);
+  the four-stage dynamic ring stays best (overlap peel neutral).
+
+`bench.py` now uses mode 4 for FP16 up to K=16384 and adds `--l2-lookahead 4`
+from K=16384; FP16 32768³ keeps the dynamic ring. Full A8W8 bench on device:
+8192²x4096 7,004 / 6,488 (FP16 / FP32), 8192³ 7,699 / 7,099, 16384³
+**7,710** / 7,266, 32768³ 7,298 / 7,043. FP16 32768³ remains about 5% below
+8192³ in both loop forms (the dynamic ring also drops 3-4% from 16384³):
+the operands no longer fit the caches, and the merged barrier exposes each
+step to the slowest wave's TDM latency. 32768³ timings are noisy (the same
+config spans 7,052-7,324 across rounds).
+Archive (sweep scripts, logs, ships):
+`/home/ibutygin/tlx/perf-data/mxfp-realign-20261106.tar.gz` (SHA256
+`5f194b78f8d5dce26773bb4df53fef0761488810079e4354c547627944636a1d`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

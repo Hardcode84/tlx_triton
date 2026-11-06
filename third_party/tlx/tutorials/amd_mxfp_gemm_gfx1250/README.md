@@ -43,7 +43,8 @@ with a cluster barrier every eight input K blocks: each A tile is shared by
 the four workgroups of its cluster row and each B tile by the four of its
 column, halving the unique input each CU loads per K step compared with the
 previous 2x2 clusters. MX8xMX8 also switches to a four-stage input ring with
-two C slots for K >= 16384. On gfx1250 this is 3-6% faster than 2x2 clusters
+two C slots for K >= 16384 (FP16 up to K=16384 uses the static four-stage
+ring described below). On gfx1250 this is 3-6% faster than 2x2 clusters
 for MX8xMX4 and 5-12% faster for MX8xMX8. Eager timing repeats 256 ms batches: 1 s of warmup, then the median
 batch over 2 s (`--warmup-seconds`, `--duration-seconds`). A single batch from
 a fresh process overstates gfx1250 kernel times because of a few slow first
@@ -93,13 +94,12 @@ Membar adds neither barrier back. The refill now waits for the next slot and
 the slowest wave, so it needs a deep enough ring. The static loop also
 supports four buffers. With FP16 output a four-stage ring and two C slots fit
 LDS (321,768 bytes), and `bench.py` uses four stages, static slots, the
-overlap peel, and the merged barrier for FP16 MX8xMX8 below K=16384. On
+overlap peel, and the merged barrier for FP16 MX8xMX8 up to K=16384. On
 gfx1250 that is 1.6% faster at 8192 cubed and 2.2% faster at 8192^2x4096
 than the three-stage default. With three stages the merged barrier is 23%
-slower (TDM waits rise from 40 to 128 cycles per K step), and at K >= 16384
-the four-stage static loop is slower with or without it (16384 cubed +0.2 to
-+0.8%, 32768 cubed +1.5 to +7.6%), so those cases keep their defaults. See
-[HANDOFF.md](HANDOFF.md).
+slower (TDM waits rise from 40 to 128 cycles per K step). At 32768 cubed the
+static loop is 6-8% slower than the dynamic four-stage ring, so that case
+keeps it. See [HANDOFF.md](HANDOFF.md).
 
 `--refill-overlap 4` (`REFILL_OVERLAP=4`, requires the merged barrier and four
 buffers) splits that barrier as the gluon v14 tutorial and FlyDSL do: each
@@ -109,7 +109,12 @@ slot across C10 and C11. The split uses `tlx.named_barrier_arrive(0, ...)` /
 `tlx.named_barrier_wait(0, ...)`, which lower on AMD to `s_barrier_signal -1`
 / `s_barrier_wait -1`; Membar treats the pair as one workgroup barrier. On gfx1250 it is a further 2.2%
 faster at 8192 cubed and 1.25% at 8192^2x4096, and `bench.py` uses it wherever
-it uses the merged barrier. Modes 1 and 3 are experimental schedule variants (see
+it uses the merged barrier. At 16384 cubed it is 1% faster than the dynamic
+four-stage ring, and `--l2-lookahead 4` (`L2_LOOKAHEAD=4` with
+`L2_LOOKAHEAD_SPLIT`) adds another 1.3%: each step L2-prefetches the input
+stage four steps past the refill, branch-free, with every cluster CTA
+covering its share of the shared A and B rows. `bench.py` enables it from
+K=16384; it is 2% slower at 8192 cubed. Modes 1 and 3 are experimental schedule variants (see
 [HANDOFF.md](HANDOFF.md)).
 
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
