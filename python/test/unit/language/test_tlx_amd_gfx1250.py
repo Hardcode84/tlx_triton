@@ -729,15 +729,14 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
         for k in ks
     ],
 )
-def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
-                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
-                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
-                                      COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
-                                      HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
-                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
-                                      WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
-                                      INTERLEAVE_C_FILL=0, STATIC_CLUSTER_STEPS=False, REFILL_OVERLAP=0):
+def test_mxgemm_persistent_ring_phase(
+        K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING, NUM_WARPS, REGISTER_PIPELINE,
+        SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False,
+        ASYNC_OUTPUT=False, COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
+        HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
+        CLUSTER_BARRIER_INTERVAL=4, WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
+        OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False, INTERLEAVE_C_FILL=0,
+        STATIC_CLUSTER_STEPS=False, REFILL_OVERLAP=0, L2_LOOKAHEAD=0, L2_LOOKAHEAD_SPLIT=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -759,20 +758,22 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         a.cuda(),
         b_data.T.contiguous().cuda(),
         _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(), config=dict(
-            BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
-            DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
-            TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
-            CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
-            OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
-            STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
-            HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-            SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
-            WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF, STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL,
-            OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL, OUT_DTYPE=OUT_DTYPE,
-            MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER, INTERLEAVE_C_FILL=INTERLEAVE_C_FILL,
-            STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, REFILL_OVERLAP=REFILL_OVERLAP))
+        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
+        config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
+                    DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
+                    TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs,
+                    CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, OUTPUT_STAGING=OUTPUT_STAGING,
+                    REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2, CLUSTER_SIZE=CLUSTER_SIZE,
+                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
+                    OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
+                    STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
+                    HANDOFF_SCHEDULE=HANDOFF_SCHEDULE, HANDOFF_TDM_FUSION=HANDOFF_TDM_FUSION,
+                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
+                    EARLY_C_STORES=EARLY_C_STORES, WAVE_SPECIALIZED_HANDOFF=WAVE_SPECIALIZED_HANDOFF,
+                    STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
+                    OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
+                    INTERLEAVE_C_FILL=INTERLEAVE_C_FILL, STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS,
+                    REFILL_OVERLAP=REFILL_OVERLAP, L2_LOOKAHEAD=L2_LOOKAHEAD, L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -813,16 +814,21 @@ def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, buffers, cluster_size
 @pytest.mark.parametrize("k_iters", [5, 6, 7, 9, 13])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("mode", [1, 3, 4])
-def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode):
+@pytest.mark.parametrize("l2_lookahead", [0, 4])
+def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode, l2_lookahead):
     # The merged four-stage refill overlaps C10 (mode 1) or follows a split
     # workgroup barrier (tlx.named_barrier_arrive / named_barrier_wait) that
     # brackets C10 (mode 3) or C01 (mode 4, which reads both second halves
     # during C00 and the next slot across C10 and C11). Cover ring wrap, short
-    # steady loops, tile handoffs, and multicast clusters.
+    # steady loops, tile handoffs, and multicast clusters. Mode 4 also takes
+    # the branch-free split L2 lookahead, whose stages past K clamp to the last.
+    if l2_lookahead and (mode != 4 or cluster_size == 1):
+        pytest.skip("the split L2 lookahead is used with refill overlap mode 4 and 2x2/4x4 clusters")
     test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, cluster_size, False,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
                                       OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, OUT_DTYPE="fp16",
-                                      MERGED_HANDOFF_BARRIER=True, REFILL_OVERLAP=mode)
+                                      MERGED_HANDOFF_BARRIER=True, REFILL_OVERLAP=mode, L2_LOOKAHEAD=l2_lookahead,
+                                      L2_LOOKAHEAD_SPLIT=bool(l2_lookahead))
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")

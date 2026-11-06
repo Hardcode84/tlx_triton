@@ -12,7 +12,8 @@ Both use 256 persistent programs, group-M 8, chunked XCD remapping of whole
 clusters (8 XCDs, chunk 2), and 16-workgroup
 multicast in a 4x4 tile layout (each A and B tile shared by four workgroups),
 with a cluster barrier every eight input K blocks. MX8xMX8 uses a four-stage
-input ring with two C slots for K >= 16384, and three stages otherwise.
+input ring with two C slots for K >= 16384, and three stages otherwise (FP16
+up to K=16384 uses the static four-stage ring described below).
 MX8xMX4 also enables split cluster barriers and early C stores. These two
 options are disabled by default for MX8xMX8 and output-tail reuse. Other
 operand schedules do not support these options. SCHED_MODE[2] is off.
@@ -50,11 +51,13 @@ FP16 output writes FP16 C (FP32 accumulation, one rounding before staging)
 for every variant except --async-output, which runs FP32 only by default.
 Repeat --out-dtype to choose output types (default: fp32 and fp16). MX8xMX8 uses six FP16 C
 slots for the three-buffer ring and two 64x128 slots for the four-buffer ring.
-For FP16 MX8xMX8 below K=16384 it uses a four-stage static-slot ring with two C
+For FP16 MX8xMX8 up to K=16384 it uses a four-stage static-slot ring with two C
 slots, the overlap peel, and one merged handoff barrier per K step
 (--merged-handoff-barrier; 1.6-2.2% faster on gfx1250), split around the C01
 WMMAs with the refill and next-slot reads across C10/C11 (--refill-overlap 4;
-a further 1.3-2.2%).
+a further 1.3-2.2%). At K=16384 it also L2-prefetches the input stage four
+steps past the refill (--l2-lookahead 4; 1.3%). FP16 at K=32768 keeps the
+dynamic four-stage ring.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -182,12 +185,19 @@ GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 
 # With 4x4 multicast, a four-stage MX8xMX8 ring (two C slots, dynamic slots)
 # beats three stages from K=16384 (-4 to -5% on gfx1250) but not at K<=8192.
 FOUR_BUFFER_MIN_K = 16384
-# Below that K, FP16 output leaves room for a four-stage static-slot ring with
-# two C slots, the overlap peel, and one merged handoff barrier per K step
-# (gfx1250: 8192^3 -1.6%, 8192^2x4096 -2.2%). Splitting that barrier around
-# the C01 WMMAs (refill overlap mode 4) gives a further -2.2% / -1.25%. With three stages, or at
-# K>=16384, the merged barrier starves the TDM input (+23% at 8192^3, +7.6% at
-# 32768^3); the static four-stage ring alone does not help there either.
+# Up to this K, FP16 output uses a four-stage static-slot ring with two C
+# slots, the overlap peel, and one merged handoff barrier per K step
+# (gfx1250: 8192^3 -1.6%, 8192^2x4096 -2.2%), split around the C01 WMMAs
+# (refill overlap mode 4: a further -2.2% / -1.25%). At 16384^3 this is 1%
+# faster than the dynamic four-stage ring. At 32768^3 the merged barrier
+# starves the TDM input (+6 to +8%, +4 to +6% even with the L2 lookahead),
+# so that case keeps the dynamic ring.
+MERGED_FP16_MAX_K = 16384
+# From this K, the merged FP16 ring also L2-prefetches the input stage this
+# many steps past the TDM refill, branch-free, every cluster CTA covering its
+# share (16384^3 -1.3%; 8192^3 +2%).
+SPLIT_L2_LOOKAHEAD_MIN_K = 16384
+SPLIT_L2_LOOKAHEAD = 4
 
 
 def _supports_static_slot_unroll(args, dtype_b):
@@ -270,14 +280,8 @@ def _variant_args(args, dtype_b):
 def _case_args(args, case):
     if not args.auto_ring_depth:
         return args
-    if case[2] >= FOUR_BUFFER_MIN_K:
-        resolved = argparse.Namespace(**vars(args))
-        resolved.num_buffers = 4
-        resolved.output_c_slots = None
-        resolved.static_slot_unroll = False
-        return resolved
     if (args.out_dtype == "fp16" and args.static_slot_unroll is None and args.merged_handoff_barrier is not False
-            and case[2] // args.block_k > 4):
+            and case[2] // args.block_k > 4 and case[2] <= MERGED_FP16_MAX_K):
         resolved = argparse.Namespace(**vars(args))
         resolved.num_buffers = 4
         resolved.output_c_slots = 2
@@ -287,6 +291,14 @@ def _case_args(args, case):
             resolved.refill_overlap = 4
         if resolved.overlap_peel is None:
             resolved.overlap_peel = True
+        if (resolved.l2_lookahead is None and resolved.refill_overlap == 4 and case[2] >= SPLIT_L2_LOOKAHEAD_MIN_K):
+            resolved.l2_lookahead = SPLIT_L2_LOOKAHEAD
+        return resolved
+    if case[2] >= FOUR_BUFFER_MIN_K:
+        resolved = argparse.Namespace(**vars(args))
+        resolved.num_buffers = 4
+        resolved.output_c_slots = None
+        resolved.static_slot_unroll = False
         return resolved
     return args
 
@@ -378,6 +390,8 @@ def _command(args, case, dtype_b):
         command.append("--merged_handoff_barrier")
     if args.refill_overlap:
         command.extend(["--refill_overlap", str(args.refill_overlap)])
+    if args.l2_lookahead:
+        command.extend(["--l2_lookahead", str(args.l2_lookahead), "--l2_lookahead_split"])
     if args.out_dtype != "fp32":
         command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
@@ -488,11 +502,16 @@ def parse_benchmark_args(argv=None):
     parser.add_argument(
         "--merged-handoff-barrier", action=argparse.BooleanOptionalAction, default=None,
         help="one workgroup barrier per static-slot K step with relaxed operand loads "
-        f"(default: four-stage FP16 MX8xMX8 below K={FOUR_BUFFER_MIN_K}; requires --static-slot-unroll)")
+        f"(default: four-stage FP16 MX8xMX8 up to K={MERGED_FP16_MAX_K}; requires --static-slot-unroll)")
     parser.add_argument(
         "--refill-overlap", type=int, choices=(0, 1, 3, 4), default=None,
         help="merged four-stage step schedule: 4 splits the handoff barrier around the C01 WMMAs and refills "
         "across C10/C11; 0 keeps one plain merged barrier (default: 4 where the merged barrier is the default)")
+    parser.add_argument(
+        "--l2-lookahead", type=int, default=None,
+        help="refill overlap mode 4: branch-free L2 prefetch of the input stage this many steps past the TDM "
+        f"refill (default: {SPLIT_L2_LOOKAHEAD} where mode 4 is the default and K >= {SPLIT_L2_LOOKAHEAD_MIN_K}; "
+        "0 disables)")
     parser.add_argument(
         "--out-dtype", choices=OUT_DTYPES, action="append",
         help="repeatable C element type; default: fp32 and fp16 (fp32 only with --async-output). "
@@ -661,6 +680,9 @@ def parse_benchmark_args(argv=None):
             parser.error("--merged-handoff-barrier requires --static-slot-unroll")
         if run_args.refill_overlap and not (run_args.merged_handoff_barrier and run_args.num_buffers == 4):
             parser.error("--refill-overlap requires --merged-handoff-barrier with four buffers")
+        if run_args.l2_lookahead and not (run_args.refill_overlap == 4 and run_args.cluster_size > 1
+                                          and run_args.cluster_layout in ("2x2", "4x4")):
+            parser.error("--l2-lookahead requires --refill-overlap 4 with a 2x2 or 4x4 cluster")
         if run_args.static_slot_unroll and not _supports_static_slot_unroll(run_args, dtype_b):
             parser.error("--static-slot-unroll requires persistent MX8xMX8, 256x256x128 tiles, three or four buffers, "
                          "four warps, and dedicated output staging without other operand schedules")
@@ -839,10 +861,10 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
-                                                                     dtype_b), output_c_slots=run_args.output_c_slots
-            or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier), refill_overlap=run_args.refill_overlap
-            or 0, dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
+            output_c_slots=run_args.output_c_slots or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier),
+            refill_overlap=run_args.refill_overlap or 0, l2_lookahead=run_args.l2_lookahead or 0,
+            dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
             async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
@@ -867,7 +889,7 @@ def main():
             f"\nConfiguration ({variant}, {run_args.out_dtype}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}"
-            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K}, and static/merged/split for FP16 below it)' if run_args.auto_ring_depth else ''}, "
+            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K}; static/merged/split for FP16 up to K={MERGED_FP16_MAX_K})' if run_args.auto_ring_depth else ''}, "
             f"warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"scale_buffers={3 if run_args.warp_pipeline else run_args.num_buffers}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
@@ -880,6 +902,7 @@ def main():
             f"static_slot_unroll={'auto' if run_args.static_slot_unroll is None else run_args.static_slot_unroll}, "
             f"overlap_peel={'auto' if run_args.overlap_peel is None else run_args.overlap_peel}, "
             f"refill_overlap={'auto' if run_args.refill_overlap is None else run_args.refill_overlap}, "
+            f"l2_lookahead={'auto' if run_args.l2_lookahead is None else run_args.l2_lookahead}, "
             f"output_c_slots={run_args.output_c_slots or 2}, "
             f"out_dtype={run_args.out_dtype}, "
             f"dynamic_scales_first={run_args.dynamic_scales_first}, "
