@@ -1722,6 +1722,23 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
     return c00, c01, a10, sa10, b01, sb01
 
 
+@triton.jit
+def _mxgemm_split_barrier_signal(TDM_PENDING: tl.constexpr):
+    # EXPERIMENT: arrive at the workgroup barrier once this wave's share of the
+    # next slot has landed and its LDS reads are complete. The TDM wait lives
+    # in the asm: an explicit async wait makes Membar add its own full barrier.
+    # The asm is side-effecting, so LLVM keeps memory operations on their side
+    # of it; register-only WMMAs may run before the wait.
+    tl.static_assert(TDM_PENDING == 4)
+    tl.inline_asm_elementwise("s_wait_tensorcnt 0x4\n\ts_wait_dscnt 0x0\n\ts_barrier_signal -1", "=s", [],
+                              dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _mxgemm_split_barrier_wait():
+    tl.inline_asm_elementwise("s_barrier_wait -1", "=s", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
 @triton.constexpr_function
 def _mxgemm_can_be_cluster_step(k0, step, interval):
     # Can k = k0 + step * n be a multiple of interval for some n >= 0?
@@ -1849,7 +1866,8 @@ def _mxgemm_defer_bottom_k_step(
         REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr,
         MERGED_BARRIER: tl.constexpr = False, L2_LOOKAHEAD: tl.constexpr = 0, K_ITERS: tl.constexpr = 0,
         L2_LOOKAHEAD_SCALES: tl.constexpr = False, L2_LOOKAHEAD_SPLIT: tl.constexpr = False, l2_a_ptr=None,
-        l2_b_ptr=None, L2_STRIDE_A: tl.constexpr = 0, L2_STRIDE_B: tl.constexpr = 0, CLUSTER_STEP: tl.constexpr = None):
+        l2_b_ptr=None, L2_STRIDE_A: tl.constexpr = 0, L2_STRIDE_B: tl.constexpr = 0, CLUSTER_STEP: tl.constexpr = None,
+        REFILL_OVERLAP: tl.constexpr = 0):
     # One steady BK128 step of the deferred-bottom schedule. This matches the
     # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
     # Pin every dot to the output store's native WMMA layout. A peeled step
@@ -1862,6 +1880,40 @@ def _mxgemm_defer_bottom_k_step(
         CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=True,
         RELAXED=MERGED_BARRIER)
     last_b00, last_sb00 = b00, sb00
+    if MERGED_BARRIER and REFILL_OVERLAP == 2:
+        # Split the merged rendezvous: each wave signals once its reads of this
+        # slot and its share of the next slot have completed, issues all C10
+        # WMMAs (registers only), then waits. The refill and both next-slot
+        # reads follow the wait and interleave with C11.
+        tl.static_assert(GROUPED_PREFETCH and PREFETCH_B_AFTER_C10)
+        _mxgemm_split_barrier_signal((BUFFERS - 2) * LOADS)
+        tlx.amd_sched_barrier()
+        c10 = _mxgemm_native_dot(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+        tlx.amd_sched_barrier()
+        _mxgemm_split_barrier_wait()
+        tlx.amd_sched_barrier()
+        _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
+                                i + BUFFERS, slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE,
+                                CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                                REGISTER_PIPELINE, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP)
+        a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
+                                         RELAXED=True)
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True)
+        c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+        # Refill SALU and TDM issue, then 34 next-slot reads, across C11.
+        tlx.amd_sched_group_barrier(0x4, 8, 105)
+        tlx.amd_sched_group_barrier(0x8, 1, 105)
+        tlx.amd_sched_group_barrier(0x10, 1, 105)
+        tlx.amd_sched_group_barrier(0x4, 6, 105)
+        tlx.amd_sched_group_barrier(0x8, 1, 105)
+        tlx.amd_sched_group_barrier(0x10, 1, 105)
+        for _ in tl.static_range(12):
+            tlx.amd_sched_group_barrier(0x8, 1, 105)
+            tlx.amd_sched_group_barrier(0x100, 3, 105)
+        tlx.amd_sched_group_barrier(0x8, 2, 105)
+        tlx.amd_sched_barrier()
+        return c00, c01, c10, c11, a00, sa00, b00, sb00
     # With MERGED_BARRIER, one rendezvous per step: waiting for the next slot
     # before the refill leaves the refill issue point unchanged, and the
     # barrier covers both the slot's last reads before its refill and every
@@ -1879,7 +1931,23 @@ def _mxgemm_defer_bottom_k_step(
     if not PREFETCH_B_AFTER_C10:
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=MERGED_BARRIER)
     c10 = _mxgemm_native_dot(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
-    if GROUPED_PREFETCH:
+    if REFILL_OVERLAP == 1:
+        # Interleave the refill's descriptor SALU and TDM issue with the first
+        # C10 WMMAs instead of issuing them as a block after the barrier.
+        tl.static_assert(GROUPED_PREFETCH)
+        tlx.amd_sched_group_barrier(0x4, 8, 103)
+        tlx.amd_sched_group_barrier(0x8, 1, 103)
+        tlx.amd_sched_group_barrier(0x10, 1, 103)
+        tlx.amd_sched_group_barrier(0x4, 6, 103)
+        tlx.amd_sched_group_barrier(0x8, 1, 103)
+        tlx.amd_sched_group_barrier(0x10, 1, 103)
+        for _ in tl.static_range(7):
+            tlx.amd_sched_group_barrier(0x8, 1, 103)
+            tlx.amd_sched_group_barrier(0x100, 2, 103)
+        tlx.amd_sched_group_barrier(0x8, 1, 103)
+        tlx.amd_sched_group_barrier(0x100, 1, 103)
+        tlx.amd_sched_group_barrier(0x8, 6, 103)
+    elif GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(103, True)
     tlx.amd_sched_barrier()
     if L2_LOOKAHEAD > 0 and L2_LOOKAHEAD_SPLIT:
@@ -2356,6 +2424,7 @@ def mxgemm_tdm_persistent_kernel(
     L2_LOOKAHEAD_SCALES: tl.constexpr = False,
     L2_LOOKAHEAD_SPLIT: tl.constexpr = False,
     STATIC_CLUSTER_STEPS: tl.constexpr = False,
+    REFILL_OVERLAP: tl.constexpr = 0,
     probe_ptr=None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
@@ -2591,13 +2660,14 @@ def mxgemm_tdm_persistent_kernel(
         a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, 0, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS, WITH_A_SCALE)
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, 0, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
         c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
-            tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32),
             tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros(
-                (BLOCK_M // 2, BLOCK_N // 2), tl.float32), a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc,
-            a_buf, b_buf, as_buf, bs_buf, off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B,
-            NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE,
-            CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE,
-            CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF, L2_LOOKAHEAD=L2_LOOKAHEAD,
+                (BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32),
+            tl.zeros((BLOCK_M // 2, BLOCK_N // 2),
+                     tl.float32), a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+            off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE,
+            TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER,
+            MERGED_BARRIER=MERGED_HANDOFF, REFILL_OVERLAP=REFILL_OVERLAP, L2_LOOKAHEAD=L2_LOOKAHEAD,
             K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES, L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT,
             l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn)
 
@@ -2973,8 +3043,8 @@ def mxgemm_tdm_persistent_kernel(
                         BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
                         GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
                         XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
-                        SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF, L2_LOOKAHEAD=L2_LOOKAHEAD,
-                        K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
+                        SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF, REFILL_OVERLAP=REFILL_OVERLAP,
+                        L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
                         L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
                         L2_STRIDE_B=stride_bn)
                 REST: tl.constexpr = STEADY_STEPS - PEEL
@@ -2990,9 +3060,10 @@ def mxgemm_tdm_persistent_kernel(
                             NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
                             CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
                             REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF,
-                            L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
-                            L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr,
-                            L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn, CLUSTER_STEP=_mxgemm_can_be_cluster_step(
+                            REFILL_OVERLAP=REFILL_OVERLAP, L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K,
+                            L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES, L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT,
+                            l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
+                            L2_STRIDE_B=stride_bn, CLUSTER_STEP=_mxgemm_can_be_cluster_step(
                                 PEEL + j +
                                 NUM_BUFFERS, NUM_BUFFERS, CLUSTER_BARRIER_INTERVAL) if STATIC_CLUSTER_STEPS else None)
                 for j in tl.static_range(REST % NUM_BUFFERS):
@@ -3003,9 +3074,9 @@ def mxgemm_tdm_persistent_kernel(
                         DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
                         CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
                         REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF,
-                        L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
-                        L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
-                        L2_STRIDE_B=stride_bn)
+                        REFILL_OVERLAP=REFILL_OVERLAP, L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K,
+                        L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES, L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr,
+                        l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn)
                 slot = slots[STEADY_STEPS % NUM_BUFFERS]
             # With STATIC_SLOT_UNROLL the steps above consume the whole range.
             for i in tl.range(
@@ -3843,6 +3914,7 @@ def mxgemm_tdm_pipelined(
         L2_LOOKAHEAD_SPLIT: bool = False,
         CYCLE_PROBE: bool = False,
         STATIC_CLUSTER_STEPS: bool = False,
+        REFILL_OVERLAP: int = 0,
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
@@ -4262,6 +4334,10 @@ def mxgemm_tdm_pipelined(
         persistent_options["L2_LOOKAHEAD_SPLIT"] = bool(L2_LOOKAHEAD_SPLIT)
     if STATIC_CLUSTER_STEPS:
         persistent_options["STATIC_CLUSTER_STEPS"] = True
+    if REFILL_OVERLAP:
+        if not (MERGED_HANDOFF_BARRIER and NUM_BUFFERS == 4):
+            raise ValueError("REFILL_OVERLAP requires MERGED_HANDOFF_BARRIER with four buffers")
+        persistent_options["REFILL_OVERLAP"] = int(REFILL_OVERLAP)
     if CYCLE_PROBE:
         if not PERSISTENT:
             raise ValueError("CYCLE_PROBE requires the persistent kernel")
@@ -4455,7 +4531,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                     "INTERLEAVE_C_FILL", 0), L2_LOOKAHEAD=cfg.get("L2_LOOKAHEAD", 0), L2_LOOKAHEAD_SCALES=cfg.get(
                         "L2_LOOKAHEAD_SCALES",
                         False), L2_LOOKAHEAD_SPLIT=cfg.get("L2_LOOKAHEAD_SPLIT", False), CYCLE_PROBE=cfg.get(
-                            "CYCLE_PROBE", False), STATIC_CLUSTER_STEPS=cfg.get("STATIC_CLUSTER_STEPS", False))
+                            "CYCLE_PROBE",
+                            False), STATIC_CLUSTER_STEPS=cfg.get("STATIC_CLUSTER_STEPS",
+                                                                 False), REFILL_OVERLAP=cfg.get("REFILL_OVERLAP", 0))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -4561,6 +4639,10 @@ if __name__ == "__main__":
         help="static-slot BK128: L2-prefetch the input stage this many steps past the TDM refill "
         "(an extra ring stage without an LDS slot)")
     parser.add_argument("--l2_lookahead_scales", action="store_true", help="also L2-prefetch the lookahead scales")
+    parser.add_argument(
+        "--refill_overlap", type=int, choices=(0, 1, 2), default=0,
+        help="merged four-stage loop: 1 interleaves the refill with C10 WMMAs; 2 splits the step "
+        "barrier around the C10 WMMAs and overlaps the refill with C11")
     parser.add_argument("--static_cluster_steps", action="store_true",
                         help="static-slot loop: test the cluster rendezvous only in unrolled steps that can hit it")
     parser.add_argument("--cycle_probe", action="store_true",
@@ -4711,6 +4793,7 @@ if __name__ == "__main__":
         L2_LOOKAHEAD_SPLIT=args.l2_lookahead_split,
         CYCLE_PROBE=args.cycle_probe,
         STATIC_CLUSTER_STEPS=args.static_cluster_steps,
+        REFILL_OVERLAP=args.refill_overlap,
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,

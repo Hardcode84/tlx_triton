@@ -3081,6 +3081,66 @@ three-stage kernel in 2026-10: it shifts VGPR pressure and the schedule)
 and `s_set_vgpr_msb` (bank-aware allocation is an LLVM change; cost
 untraced).
 
+
+### K-loop profile, refill overlap, per-wave skew and LDS peak (2026-11-06)
+
+**Profile** (ATT of the FP16 8192³ default, uncapped, 3,584 steady steps):
+754 cycles per K step against the 512-cycle WMMA floor. WMMA plus
+`ds_load` issue is 507; WMMAs average 5 cycles to the next issue, so pipe
+time is charged to the interleaved `ds_load`s and adds. WMMA-pipe idle per
+step (235), by the instruction it waited behind: workgroup barrier 65, LDS
+68 (`ds_load` backpressure 30, `s_wait_dscnt` 39), TDM 51 (next stage not
+landed 26, second refill load behind the first 26), SALU ~30 (mostly the
+descriptor-quad copies), VALU 19 (rematerialized LDS addresses; the IR has
+them hoisted out of the tile loop, the backend sinks them back). The
+`s_wait_tensorcnt 0xa` before each second refill load is inserted by LLVM's
+wait pass, not the kernel.
+
+**Refill overlap (`REFILL_OVERLAP`, `--refill_overlap`).** Mode 1
+interleaves the refill's descriptor SALU and TDM issue with the first C10
+WMMAs (sched groups). Mode 2 splits the step barrier with inline asm
+(`s_wait_tensorcnt 4; s_wait_dscnt 0; s_barrier_signal -1`, C10 WMMAs,
+`s_barrier_wait -1`) and overlaps the refill and both next-slot reads with
+C11. Membar does not recognize the asm as a barrier: an explicit
+async-TDM wait before it makes Membar add a full barrier (so the TDM wait
+lives in the asm), and the refill still gets a Membar barrier because
+dynamically indexed slots look like a TDM write-after-write. FFM ring-phase
+test passes (20 cases). Hardware, four rounds:
+
+| Variant | 8192³ | 8192²x4096 |
+| --- | ---: | ---: |
+| Mode 1 | +0.01% | -0.07% |
+| Mode 2 (split + Membar barrier) | +2.96% | +1.39% |
+
+**Per-wave skew.** Single-SIMD ATT runs of the same binary (one wave per
+workgroup each; `--simd-select` acts as a SIMD index mod 4), per K step:
+
+| Wave | Step | Barrier | TDM wait | LDS wait | Wave cycles |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SIMD 0 (two runs) | 722 / 785 | 20 / 30 | 63 / 113 | 59 / 62 | 226k / 244k |
+| SIMD 1 | 724 | 49 | 40 | 55 | 230k |
+| SIMD 2 | 717 | 26 | 53 | 57 | 228k |
+| SIMD 3 | 754 | 68 | 46 | 58 | 235k |
+
+Barrier plus TDM wait is 80-140 cycles per step on every wave: each step
+waits for the next stage. Wave 0 waits longest for its own TDM loads and
+arrives last; the others absorb that at the barrier. LDS waits and issue
+are the same on all waves.
+
+**LDS read peak** (`lds_bw.py`: 256 CTAs, one per CU, contiguous
+`ds_load_b128`, XOR-reduced, per-wave shader-cycle counters): 217 B/clk
+per CU with 4 waves, 260 with 16 waves (8 waves: 99.6, an unexplained
+outlier). The default reads 139 KB per CU per K step (68 `ds_load_b128` per
+wave, 4 waves), so at 217 B/clk LDS alone needs ~640 cycles per step,
+above the 512-cycle WMMA floor. The measured 717-785 is within ~12-20% of
+that LDS bound: the K loop is mainly LDS-read bound at four waves, and the
+remaining slack is next-stage arrival. Larger gains need fewer LDS bytes per
+WMMA (more register reuse per wave) or more LDS throughput (more waves), not
+schedule changes.
+Archive (traces, logs, microbenchmark, scripts, patch):
+`/home/ibutygin/tlx/perf-data/mxfp-kloop-profile-20261106.tar.gz` (SHA256
+`0837f399db8d24e283461add88fcf8a7d2b75f6d3d59987877d6d24a14ff681d`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
