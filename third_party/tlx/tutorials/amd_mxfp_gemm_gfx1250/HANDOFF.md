@@ -2896,6 +2896,152 @@ placement. Further gains need more output bytes in flight, so more
 or larger C slots (no LDS left with four stages), or C stores spread
 across the next tile's K loop.
 
+
+### L2-only lookahead stage with three stages and six C slots (2026-11-05): slower
+
+`L2_LOOKAHEAD=d` (opt-in, `--l2_lookahead d`, static-slot BK128 only) adds a
+"fake" ring stage with no LDS slot. Each static step, after the `c10` dot,
+it L2-prefetches the stage `d` past the TDM refill. Even stages only (one
+256-byte line holds two BK128 steps of a row). Within a cluster, ownership
+of each shared A or B tile rotates per pair, so each CTA issues an A and a
+B prefetch about every eight steps. Speculative prefetches, block-uniform
+branches. With three stages the freed LDS holds six FP16 C slots (319,656
+B). Cost in the three-step steady loop: 667 -> 800 instructions (+85 SALU,
++21 VALU, 10 `global_prefetch_b8`, +7 branches), 901 -> 907 VGPRs, no
+scratch.
+
+Hardware, FP16 8192³, four interleaved rounds after FP32-reference
+checks, against the current default (four stages, merged barrier, two C
+slots: 0.14635 ms):
+
+| Variant | Time | Cycles | Clock |
+| --- | ---: | ---: | ---: |
+| Three stages, six C slots (old default) | +1.81% | +3.16% | 1,743 MHz |
+| … + lookahead 2 | +11.07% | +16.74% | 1,807 MHz |
+| Three stages, merged, six C slots | +25.62% | +40.52% | 1,922 MHz |
+| … + lookahead 1 | +26.38% | +40.72% | 1,914 MHz |
+| … + lookahead 2 | +21.90% | +33.77% | 1,886 MHz |
+| … + lookahead 4 | +22.15% | +34.23% | 1,889 MHz |
+
+The prefetch does shorten the merged three-stage stalls (cycles +40.5% ->
++33.8% at d=2), but recovers less than a fifth of the loss. On the
+unmerged three-stage ring it costs about 9% (energy +11.1% vs +1.8%): even
+deduplicated and paired, the prefetch requests plus their address and
+guard code cost more than the stalls they hide, at the power cap. An L2
+stage does not replace an LDS stage: the merged barrier needs the refill's
+data in LDS one step earlier, and an L2 hit still leaves the TDM transfer
+on the critical path. Four real stages with two C slots stay the FP16
+default.
+
+ATT (16 SEs, one wave each, 3,840 steady steps; profiled runs are not
+power-capped) of the three-stage ring without and with lookahead 2: the
+median steady step grows 834 -> 924 cycles (mean 858 -> 972, +114). Per
+step:
+
+- Guard code, +66: `s_and_b32` (+26) and `s_cbranch_vccnz` (+22) dominate.
+  Each step evaluates the pair and owner predicates for A and B and turns
+  them into `s_and_b32 vcc_lo, exec_lo, sN` + `s_cbranch_vccnz`. The block
+  sits between the `c10` and `c11` WMMA groups, and the matrix pipe idles
+  while it runs: in-order issue does not hide SALU between WMMA groups.
+- LDS reads, +36: `ds_load_2addr_b32` (scales) +17, `s_wait_dscnt` +15.
+- TDM waits, +14.
+- Address VALU and the prefetches themselves, about +8.
+- Barrier waits unchanged in total (cluster +62, workgroup -66): owners
+  lag on their prefetch steps and the skew moves to the cluster rendezvous.
+
+So most of the loss is guard code on the WMMA critical path, not prefetch
+traffic. Even without guards, the LDS and TDM waits alone (+50 cycles per
+step, about +6%) exceed anything the lookahead could recover on this ring.
+**Branch-free split lookahead (`L2_LOOKAHEAD_SPLIT`).** Every CTA
+prefetches its own slice every step: the C CTAs sharing an A tile split its
+rows, each takes half of its slice per step by step parity, so each 256-byte
+line is requested once per pair (B likewise). Waves 0-1 cover A and 2-3 B;
+lanes l and l+16 of a wave share a line. The per-lane base is hoisted out of
+the K loop; each step adds one scalar offset: 6 SALU, one
+`v_add_nc_u64` and one `global_prefetch_b8` per wave, no branches (loop
+511 -> 538 instructions per three steps). The descriptor prefetch op always
+covers its whole block, so this uses elementwise inline asm on a pointer
+tensor.
+
+Inline-asm pitfall: `global_prefetch_b8` reads its address VGPRs after
+issue. LLVM inserts `s_wait_alu depctr_vm_vsrc(0)` before overwriting a VMEM
+source only for instructions it knows, so a later write to the address
+registers corrupted the address. Symptom: intermittent
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, every launch for the
+four-stage build, rarely for three stages; FFM does not catch it. A
+`depctr_vm_vsrc(0)` wait inside the asm fixes it (2,000-launch stress clean).
+
+Hardware, FP16 8192³ (0.14665 ms default):
+
+| Variant | Time | Cycles |
+| --- | ---: | ---: |
+| Three stages, six C slots | +1.67% | +2.99% |
+| … + split lookahead 2 | +6.23% | +9.05% |
+| Four stages (default) + split lookahead 2 | +0.70% | +0.34% |
+
+The merged three-stage split builds (lookahead 2 and 4) passed one check and
+then hung in a 2,000-launch repeat (not investigated; they were +22% with
+the branched prefetch).
+
+ATT of three stages with and without the split lookahead (profiled, so not
+power-capped, ~2.4 GHz): the prefetch is faster there. Mean steady step 858
+-> 834 cycles, wave 241.5k -> 236.9k (-1.9%). Barrier waits fall 141 -> 73
+per step (workgroup 108 -> 38, cluster unchanged), so the guard skew is
+gone and the earlier input arrival shortens the slot waits. Costs: SALU +11,
+the prefetch with its `vm_vsrc` wait +9, WMMA issue +18, TDM waits +3; LDS
+unchanged. At the 2,500 W cap the same kernel takes 9% more cycles.
+
+Telemetry under the cap (`run_ab2.py`: amd-smi clocks, usage and throttle
+counters per timing window, four rounds, all at 2,500 W with the PPT limit
+active 99.5-100% of the time):
+
+| Kernel | Time | Cycles | GFX MHz | FCLK MHz | UMC activity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four stages (default) | 0 | 0 | 1,717 | 1,761 | 12% |
+| … + split lookahead 2 | +0.57% | +0.19% | 1,710 | 1,757 | 12% |
+| Three stages | +1.77% | +3.14% | 1,741 | 1,782 | 12% |
+| … + split lookahead 2 | +6.46% | +9.42% | 1,765 | 1,797 | 11% |
+| … + branched lookahead 2 | +10.79% | +16.45% | 1,804 | 1,811 | 11% |
+
+The amd-smi "cycles" above are time x sampled clock, not counts.
+`CYCLE_PROBE` (opt-in, `--cycle_probe`) records each wave's
+`s_get_shader_cycles_u64` and 100 MHz realtime at kernel start and end
+(stored at once, so nothing stays live), timed interleaved with unprobed
+builds under the cap (`run_probe.py`). Medians over 1,024 waves:
+
+| Kernel | Probed vs unprobed time | Wave cycles | Wave µs | Effective MHz | amd-smi MHz |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four stages (default) | +0.09% | 225.5k | 138.9 | 1,623 | 1,715 |
+| … + split lookahead 2 | +1.58% | 237.8k | 144.1 | 1,647 | 1,723 |
+| Three stages | +0.21% | 228.8k | 138.9 | 1,645 | 1,736 |
+| … + split lookahead 2 | -1.43% | 240.4k | 144.3 | 1,671 | 1,750 |
+
+- The effective clock (cycles / realtime) is about 5% below the amd-smi
+  sample median for every kernel; relative comparisons are unaffected.
+- Under the cap the prefetch does add cycles: +5.4% (four stages) and +5.1%
+  (three stages) per wave, at a 1.5% higher effective clock. The probe
+  shifts the prefetch builds by up to 1.6% (their code changed slightly),
+  so these deltas are approximate; the default and three-stage builds are
+  unperturbed.
+- In the profiled traces (~2.4 GHz) the same kernels take more cycles per
+  wave (default 235.1k, three stages 241.5k) and the prefetch reduces them
+  (229.9k, 236.9k). Memory latency is roughly fixed in time, so it costs
+  more cycles at the higher clock, where hiding it pays. At ~1.65 GHz the
+  kernel is less latency-bound and the prefetch's extra requests cost more
+  than they hide. Judge such changes at the cap, by time.
+
+ATT of the four-stage default under the same profiling conditions: steady
+loop 4 steps per iteration, median 767-782 and mean 754-811 cycles per
+step (lds 243, workgroup barrier 68, TDM 46, SALU 38, VALU 28, WMMA issue
+322; the cluster rendezvous is outside the steady block); wave 235.1k
+cycles, against 241.5k (three stages) and 236.9k (three stages + split
+lookahead). A schedule change that wins in an uncapped trace can still
+lose at the cap; judge prefetch-like changes only by sustained timing.
+
+Archive (knob patch, ships, hardware log, ATT bundles, phase reports):
+`/home/ibutygin/tlx/perf-data/mxfp-l2-lookahead-20261105.tar.gz` (SHA256
+`ac634a2b80fd1afcf86fc2ae1385469ee0be89efc5e3a0184a55fde3ea7152db`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

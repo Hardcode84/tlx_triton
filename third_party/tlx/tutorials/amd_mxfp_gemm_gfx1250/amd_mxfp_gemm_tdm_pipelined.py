@@ -1720,16 +1720,126 @@ def _mxgemm_persistent_compute_top(c00, c01, a00, sa00, b00, sb00, a_buf, b_buf,
 
 
 @triton.jit
-def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf,
-                                b_buf, as_buf, bs_buf, off_m, off_n, i, slot, next_slot, BM: tl.constexpr,
-                                BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr,
-                                DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
-                                WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr, LOADS: tl.constexpr,
-                                GROUPED_PREFETCH: tl.constexpr, PREFETCH_B_AFTER_C10: tl.constexpr,
-                                CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
-                                XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
-                                REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr,
-                                SPLIT_CLUSTER_BARRIER: tl.constexpr, MERGED_BARRIER: tl.constexpr = False):
+def _mxgemm_lookahead_l2_prefetch(a_desc, b_desc, as_desc, bs_desc, off_m, off_n, pk, K_ITERS: tl.constexpr,
+                                  BK: tl.constexpr, DA: tl.constexpr, DB: tl.constexpr, CLUSTER_SIZE: tl.constexpr,
+                                  CLUSTER_LAYOUT: tl.constexpr, SCALES: tl.constexpr):
+    # Warm L2 with input stage pk beyond the TDM ring, a "fake" extra stage
+    # with no LDS slot. A 256-byte L2 line holds two BK128 K steps of a row,
+    # so prefetch only even stages and cover the pair. One CTA of each
+    # multicast group prefetches a shared tile, rotating per pair. Branch on
+    # block-uniform predicates: a masked prefetch is still issued, redirected
+    # to the last element of the descriptor view.
+    PAIRED: tl.constexpr = BK // DA == 128 and BK // DB == 128
+    live = pk < K_ITERS
+    if PAIRED:
+        live = live & (pk % 2 == 0)
+    pa = live
+    pb = live
+    if CLUSTER_SIZE > 1 and CLUSTER_LAYOUT != "linear":
+        R: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT)
+        C: tl.constexpr = _mxgemm_grid_cols(CLUSTER_LAYOUT)
+        rank = tlx.cluster_cta_rank()
+        pair = pk // 2 if PAIRED else pk
+        # A is shared by the C ranks with equal rank % R; B by the R ranks
+        # with equal rank // R.
+        pa = pa & (rank // R == pair % C)
+        pb = pb & (rank % R == pair % R)
+    if pa:
+        if _mxgemm_desc_group_rows(a_desc) != 0:
+            ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // _mxgemm_desc_group_rows(a_desc), 0, 0],
+                                              clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(ad, [0, 0, pk * (BK // DA)], speculative=True)
+        else:
+            ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(ad, [0, pk * (BK // DA)], speculative=True)
+        if SCALES:
+            # Scales advance 512 bytes (two lines) per BK128 stage.
+            asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // 128, 0], clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(asd, [0, pk * (BK // 32 * 128)], speculative=True)
+            if PAIRED:
+                tlx.amd_descriptor_prefetch_tensor(asd, [0, (pk + 1) * (BK // 32 * 128)], speculative=True)
+    if pb:
+        if _mxgemm_desc_group_rows(b_desc) != 0:
+            bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // _mxgemm_desc_group_rows(b_desc), 0, 0],
+                                              clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(bd, [0, 0, pk * (BK // DB)], speculative=True)
+        else:
+            bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(bd, [0, pk * (BK // DB)], speculative=True)
+        if SCALES:
+            bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // 128, 0], clamp_bounds=False)
+            tlx.amd_descriptor_prefetch_tensor(bsd, [0, pk * (BK // 32 * 128)], speculative=True)
+            if PAIRED:
+                tlx.amd_descriptor_prefetch_tensor(bsd, [0, (pk + 1) * (BK // 32 * 128)], speculative=True)
+
+
+@triton.jit
+def _mxgemm_split_l2_prefetch(a_ptr, b_ptr, off_m, off_n, pk, K_ITERS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                              stride_am: tl.constexpr, stride_bn: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr):
+    # Branch-free lookahead: every CTA prefetches its own slice of the
+    # shared A and B tiles every step. A 256-byte L2 line holds two BK128
+    # steps of an FP8 row, so the C CTAs sharing an A tile split its rows,
+    # and each takes half of its rows per step (by step parity): each line
+    # is requested once per pair. B likewise across the R CTAs sharing it.
+    # Each lane addresses one line; the per-lane base is loop-invariant and
+    # each step only adds a uniform offset. Speculative, at SE scope.
+    R: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT)
+    C: tl.constexpr = _mxgemm_grid_cols(CLUSTER_LAYOUT)
+    LINES_A: tl.constexpr = BM // (2 * C)
+    LINES_B: tl.constexpr = BN // (2 * R)
+    tl.static_assert(LINES_A == LINES_B and stride_am == stride_bn, "split L2 prefetch needs symmetric A/B slices")
+    LINES: tl.constexpr = LINES_A + LINES_B
+    tl.static_assert(LINES <= 128 and 128 % LINES == 0)
+    PER_WARP: tl.constexpr = LINES // 4
+    tl.static_assert(PER_WARP >= 1 and 32 % PER_WARP == 0)
+    rank = tlx.cluster_cta_rank()
+    e = tl.arange(0, 128)
+    # Wave w covers lines [w * PER_WARP, (w + 1) * PER_WARP); duplicate lanes
+    # of one wave request the same line.
+    j = (e // 32) * PER_WARP + (e % 32) % PER_WARP
+    a_row = off_m + (rank // R) * (BM // C) + j
+    b_row = off_n + (rank % R) * (BN // R) + (j - LINES_A)
+    base = tl.where(j < LINES_A, a_ptr + a_row.to(tl.int64) * stride_am, b_ptr + b_row.to(tl.int64) * stride_bn)
+    pk = tl.minimum(pk, K_ITERS - 1)
+    step = (pk % 2) * (LINES_A * stride_am) + (pk // 2) * 256
+    # The prefetch reads its address VGPRs after issue. LLVM inserts
+    # depctr_vm_vsrc waits before overwriting a VMEM source only for
+    # instructions it knows; inline asm is opaque, so wait here. Without it a
+    # later write to the address registers intermittently corrupts the
+    # address (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION).
+    tl.inline_asm_elementwise("global_prefetch_b8 $1, off scope:SCOPE_SE\n\ts_wait_alu depctr_vm_vsrc(0)", "=v,v",
+                              [base + step], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _mxgemm_cycle_probe(probe_ptr, WHICH: tl.constexpr):
+    # EXPERIMENT: per-wave shader-cycle and 100 MHz realtime counters, stored
+    # at once; they never feed control flow or addresses. Layout [program,
+    # 4, lanes]: start cycles, end cycles, start realtime, end realtime;
+    # element w * 32 holds wave w's values.
+    cycles = tl.inline_asm_elementwise("s_get_shader_cycles_u64 $0", "=s", [], dtype=tl.int64, is_pure=False, pack=1)
+    realtime = tl.inline_asm_elementwise("s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n\ts_wait_kmcnt 0", "=s",
+                                         [], dtype=tl.int64, is_pure=False, pack=1)
+    LANES: tl.constexpr = tlx.num_warps() * 32
+    e = tl.arange(0, LANES)
+    base = probe_ptr + tl.program_id(0).to(tl.int64) * (4 * LANES) + WHICH * LANES + e
+    zero = tl.zeros([LANES], tl.int64)
+    tl.store(base, zero + cycles)
+    tl.store(base + 2 * LANES, zero + realtime)
+
+
+@triton.jit
+def _mxgemm_defer_bottom_k_step(
+        c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m,
+        off_n, i, slot, next_slot, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr,
+        DB: tl.constexpr, DTYPE_A: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
+        WITH_A_SCALE: tl.constexpr, FUSION: tl.constexpr, LOADS: tl.constexpr, GROUPED_PREFETCH: tl.constexpr,
+        PREFETCH_B_AFTER_C10: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
+        REGISTER_PIPELINE: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr,
+        MERGED_BARRIER: tl.constexpr = False, L2_LOOKAHEAD: tl.constexpr = 0, K_ITERS: tl.constexpr = 0,
+        L2_LOOKAHEAD_SCALES: tl.constexpr = False, L2_LOOKAHEAD_SPLIT: tl.constexpr = False, l2_a_ptr=None,
+        l2_b_ptr=None, L2_STRIDE_A: tl.constexpr = 0, L2_STRIDE_B: tl.constexpr = 0):
     # One steady BK128 step of the deferred-bottom schedule. This matches the
     # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
     # Pin every dot to the output store's native WMMA layout. A peeled step
@@ -1762,6 +1872,16 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
     if GROUPED_PREFETCH:
         _mxgemm_schedule_prefetch(103, True)
     tlx.amd_sched_barrier()
+    if L2_LOOKAHEAD > 0 and L2_LOOKAHEAD_SPLIT:
+        # Mid-step, away from the refill: the stage L2_LOOKAHEAD past it.
+        # No branches, so let it schedule into the c11 WMMAs.
+        _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM, BN,
+                                  L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT)
+    elif L2_LOOKAHEAD > 0:
+        # Mid-step, away from the refill: the stage L2_LOOKAHEAD past it.
+        _mxgemm_lookahead_l2_prefetch(a_desc, b_desc, as_desc, bs_desc, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD,
+                                      K_ITERS, BK, DA, DB, CLUSTER_SIZE, CLUSTER_LAYOUT, L2_LOOKAHEAD_SCALES)
+        tlx.amd_sched_barrier()
     if PREFETCH_B_AFTER_C10:
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=MERGED_BARRIER)
     c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
@@ -2222,8 +2342,15 @@ def mxgemm_tdm_persistent_kernel(
     OVERLAP_PEEL: tl.constexpr = False,
     MERGED_HANDOFF_BARRIER: tl.constexpr = False,
     INTERLEAVE_C_FILL: tl.constexpr = 0,
+    L2_LOOKAHEAD: tl.constexpr = 0,
+    L2_LOOKAHEAD_SCALES: tl.constexpr = False,
+    L2_LOOKAHEAD_SPLIT: tl.constexpr = False,
+    probe_ptr=None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
+    if probe_ptr is not None:
+        # Store right away so no probe value stays live across the kernel.
+        _mxgemm_cycle_probe(probe_ptr, 0)
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
     tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4 or CLUSTER_SIZE == 8
@@ -2459,7 +2586,9 @@ def mxgemm_tdm_persistent_kernel(
             a_buf, b_buf, as_buf, bs_buf, off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B,
             NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE,
             CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE,
-            CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF)
+            CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF, L2_LOOKAHEAD=L2_LOOKAHEAD,
+            K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES, L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT,
+            l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn)
 
     while tile < total_tiles:
         off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N,
@@ -2833,7 +2962,10 @@ def mxgemm_tdm_persistent_kernel(
                         BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS,
                         GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
                         XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, REGISTER_PIPELINE, CLUSTER_LAYOUT,
-                        SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF)
+                        SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF, L2_LOOKAHEAD=L2_LOOKAHEAD,
+                        K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
+                        L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
+                        L2_STRIDE_B=stride_bn)
                 REST: tl.constexpr = STEADY_STEPS - PEEL
                 UNROLLED_END: tl.constexpr = PEEL + REST - REST % NUM_BUFFERS
                 for i in tl.range(PEEL, UNROLLED_END, NUM_BUFFERS):
@@ -2844,7 +2976,10 @@ def mxgemm_tdm_persistent_kernel(
                             slots[(PEEL + j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B,
                             NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
                             CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                            REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF)
+                            REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF,
+                            L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
+                            L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr,
+                            L2_STRIDE_A=stride_am, L2_STRIDE_B=stride_bn)
                 for j in tl.static_range(REST % NUM_BUFFERS):
                     c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                         c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
@@ -2852,7 +2987,10 @@ def mxgemm_tdm_persistent_kernel(
                         slots[(UNROLLED_END + j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
                         DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10,
                         CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                        REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF)
+                        REGISTER_PIPELINE, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF,
+                        L2_LOOKAHEAD=L2_LOOKAHEAD, K_ITERS=K // BLOCK_K, L2_LOOKAHEAD_SCALES=L2_LOOKAHEAD_SCALES,
+                        L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
+                        L2_STRIDE_B=stride_bn)
                 slot = slots[STEADY_STEPS % NUM_BUFFERS]
             # With STATIC_SLOT_UNROLL the steps above consume the whole range.
             for i in tl.range(
@@ -3494,6 +3632,8 @@ def mxgemm_tdm_persistent_kernel(
     if CLUSTER_SIZE > 1 and CLUSTER_BARRIER_INTERVAL > 0:
         tlx.async_amd_descriptor_wait(0)
         tlx.cluster_barrier()
+    if probe_ptr is not None:
+        _mxgemm_cycle_probe(probe_ptr, 1)
 
 
 def _mxgemm_persistent_programs(a, b, a_scale, b_scale, M, N, K, BM, BN, BK, num_buffers, group_m, transpose_b,
@@ -3683,6 +3823,10 @@ def mxgemm_tdm_pipelined(
         OVERLAP_PEEL: bool = False,
         MERGED_HANDOFF_BARRIER: bool = False,
         INTERLEAVE_C_FILL: int = 0,
+        L2_LOOKAHEAD: int = 0,
+        L2_LOOKAHEAD_SCALES: bool = False,
+        L2_LOOKAHEAD_SPLIT: bool = False,
+        CYCLE_PROBE: bool = False,
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
 ) -> torch.Tensor:
@@ -3905,6 +4049,11 @@ def mxgemm_tdm_pipelined(
         raise ValueError("INTERLEAVE_C_FILL must be 0, 1 or 2")
     if INTERLEAVE_C_FILL and not OVERLAP_PEEL:
         raise ValueError("INTERLEAVE_C_FILL requires OVERLAP_PEEL")
+    if L2_LOOKAHEAD and not (STATIC_SLOT_UNROLL and BLOCK_K == 128 and L2_LOOKAHEAD > 0):
+        raise ValueError("L2_LOOKAHEAD requires STATIC_SLOT_UNROLL with BK128 and a positive distance")
+    if L2_LOOKAHEAD_SPLIT and not (L2_LOOKAHEAD and CLUSTER_SIZE > 1 and CLUSTER_LAYOUT in ("2x2", "4x4")
+                                   and DTYPE_A == DTYPE_B and not L2_LOOKAHEAD_SCALES):
+        raise ValueError("L2_LOOKAHEAD_SPLIT requires L2_LOOKAHEAD, a 2x2 or 4x4 cluster, A8W8, and no scale prefetch")
     if OVERLAP_PEEL and not (
             PERSISTENT and OUTPUT_STAGING and CROSS_TILE_PREFETCH and BLOCK_K == 128 and NUM_WARPS == 4
             and K // BLOCK_K > NUM_BUFFERS and HANDOFF_SCHEDULE == "current"
@@ -4091,6 +4240,15 @@ def mxgemm_tdm_pipelined(
         persistent_options["MERGED_HANDOFF_BARRIER"] = True
     if INTERLEAVE_C_FILL:
         persistent_options["INTERLEAVE_C_FILL"] = int(INTERLEAVE_C_FILL)
+    if L2_LOOKAHEAD:
+        persistent_options["L2_LOOKAHEAD"] = int(L2_LOOKAHEAD)
+        persistent_options["L2_LOOKAHEAD_SCALES"] = bool(L2_LOOKAHEAD_SCALES)
+        persistent_options["L2_LOOKAHEAD_SPLIT"] = bool(L2_LOOKAHEAD_SPLIT)
+    if CYCLE_PROBE:
+        if not PERSISTENT:
+            raise ValueError("CYCLE_PROBE requires the persistent kernel")
+        persistent_options["probe_ptr"] = torch.zeros(NUM_PROGRAMS * 4 * NUM_WARPS * 32, dtype=torch.int64,
+                                                      device=a.device)
 
     def run_kernel():
         if WARP_PIPELINE:
@@ -4275,8 +4433,11 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                            True), LDS_PARTITIONED_AB=cfg.get("LDS_PARTITIONED_AB"),
             OVERLAP_PEEL=cfg.get("OVERLAP_PEEL", False), OUT_DTYPE=cfg.get("OUT_DTYPE", "fp32"), TILES_PER_WARP=cfg.get(
                 "TILES_PER_WARP",
-                (2, 2)), MERGED_HANDOFF_BARRIER=cfg.get("MERGED_HANDOFF_BARRIER",
-                                                        False), INTERLEAVE_C_FILL=cfg.get("INTERLEAVE_C_FILL", 0))
+                (2, 2)), MERGED_HANDOFF_BARRIER=cfg.get("MERGED_HANDOFF_BARRIER", False), INTERLEAVE_C_FILL=cfg.get(
+                    "INTERLEAVE_C_FILL", 0), L2_LOOKAHEAD=cfg.get("L2_LOOKAHEAD", 0), L2_LOOKAHEAD_SCALES=cfg.get(
+                        "L2_LOOKAHEAD_SCALES",
+                        False), L2_LOOKAHEAD_SPLIT=cfg.get("L2_LOOKAHEAD_SPLIT",
+                                                           False), CYCLE_PROBE=cfg.get("CYCLE_PROBE", False))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -4377,6 +4538,15 @@ if __name__ == "__main__":
         "(default: 64 with --static_slot_unroll, else 0)")
     parser.add_argument("--merged_handoff_barrier", action="store_true",
                         help="one workgroup barrier per static-slot K step, with relaxed operand loads")
+    parser.add_argument(
+        "--l2_lookahead", type=int, default=0,
+        help="static-slot BK128: L2-prefetch the input stage this many steps past the TDM refill "
+        "(an extra ring stage without an LDS slot)")
+    parser.add_argument("--l2_lookahead_scales", action="store_true", help="also L2-prefetch the lookahead scales")
+    parser.add_argument("--cycle_probe", action="store_true",
+                        help="EXPERIMENT: record per-wave shader cycles and realtime at kernel start and end")
+    parser.add_argument("--l2_lookahead_split", action="store_true",
+                        help="branch-free lookahead: every cluster CTA prefetches its own rows every step")
     parser.add_argument(
         "--interleave_c_fill", type=int, choices=(0, 1, 2), default=0,
         help="overlapped C fill schedule: 1 alternates each chunk's LDS writes with next-tile WMMAs; "
@@ -4516,6 +4686,10 @@ if __name__ == "__main__":
         OVERLAP_PEEL=args.overlap_peel,
         MERGED_HANDOFF_BARRIER=args.merged_handoff_barrier,
         INTERLEAVE_C_FILL=args.interleave_c_fill,
+        L2_LOOKAHEAD=args.l2_lookahead,
+        L2_LOOKAHEAD_SCALES=args.l2_lookahead_scales,
+        L2_LOOKAHEAD_SPLIT=args.l2_lookahead_split,
+        CYCLE_PROBE=args.cycle_probe,
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
