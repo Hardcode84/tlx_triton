@@ -3141,6 +3141,56 @@ Archive (traces, logs, microbenchmark, scripts, patch):
 `/home/ibutygin/tlx/perf-data/mxfp-kloop-profile-20261106.tar.gz` (SHA256
 `0837f399db8d24e283461add88fcf8a7d2b75f6d3d59987877d6d24a14ff681d`).
 
+
+### FlyDSL comparison and split-barrier refill (2026-11-06)
+
+Target: 620-650 cycles per K128 step. Sources: FlyDSL
+(`github.com/ROCm/FlyDSL`, `kernels/gemm/gemm_a8w8_256x256_gfx1250.py`) and
+the gluon tutorial (`~/gluon-tutorials/gfx12-gluon-tutorials`, A8W8 v14:
+681.9 cycles/K128 with LDS wait 36, TDM wait 5.5, barrier 7; FlyDSL tiles
+without long waits 617). FlyDSL's 256x256x128 MX kernel (four waves, four
+buffers): preshuffled B (`[N/16, K*16]`, so B fragments are contiguous
+512-byte LDS runs; only A is padded); one TDM descriptor per wave (A, B,
+A scales, B scales) patched only in the LDS and global address words;
+quadrants Q0 (reads B1), Q1 (reads A1), then `s_wait_dscnt 0` + signal, 3
+register-only Q2 WMMAs, wait + refill, and the next stage's reads over the
+rest of Q2 and Q3; odd waves mirror the quadrant order; cluster barrier
+every 32 K steps. The v14 tutorial gets its split from two ordinary
+barriers that an LLVM-IR stage hook rewrites into `s_barrier_signal` /
+`s_barrier_wait`, so Membar and alias analysis still see full barriers.
+
+`REFILL_OVERLAP` modes 3 and 4 use that IR rewrite
+(`_mxgemm_install_split_lowering`, active only when requested):
+
+- Mode 3: TDM wait, barrier (signal), the 16 C10 WMMAs, barrier (wait),
+  then the refill and both next-slot reads across C11 (16 WMMAs).
+- Mode 4: both second halves of this slot read during C00 (front-loaded:
+  four reads per WMMA over the first nine), TDM wait, signal, the 16 C01
+  WMMAs, wait, then the refill and the next slot read across C10 and C11
+  (32 WMMAs, also front-loaded).
+
+FFM ring-phase test passes for all modes. Hardware (four rounds,
+FP32-reference checks; repeated runs agree within ~0.1%):
+
+| Variant | 8192³ | 8192²x4096 |
+| --- | ---: | ---: |
+| Mode 3 | -1.51% to -1.58% | -0.10% to -0.13% |
+| Mode 4, reads spread evenly | -1.24% | -0.80% / -1.39% |
+| **Mode 4, front-loaded reads** | **-2.21%** (0.14345 ms, 7,665 TFLOPS) | **-1.25%** |
+
+ATT (uncapped) per K step: default 754, mode 3 707 (barrier 65 -> 23, TDM
+45 -> 14, but LDS waits 39 -> 69: the next slot is read in only 16 WMMAs),
+mode 4 front-loaded 745 (release drain `s_wait_dscnt 0` before the signal
+83, `ds_load` backpressure 41). The 16-WMMA window carries no LDS reads, so
+a quarter of each step leaves the LDS idle while the rest must move the
+step's 139 KB. Closing the gap to ~620-650 needs FlyDSL's short window
+(3-8 WMMAs), which needs quadrant dots split into 8-WMMA halves (N-split of
+the accumulator and B operand; the 64-column bit is a register bit in both
+layouts), so reads continue around the window.
+Archive (traces, logs, ships, patch):
+`/home/ibutygin/tlx/perf-data/mxfp-split-refill-20261106.tar.gz` (SHA256
+`9e1dc69faea57237e5e534c59f7f99e1e91b9debac8411e820e6f33ab5934d49`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

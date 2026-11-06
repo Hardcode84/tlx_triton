@@ -101,6 +101,17 @@ the four-stage static loop is slower with or without it (16384 cubed +0.2 to
 +0.8%, 32768 cubed +1.5 to +7.6%), so those cases keep their defaults. See
 [HANDOFF.md](HANDOFF.md).
 
+`--refill-overlap 4` (`REFILL_OVERLAP=4`, requires the merged barrier and four
+buffers) splits that barrier as the gluon v14 tutorial and FlyDSL do: each
+step reads both second halves of its slot during C00, signals, runs the 16
+register-only C01 WMMAs, then waits, refills the slot, and reads the next
+slot across C10 and C11. The kernel keeps two ordinary barriers through
+Membar and LLVM optimization; an LLVM IR stage hook rewrites the marked pair
+into `s_barrier_signal` / `s_barrier_wait`. On gfx1250 it is a further 2.2%
+faster at 8192 cubed and 1.25% at 8192^2x4096, and `bench.py` uses it wherever
+it uses the merged barrier. Modes 1-3 are experimental schedule variants (see
+[HANDOFF.md](HANDOFF.md)).
+
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
 FP32 output staging slots (kernel default two). `bench.py` uses three for
 three-buffer MX8xMX8, which keeps more C stores in flight at each tile
