@@ -1899,6 +1899,11 @@ def _mxgemm_defer_bottom_k_step(
             tlx.amd_sched_group_barrier(0x100, 3, 108)
         tlx.amd_sched_group_barrier(0x8, 8, 108)
         tlx.amd_sched_barrier()
+        if L2_LOOKAHEAD > 0:
+            # Branch-free L2 lookahead, scheduled into the C11 WMMAs.
+            tl.static_assert(L2_LOOKAHEAD_SPLIT, "refill overlap mode 4 supports only the split L2 lookahead")
+            _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM, BN,
+                                      L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT)
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True)
         c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
         for _ in tl.static_range(6):
