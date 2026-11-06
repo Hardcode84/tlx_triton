@@ -1734,6 +1734,72 @@ def _mxgemm_split_barrier_signal(TDM_PENDING: tl.constexpr):
                               dtype=tl.int32, is_pure=False, pack=1)
 
 
+_MXGEMM_SPLIT_MARKER = "MXGEMM_SPLIT_SIGNAL_V1"
+_MXGEMM_SPLIT_HOOK_INSTALLED = False
+
+
+@triton.jit
+def _mxgemm_split_signal_marker():
+    # Marks the preceding workgroup barrier as the signal half of a split pair
+    # (see _mxgemm_install_split_lowering).
+    tl.inline_asm_elementwise("; MXGEMM_SPLIT_SIGNAL_V1\n\ts_mov_b32 $0, 0", "=s,~{memory}", [], dtype=tl.int32,
+                              is_pure=False, pack=1)
+
+
+def _mxgemm_install_split_lowering():
+    # EXPERIMENT (REFILL_OVERLAP=3), after the gluon v14 tutorial: keep ordinary
+    # barriers through Membar and LLVM optimization, then rewrite the marked
+    # barrier into s_barrier_signal and the next barrier into s_barrier_wait.
+    # Kernels without the marker are unchanged.
+    global _MXGEMM_SPLIT_HOOK_INSTALLED
+    if _MXGEMM_SPLIT_HOOK_INSTALLED:
+        return
+    import hashlib
+    import re
+    from triton import knobs
+    previous = knobs.runtime.add_stages_inspection_hook
+
+    def hook(backend=None, stages=None, options=None, language=None, capability=None):
+        if stages is None:
+            key = "mxgemm-split-barrier-v1"
+            if previous is not None:
+                key += "|" + previous()[0]
+            return key, hashlib.sha256(key.encode()).hexdigest()
+        if previous is not None:
+            previous(backend, stages, options, language, capability)
+        lower = stages["llir"]
+
+        def split(src, metadata):
+            llir = lower(src, metadata)
+            if _MXGEMM_SPLIT_MARKER not in llir:
+                return llir
+            lines = llir.splitlines()
+            pending, pairs = None, 0
+            for i, line in enumerate(lines):
+                if _MXGEMM_SPLIT_MARKER in line:
+                    assert pending is None
+                    j = next(j for j in range(i - 1, max(i - 6, 0), -1) if "@llvm.amdgcn.s.barrier()" in lines[j])
+                    lines[j] = lines[j].replace("call void @llvm.amdgcn.s.barrier()",
+                                                'call void asm sideeffect "s_barrier_signal -1", "~{memory}"()')
+                    pending = i
+                elif pending is not None:
+                    if "@llvm.amdgcn.s.barrier()" in line:
+                        lines[i] = line.replace("call void @llvm.amdgcn.s.barrier()",
+                                                'call void asm sideeffect "s_barrier_wait -1", "~{memory}"()')
+                        pending, pairs = None, pairs + 1
+                    else:
+                        assert not re.search(r"\b(load|store|br|switch)\b|@llvm\.amdgcn\.(raw|ds|global|tensor)",
+                                             line), line
+            assert pending is None and pairs > 0
+            metadata["mxgemm_split_pairs"] = pairs
+            return "\n".join(lines) + "\n"
+
+        stages["llir"] = split
+
+    knobs.runtime.add_stages_inspection_hook = hook
+    _MXGEMM_SPLIT_HOOK_INSTALLED = True
+
+
 @triton.jit
 def _mxgemm_split_barrier_wait():
     tl.inline_asm_elementwise("s_barrier_wait -1", "=s", [], dtype=tl.int32, is_pure=False, pack=1)
@@ -1874,12 +1940,98 @@ def _mxgemm_defer_bottom_k_step(
     # starts from constant zeros and remainder steps follow the loop; without
     # pins, layout selection can pick different warp distributions for these
     # dots and insert accumulator conversions through LDS.
+    if MERGED_BARRIER and REFILL_OVERLAP == 4:
+        # FlyDSL-like order: read both second halves of this slot during C00,
+        # split the rendezvous around C01's register-only WMMAs (LLVM IR rewrite
+        # of two ordinary barriers), then refill and read the next slot across
+        # C10 and C11 (32 WMMAs).
+        tl.static_assert(GROUPED_PREFETCH and PREFETCH_B_AFTER_C10)
+        b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS, RELAXED=True)
+        a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE, RELAXED=True)
+        c00 = _mxgemm_native_dot(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
+        # Front-load the 34 reads so the release drain before the signal has
+        # several WMMAs of cover.
+        for _ in tl.static_range(9):
+            tlx.amd_sched_group_barrier(0x8, 1, 107)
+            tlx.amd_sched_group_barrier(0x100, 4, 107)
+        tlx.amd_sched_group_barrier(0x8, 7, 107)
+        tlx.amd_sched_barrier()
+        tlx.async_amd_descriptor_wait((BUFFERS - 2) * LOADS)
+        tl.debug_barrier()
+        _mxgemm_split_signal_marker()
+        tlx.amd_sched_barrier()
+        c01 = _mxgemm_native_dot(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
+        tlx.amd_sched_barrier()
+        tl.debug_barrier()
+        _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
+                                i + BUFFERS, slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE,
+                                CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                                REGISTER_PIPELINE, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP)
+        last_b00, last_sb00 = b00, sb00
+        a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
+                                         RELAXED=True)
+        c10 = _mxgemm_native_dot(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+        tlx.amd_sched_group_barrier(0x4, 8, 108)
+        tlx.amd_sched_group_barrier(0x8, 1, 108)
+        tlx.amd_sched_group_barrier(0x10, 1, 108)
+        tlx.amd_sched_group_barrier(0x4, 6, 108)
+        tlx.amd_sched_group_barrier(0x8, 1, 108)
+        tlx.amd_sched_group_barrier(0x10, 1, 108)
+        for _ in tl.static_range(6):
+            tlx.amd_sched_group_barrier(0x8, 1, 108)
+            tlx.amd_sched_group_barrier(0x100, 3, 108)
+        tlx.amd_sched_group_barrier(0x8, 8, 108)
+        tlx.amd_sched_barrier()
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True)
+        c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+        for _ in tl.static_range(6):
+            tlx.amd_sched_group_barrier(0x8, 1, 109)
+            tlx.amd_sched_group_barrier(0x100, 3, 109)
+        tlx.amd_sched_group_barrier(0x8, 10, 109)
+        tlx.amd_sched_barrier()
+        return c00, c01, c10, c11, a00, sa00, b00, sb00
     c00, c01, a10, sa10, b01, sb01 = _mxgemm_persistent_compute_top(
         c00, c01, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BM, BN, BK, DA, DB, DTYPE_A, DTYPE_B,
         BUFFERS, WITH_A_SCALE, GROUPED_PREFETCH, ARRIVE_K=i + BUFFERS if SPLIT_CLUSTER_BARRIER else None,
         CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, PIN_NATIVE=True,
         RELAXED=MERGED_BARRIER)
     last_b00, last_sb00 = b00, sb00
+    if MERGED_BARRIER and REFILL_OVERLAP == 3:
+        # Split the merged rendezvous as the gluon v14 tutorial does: two
+        # ordinary barriers keep Membar and alias analysis exact, and an LLVM
+        # IR stage hook turns the marked first one into s_barrier_signal and
+        # the next into s_barrier_wait. C10's register-only WMMAs run between
+        # them; the refill and both next-slot reads follow and overlap C11.
+        tl.static_assert(GROUPED_PREFETCH and PREFETCH_B_AFTER_C10)
+        tlx.async_amd_descriptor_wait((BUFFERS - 2) * LOADS)
+        tl.debug_barrier()
+        _mxgemm_split_signal_marker()
+        tlx.amd_sched_barrier()
+        c10 = _mxgemm_native_dot(a10, sa10, DTYPE_A, last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
+        tlx.amd_sched_barrier()
+        tl.debug_barrier()
+        _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
+                                i + BUFFERS, slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE,
+                                CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                                REGISTER_PIPELINE, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP)
+        a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
+                                         RELAXED=True)
+        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True)
+        c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+        tlx.amd_sched_group_barrier(0x4, 8, 106)
+        tlx.amd_sched_group_barrier(0x8, 1, 106)
+        tlx.amd_sched_group_barrier(0x10, 1, 106)
+        tlx.amd_sched_group_barrier(0x4, 6, 106)
+        tlx.amd_sched_group_barrier(0x8, 1, 106)
+        tlx.amd_sched_group_barrier(0x10, 1, 106)
+        for _ in tl.static_range(12):
+            tlx.amd_sched_group_barrier(0x8, 1, 106)
+            tlx.amd_sched_group_barrier(0x100, 3, 106)
+        tlx.amd_sched_group_barrier(0x8, 2, 106)
+        tlx.amd_sched_barrier()
+        return c00, c01, c10, c11, a00, sa00, b00, sb00
     if MERGED_BARRIER and REFILL_OVERLAP == 2:
         # Split the merged rendezvous: each wave signals once its reads of this
         # slot and its share of the next slot have completed, issues all C10
@@ -4338,6 +4490,8 @@ def mxgemm_tdm_pipelined(
         if not (MERGED_HANDOFF_BARRIER and NUM_BUFFERS == 4):
             raise ValueError("REFILL_OVERLAP requires MERGED_HANDOFF_BARRIER with four buffers")
         persistent_options["REFILL_OVERLAP"] = int(REFILL_OVERLAP)
+        if REFILL_OVERLAP >= 3:
+            _mxgemm_install_split_lowering()
     if CYCLE_PROBE:
         if not PERSISTENT:
             raise ValueError("CYCLE_PROBE requires the persistent kernel")
@@ -4640,7 +4794,7 @@ if __name__ == "__main__":
         "(an extra ring stage without an LDS slot)")
     parser.add_argument("--l2_lookahead_scales", action="store_true", help="also L2-prefetch the lookahead scales")
     parser.add_argument(
-        "--refill_overlap", type=int, choices=(0, 1, 2), default=0,
+        "--refill_overlap", type=int, choices=(0, 1, 2, 3, 4), default=0,
         help="merged four-stage loop: 1 interleaves the refill with C10 WMMAs; 2 splits the step "
         "barrier around the C10 WMMAs and overlaps the refill with C11")
     parser.add_argument("--static_cluster_steps", action="store_true",
