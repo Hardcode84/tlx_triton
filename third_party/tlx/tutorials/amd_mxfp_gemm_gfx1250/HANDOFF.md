@@ -3329,6 +3329,157 @@ up to 15%. Archive (patch, logs, asm):
 `/home/ibutygin/tlx/perf-data/mxfp-late-l2-20261106.tar.gz` (SHA256
 `f52bcddb5f3b7979d4559ad11d0789260af294307e08ef713e19e44c3f21a304`).
 
+### LDS width and partition conflicts on the FP16 mode 4 loop (2026-11-06)
+
+LDS reads per K step: 64 `ds_load_b128` A/B operand reads (the widest LDS
+read on gfx1250; each wave reads its 128x128 FP8 A and B slices) and 4
+`ds_load_2addr_b32` scale reads (two dwords 8 bytes apart). Only the scales
+could widen: a scale layout with adjacent dwords would merge two of them
+into one `ds_load_b128`, at most 2 of 68 LDS instructions per step.
+
+AM (r8.05, 2048³, 16 programs, 2x2 clusters with barrier interval 8; new
+`run_am_v2.py` drives the current kernel through `matmul`; all passed the
+CPU check; bank conflicts zero):
+
+| Config | Read conflicts / LDS read | Write conflicts | LDS latency |
+| --- | ---: | ---: | ---: |
+| FP16 default (four stages, mode 4, 64-row pieces) | 0.57 | 37.9k | 109 |
+| FP16, no pieces | 0.73 | 37.2k | 114 |
+| FP16, 32-row pieces | 0.12 | 41.7k | 102 |
+| FP32 default (three stages, 64-row pieces) | 0.64 | 59.6k | 118 |
+
+Device, `bench.py` FP16 defaults, four alternating rounds, mean change
+against 64-row pieces: 32-row pieces -3.5% (8192²x4096), -2.3% (8192³),
+-1.2% (16384³); no pieces -0.05%, -1.4%, -1.8%. The 32-row layout still
+loses despite removing most conflicts (as on 2026-10-23: per-wave partition
+balance matters more than the conflict count), so 64-row pieces stay.
+Archive (AM harness and counters, device logs):
+`/home/ibutygin/tlx/perf-data/mxfp-lds-partition-20261106.tar.gz` (SHA256
+`7a791d3562e5604d062127f6b82e6f6459ed3f7b6aac9b601fcd6db7dc87c7b1`).
+
+### FlyDSL / Gluon tutorial partition handling and wave parity (2026-11-06): no gain
+
+Neither keeps a partition-aware layout in its best kernel. FlyDSL
+(`gemm_a8w8_256x256_gfx1250.py`) places all B slots at a 64 KiB-aligned
+offset 0, then A (16-byte row padding), then scales, with no pieces or
+swizzle; its conflict measure is a wave-parity traversal (`wave % 2` picks
+one of two steady loops; odd waves read A1 before B1, so half the waves read
+A while half read B). The Gluon tutorials (v16: plain 256:+16 padding) tried
+partition-separated ring slots (+0.38 / +0.15%), a partitioned layout
+(segment stalls -51.6%, +0.32%) and FlyDSL's parity by SIMD ID (stalls -57 /
+-68%, time -0.30% on v11, no gain on v12/v13). They read hardware stalls
+with `TX_PERF_SEL_VMW_CROSS_PORT_SEGMENT_CONFLICT_LDS_STALLED_CYCLES`
+(needs a clock-gating override); we have not used that counter.
+
+Our port (temporary `WAVE_PARITY`): odd waves run a mirrored mode 4 step
+(C00 reading A10 then B01; C10 in the split window; refill; C01 reading the
+next B00; C11 reading the next A00) in a second copy of the static steady
+loop. The two loops run in sequence with wave-uniform trip counts from
+`tlx.assume_uniform(tlx.thread_id(0) // 32) % 2`; both issue the same
+barrier, cluster, TDM and wait sequence. 929 VGPRs (unchanged), SGPR spills
+28 -> 36, +850 instructions. FFM: 12 ring-phase cases pass (K 9/13/14,
+clusters 1/4, static cluster steps on/off). Device, FP16 defaults, four
+alternating rounds, mean change against the default:
+
+| Case | Parity | Parity, no pieces | Parity, 32-row pieces |
+| --- | ---: | ---: | ---: |
+| 8192²x4096 | +0.10% (noise) | -0.64% | +0.61% (two rounds ~0) |
+| 8192³ | -1.95% | -1.05% | -0.57% |
+| 16384³ | -0.78% | +0.28% | +0.04% |
+
+Parity alone loses; it makes 32-row pieces almost neutral (they were -1.2 to
+-3.5% without it), but no combination beats the default. Not kept.
+Archive (patch, FFM check, device log, asm):
+`/home/ibutygin/tlx/perf-data/mxfp-wave-parity-20261106.tar.gz` (SHA256
+`dc74d99e8bebcb9628762301704a125eab7e72b920520f4235ef089be8d98818`).
+
+### Automatic wave specialization on the current kernel (2026-11-06): works, mostly slower
+
+The six `wave-specialization` commits (uniformity analysis, whole-body
+specialization, fused-TDM selector specialization, thread-ID states and
+integer ranges) cherry-picked onto `776e29fcaf` in worktree
+`/home/ibutygin/tlx/triton-ws` (branch `ws-current`; conflicts in
+`CanonicalizeLLVMIR.cpp`, `compiler.py` and a lit RUN block), plus the
+uncommitted fix lowering `AsyncTDMIntrinsicWait` to `ROCDL::WaitTensorcntOp`
+(otherwise block merging turns the wait count into a non-immediate operand).
+Built separately (`build-ws`; needs `TRITON_EXT_ENABLED=0` for the export
+version script, without which `libtriton.so` crashes next to the model's ROCm
+libraries, and `TRITON_BACKENDS_IN_TREE=1`). With the option off the kernel
+is identical to the main build. Two lit files fail from the merge
+(`test-alignment.mlir` uses unregistered `vector`/`memref` ops;
+`warp_id_to_llvm.mlir` RUN lines).
+
+It works: `enable_wave_specialization=True` clones the whole body into two
+wave versions (FP16 8192³: 4,397 -> 8,308 instructions), and the wave-selector
+`s_cselect`s drop 44 -> 5 (FP16), 52 -> 21 (FP32 three-stage), 41 -> 7 (FP32
+dynamic). In the FP16 mode 4 loop the specialized versions recompute each
+step's global addresses from `k` (SALU 58 -> 70-72 per iteration); VGPRs
+929 -> 938 (956 at 16384³), SGPR spills 28 -> 30 (30 -> 48 at 16384³). FFM:
+10 ring-phase cases pass with the option (FP16 mode 4, FP32 three-stage
+static, dynamic four-stage; clusters 1 and 4). Device (`run_ab2.py`, local
+compiles of the `bench.py` defaults, FP32-reference checks pass, four
+rotated rounds at the 2.5 kW cap):
+
+| Case | Time | Cycles | Pairs |
+| --- | ---: | ---: | --- |
+| FP16 8192²x4096 | -0.13% | -0.05% | +0.14, -0.30, -0.21, -0.14 |
+| FP16 8192³ | +1.78% | +3.09% | +1.74 to +1.86 |
+| FP16 16384³ | +2.61% | +4.89% | +2.48 to +2.66 |
+| FP32 8192³ (three stages) | +1.30% | +1.93% | +1.26 to +1.44 |
+| FP32 16384³ (dynamic four stages) | **-0.47%** | -1.03% | -0.33 to -0.51 |
+
+Only the dynamic FP32 loop gains (its selectors sit in the tile loop); the
+static loops lose to the larger code and extra loop SALU. Not adopted.
+
+Why the specialized loop recomputes `base + (k << 7)` every step (reproduced
+with Triton's `llc`): the per-step addresses are identical in LLVM IR, and
+in the base build the backend's straight-line strength reduction (SLSR)
+rewrites step j+1 as step j's address + 128 (one shift per iteration; LSR
+drops its own solution in both builds). SLSR only registers an address as a
+reusable basis if `ScalarEvolution::canReuseInstruction` proves reuse adds
+no poison. In the base build the TDM base is `select(wave_is_A, A_off,
+B_off) + ptr`; SCEV treats the select as an opaque leaf and the walk stops
+there. Specialization folds that select, exposing the whole tile-offset
+chain (`shl nsw`, `sext`, `ashr exact`, `sdiv`/`trunc` from the tile id, and
+`wave.id` with `range(0, 4)`), the walk gives up, and no step becomes a basis.
+Confirmations: `-enable-poison-reuse-guard=false` restores the folding (10 ->
+4 per-step shifts); a `freeze` on the tile-offset term of the base
+(`%.reass*`) gives 2 shifts and 56-57 loop SALU in the first clone (base 58).
+**Freeze fix, measured (2026-11-06).** The pass now folds selects on the
+version predicate itself, replacing each with `freeze(chosen operand)`
+(worktree diff, archived). Loop SALU per iteration drops below the base
+build (FP16 8192³ 58 -> 55-57, 16384³ 68 -> 64-65, FP32 8192³ 32 -> 27-28);
+VGPRs 930 (8k), SGPR spills 32 (8k) / 24 (16k, base 30). FFM: the same 10
+ring-phase cases pass.
+
+Timing method: `run_ab2/3.py` (several kernels in one process, one C buffer
+each) gave the same binary up to +/-10% depending on its position (FP16
+16384³ frozen build +9.4% in one order, +0.5% with a shared C buffer, ~+10%
+first in reversed order). Final numbers use `proc_ab.py`: one fresh process
+per kernel and round, six rotated rounds, median. Base binaries are stable
+(16384³ 1.141-1.147 ms); both specialized binaries are bimodal at FP16
+16384³ (2 of 6 processes at 1.27-1.29 ms with the clock up at ~1655 MHz,
+i.e. stalled), consistent with placement-dependent instruction fetch for
+the doubled code that both versions run concurrently on a CU (not traced).
+
+| Case | WS | WS + freeze |
+| --- | ---: | ---: |
+| FP16 8192²x4096 | +0.49% | +1.20% |
+| FP16 8192³ | +1.80% | +1.55% |
+| FP16 16384³ (median; bimodal) | +0.36% | +1.08% |
+| FP32 8192³ | +1.29% | **+0.06%** |
+| FP32 16384³ (`run_ab3`, separate buffers) | -0.47% | -0.49% |
+
+The freeze fully removes the FP32 three-stage regression (SALU was the
+cost there) but not the FP16 mode 4 one: there the remaining loss is not
+loop SALU (now below base) and is likely the doubled code footprint. Not
+adopted. Archive (pass diff, harnesses, logs, binaries):
+`/home/ibutygin/tlx/perf-data/mxfp-auto-ws-freeze-20261106.tar.gz` (SHA256
+`f0fb2d503f231a4d4896143fcae3e4695522fa7c8c491853d11340af77e3efad`).
+Archive (patches, check scripts, binaries, device logs):
+`/home/ibutygin/tlx/perf-data/mxfp-auto-ws-20261106.tar.gz` (SHA256
+`422ee5c3ef443f2522049089b8cfb46649c8218b5991a9d254de3e2f23f8bbbb`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
