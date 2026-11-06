@@ -105,11 +105,11 @@ the four-stage static loop is slower with or without it (16384 cubed +0.2 to
 buffers) splits that barrier as the gluon v14 tutorial and FlyDSL do: each
 step reads both second halves of its slot during C00, signals, runs the 16
 register-only C01 WMMAs, then waits, refills the slot, and reads the next
-slot across C10 and C11. The kernel keeps two ordinary barriers through
-Membar and LLVM optimization; an LLVM IR stage hook rewrites the marked pair
-into `s_barrier_signal` / `s_barrier_wait`. On gfx1250 it is a further 2.2%
+slot across C10 and C11. The split uses `tlx.named_barrier_arrive(0, ...)` /
+`tlx.named_barrier_wait(0, ...)`, which lower on AMD to `s_barrier_signal -1`
+/ `s_barrier_wait -1`; Membar treats the pair as one workgroup barrier. On gfx1250 it is a further 2.2%
 faster at 8192 cubed and 1.25% at 8192^2x4096, and `bench.py` uses it wherever
-it uses the merged barrier. Modes 1-3 are experimental schedule variants (see
+it uses the merged barrier. Modes 1 and 3 are experimental schedule variants (see
 [HANDOFF.md](HANDOFF.md)).
 
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
