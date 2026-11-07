@@ -121,6 +121,22 @@ the run-time test from the other three: 0.7% faster at 8192 cubed and 0.4%
 at 16384 cubed. Modes 1 and 3 are experimental schedule variants (see
 [HANDOFF.md](HANDOFF.md)).
 
+`--scale-layout wave256` (`SCALE_LAYOUT="wave256"`, packed with
+`pack_scale(x, layout="wave256")`) selects a second preshuffled scale format
+for persistent MX8xMX8 256x256x128 tiles. The default `block128` format
+stores one row per 128 M/N rows; `wave256` stores one row per 256 rows,
+ordered per K128 step as `[row bit 5][row % 32][row bit 7][row bit 6][4 K]`,
+so each lane's 16 bytes are the four scale dwords its wave needs for both
+128-row quadrants. The `--refill-overlap 4` step then reads each operand's
+scales with one `ds_load_b128` alongside the next slot's first payload
+reads and splits the quadrants in registers: two scale reads per K step
+instead of four. Other schedules read one quadrant per load from the same
+format with one `ds_load_b64` per quadrant. On gfx1250 it is 0.9% (FP16)
+and 1.7% (FP32) faster at 8192 cubed and 0.6% faster at 16384 cubed with
+FP16, within noise at 32768 cubed, but 1.3% slower at 8192^2x4096 with FP16,
+so `bench.py` keeps `block128` by default. MX8xMX4 runs always
+use `block128`. See [HANDOFF.md](HANDOFF.md).
+
 `--output-c-slots` (`OUTPUT_C_SLOTS`) sets the number of dedicated 64x128
 FP32 output staging slots (kernel default two). `bench.py` uses three for
 three-buffer MX8xMX8, which keeps more C stores in flight at each tile
