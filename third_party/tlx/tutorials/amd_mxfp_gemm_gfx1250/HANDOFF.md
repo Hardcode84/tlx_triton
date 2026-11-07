@@ -3480,6 +3480,48 @@ Archive (patches, check scripts, binaries, device logs):
 `/home/ibutygin/tlx/perf-data/mxfp-auto-ws-20261106.tar.gz` (SHA256
 `422ee5c3ef443f2522049089b8cfb46649c8218b5991a9d254de3e2f23f8bbbb`).
 
+### SGPR spills and live values (2026-11-07): spills sit outside the K loop; reductions do not pay
+
+Current defaults: FP16 four-stage builds spill 28 (4k, 8k) / 30 (16k) SGPRs
+at 107 allocated; FP32 builds do not spill (101-102). All spill code
+(88-110 `v_readlane`) is outside the steady K loop, in tile setup and the
+transition. Pre-RA MIR liveness (`mir_live2.py`, per-instruction peaks in
+`mir_peak.py`) for FP16 8192³:
+
+- K-loop header: 113 SGPR units live: 9 carried, 49 invariant and used
+  (fused TDM descriptor groups, global bases), 55 live through unused. The
+  last group is: 7 `base | k*BK` constants for the K tail's next-tile
+  prefetch (k = 0..3, line ~3401) and the overlap-store refill (k = 4),
+  hoisted by LLVM IR LICM into the tile preheader (16 units); the C-store
+  TDM group 1, a constant 8-dword tuple LLVM shares with the load
+  descriptor's group 1 and keeps from kernel entry (8); C group-0 templates
+  and address terms (10); the kernel-argument block (10); tile terms.
+- Peaks (~150 units, tuple-granular) are in the K tail, where each of the
+  four steps builds next-tile A and B addresses and selects per wave, then
+  in the steady step refill (~140) and the next-tile offset math (~144).
+
+Experiments (temporary knobs, compile then device with `proc_ab2.py`, six
+per-process rounds, median vs default):
+
+| Variant | Spills (4k/8k/16k) | Loop instructions | Device 8²x4096 / 8³ / 16³ / FP32 8³ |
+| --- | --- | --- | --- |
+| Sched barriers around C descriptor creation (grouped GEMM) | unchanged | unchanged | - |
+| C descriptor shape + per-tile opaque zero (`off_m >> 30`) | unchanged (header +2) | unchanged | - |
+| Tail/refill prefetch `k` + opaque zero | 26 / 26 / 22 (header 113 -> 97) | 949 -> 931 (16k 963 -> 979) | +0.24 / +0.57 / +0.53 / +0.54% |
+| Steady loop as `tl.range(..., loop_unroll_factor=4)` (runtime slots) | 68 | 948, SALU 58 -> 52 (FP32: SALU 32 -> 108) | +0.45 / +0.59 / 0.00 / +1.22% |
+| Both opaque knobs | 36 | 951 | - |
+
+The C-descriptor levers that helped grouped GEMM do nothing here: the
+constant group-1 tuple is shared with the loads, and the allocator does not
+rematerialize multi-def tuples (a lowering-level fix would rebuild group 1
+at the store). Cutting the K-loop header to 97 units removes only 2-8
+spills (the peaks are elsewhere) and is slower everywhere, including FP32,
+which has no spills. The late unroll loses the static slots and per-step
+cluster tests. No change kept; spills cost only transition time.
+Archive (knob patch, MIR, analysis scripts, binaries, device log):
+`/home/ibutygin/tlx/perf-data/mxfp-sgpr-pressure-20261107.tar.gz` (SHA256
+`2051330e815455101bf11dd6483a0fc1460f5a0d3ae2433415e8c5120be320e2`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
