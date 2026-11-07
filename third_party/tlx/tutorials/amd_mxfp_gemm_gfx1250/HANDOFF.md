@@ -3522,6 +3522,102 @@ Archive (knob patch, MIR, analysis scripts, binaries, device log):
 `/home/ibutygin/tlx/perf-data/mxfp-sgpr-pressure-20261107.tar.gz` (SHA256
 `2051330e815455101bf11dd6483a0fc1460f5a0d3ae2433415e8c5120be320e2`).
 
+### Scale LDS reads: format comparison and placement in mode 4 (2026-11-07): current placement kept
+
+Scale reads per K128 step: ours 4 `ds_load_2addr_b32` (`pack_scale` 128-row
+blocks, `[lane][4 row groups][4 K]`; each wave needs row groups wm and wm+2,
+8 bytes apart; the two quadrants sit in different 128-row blocks, +528).
+FlyDSL `gemm_a8w8_256x256_gfx1250.py` (MX32): `[M/32][K/128][32][4]`, 8
+`ds_load_b32` per step (one word per 32-row group, native scale opsel).
+Gluon tutorials (v10+, FlyDSL format): 4 `ds_load_2addr_stride64_b32`. All
+read 8 scale bytes per lane per step; none uses b128. A b128 read would
+need a 256-row wave-ordered preshuffle `[wm][lane][(blk0, wm), (blk0, wm+2),
+(blk1, wm), (blk1, wm+2)]` that also reads both quadrants' scales at once
+(4 -> 2 reads of 68 per step); not implemented.
+
+Placement in the mode 4 step (loop rotated at the barrier wait; positions
+in WMMAs of 64): next-slot A scale at pos 3, B scale at 17 (each before its
+payload), second-half B01/A10 scales at 33/37 in the C00 window, release
+drain `s_wait_dscnt 0` at 48. Variants (temporary `MXSP` knob and a
+`LOAD` payload/scale mask in the operand loaders): v1 both next-slot scales
+at the refill (pos 3, 8; loop 949 -> 915 instructions, VGPRs 929 -> 891);
+v2 scales after payloads (adds a full `s_wait_dscnt 0` at pos 32); v3 both
+C00-window scales first (pos 33); v13 = v1 + v3. Device, FP16 defaults,
+`proc_ab2.py` six per-process rounds, median change:
+
+| Variant | 8192²x4096 | 8192³ | 16384³ |
+| --- | ---: | ---: | ---: |
+| v1 | +0.39% | +0.09% | +2.08% |
+| v2 | +1.34% | +1.25% | +2.37% |
+| v3 | -0.03% | +0.19% | +0.95% |
+| v13 | +0.21% | +0.06% | +2.05% |
+
+None is faster; the current scales-first order is kept. v1's smaller loop
+and lower VGPRs do not help (+2% at 16384³). Archive (patch, placement
+script, binaries, device log):
+`/home/ibutygin/tlx/perf-data/mxfp-scale-placement-20261107.tar.gz` (SHA256
+`503a241bc6ba71a15bad5f57c5824baf0a64c585efbf6bfe2ca63243e0fde301`).
+
+### 256-row wave-ordered scale preshuffle (W256), b128 scale reads (2026-11-07): faster at 8k/16k
+
+Host format: per 256 rows and K128 step, 1024 bytes ordered `[row bit 5][row %
+32][row bit 7][row bit 6][4 K]` (`reshape(n/256, 2, 2, 2, 32, k/4, 4)
+.permute(0, 5, 3, 4, 1, 2, 6)`), so each lane's 16 bytes are the four scale
+dwords its wave needs for both 128-row quadrants. Kernel (now
+`SCALE_LAYOUT="wave256"` / `--scale_layout wave256`, bench
+`--scale-layout wave256`; helpers detect the format from the scale buffer's
+row width, `BK/32*256` bytes): scale descriptors `[M/256, K/32*256]`, block `[1, 1024]`,
+slots padded `[[1024, 16]]`; a logical `[256, 4]` view over the slot; in the
+mode 4 step `sa00`/`sb00` carry both quadrants (one `ds_load_b128` each with
+the next slot's A00/B00, split in registers), so A10/B01 scales are no
+longer read in the C00 window. Tile entry and the first-tile prologue load
+the combined form; it converts back to quadrants after the steady loop.
+Other readers use the new view per quadrant. The step's fallthrough code had
+to sit under a static `if` (Triton type-checks returns after an early return).
+
+Steady loop: 272 -> 264 LDS reads per 4 steps (all `ds_load_b128`; scale
+reads 4 -> 2 per step), 949 -> 910 instructions (16k: 963 -> 923), VGPRs
+929 -> 938, LDS 321,768 -> 321,616 B, spills unchanged. FFM: 45 refill-overlap
+ring-phase cases pass with the format. Device (`proc_ab2.py`, 8 per-process
+rounds, median; `run_ab5.py` packs W256 when the binary expects it):
+
+| Case | Base | W256 | Change |
+| --- | ---: | ---: | ---: |
+| FP16 8192³ | 0.14233 ms (0.14221-0.14246) | 0.14094 ms (0.14081-0.14108) | **-0.97%** |
+| FP16 16384³ | 1.14270 ms | 1.13801 ms (all rounds below base) | **-0.41%** |
+| FP16 8192²x4096 | 0.07722 ms (0.0762-0.0788) | 0.07811 ms (0.0767-0.0787) | +1.14% (ranges overlap; noisy) |
+
+Device A/B of the option (2026-11-07, `ship45`: block128 vs wave256 built
+from the bench default CLIs; `proc_ab2.py`, 6 per-process rotated rounds,
+median, all 96 runs pass the correctness check):
+
+| Case (bench default schedule) | block128 | wave256 | Change |
+| --- | ---: | ---: | ---: |
+| FP16 8192³ (4-stage mode 4) | 0.14244 ms | 0.14120 ms | **-0.87%** (ranges disjoint) |
+| FP32 8192³ (3-stage static) | 0.15557 ms | 0.15288 ms | **-1.73%** (ranges disjoint) |
+| FP16 8192²x4096 (4-stage mode 4) | 0.07708 ms | 0.07812 ms | **+1.34%** (slower; again, as +1.14% before) |
+| FP32 8192²x4096 (3-stage dynamic) | 0.08549 ms | 0.08506 ms | -0.50% (ranges overlap) |
+| FP16 16384³ (mode 4 + L2 lookahead) | 1.14472 ms | 1.13848 ms | **-0.55%** |
+| FP32 16384³ (4-stage dynamic) | 1.21177 ms | 1.21067 ms | -0.09% (noise) |
+| FP16 32768³ (4-stage dynamic) | 9.68464 ms | 9.68086 ms | -0.04% (noise) |
+| FP32 32768³ (4-stage dynamic) | 9.84004 ms | 9.81991 ms | -0.20% |
+
+Outside mode 4 each quadrant's scale read becomes one `ds_load_b64`
+instead of a `ds_load_2addr_b32`, with unchanged VGPRs; that is the FP32 8k
+gain. Mode 4 adds 9-12 VGPRs (929 -> 938, 16k 935 -> 947). The FP16 K=4096
+loss is reproducible and unexplained; with 32 K steps per tile the tile
+transition weighs twice as much as at 8k, so the combined-scale entry loads
+and the quadrant split after the steady loop are the first suspects.
+Log: `/tmp/ibutygin-live/w256opt/ab45.log`. With `--scale-layout wave256` the bench's 8k FP16
+build is instruction-identical to the measured experiment binary, and the
+default build is unchanged. `test_mxgemm_wave256_scales_ring_phase` covers
+mode 4 (with and without the split L2 lookahead), the three-stage static and
+dynamic loops, and the dynamic four-stage ring on FFM (49 cases). FP32
+(three-stage, quadrant reads only) not measured on hardware. The archived
+experiment patch also carries the scale-placement `LOAD`-mask variants.
+Archive: `/home/ibutygin/tlx/perf-data/mxfp-w256-scales-20261107.tar.gz`
+(SHA256 `12d5d8470826b29b28eea07b1b9c48c1b510aa893b9ff982ae7fed97a97dabfd`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

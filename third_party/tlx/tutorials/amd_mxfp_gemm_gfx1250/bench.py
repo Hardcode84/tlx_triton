@@ -60,6 +60,11 @@ steps past the refill (--l2-lookahead 4; 1.3%). That loop tests the cluster
 rendezvous only in the one unrolled step of four that can hit it
 (--static-cluster-steps; 0.4-0.7%). FP16 at K=32768 keeps the dynamic
 four-stage ring.
+--scale-layout wave256 packs MX8xMX8 scales one row per 256 M/N rows, ordered
+so each wave reads the scales of both 128-row quadrants with one ds_load_b128
+in the --refill-overlap 4 step (two scale reads per K step instead of four).
+It changes only the scale packing and LDS reads; MX8xMX4 runs keep the
+default block128 layout.
 Without static slot unroll (K < 8192), the MX8xMX8 K loop reads each operand's
 scale before its payload, so each quadrant waits only for its own LDS reads
 (0.4-1.9% faster on hardware). Use --no-dynamic-scales-first for the
@@ -127,6 +132,7 @@ Examples::
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-buffers 4
+    python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --scale-layout wave256
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 --num-warps 8
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --warp-pipeline
     python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --operand-pipeline
@@ -251,8 +257,19 @@ def _supports_default_output_c_slots(args, dtype_b):
                      or args.output_tail_reuse or args.first_use_prefetch or args.wave_specialized_handoff))
 
 
+def _supports_wave256_scales(args, dtype_b):
+    return (args.persistent and (args.block_m, args.block_n, args.block_k) == (256, 256, 128) and args.num_warps == 4
+            and args.dtype_a == dtype_b == "float8_e4m3" and args.handoff_schedule == "current"
+            and args.handoff_tdm_fusion == "partial"
+            and not (args.register_pipeline or args.warp_pipeline or args.operand_pipeline or args.streamed_operands
+                     or args.output_tail_reuse or args.first_use_prefetch or args.wave_specialized_handoff))
+
+
 def _variant_args(args, dtype_b):
     resolved = argparse.Namespace(**vars(args))
+    if dtype_b == "float4":
+        # wave256 scales are defined for the A8W8 256x256x128 tile only.
+        resolved.scale_layout = "block128"
     if resolved.block_k is None:
         resolved.block_k = 256 if dtype_b == "float4" or resolved.register_pipeline or resolved.warp_pipeline else 128
     if resolved.num_buffers is None:
@@ -401,6 +418,8 @@ def _command(args, case, dtype_b):
         command.extend(["--l2_lookahead", str(args.l2_lookahead), "--l2_lookahead_split"])
     if args.static_cluster_steps:
         command.append("--static_cluster_steps")
+    if args.scale_layout != "block128":
+        command.extend(["--scale_layout", args.scale_layout])
     if args.out_dtype != "fp32":
         command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
@@ -525,6 +544,10 @@ def parse_benchmark_args(argv=None):
         help="refill overlap mode 4: branch-free L2 prefetch of the input stage this many steps past the TDM "
         f"refill (default: {SPLIT_L2_LOOKAHEAD} where mode 4 is the default and K >= {SPLIT_L2_LOOKAHEAD_MIN_K}; "
         "0 disables)")
+    parser.add_argument(
+        "--scale-layout", choices=("block128", "wave256"), default="block128",
+        help="preshuffled scale format: wave256 reads both 128-row quadrants' scales with one ds_load_b128 "
+        "per wave (MX8xMX8 persistent 256x256x128; MX8xMX4 keeps block128)")
     parser.add_argument(
         "--out-dtype", choices=OUT_DTYPES, action="append",
         help="repeatable C element type; default: fp32 and fp16 (fp32 only with --async-output). "
@@ -695,6 +718,9 @@ def parse_benchmark_args(argv=None):
             parser.error("--refill-overlap requires --merged-handoff-barrier with four buffers")
         if run_args.static_cluster_steps and not run_args.static_slot_unroll:
             parser.error("--static-cluster-steps requires --static-slot-unroll")
+        if run_args.scale_layout == "wave256" and not _supports_wave256_scales(run_args, dtype_b):
+            parser.error("--scale-layout wave256 requires persistent MX8xMX8 256x256x128 tiles with four warps "
+                         "and the current handoff schedule without other operand schedules")
         if run_args.l2_lookahead and not (run_args.refill_overlap == 4 and run_args.cluster_size > 1
                                           and run_args.cluster_layout in ("2x2", "4x4")):
             parser.error("--l2-lookahead requires --refill-overlap 4 with a 2x2 or 4x4 cluster")
@@ -876,10 +902,10 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
-                                                                     dtype_b), output_c_slots=run_args.output_c_slots
-            or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier), refill_overlap=run_args.refill_overlap
-            or 0, l2_lookahead=run_args.l2_lookahead or 0, static_cluster_steps=bool(run_args.static_cluster_steps),
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
+            output_c_slots=run_args.output_c_slots or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier),
+            refill_overlap=run_args.refill_overlap or 0, l2_lookahead=run_args.l2_lookahead or 0,
+            static_cluster_steps=bool(run_args.static_cluster_steps), scale_layout=run_args.scale_layout,
             dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
             handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
             handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
@@ -921,6 +947,7 @@ def main():
             f"l2_lookahead={'auto' if run_args.l2_lookahead is None else run_args.l2_lookahead}, "
             f"static_cluster_steps={'auto' if run_args.static_cluster_steps is None else run_args.static_cluster_steps}, "
             f"output_c_slots={run_args.output_c_slots or 2}, "
+            f"scale_layout={run_args.scale_layout}, "
             f"out_dtype={run_args.out_dtype}, "
             f"dynamic_scales_first={run_args.dynamic_scales_first}, "
             f"compact_k_tail={run_args.compact_k_tail}, "
