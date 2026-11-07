@@ -1867,4 +1867,37 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
   let assemblyFormat = "attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// WorkgroupBarrierSignalOp / WorkgroupBarrierWaitOp
+//===----------------------------------------------------------------------===//
+
+def WorkgroupBarrierSignalOp : TT_AMDGPU_Op<"workgroup_barrier_signal"> {
+  let summary = "Arrive at the workgroup barrier without waiting";
+  let description = [{
+    First half of a split workgroup barrier. Shared-memory operations issued
+    before the signal are visible to every thread of the workgroup after its
+    matching `amdg.workgroup_barrier_wait`. Work between the signal and the
+    wait overlaps the rendezvous.
+
+    The signal must be followed, in the same block, by a matching wait, with
+    no other signal, wait, or shared-memory access in between: Membar treats
+    the wait as the barrier, so accesses between the two would not be
+    synchronized.
+  }];
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+def WorkgroupBarrierWaitOp : TT_AMDGPU_Op<"workgroup_barrier_wait"> {
+  let summary = "Wait for the workgroup barrier signalled earlier";
+  let description = [{
+    Second half of a split workgroup barrier: waits until every thread of
+    the workgroup has executed its `amdg.workgroup_barrier_signal`. It must
+    follow its signal in the same block with no shared-memory access in
+    between. Membar treats it as a workgroup barrier.
+  }];
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
 #endif

@@ -2647,3 +2647,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @workgroup_barrier_signal_without_wait() {
+    // expected-error @below {{must be followed by amdg.workgroup_barrier_wait in the same block}}
+    amdg.workgroup_barrier_signal
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @workgroup_barrier_wait_without_signal() {
+    // expected-error @below {{must follow an amdg.workgroup_barrier_signal in the same block}}
+    amdg.workgroup_barrier_wait
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @workgroup_barrier_encloses_shared_access(%buf: !ttg.memdesc<64xf16, #shared, #smem, mutable>, %v: tensor<64xf16, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>>) {
+    // expected-error @below {{cannot enclose shared-memory accesses}}
+    amdg.workgroup_barrier_signal
+    ttg.local_store %v, %buf : tensor<64xf16, #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>> -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    amdg.workgroup_barrier_wait
+    tt.return
+  }
+}

@@ -185,4 +185,33 @@ void registerSchedulingBarrierExternalModel(DialectRegistry &registry) {
         SchedulingBarrierModel<ROCDL::SchedGroupBarrier>>(*ctx);
   });
 }
+
+triton::BarrierStages AMDMembarAnalysis::getBarrierStages(Operation *op) {
+  // The verifier keeps shared-memory accesses out of the signal/wait window,
+  // so the signal is the earliest point synchronizing earlier accesses. This
+  // also lets an async wait right before the signal defer to it.
+  if (isa<triton::amdgpu::WorkgroupBarrierSignalOp,
+          triton::amdgpu::WorkgroupBarrierWaitOp>(op)) {
+    triton::BarrierStages stages;
+    stages.beforeMemoryEffects = true;
+    return stages;
+  }
+  return MembarAnalysis::getBarrierStages(op);
+}
+
+void AMDMembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder,
+                                      bool cluster) {
+  // A barrier inserted before `op` lands inside a split barrier window when an
+  // earlier signal in the block has not been waited on yet.
+  for (Operation *prev = op->getPrevNode(); prev; prev = prev->getPrevNode()) {
+    if (isa<triton::amdgpu::WorkgroupBarrierWaitOp>(prev))
+      break;
+    if (isa<triton::amdgpu::WorkgroupBarrierSignalOp>(prev)) {
+      prev->emitError("Membar requires a barrier between "
+                      "amdg.workgroup_barrier_signal and its wait");
+      llvm::report_fatal_error("invalid split workgroup barrier");
+    }
+  }
+  MembarAnalysis::insertBarrier(op, builder, cluster);
+}
 } // namespace mlir::triton::AMD
