@@ -75,9 +75,10 @@ the zero accumulator as an inline constant instead of zeroing 512 VGPRs.
 `--overlap-peel` (`OVERLAP_PEEL=True`) runs each next tile's first K step
 inside the current tile's FP32 output epilogue. After a C quadrant is staged,
 its registers take that quadrant's next-tile WMMAs, which run during later
-output-slot waits; the next tile enters its K loop at step 1. The next tile's
-first ring refill is issued before the last C chunks: TDM operations complete
-in order, so it may precede only as many chunks as there are C slots. It works
+output-slot waits; the next tile enters its K loop at step 1. With four
+buffers the next tile's first ring refill follows the last C chunk; with three
+it is issued before the last C chunks (TDM operations complete in order, so it
+may precede only as many chunks as there are C slots). It works
 with the static and dynamic loops and with three or four buffers. On hardware
 it is 0.2% faster at 8192 cubed and 1.2% faster at K=4096; the power-bound
 four-stage ring used for K >= 16384 is unchanged. `bench.py` enables it for
