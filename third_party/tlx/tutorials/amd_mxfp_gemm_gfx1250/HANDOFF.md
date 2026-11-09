@@ -3618,6 +3618,73 @@ experiment patch also carries the scale-placement `LOAD`-mask variants.
 Archive: `/home/ibutygin/tlx/perf-data/mxfp-w256-scales-20261107.tar.gz`
 (SHA256 `12d5d8470826b29b28eea07b1b9c48c1b510aa893b9ff982ae7fed97a97dabfd`).
 
+### Tile transition profile and late next-tile refill (2026-11-09): adopted for four buffers
+
+ATT of the FP16 8192³ default (four-stage mode 4, 2 C slots, 16 SEs,
+~2.27 GHz under the profiler; the machine has been ~2.5-4% slow since the
+Nov 7 reboot, so only relative values are used). A wave takes ~245k cycles:
+steady loop 79%, tile transitions 13%, final epilogue 6%, prologue 2%; a
+steady step is 864 cycles. The median transition (10.3k cycles) is 7 K
+steps (3 leftover steady + 4 prefetch tail, ~5.5k, real work), the C
+epilogue (4.2-4.7k: TDM slot waits 2.6k, LDS drains 0.74k, workgroup
+barriers 0.59k, WMMA 0.36k) and the next-tile start (0.4k). A C store takes
+~1.0k cycles (p10 908, median 1,010, p90 1,240); 8 chunks through 2 slots
+serialize into ~4 rounds. The epilogue's last wait acquires only stage 1, so
+the final C stores stay in flight into the next tile, whose first K steps
+show no tensor-wait stall (9 cycles).
+
+The cost is the first cluster rendezvous after a transition (tile step 4):
+2,652 cycles with a median cluster-barrier wait of 1,632 (p90 3,186), against
+886 / 158 for a steady rendezvous step. It comes from epilogue imbalance
+across the 16 CTAs: occasional C stores take 1.1-3.5k cycles, and they are
+always the store issued right before the next tile's multicast A/B refill
+(chunk 6; chunk 1 less often). They coincide in time across SEs during
+transition bursts, and the spike moves with the refill (refill after store
+5: chunk 5 spikes).
+
+AM (`~/rocdtif-7.15-am+ffmlite-mi400-r8.05`) offers no explanation. The model
+has a per-SIMD TDM counter (`tdm_per_simd=6`, stalls at issue), a TA TDM
+entry buffer with a 128-byte request generator, `rr` TDM arbitration
+(`priority_rate_tdm=3`) and a TCP `utc_tdm_xack_fifo`. Hardware ATT shows no
+TDM issue stall (`tensor_store`/`tensor_load` issue-to-next <= 5 cycles). AM
+debug emitters are compiled out (`gclog_init=<cfg>` in the `DtifGeneralArgs`
+`pm4p2_args` loads a config but prints nothing). `perf_counters.csv`:
+`max_tdm_desc_stall_simd` and `max_store_desc_stall_simd` are always 0, TA
+adapters stay at <= 0.6 TDM requests/cycle, and a tile's C stores need ~0.5k
+TA cycles, so per-CU TDM is not saturated. AM 2048³ (16 programs, 2x2
+cluster) gives 135,249 cycles by default and 135,333 with the late refill: it
+does not reproduce the effect.
+
+Change: with four buffers and without `INTERLEAVE_C_FILL`, `REFILL_CHUNK`
+is now `C_CHUNKS`, so the refill follows the last C store. The refilled stage
+is first needed at the next tile's step 4. Device A/B (`proc_ab2.py`, 6
+per-process rounds, median, all runs pass the correctness check; the new
+bench builds are instruction-identical to the measured binaries):
+
+| Case | Early refill | After last C store | Change |
+| --- | ---: | ---: | ---: |
+| FP16 8192²x4096 | 0.08022 ms | 0.07874 ms | **-1.84%** |
+| FP16 8192³ | 0.14617 ms | 0.14420 ms | **-1.35%** (earlier run -1.14%) |
+| FP16 16384³ | 1.18792 ms | 1.18748 ms | -0.04% |
+| FP32 8192²x4096 (3-stage) | 0.08816 ms | 0.09012 ms | +2.22% (kept early) |
+| FP32 8192³ (3-stage) | 0.15951 ms | 0.16183 ms | +1.45% (kept early) |
+
+Three buffers need the refilled stage a step sooner, so they keep the early
+refill. In the FP16 8k traces the epilogue p90 drops 6,273 -> 5,037 cycles,
+the first-rendezvous wait median 1,234 -> 518, and chunks 2-6 have no slow
+stores. Pitfall: placing the refill before more than `C_SLOTS` chunks makes
+the later slot-reuse waits (`EXTRA_PENDING=LOADS`) too permissive; such a
+variant failed on hardware while passing FFM. The default and three-buffer
+formulas stay within that limit.
+
+Archives in `/home/ibutygin/tlx/perf-data/`:
+`mxfp-f16-8k-transition-20261109.tar.gz` (SHA256
+`26506721c988890498bbe6652a1a74d1788542016b059124a0a5e3f25123e660`),
+`mxfp-f16-8k-refill-20261109.tar.gz` (SHA256
+`bc363bb7afc111851a2f66aeacc3f6224c7f8bd3c11b9319db088f7bd1af7c67`),
+`mxfp-refill-shapes-20261109.tar.gz` (SHA256
+`d0f24c4c27d15fafb98efd97fd26abd2bff9609ae5d036768dc705695be0c55f`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

@@ -112,9 +112,9 @@ stages it no longer needs, and starts C stores early.
   contend less for a partition.
 - `OVERLAP_PEEL` (three stages): the next tile's first K step runs inside
   the C epilogue. After a C quadrant is staged, its registers take that
-  quadrant's next-tile WMMAs, which run during later slot waits. The next
-  tile's first refill is issued before the last C chunks, because TDM
-  completes in order.
+  quadrant's next-tile WMMAs, which run during later slot waits. With three
+  buffers the next tile's first refill is issued before the last C chunks,
+  because TDM completes in order; with four it follows the last C chunk.
 - Scales first (dynamic loop, K < 8192): each quadrant waits only for its
   own LDS reads.
 - For K ≥ 16384, a four-stage ring with two C slots replaces the three-stage

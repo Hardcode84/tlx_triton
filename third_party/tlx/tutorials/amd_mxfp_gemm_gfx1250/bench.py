@@ -44,7 +44,8 @@ Three-stage MX8xMX8 also overlaps each next tile's first K step with the
 FP32 output epilogue (--overlap-peel): once a C quadrant is staged, its
 registers take that quadrant's next-tile WMMAs, which run during later
 output-slot waits, and the next tile's first ring refill precedes the last
-C chunks. This is 0.2% faster at 8192^3 and 1.2% faster at K=4096 on
+C chunks (with four buffers it follows them). This is 0.2% faster at 8192^3
+and 1.2% faster at K=4096 on
 hardware; the power-bound four-stage ring is unchanged, so it stays off there.
 Use --no-overlap-peel to disable it.
 FP16 output writes FP16 C (FP32 accumulation, one rounding before staging)
