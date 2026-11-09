@@ -3685,6 +3685,44 @@ Archives in `/home/ibutygin/tlx/perf-data/`:
 `mxfp-refill-shapes-20261109.tar.gz` (SHA256
 `d0f24c4c27d15fafb98efd97fd26abd2bff9609ae5d036768dc705695be0c55f`).
 
+### Epilogue TDMs on separate waves via wave masks (2026-11-09): not viable, reverted
+
+Tried without wave specialization: every wave runs the same epilogue, fills
+C in LDS and executes every barrier and wait. Only the TDM wave masks change:
+C stores use `warp_used_hint=0xC` (waves 2/3), and the next-tile refill
+issues A and B on waves 0/1. Inactive waves issue null descriptors, so every
+wave's TDM count and all uniform waits stay valid. The refill's final epilogue
+wait counts three refill operations per wave. The partitioned A/B slots need
+two issuing waves per member and fused members need disjoint masks, so
+A-on-0/1 and B-on-0/1 had to be one-member fused loads (the verifier and
+lowering were relaxed to 1-4 members; a one-member load keeps its explicit
+multicast mask). FFM: 32 ring-phase cases pass (mode 4 FP16 at late refill
+and chunks 6 and 4; three-stage static FP32).
+
+Codegen breaks the K loop in every variant, as in October:
+
+- FP16 8192³ SGPR spills go from 28 to 74-112 at 107 SGPRs.
+- The steady loop loses the WMMAs around the TDM refill and clusters 17-34
+  LDS reads; FP32 three-stage goes from 101 SGPRs and no spills to 107 SGPRs
+  and 22 spills, and its barriers lose their straddling WMMAs.
+- Masks on the C stores alone already reschedule one of the four loop
+  steps; the refill alone is worse. The hinted per-wave descriptor terms are
+  invariant in the tile loop and get hoisted into the K loop's live set.
+- Keeping the refill's scale load on the loop's masks (5/10) and rebuilding
+  the refill A/B descriptors in the epilogue from `tlx.assume_uniform`
+  bases did not help (78-94 spills).
+
+It would not help even with clean codegen. Re-analysis of the October
+`OVERLAP_WS` ATT (`att3/att-ows-s2`), where waves 2/3 issue only C stores and
+waves 0/1 issue the refill before chunk 4: on the store-only waves the wait
+retiring chunk 5 stalls a median 1,064 cycles (p90 1.4-1.7k), against 410-655
+for chunks 1, 3 and 4. The store that overlaps the multicast refill is slow
+even when it is not in the refill's queue, so the effect comes from a path
+shared across waves, not per-wave TDM ordering. Not measured on hardware.
+Archive (patch, FFM test, builds and loop sequences, ATT analysis scripts
+and output): `/home/ibutygin/tlx/perf-data/mxfp-epilogue-tdm-waves-20261109.tar.gz`
+(SHA256 `e67df2a59964dc2104ebc67b2350e4436d0bf6d5400a85ab2b99335229ca137f`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
