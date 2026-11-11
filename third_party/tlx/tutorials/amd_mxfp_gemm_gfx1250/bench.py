@@ -152,6 +152,13 @@ Examples::
 For a single dispatch per shape/variant, select
 --benchmark-mode none and --output-dir to keep each run's artifacts in
 its own directory.
+
+--devices 0,1 splits each case's M evenly across devices (for example the two
+partitions of a gfx1250 in DPX mode): each device computes its own rows from
+its rows of A and full copies of B, and the reported time is the slowest
+device's for the whole case. --num-programs then applies per device and
+defaults to each device's CU count; cluster requirements apply to each
+device's M / devices rows.
 """
 
 import argparse
@@ -455,6 +462,8 @@ def _command(args, case, dtype_b):
         command.append("--tdm_split")
     if args.num_programs is not None:
         command.extend(["--num_programs", str(args.num_programs)])
+    if args.devices:
+        command.extend(["--devices", args.devices])
     if not args.cross_tile_prefetch:
         command.append("--no-cross_tile_prefetch")
     return command
@@ -560,8 +569,14 @@ def parse_benchmark_args(argv=None):
     parser.add_argument(
         "--cross-tile-prefetch", action=argparse.BooleanOptionalAction, default=None,
         help="default: enabled for BK128/register pipeline; with A8W4 BK256, overlap C retirement and refills")
-    parser.add_argument("--num-programs", type=int, default=256,
-                        help="persistent program count, capped by tile count (default: 256)")
+    parser.add_argument(
+        "--num-programs", type=int, default=None,
+        help="persistent program count per device, capped by tile count (default: 256, or each device's CU "
+        "count with --devices)")
+    parser.add_argument(
+        "--devices", default=None,
+        help="comma-separated device indices: split M evenly across them, each device computing its own rows "
+        "(e.g. 0,1 for the two partitions of a gfx1250 in DPX mode)")
     parser.add_argument(
         "--xcd-remap", choices=("none", "balanced", "chunked"), default=None,
         help="persistent program remapping (default: chunked for 4x4 clusters, which remaps whole "
@@ -649,6 +664,17 @@ def parse_benchmark_args(argv=None):
         variants = [(variant, VARIANT_DTYPES_B[variant]) for variant in (args.variant or default_variants)]
     if args.num_programs is not None and args.num_programs <= 0:
         parser.error("--num-programs must be positive")
+    if args.devices is not None:
+        try:
+            device_ids = [int(device) for device in args.devices.split(",")]
+        except ValueError:
+            parser.error("--devices takes comma-separated device indices")
+        if not device_ids or min(device_ids) < 0:
+            parser.error("--devices takes comma-separated device indices")
+        if not args.persistent:
+            parser.error("--devices requires --persistent")
+    elif args.num_programs is None:
+        args.num_programs = 256
     if args.warmup_seconds < 0 or args.duration_seconds < 0:
         parser.error("--warmup-seconds and --duration-seconds must be nonnegative")
     if args.benchmark_num_iters <= 0:
@@ -832,7 +858,12 @@ def parse_benchmark_args(argv=None):
         ring_bytes = run_args.num_buffers * data_bytes * 272 // 256 + scale_buffers * scale_bytes * 264 // 256
         if ring_bytes > 320 * 1024:
             parser.error("input rings exceed gfx1250 LDS capacity; reduce --block-k, --num-buffers, or M/N tiles")
+        shards = len(run_args.devices.split(",")) if run_args.devices else 1
         for m, n, k in cases:
+            if m % shards:
+                parser.error("--devices requires M divisible by the number of devices")
+            # Each device computes M / shards rows.
+            m //= shards
             if run_args.operand_pipeline and (k < 512 or k % 256):
                 parser.error("--operand-pipeline requires K >= 512 divisible by 256")
             if run_args.warp_pipeline and (k < 1024 or k % 512):
@@ -916,7 +947,7 @@ def main():
             cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
             cross_tile_prefetch=run_args.cross_tile_prefetch if run_args.persistent else False,
-            requested_programs=run_args.num_programs if run_args.persistent else None,
+            requested_programs=run_args.num_programs if run_args.persistent else None, devices=run_args.devices or "",
             benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
             warmup_seconds=run_args.warmup_seconds, duration_seconds=run_args.duration_seconds, seed=run_args.seed,
             amd_codegen=codegen)
@@ -963,7 +994,8 @@ def main():
             f"cluster_layout={run_args.cluster_layout}, split_cluster_barrier={run_args.split_cluster_barrier}, "
             f"early_c_stores={run_args.early_c_stores}, "
             f"cross_tile_prefetch={run_args.cross_tile_prefetch if run_args.persistent else False}, "
-            f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}, "
+            f"programs={(run_args.num_programs or 'auto') if run_args.persistent else 'tile count'}"
+            f"{f' per device, devices={run_args.devices}' if run_args.devices else ''}, "
             f"timing={run_args.benchmark_mode}/{run_args.benchmark_num_iters} ms batches, "
             f"warmup={run_args.warmup_seconds:g} s, median over {run_args.duration_seconds:g} s, "
             f"amd_codegen={codegen}", flush=True)

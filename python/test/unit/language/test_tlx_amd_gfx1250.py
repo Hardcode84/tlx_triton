@@ -1282,6 +1282,24 @@ def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap
     assert torch.equal(cols[:, 0] % cols_per, torch.zeros_like(cols[:, 0]))
 
 
+def test_mxgemm_bench_devices_split_rows():
+    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
+
+    # --devices passes through; the program count is per device and defaults
+    # to each device's CU count, and cluster checks apply to each device's rows.
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--devices", "0,1", "--case", "4096x8192x8192", "--variant", "mx8xmx8", "--out-dtype", "fp16", "--dry-run"])
+    _, dtype_b, args = variants[0]
+    cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
+    assert cmd[cmd.index("--devices") + 1] == "0,1"
+    assert "--num_programs" not in cmd
+    _, _, variants = bench.parse_benchmark_args(["--case", "4096x8192x8192", "--variant", "mx8xmx8", "--dry-run"])
+    assert variants[0][2].num_programs == 256
+    # 1536 rows per device cannot form whole 2048-row cluster M groups.
+    with pytest.raises(SystemExit):
+        bench.parse_benchmark_args(["--devices", "0,1", "--case", "3072x8192x8192", "--dry-run"])
+
+
 def test_mxgemm_bench_cluster_and_output_options():
     from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
 
