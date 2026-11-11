@@ -3754,6 +3754,148 @@ Archive (ships, launcher, logs):
 `/home/ibutygin/tlx/perf-data/mxfp-dpx-sharded-20261111.tar.gz` (SHA256
 `365b4a4cb0785e6d590bea0fa931bd8a82c3b3dc1a5c6d241c20d50160048273`).
 
+### Why the DPX split scales worse at smaller shapes (2026-11-11)
+
+Two costs, both measured on the 2223 machine with the bench FP16 schedule
+(128 programs, 4x4 clusters):
+
+1. **A fixed cost per launch, about 13.5 us**, which the split doubles in
+   relative terms because each partition gets half the tiles per program.
+   One-partition M sweep (N=8192, flushed do_bench timing; tiles per
+   program 2/4/8/16): K=8192 0.07567 / 0.14137 / 0.26921 / 0.52307 ms,
+   K=4096 0.04517 / 0.07974 / 0.14612 / 0.28338 ms. Time is linear in tiles
+   per program (32 us per tile at K=8192, 17 us at K=4096) plus
+   2 * half - full = 13.5 us at both K. Clocks stay at 1.80-1.83 GHz, so it
+   is not power. Cycle-probe builds (per-wave 100 MHz realtime at kernel
+   start and end) split it:
+   - outside the waves (dispatch and completion, start event to first wave
+     plus last wave to end event): 3.8 us with queued launches, 8-9 us after
+     an idle queue;
+   - inside: program time is linear in tiles with a 6-8 us intercept, the
+     prologue's fill from cold L2 and the last tile's unoverlapped epilogue.
+     Without L2 flushes the per-launch cost falls to about 7 us.
+   - Start skew across programs is 0.4-0.7 us and end skew 0.7-2 us, so
+     neither dispatch spread nor tile imbalance matters.
+   The fixed cost is 5% of an 8192^3 run on one partition and 9.6% of each
+   8192^3 half; 9.2% vs 16.8% for 8192^2x4096; 1.6% of a 16384^3 half.
+2. **Shared socket power under sustained load.** With both partitions busy,
+   partition 0's clock drops from about 1.80 GHz to 1.62-1.69 GHz with
+   flushed timing and to 1.54 GHz back to back. 8192^3 and 8192^2x4096 lose
+   4.5-9% to it; 16384^3 loses under 1% at the same clocks (1.0114 vs
+   1.0154 ms synced), so it is not limited by the shader clock. The same
+   flush-and-sync timing shows the loss, so it is not the do_bench L2 flush
+   overlapping the other device's kernel, and short probe bursts (10 queued
+   launches) show none (153.07 vs 153.27 us), so it is not interference
+   inside the kernels.
+
+Together these account for the 1.81x (8192^3: 4.6% + 5.5%) and 1.73x
+(8192^2x4096: about 8% + 4.5%) speedups. The probe builds allocate registers
+differently (23 instead of 28 SGPR spills) and run about 8% slower, so they
+were used only for the timeline. The remote launcher now passes runtime
+arguments by kernel parameter position, so kernels with probe_ptr launch.
+Archive: `/home/ibutygin/tlx/perf-data/mxfp-dpx-profile-20261111.tar.gz`
+(SHA256 `88354c973d690156598405913d0fab86f012342bf10bf05f349768ace2f62ed2`).
+
+### Exit TDM drain and cluster barrier (2026-11-11): no gain; stress finds a rare C corruption
+
+The kernel ends with `async_amd_descriptor_wait(0)` (plus a workgroup
+barrier), and with clusters a second wait and an exit cluster barrier. A
+temporary switch removed all three (the asm loses only `s_wait_tensorcnt 0`,
+one workgroup barrier and the `-3` cluster barrier).
+
+- **Perf:** no measurable change on the 2223 machine (flushed timing, two
+  interleaved runs each): 8192^2x4096 halves together 0.0836/0.0834 vs
+  0.0835/0.0834 ms; 8192^3 halves together 0.1491/0.1487 vs 0.1493/0.1491;
+  8192^3 half alone 0.1415 vs 0.1413; 8192^2x4096 full 0.1461 vs 0.1460;
+  8192^3 full 0.2690/0.2694 vs 0.2690/0.2691; 16384^3 halves 1.0110 vs
+  1.0110 ms. The last C stores are nearly done when the waves reach the
+  drain. The switch was reverted.
+- **Correctness stress:** each trial poisons C with NaN, launches the GEMM,
+  optionally launches an LDS scribbler right behind it (every program fills
+  323,584 B of LDS with a per-program pattern; FP16 0x7c00 / 0x7c00 + pid), and
+  compares C bit for bit with a clean launch. Without the drain: 0 bad trials
+  in 1000 for 8192^2x4096 full on each partition (1 in 300 earlier), 0 in 300
+  for the 8192^3 cases and the 8192^2x4096 halves.
+- **The current kernel, with the drain, also corrupts C rarely**, so this is
+  not the exit drain:
+  - 8192^2x4096 full, with the scribbler: 1 in 1000 per partition. One case
+    held the scribbler's pattern (32 elements of row 1296, program 988's
+    0x7fdc / 0x7c00), i.e. a TDM store read LDS that a later kernel had
+    written.
+  - Without any scribbler: 1 in 3000 on each partition.
+  - Every failure is a short aligned run of 8 or 16 consecutive FP16 elements
+    (16-32 bytes) at 16-aligned rows and 8/16-aligned columns, sometimes over
+    a few rows (rows 3600-3605, last 16 columns of a 128-column chunk). The
+    values are plausible C values from elsewhere.
+  - The single-launch FP32 reference checks and the earlier ring-phase tests
+    cannot see a rate this low.
+  - Not yet isolated by schedule, commit, or machine (d04-1 SPX not tested).
+Archive (launcher with stress mode, scribbler, ships, logs):
+`/home/ibutygin/tlx/perf-data/mxfp-dpx-exit-drain-20261111.tar.gz` (SHA256
+`2f86ea47722f2ba6f8f27f93316ba85debafa8e48ae4452d2ecc92b99f9e1b8e`).
+
+### Chunk-0 C store race in the FP16 four-stage epilogue (2026-11-11)
+
+Follow-up to the corruption above. The stress launcher now runs both
+partitions together and searches the golden output for every corrupted run.
+
+- **Where:** every corruption (about 40 events) is in chunk 0 of a tile, the
+  first 64x128 C chunk, which uses C slot 0 with no reuse wait. It is at
+  in-chunk row 16 (once 17-21, once 32-33), columns 64-127. Those are the
+  slot rows each lane writes with its last `ds_store_b128` instructions
+  (offsets 4352 + 128/160).
+- **What:** the wrong values are slot 0's previous contents. Without the
+  scribbler they match, at the same in-chunk offset, chunk 6 of an earlier tile
+  (the last chunk to use slot 0; in-tile row +128, column +128). With the
+  scribbler they are its pattern, i.e. the first tile of a launch read LDS left
+  by the previous kernel. So chunk 0's TDM store sometimes reads slot 0 before
+  that chunk's own LDS writes are visible.
+- **The asm is ordered:** the 8 fill stores, `s_wait_dscnt 0`,
+  `s_barrier_signal/wait -1`, then `tensor_store_from_lds`, in both epilogue
+  copies. Chunk 0's fill directly follows the next tile's operand reads (16
+  `ds_load_b128` plus scales) while the next-tile TDM loads are in flight, so
+  LDS is at its busiest there. This looks like a hardware ordering hazard
+  between DS writes and TDM reads of LDS, not a missing wait; not confirmed
+  with AMD.
+- **Scope:** scribbler stress, bad trials over 10,000 (5,000 per
+  partition):
+
+  | Case | Bad trials |
+  |---|---:|
+  | FP16 four-stage, 8192^2x4096 full | 4 (earlier 11 / 10,000 and 3 / 10,000 without scribbler) |
+  | FP16 four-stage, 8192^3 full | 5 |
+  | FP16 four-stage, 8192^3 halves | 0 |
+  | FP32 three-stage, 8192^2x4096 and 8192^3 | 0 each |
+- **Fixes, applied to chunk 0 only** (temporary `MX_C0` switch, reverted):
+  - **One extra workgroup barrier between chunk 0's fill and its TDM store:**
+    0 / 10,000 at 8192^2x4096 and 0 / 10,000 at 8192^3. A single explicit
+    barrier only replaces Membar's, so the code needs two
+    `tlx.workgroup_barrier()` calls. Cost: +0.55% (0.1459 -> 0.1467 ms) and
+    +0.26% (0.2674 -> 0.2681 ms) on one partition, none with both halves
+    concurrent (8192^3 0.1481/0.1485 vs 0.1490/0.1487 ms; 8192^2x4096
+    0.0831/0.0826 vs 0.0835/0.0833 ms).
+  - **`async_amd_descriptor_wait(0)` before chunk 0's fill:** 0 / 10,000 at
+    8192^2x4096, but +1.0% and +1.4% on one partition and about +0.6-1% with
+    both halves.
+
+**Adopted:** `_mxgemm_persistent_store` now issues the extra barrier for the
+first chunk of every dedicated 64-row-slot epilogue: the overlapped and the
+final-tile copy, FP16 four-stage and FP32 three-stage. The opt-in
+wave-specialized handoff (role-split C stores) is excluded: its two roles pair
+one fill barrier each, and an extra pair on both sides desynchronized them
+(its ring-phase tests failed). The FP16 build is
+instruction-identical to the stress-tested variant at 8192^2x4096 and 8192^3.
+FP32 three-stage cost on one partition: 8192^2x4096 0.1624 -> 0.1625 ms
+(+0.1%), 8192^3 0.2944 -> 0.2956 ms (+0.4%).
+`test_gfx1250_mxgemm_first_c_chunk_extra_barrier` checks that each
+epilogue's first C TDM store follows two barrier waits after its fill and
+every other C store follows one. The compile helper in `test_tlx_codegen.py`
+now fills in kernel constexpr defaults, which ASTSource leaves as None; that
+had broken the merged-barrier and static-slot compile tests.
+Archive (launcher, scribbler, ships, logs):
+`/home/ibutygin/tlx/perf-data/mxfp-dpx-c0-race-20261111.tar.gz` (SHA256
+`34e52208d023065737e5fbe19107ad0c5f149e27c04707fd8e644a1f1bc78cc8`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
