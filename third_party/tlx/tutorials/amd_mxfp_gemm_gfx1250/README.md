@@ -606,5 +606,32 @@ For one dispatch per shape/variant, use `--benchmark-mode none
 whose name includes the variant. This mode leaves timing fields blank. Both
 scripts provide `--help` for configuration options.
 
+## Several devices: row sharding
+
+`mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, ...)` (standalone flag
+`--devices 0,1`) splits M evenly across devices. Each device gets its own rows
+of A and of A's scales plus full copies of B and B's scales, and runs the
+persistent kernel on its rows with its own workgroups, so there is no
+reduction and no synchronization between devices. The remaining arguments are
+those of `mxgemm_tdm_pipelined`; `NUM_PROGRAMS` applies per device. With
+`BENCHMARK="eager"` every repetition clears each device's L2 and launches on
+all devices together, and the slowest device's median is reported for the
+whole problem.
+
+This targets a gfx1250 in DPX mode, which appears as two 128-CU devices with
+eight shader engines each (use `--num_programs 128`; `--num_xcds 4` and 8
+time the same). FP16 output with the benchmark's four-stage schedule, 4x4
+clusters, measured on one DPX gfx1250:
+
+| Shape | One partition, whole problem | Two partitions, M split | Speedup |
+|---|---:|---:|---:|
+| 8192x8192x4096 | 0.1442 ms | 0.0833 ms (6,598 TFLOPS) | 1.73x |
+| 8192x8192x8192 | 0.2691 ms | 0.1490 ms (7,380 TFLOPS) | 1.81x |
+| 16384x16384x16384 | 2.0066 ms | 1.0122 ms (8,690 TFLOPS) | 1.98x |
+
+The partitions share the socket's power: running both lowers partition 0's
+graphics clock from about 1.80 GHz to 1.62-1.69 GHz, so a half running next
+to the other is 3-5% slower than alone.
+
 Compile checks live in `python/test/unit/language/test_tlx_codegen.py`; gfx1250
 runtime checks live in `python/test/unit/language/test_tlx_amd_gfx1250.py`.
