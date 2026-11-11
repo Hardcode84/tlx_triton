@@ -3723,6 +3723,37 @@ Archive (patch, FFM test, builds and loop sequences, ATT analysis scripts
 and output): `/home/ibutygin/tlx/perf-data/mxfp-epilogue-tdm-waves-20261109.tar.gz`
 (SHA256 `e67df2a59964dc2104ebc67b2350e4436d0bf6d5400a85ab2b99335229ca137f`).
 
+### Row sharding across the two DPX partitions (2026-11-11)
+
+`heliosr-1b114-d01-4` (ssh port 2223) runs its gfx1250 in DPX/NPS2: two
+devices of 128 CUs and 8 shader engines each, 216 GiB local HBM each, peer
+access over XGMI. `mxgemm_tdm_sharded` / `--devices 0,1` splits M across
+them: each device gets its rows of A and A's scales and full copies of B and
+B's scales, so the halves never communicate. Binaries were compiled locally
+with the bench FP16 defaults (four stages, mode 4, 4x4 clusters, 2 C slots),
+`--num_programs 128`, and run with a remote launcher that loads one kernel per
+device and times do_bench-style (L2 cleared per repetition, all devices
+launched together, slowest device's median). Every case passes the FP32
+reference on both devices.
+
+| Shape | 1 partition, whole problem | Half alone (dev 0 / 1) | 2 partitions, M split | Speedup |
+|---|---:|---:|---:|---:|
+| 8192²x4096 | 0.14417 ms | 0.07972 ms | 0.08332 ms (6,598 TFLOPS) | 1.73x |
+| 8192³ | 0.26908 ms (4,086 TFLOPS) | 0.14121 / 0.14367 ms | 0.14898 ms (7,380 TFLOPS) | 1.81x |
+| 16384³ | 2.00661 ms (4,384 TFLOPS) | - | 1.01217 ms (8,690 TFLOPS) | 1.98x |
+
+`--num_xcds 4` and `8` are within 0.2% (8k: 0.2689 / 0.2693 ms alone, 0.1483
+/ 0.1488 ms split). Partition 0's graphics clock is about 1.80 GHz with one
+partition busy and 1.62-1.69 GHz with both, at 1.8-2.0 kW and 2.0-3.1 kW
+socket power (amd-smi reports partition 1's clocks as N/A); that throttling is
+the 3-5% a half loses next to the other. The socket draws about 0.8 kW idle.
+These are a different machine than d04-1, so compare them with its SPX
+numbers only loosely. Not tried: inputs on one device read by the other over
+XGMI, or C written to the peer.
+Archive (ships, launcher, logs):
+`/home/ibutygin/tlx/perf-data/mxfp-dpx-sharded-20261111.tar.gz` (SHA256
+`365b4a4cb0785e6d590bea0fa931bd8a82c3b3dc1a5c6d241c20d50160048273`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
