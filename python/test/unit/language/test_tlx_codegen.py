@@ -7735,12 +7735,12 @@ def _strip_tdm_hazard_waits(asm):
 
 
 def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=4, streamed_operands=False,
-                                       **constants):
+                                       c_type="*fp32", **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     if streamed_operands:
         from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_streamed import (
             mxgemm_tdm_streamed_kernel as kernel, )
-    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr="*fp32", a_scale="*u8",
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr=c_type, a_scale="*u8",
                      b_scale="*u8")
     # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
     # and strides so the persistent kernel can fold descriptor/tile setup.
@@ -7757,6 +7757,11 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
     # Drop defaults the selected kernel does not declare (the streamed kernel has no handoff options).
     config = {name: value for name, value in config.items() if name in kernel.arg_names}
     config.update(constants)
+    # ASTSource does not apply parameter defaults; constexprs the caller leaves
+    # out would otherwise arrive as None.
+    for param in kernel.params:
+        if param.is_constexpr and param.has_default and param.name not in config:
+            config[param.name] = param.default
     # SCHED_MODE_2 is a launch option (enable_wmma_queuing), not a kernel constexpr.
     enable_wmma_queuing = config.pop("SCHED_MODE_2", False)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
@@ -7871,6 +7876,37 @@ def test_gfx1250_mxgemm_merged_handoff_barrier_drops_one_barrier(buffers):
         assert steps == buffers
         counts.append(sum(bool(re.match(r"\s+s_barrier_signal -1", inst)) for inst in body))
     assert counts[1] == counts[0] - buffers
+
+
+@pytest.mark.parametrize("schedule", ["fp16_four_stage", "fp32_three_stage"])
+def test_gfx1250_mxgemm_first_c_chunk_extra_barrier(schedule):
+    # Each epilogue's first C chunk gets one more workgroup rendezvous between
+    # its LDS fill and its TDM store (gfx1250 DS-write / TDM-read hazard, see
+    # _mxgemm_persistent_store); every later chunk keeps the single fill
+    # barrier. Count barrier waits between each TDM store and the C fill's
+    # LDS stores before it.
+    cluster = dict(NUM_PROGRAMS=128, CLUSTER_SIZE=16, CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8,
+                   XCD_REMAP_MODE=2)
+    if schedule == "fp16_four_stage":
+        compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 4, 128, c_type="*fp16", K=4096, STATIC_SLOT_UNROLL=True,
+                                                      OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True,
+                                                      REFILL_OVERLAP=4, STATIC_CLUSTER_STEPS=True, **cluster)
+    else:
+        compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=8192, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3,
+                                                      OVERLAP_PEEL=True, **cluster)
+    waits, count = [], None
+    for line in compiled.asm["amdgcn"].splitlines():
+        inst = line.strip()
+        if inst.startswith("ds_store"):
+            count = 0
+        elif count is not None and re.match(r"s_barrier_wait -1\b", inst):
+            count += 1
+        elif inst.startswith("tensor_store_from_lds"):
+            waits.append(count)
+            count = None
+    # Eight C chunks per tile, in the overlapped and the final-tile epilogue.
+    assert len(waits) == 16
+    assert waits == ([2] + [1] * 7) * 2
 
 
 @pytest.mark.parametrize("cluster_size", [1, 4])

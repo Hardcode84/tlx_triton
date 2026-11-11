@@ -62,6 +62,14 @@ when a C slot is reused, and leave the other chunk in flight. The current
 tile's input waits retire any previous tile's C stores before this output
 phase, so there is no need to drain incoming A/B before the first C chunk.
 
+The first C chunk of every epilogue has one extra workgroup barrier between
+its LDS fill and its TDM store. On gfx1250 that chunk's TDM store occasionally
+read the slot before the fill's last LDS stores were visible, despite
+`s_wait_dscnt 0` and the fill barrier. It then wrote the slot's previous
+contents to C, about once in 1,000-2,000 launches of the FP16 four-stage
+schedule. The extra barrier removes it and costs at most 0.6% on one
+partition. See [HANDOFF.md](HANDOFF.md), "Chunk-0 C store race".
+
 `--static-slot-unroll` (`STATIC_SLOT_UNROLL=True`) unrolls the MX8xMX8
 steady loop by its three-slot ring. Each step then reads a loop-invariant
 slot, so LDS operand addresses and the loop-carried operand copies move out
