@@ -618,6 +618,10 @@ those of `mxgemm_tdm_pipelined`; `NUM_PROGRAMS` applies per device. With
 all devices together, and the slowest device's median is reported for the
 whole problem.
 
+`bench.py --devices 0,1` runs every case this way; there `--num-programs` is
+per device and defaults to each device's CU count, and the cluster
+requirements apply to each device's rows.
+
 This targets a gfx1250 in DPX mode, which appears as two 128-CU devices with
 eight shader engines each (use `--num_programs 128`; `--num_xcds 4` and 8
 time the same). FP16 output with the benchmark's four-stage schedule, 4x4
