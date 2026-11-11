@@ -837,6 +837,34 @@ def test_mxgemm_refill_overlap_ring_phase(k_iters, cluster_size, mode, l2_lookah
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("scale_layout", ["block128", "wave256"])
+def test_mxgemm_sharded_rows_across_devices(scale_layout):
+    # Each device computes its own rows of C from its rows of A and A's
+    # scales and full copies of B. With one device, both shards run there.
+    devices = [f"cuda:{index % torch.cuda.device_count()}" for index in range(2)]
+    M, N, K = 2048, 1024, 6 * 128
+    torch.manual_seed(1250)
+    a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
+    b = (torch.randn((N, K)) * 0.5).to(torch.float8_e4m3fn)
+    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
+    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
+    ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b.T, a_scale, b_scale, 32, M, N, K)
+    shards = _gfx1250_mxfp.mxgemm_tdm_sharded(devices, a, b, _gfx1250_mxfp.pack_scale(a_scale, layout=scale_layout),
+                                              _gfx1250_mxfp.pack_scale(b_scale, layout=scale_layout), BLOCK_M=256,
+                                              BLOCK_N=256, BLOCK_K=128, TRANSPOSE_B=True, NUM_BUFFERS=4, DTYPE_A="e4m3",
+                                              DTYPE_B="e4m3", SCHEDULE="sliceMNK", TDM_FUSION="partial", GROUP_SIZE_M=4,
+                                              PERSISTENT=True, NUM_PROGRAMS=16, OUTPUT_STAGING=True,
+                                              XCD_REMAP="chunked", CLUSTER_SIZE=4, CLUSTER_LAYOUT="2x2",
+                                              CLUSTER_BARRIER_INTERVAL=4, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=2,
+                                              OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True, REFILL_OVERLAP=4,
+                                              STATIC_CLUSTER_STEPS=True, SCALE_LAYOUT=scale_layout, OUT_DTYPE="fp16")
+    assert [shard.device for shard in shards] == [torch.device(device) for device in devices]
+    assert [tuple(shard.shape) for shard in shards] == [(M // 2, N)] * 2
+    out = torch.cat([shard.cpu() for shard in shards])
+    torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 13])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("schedule", ["mode4", "mode4-l2", "static3", "dynamic3", "dynamic4"])

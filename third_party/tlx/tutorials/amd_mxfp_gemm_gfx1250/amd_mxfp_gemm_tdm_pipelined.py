@@ -28,6 +28,7 @@ tiles, BK128 for A8W8 and BK256 for A8W4, three input buffers, output staging,
 and partial TDM fusion.
 """
 from collections.abc import Callable
+import inspect
 import statistics
 import time
 
@@ -4621,6 +4622,92 @@ def mxgemm_tdm_pipelined(
     return c
 
 
+def _mxfp_concurrent_batch(devices, launches, rep_ms):
+    """One do_bench-style batch over several devices: return the slowest device's median time.
+
+    Every device runs its own launch stream concurrently. Each repetition
+    clears that device's L2 before timing one launch, as ``do_bench`` does.
+    """
+    driver = triton.runtime.driver.active
+    caches = []
+    for device in devices:
+        with torch.cuda.device(device):
+            caches.append(driver.get_empty_cache_for_benchmark())
+
+    def run(reps, timed):
+        events = [[] for _ in devices]
+        for _ in range(reps):
+            for index, (device, launch) in enumerate(zip(devices, launches)):
+                with torch.cuda.device(device):
+                    driver.clear_cache(caches[index])
+                    if timed:
+                        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        start.record()
+                    launch()
+                    if timed:
+                        end.record()
+                        events[index].append((start, end))
+        for device in devices:
+            torch.cuda.synchronize(device)
+        return events
+
+    estimate = run(5, True)
+    estimate_ms = max(statistics.median(s.elapsed_time(e) for s, e in times) for times in estimate)
+    events = run(max(1, int(rep_ms / estimate_ms)), True)
+    return max(statistics.median(s.elapsed_time(e) for s, e in times) for times in events)
+
+
+def mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, *args, **kwargs):
+    """Split a persistent MXFP GEMM by rows of A across several devices.
+
+    ``devices`` lists torch devices, for example the two compute partitions
+    of a gfx1250 in DPX mode. Each device gets its own rows of A and of A's
+    scales plus full copies of B and B's scales, and runs
+    ``mxgemm_tdm_pipelined`` on its rows with its own workgroups. The shards
+    are independent: there is no reduction and no synchronization between
+    devices. The remaining arguments are those of ``mxgemm_tdm_pipelined``;
+    ``NUM_PROGRAMS`` applies to each device. Returns the C shards in row
+    order. ``BENCHMARK="eager"`` launches all shards concurrently and reports
+    the slowest device's time for the whole problem.
+    """
+    params = inspect.signature(mxgemm_tdm_pipelined).bind(a, b, a_scale, b_scale, *args, **kwargs)
+    params.apply_defaults()
+    params = params.arguments
+    devices = [torch.device(device) for device in devices]
+    if not devices:
+        raise ValueError("sharded MXFP needs at least one device")
+    if not (params["PERSISTENT"] and params["TRANSPOSE_B"] and params["SCALE_PRESHUFFLE"] and params["WITH_A_SCALE"]):
+        raise ValueError("sharded MXFP requires the persistent kernel with transposed B and preshuffled A and B "
+                         "scales")
+    benchmark = params["BENCHMARK"]
+    if benchmark not in (None, "eager"):
+        raise ValueError("sharded MXFP supports BENCHMARK='eager' or None")
+    M = a.shape[0] if params["M"] is None else params["M"]
+    N = b.shape[0] if params["N"] is None else params["N"]
+    K = params["K"] or a.shape[1] * (2 if params["DTYPE_A"] == "e2m1" else 1)
+    scale_rows = 256 if params["SCALE_LAYOUT"] == "wave256" else 128
+    rows = M // len(devices)
+    if M % len(devices) or rows % scale_rows:
+        raise ValueError(f"sharded MXFP needs M divisible by {len(devices)} * {scale_rows}")
+    launches, shards = [], []
+    for index, device in enumerate(devices):
+        first = index * rows
+        shard = dict(params)
+        shard.update(a=a[first:first + rows].to(device),
+                     a_scale=a_scale[first // scale_rows:(first + rows) // scale_rows].to(device), b=b.to(device),
+                     b_scale=b_scale.to(device), M=rows, N=N, K=K,
+                     BENCHMARK=None if benchmark is None else launches.append)
+        with torch.cuda.device(device):
+            shards.append(mxgemm_tdm_pipelined(**shard))
+    if benchmark == "eager":
+        batch = lambda: _mxfp_concurrent_batch(devices, launches, params["BENCHMARK_NUM_ITERS"])  # noqa: E731
+        ms, batches = _mxfp_timed_batches(batch, params["BENCHMARK_WARMUP_SECONDS"],
+                                          params["BENCHMARK_DURATION_SECONDS"])
+        print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS over {len(devices)} devices "
+              f"(median of {batches} batches)")
+    return shards
+
+
 _DEFAULT_CONFIG = {
     "BLOCK_M": 128,
     "BLOCK_N": 128,
@@ -4876,7 +4963,11 @@ if __name__ == "__main__":
                         help="test native operand fragments with persistent E4M3 BK128 and three or four buffers")
     parser.add_argument("--async_output", action="store_true",
                         help="use direct LDS-to-global C stores with independent waits; requires --streamed_operands")
-    parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
+    parser.add_argument("--num_programs", type=int, default=None,
+                        help="persistent workgroup count per device (default: CU count)")
+    parser.add_argument(
+        "--devices", default=None, help="comma-separated device indices: split M across them, each device "
+        "computing its own rows (e.g. 0,1 for the two partitions of a gfx1250 in DPX mode)")
     parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
@@ -4945,7 +5036,11 @@ if __name__ == "__main__":
         from functools import partial
         from collect_traces import profile_workload
         benchmark = partial(profile_workload, spec_path=args.profile_workload)
-    mxgemm_tdm_pipelined(
+    run = mxgemm_tdm_pipelined
+    if args.devices:
+        devices = [f"cuda:{index}" for index in args.devices.split(",")]
+        run = lambda *run_args, **run_kwargs: mxgemm_tdm_sharded(devices, *run_args, **run_kwargs)  # noqa: E731
+    run(
         a_d,
         b_d,
         a_scale_d,
