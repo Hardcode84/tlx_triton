@@ -15,6 +15,9 @@ the loads:
   next tile's first stages are in flight while the current tile finishes.
 * B scales use the 128-row preshuffled layout (pack_scale); A scales stay
   row-major because M=64 does not fill a 128-row block.
+* C goes through LDS (STAGE_C). Stored straight from the WMMA layout, every
+  store instruction writes 16 bytes into each of 32 rows; restaged, a wave
+  writes whole rows, which took about 3% off the 128x64x8192x8192 problem.
 
 ``mxgemm_batched_split_n`` runs one problem on several devices (for example the
 two gfx1250 DPX partitions) by splitting N: every device holds its own N shard
@@ -113,7 +116,8 @@ def mxgemm_batched_kernel(
         NUM_BUFFERS: tl.constexpr,
         NUM_PROGRAMS: tl.constexpr,
         TILES_PER_WARP: tl.constexpr = (4, 4),
-        FUSION: tl.constexpr = "4way",
+        FUSION: tl.constexpr = "partial",
+        STAGE_C: tl.constexpr = True,
 ):
     """A [BATCH*M, K] e4m3, B [BATCH*N, K] e4m3 (K-contiguous, i.e. transposed),
     A scales [BATCH*M, K/32] e8m0, B scales preshuffled [BATCH*N/128, K/32*128],
@@ -154,6 +158,9 @@ def mxgemm_batched_kernel(
     bs_buf = tlx.local_alloc((BLOCK_N // 128, BKS * 128), tlx.dtype_of(b_scale), NUM_BUFFERS,
                              layout=_scale_layout([BLOCK_N // 128, BKS * 128]))
 
+    if STAGE_C:
+        c_view = tlx.local_view(tlx.local_alloc((M, BLOCK_N), tlx.dtype_of(c_ptr), 1), 0)
+
     for j in tl.static_range(NUM_BUFFERS - 1):
         _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, j, total, pid, M, N, BLOCK_N,
                     BLOCK_K, K_ITERS, TILES_N, NUM_BUFFERS, NUM_PROGRAMS, FUSION)
@@ -179,7 +186,11 @@ def mxgemm_batched_kernel(
             sb = tlx.local_load(sb_view)
             acc = tlx.dot_scaled(a, sa, "e4m3", b, sb, "e4m3", acc, tiles_per_warp=TILES_PER_WARP)
         c_tile = c_ptr + (batch * M).to(tl.int64) * N + n0
-        tl.store(c_tile + offs_m[:, None] * N + offs_n[None, :], acc.to(c_ptr.dtype.element_ty))
+        c = acc.to(c_ptr.dtype.element_ty)
+        if STAGE_C:
+            tlx.local_store(c_view, c)
+            c = tlx.local_load(c_view)
+        tl.store(c_tile + offs_m[:, None] * N + offs_n[None, :], c)
     tlx.async_amd_descriptor_wait(0)
 
 
@@ -193,7 +204,7 @@ def pack_b_scale(b_scale: torch.Tensor) -> torch.Tensor:
 
 
 def mxgemm_batched(a, b, a_scale, b_scale_packed, out=None, *, block_n=256, block_k=256, num_buffers=3,
-                   num_programs=None, out_dtype=torch.bfloat16, tiles_per_warp=(4, 4), fusion="4way"):
+                   num_programs=None, out_dtype=torch.bfloat16, tiles_per_warp=(4, 4), fusion="partial", stage_c=True):
     """C[b] = (A[b] * 2^(sA[b]-127)) @ (B[b] * 2^(sB[b]-127))^T for every batch b.
 
     a: [B, M, K] float8_e4m3fn; b: [B, N, K] float8_e4m3fn; a_scale: [B, M, K/32]
@@ -221,7 +232,7 @@ def mxgemm_batched(a, b, a_scale, b_scale_packed, out=None, *, block_n=256, bloc
                                             a_scale.view(batch * m, k // 32), b_scale_packed, BATCH=batch, M=m, N=n,
                                             K=k, BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=num_buffers,
                                             NUM_PROGRAMS=num_programs, TILES_PER_WARP=tuple(tiles_per_warp),
-                                            FUSION=fusion, num_warps=4, waves_per_eu=1)
+                                            FUSION=fusion, STAGE_C=stage_c, num_warps=4, waves_per_eu=1)
     return out
 
 
@@ -276,7 +287,8 @@ def main():
     p.add_argument("--block_k", type=int, default=256)
     p.add_argument("--num_buffers", type=int, default=3)
     p.add_argument("--num_programs", type=int, default=None)
-    p.add_argument("--fusion", choices=("4way", "partial", "none"), default="4way")
+    p.add_argument("--fusion", choices=("4way", "partial", "none"), default="partial")
+    p.add_argument("--no_stage_c", action="store_true", help="store C straight from the WMMA layout")
     p.add_argument("--check", action="store_true")
     p.add_argument("--iters", type=int, default=50)
     args = p.parse_args()
@@ -287,7 +299,7 @@ def main():
     a_dev = [a.to(d) for d in devices]
     sa_dev = [sa.to(d) for d in devices]
     kw = dict(block_n=args.block_n, block_k=args.block_k, num_buffers=args.num_buffers, num_programs=args.num_programs,
-              fusion=args.fusion)
+              fusion=args.fusion, stage_c=not args.no_stage_c)
     outs = mxgemm_batched_split_n(devices, a_dev, sa_dev, shards, **kw)
     for d in devices:
         torch.cuda.synchronize(d)
