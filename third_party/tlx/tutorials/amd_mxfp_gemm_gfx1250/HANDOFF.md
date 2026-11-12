@@ -3896,6 +3896,70 @@ Archive (launcher, scribbler, ships, logs):
 `/home/ibutygin/tlx/perf-data/mxfp-dpx-c0-race-20261111.tar.gz` (SHA256
 `34e52208d023065737e5fbe19107ad0c5f149e27c04707fd8e644a1f1bc78cc8`).
 
+### C store race: failing cases and workarounds (DEGFXARCD-12240, 2026-11-12)
+
+The chunk-0 race above is a known hardware bug, tracked as DEGFXARCD-12240
+(clones DEGFX13-37685, DEGFXMI400-13350, PLAT-216123).
+
+**Failing cases:**
+
+- A DS store or atomic to LDS, then `s_wait_dscnt 0`, then an async or TDM copy
+  that reads the same LDS bytes (`tensor_store_from_lds`,
+  `global_store_async_from_lds`). The copy can read the bytes' previous
+  contents. Barriers between the wait and the copy do not make it safe.
+- The reverse: an async or TDM load into LDS can be overwritten by an older DS
+  store to the same bytes, even after `s_wait_dscnt 0`.
+- The window grows with TDM or async loads writing the same CU's LDS. In the
+  GEMM it shows up right after the next tile's operand reads.
+- AM/GUMMI and FFM do not reproduce it; only hardware does.
+
+**Workarounds from the ticket** (pass on emulation, not yet proven in general,
+cost unknown):
+
+- WAR1: `TCP:TXA_CNTL.DISABLE_ASYNC_STORE_DIRECT_COPY=1` (a driver or firmware
+  setting, no kernel change).
+- WAR2: after the fill, exactly 6 lanes `ds_or_b32 0` to one private scratch
+  dword, then `s_wait_dscnt 0`, then the copy.
+- WAR3: 5 lanes `ds_store_b32` to scratch rows in one bank, a `ds_load_b32`,
+  `s_wait_dscnt 0`, then the copy.
+
+WAR2 and WAR3 need exact lane masks, so they need inline asm or a compiler
+lowering; neither fits the TLX kernels as written.
+
+**Measured mitigations** on `heliosr-1b114-d04-1` (MI450X SPX), inserted between
+`s_wait_dscnt 0` and the TDM store of the standalone reproducer
+(`/home/ibutygin/tlx/perf-data/gfx1250-tdm-stale-lds-repro-20261112`,
+variants in `/home/ibutygin/tlx/perf-data/gfx1250-tdm-stale-lds-mitigations-20261112`):
+
+| Between `s_wait_dscnt 0` and the store | Failing launches |
+|---|---:|
+| nothing | 1470 / 5000 (29%) |
+| 1 barrier | 12 / 5000 |
+| 2 barriers (the adopted chunk-0 fix) | 4 / 5000 |
+| 3 barriers | 1 / 5000 |
+| `ds_load_b32` of one written dword + wait | 15-19 / 5000 |
+| `s_sleep 2` (about 128 clocks) | 3 / 5000 |
+| `s_sleep 4` (about 256 clocks) | 0 / 25,000 |
+| `ds_load_b128` of every written address + wait | 0 / 27,000 |
+| drain all TDM loads + barrier | 0 / 1000 |
+
+Barriers only delay the store, so the adopted two-barrier chunk-0 fix lowers the
+odds without closing the window; it passed 20,000 GEMM trials because the GEMM's
+base rate is far lower than the reproducer's. The clean sleep and full-readback
+results may also be only delays.
+
+The batched kernel (`amd_mxfp_batched_gemm.py`) with TDM C stores did not fail in
+about 2.6 million stressed launches (1-3 barriers, either issuing wave, C shared
+with or isolated from TDM-load LDS segments, K=1024, cache-resident B; a broken
+control failed every launch). Its TDM store is no faster than restaging C through
+LDS and using `tl.store` (0.504 ms both), so it keeps `tl.store`.
+
+**Options for the MXFP GEMM epilogue, safest first:** no TDM C stores (global
+stores from registers or LDS); draining every wave's TDM loads before the fill
+(+1% in the chunk-0 test; the reproducer's `quiet` variant); WAR1 if the setting
+is available; WAR2 or WAR3 through a compiler lowering; the current two
+barriers, which only lower the probability.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
