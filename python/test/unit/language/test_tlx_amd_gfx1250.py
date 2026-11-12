@@ -6,6 +6,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import (
+    amd_mxfp_batched_gemm as _gfx1250_mxfp_batched, )
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
@@ -862,6 +864,38 @@ def test_mxgemm_sharded_rows_across_devices(scale_layout):
     assert [tuple(shard.shape) for shard in shards] == [(M // 2, N)] * 2
     out = torch.cat([shard.cpu() for shard in shards])
     torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("fusion", ["4way", "partial", "none"])
+@pytest.mark.parametrize("block_k,num_buffers", [(128, 3), (128, 6), (256, 3)])
+@pytest.mark.parametrize("num_programs", [4, 5])
+def test_mxgemm_batched_ring_phase(fusion, block_k, num_buffers, num_programs):
+    # 3 batches x 2 N tiles over 4 or 5 persistent programs: programs run one
+    # or two tiles, and the ring carries loads across tile boundaries.
+    batch, M, N, K = 3, 64, 512, 1024
+    a, b, a_scale, b_scale = _gfx1250_mxfp_batched._random_inputs(batch, M, N, K, "cpu", seed=1250)
+    ref = torch.stack(_gfx1250_mxfp_batched.reference(a, b, a_scale, b_scale))
+    out = _gfx1250_mxfp_batched.mxgemm_batched(a.cuda(), b.cuda(), a_scale.cuda(),
+                                               _gfx1250_mxfp_batched.pack_b_scale(b_scale).cuda(), block_k=block_k,
+                                               num_buffers=num_buffers, num_programs=num_programs, fusion=fusion)
+    torch.testing.assert_close(out.float().cpu(), ref, atol=0, rtol=8e-3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+def test_mxgemm_batched_split_n_across_devices():
+    # Each device computes its N shard of every batch. With one device, both
+    # shards run there.
+    devices = [f"cuda:{index % torch.cuda.device_count()}" for index in range(2)]
+    batch, M, N, K = 2, 64, 1024, 768
+    a, b, a_scale, b_scale = _gfx1250_mxfp_batched._random_inputs(batch, M, N, K, "cpu", seed=7)
+    ref = torch.stack(_gfx1250_mxfp_batched.reference(a, b, a_scale, b_scale))
+    shards = _gfx1250_mxfp_batched.split_n_inputs(devices, b, b_scale)
+    outs = _gfx1250_mxfp_batched.mxgemm_batched_split_n(devices, [a.to(d) for d in devices],
+                                                        [a_scale.to(d) for d in devices], shards, num_programs=3)
+    assert [tuple(o.shape) for o in outs] == [(batch, M, N // 2)] * 2
+    out = torch.cat([o.float().cpu() for o in outs], dim=2)
+    torch.testing.assert_close(out, ref, atol=0, rtol=8e-3)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
