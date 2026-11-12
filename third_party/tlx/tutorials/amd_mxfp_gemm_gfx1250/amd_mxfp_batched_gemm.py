@@ -15,6 +15,8 @@ the loads:
   next tile's first stages are in flight while the current tile finishes.
 * B scales use the 128-row preshuffled layout (pack_scale); A scales stay
   row-major because M=64 does not fill a 128-row block.
+* B and its scales load with a cache bypass (FUSION="split", B_CACHE=".cv")
+  and A with the default policy, about 1% faster than one policy for both.
 * C goes through LDS (STAGE_C). Stored straight from the WMMA layout, every
   store instruction writes 16 bytes into each of 32 rows; restaged, a wave
   writes whole rows, which took about 3% off the 128x64x8192x8192 problem.
@@ -59,7 +61,8 @@ def _position(desc, offsets, pred):
 @triton.jit
 def _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step, total, pid, M: tl.constexpr,
                 N: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, K_ITERS: tl.constexpr,
-                TILES_N: tl.constexpr, NUM_BUFFERS: tl.constexpr, NUM_PROGRAMS: tl.constexpr, FUSION: tl.constexpr):
+                TILES_N: tl.constexpr, NUM_BUFFERS: tl.constexpr, NUM_PROGRAMS: tl.constexpr, FUSION: tl.constexpr,
+                B_CACHE: tl.constexpr):
     # Load K step `step` of this program's flattened (tile, K step) sequence.
     # Past the end the loads are predicated off; they still count towards
     # TENSORcnt, so the ring's waits stay uniform.
@@ -74,7 +77,19 @@ def _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, 
     b_off = [row_b, k * BLOCK_K]
     as_off = [batch * M, k * BKS]
     bs_off = [row_b // 128, k * BKS * 128]
-    if FUSION == "4way":
+    if FUSION == "split":
+        # Two per wave and step: B with its scales, then A with its scales. B
+        # is read once, so it can bypass the caches (B_CACHE) while A, which
+        # every N tile of its batch reads, keeps the default policy.
+        tlx.async_amd_descriptor_load_fused([
+            (_position(b_desc, b_off, pred), tlx.local_view(b_buf, slot), 3),
+            (_position(bs_desc, bs_off, pred), tlx.local_view(bs_buf, slot), 12),
+        ], cache_modifier=B_CACHE)
+        tlx.async_amd_descriptor_load_fused([
+            (_position(a_desc, a_off, pred), tlx.local_view(a_buf, slot), 3),
+            (_position(as_desc, as_off, pred), tlx.local_view(as_buf, slot), 12),
+        ])
+    elif FUSION == "4way":
         # One TDM instruction per wave and step: each wave fills one member.
         tlx.async_amd_descriptor_load_fused([
             (_position(a_desc, a_off, pred), tlx.local_view(a_buf, slot), 1),
@@ -102,22 +117,23 @@ def _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, 
 
 @triton.jit
 def mxgemm_batched_kernel(
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        a_scale,
-        b_scale,
-        BATCH: tl.constexpr,
-        M: tl.constexpr,
-        N: tl.constexpr,
-        K: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        NUM_BUFFERS: tl.constexpr,
-        NUM_PROGRAMS: tl.constexpr,
-        TILES_PER_WARP: tl.constexpr = (4, 4),
-        FUSION: tl.constexpr = "partial",
-        STAGE_C: tl.constexpr = True,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale,
+    b_scale,
+    BATCH: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    TILES_PER_WARP: tl.constexpr = (4, 4),
+    FUSION: tl.constexpr = "split",
+    B_CACHE: tl.constexpr = ".cv",
+    STAGE_C: tl.constexpr = True,
 ):
     """A [BATCH*M, K] e4m3, B [BATCH*N, K] e4m3 (K-contiguous, i.e. transposed),
     A scales [BATCH*M, K/32] e8m0, B scales preshuffled [BATCH*N/128, K/32*128],
@@ -135,7 +151,7 @@ def mxgemm_batched_kernel(
     # TDM instructions per wave and K step. gfx1250 codegen waits for at most
     # ten outstanding TDM instructions before issuing another, which bounds the
     # ring depth that is actually in flight: fusing keeps all stages in flight.
-    LOADS: tl.constexpr = 1 if FUSION == "4way" else 2 if FUSION == "partial" else 4
+    LOADS: tl.constexpr = 1 if FUSION == "4way" else 2 if FUSION == "partial" or FUSION == "split" else 4
 
     pid = tl.program_id(0)
     my_tiles = (NUM_TILES - 1 - pid) // NUM_PROGRAMS + 1
@@ -163,7 +179,7 @@ def mxgemm_batched_kernel(
 
     for j in tl.static_range(NUM_BUFFERS - 1):
         _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, j, total, pid, M, N, BLOCK_N,
-                    BLOCK_K, K_ITERS, TILES_N, NUM_BUFFERS, NUM_PROGRAMS, FUSION)
+                    BLOCK_K, K_ITERS, TILES_N, NUM_BUFFERS, NUM_PROGRAMS, FUSION, B_CACHE)
 
     offs_m = tl.arange(0, M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -175,7 +191,7 @@ def mxgemm_batched_kernel(
         for k in range(K_ITERS):
             step = t * K_ITERS + k
             _issue_step(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step + NUM_BUFFERS - 1, total,
-                        pid, M, N, BLOCK_N, BLOCK_K, K_ITERS, TILES_N, NUM_BUFFERS, NUM_PROGRAMS, FUSION)
+                        pid, M, N, BLOCK_N, BLOCK_K, K_ITERS, TILES_N, NUM_BUFFERS, NUM_PROGRAMS, FUSION, B_CACHE)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             slot = step % NUM_BUFFERS
             a = tlx.local_load(tlx.local_view(a_buf, slot))
@@ -204,7 +220,8 @@ def pack_b_scale(b_scale: torch.Tensor) -> torch.Tensor:
 
 
 def mxgemm_batched(a, b, a_scale, b_scale_packed, out=None, *, block_n=256, block_k=256, num_buffers=3,
-                   num_programs=None, out_dtype=torch.bfloat16, tiles_per_warp=(4, 4), fusion="partial", stage_c=True):
+                   num_programs=None, out_dtype=torch.bfloat16, tiles_per_warp=(4, 4), fusion="split", b_cache=".cv",
+                   stage_c=True):
     """C[b] = (A[b] * 2^(sA[b]-127)) @ (B[b] * 2^(sB[b]-127))^T for every batch b.
 
     a: [B, M, K] float8_e4m3fn; b: [B, N, K] float8_e4m3fn; a_scale: [B, M, K/32]
@@ -232,7 +249,8 @@ def mxgemm_batched(a, b, a_scale, b_scale_packed, out=None, *, block_n=256, bloc
                                             a_scale.view(batch * m, k // 32), b_scale_packed, BATCH=batch, M=m, N=n,
                                             K=k, BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=num_buffers,
                                             NUM_PROGRAMS=num_programs, TILES_PER_WARP=tuple(tiles_per_warp),
-                                            FUSION=fusion, STAGE_C=stage_c, num_warps=4, waves_per_eu=1)
+                                            FUSION=fusion, B_CACHE=b_cache, STAGE_C=stage_c, num_warps=4,
+                                            waves_per_eu=1)
     return out
 
 
@@ -287,7 +305,8 @@ def main():
     p.add_argument("--block_k", type=int, default=256)
     p.add_argument("--num_buffers", type=int, default=3)
     p.add_argument("--num_programs", type=int, default=None)
-    p.add_argument("--fusion", choices=("4way", "partial", "none"), default="partial")
+    p.add_argument("--fusion", choices=("split", "4way", "partial", "none"), default="split")
+    p.add_argument("--b_cache", default=".cv", help="cache modifier for B loads with --fusion split")
     p.add_argument("--no_stage_c", action="store_true", help="store C straight from the WMMA layout")
     p.add_argument("--check", action="store_true")
     p.add_argument("--iters", type=int, default=50)
@@ -299,7 +318,7 @@ def main():
     a_dev = [a.to(d) for d in devices]
     sa_dev = [sa.to(d) for d in devices]
     kw = dict(block_n=args.block_n, block_k=args.block_k, num_buffers=args.num_buffers, num_programs=args.num_programs,
-              fusion=args.fusion, stage_c=not args.no_stage_c)
+              fusion=args.fusion, b_cache=args.b_cache, stage_c=not args.no_stage_c)
     outs = mxgemm_batched_split_n(devices, a_dev, sa_dev, shards, **kw)
     for d in devices:
         torch.cuda.synchronize(d)
