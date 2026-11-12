@@ -867,7 +867,7 @@ def test_mxgemm_sharded_rows_across_devices(scale_layout):
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("fusion", ["4way", "partial", "none"])
+@pytest.mark.parametrize("fusion", ["split", "4way", "partial", "none"])
 @pytest.mark.parametrize("block_k,num_buffers", [(128, 3), (128, 6), (256, 3)])
 @pytest.mark.parametrize("num_programs", [4, 5])
 def test_mxgemm_batched_ring_phase(fusion, block_k, num_buffers, num_programs):
