@@ -128,6 +128,54 @@ struct ReadBarrierPhaseOpConversion
   }
 };
 
+struct LdsWriteDrainOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::LdsWriteDrainOp> {
+  LdsWriteDrainOpConversion(LLVMTypeConverter &typeConverter,
+                            const mlir::triton::AMD::TargetInfo &targetInfo,
+                            PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
+  }
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::LdsWriteDrainOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::GFX1250) {
+      rewriter.eraseOp(op);
+      return success();
+    }
+    Location loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBuffer(),
+        typeConverter->convertType(op.getBuffer().getType().getElementType()),
+        rewriter);
+    // An LDS atomic completes only after the wave's queued DS writes, unlike
+    // s_wait_dscnt alone. Each lane ORs zero into its own dword at the start
+    // of the buffer: one conflict-free ds_or_b32 per wave, without changing
+    // EXEC or branching. The atomic is volatile so that no LLVM pass can fold
+    // or drop the idempotent OR.
+    auto bufferTy = op.getBuffer().getType();
+    int64_t bytes = product(bufferTy.getShape()) *
+                    bufferTy.getElementType().getIntOrFloatBitWidth() / 8;
+    int64_t dwords = std::clamp<int64_t>(
+        bytes / 4, 1, triton::gpu::lookupThreadsPerWarp(rewriter));
+    Value lane = b.urem(getLaneId(rewriter, loc), b.i32_val(dwords));
+    Value ptr =
+        b.gep(smemObj.getBase().getType(), i32_ty, smemObj.getBase(), lane);
+    LLVM::AtomicRMWOp::create(rewriter, loc, LLVM::AtomicBinOp::_or, ptr,
+                              b.i32_val(0), LLVM::AtomicOrdering::monotonic,
+                              "workgroup", /*alignment=*/4,
+                              /*isVolatile=*/true);
+    triton::amdgpu::MemoryCounterWaitOp::create(rewriter, loc, nullptr, nullptr,
+                                                rewriter.getI32IntegerAttr(0));
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const mlir::triton::AMD::TargetInfo &targetInfo;
+};
+
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -139,5 +187,6 @@ void populateBarrierOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
   patterns.add<InitBarrierOpConversion>(typeConverter, benefit);
   patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit);
   patterns.add<ReadBarrierPhaseOpConversion>(typeConverter, benefit);
+  patterns.add<LdsWriteDrainOpConversion>(typeConverter, targetInfo, benefit);
 }
 } // namespace mlir::triton::AMD

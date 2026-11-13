@@ -29,6 +29,7 @@ from .dynamic_launch import (
 from .mem_ops import (
     allocate_tensor_descriptor,
     amd_descriptor_prefetch_tensor,
+    amd_lds_write_drain,
     async_amd_descriptor_load,
     async_amd_descriptor_load_fused,
     async_amd_descriptor_store,
@@ -244,6 +245,7 @@ __all__ = [
     "async_amd_descriptor_store",
     "async_amd_descriptor_wait",
     "amd_descriptor_prefetch_tensor",
+    "amd_lds_write_drain",
     "async_descriptor_gather",
     "async_descriptor_load",
     "async_descriptor_scatter",

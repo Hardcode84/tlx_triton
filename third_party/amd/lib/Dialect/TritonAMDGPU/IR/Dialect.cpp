@@ -2658,4 +2658,11 @@ Type TDMPrefetchOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
 
+// -- LdsWriteDrainOp --
+LogicalResult LdsWriteDrainOp::verify() {
+  if (!isa<gpu::SharedMemorySpaceAttr>(getBuffer().getType().getMemorySpace()))
+    return emitOpError("buffer must be in shared memory");
+  return success();
+}
+
 } // namespace mlir::triton::amdgpu

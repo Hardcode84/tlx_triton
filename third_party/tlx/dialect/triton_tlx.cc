@@ -1154,6 +1154,10 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<amdgpu::ClusterBarrierArriveOp>();
              self.create<amdgpu::ClusterBarrierWaitOp>();
            })
+      .def("create_amd_lds_write_drain",
+           [](TritonOpBuilder &self, Value buffer) -> void {
+             self.create<amdgpu::LdsWriteDrainOp>(buffer);
+           })
       .def("create_amd_workgroup_barrier_signal",
            [](TritonOpBuilder &self) -> void {
              self.create<amdgpu::WorkgroupBarrierSignalOp>();

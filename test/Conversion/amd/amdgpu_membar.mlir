@@ -998,3 +998,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 }
 
+// -----
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // An LDS write drain has no shared-memory effects: the fill barrier still
+  // goes right before the TDM store that reads the buffer, after the drain.
+  // CHECK-LABEL: lds_write_drain_before_tdm_store
+  tt.func @lds_write_drain_before_tdm_store(%c: !tt.tensordesc<64x64xf16, #shared>,
+                                            %value: tensor<64x64xf16, #blocked>) {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: ttg.local_store
+    // CHECK-NEXT: amdg.lds_write_drain
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: amdg.async_tdm_copy_local_to_global
+    ttg.local_store %value, %buf : tensor<64x64xf16, #blocked> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    amdg.lds_write_drain %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    amdg.async_tdm_copy_local_to_global %c from %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x64xf16, #shared>
+    tt.return
+  }
+}
