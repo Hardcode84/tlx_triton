@@ -1353,6 +1353,7 @@ def mxgemm_tdm_pipelined_kernel(
         tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, 0], [SUBTILE_M, SUBTILE_N]), c10.to(tlx.dtype_of(c_ptr)))
         tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, SUBTILE_N], [SUBTILE_M, SUBTILE_N]),
                         c11.to(tlx.dtype_of(c_ptr)))
+        tlx.amd_lds_write_drain(c_view)
         tlx.async_amd_descriptor_store(c_desc, c_view, [c_off_m, c_off_n], clamp_bounds=True)
         tlx.async_amd_descriptor_wait(0)
     elif SCHEDULE == "sliceNK":
@@ -2209,6 +2210,11 @@ def _mxgemm_c_slot_wait(PENDINGS: tl.constexpr, C_TDM_ISSUER: tl.constexpr):
 
 @triton.jit
 def _mxgemm_c_tdm_store(desc, view, offsets, C_TDM_ISSUER: tl.constexpr):
+    # gfx1250: a TDM store can read LDS before this wave's fill writes reach
+    # it, even after s_wait_dscnt 0 and the fill barrier, and write the slot's
+    # previous contents to C. Every wave drains its writes before the barrier;
+    # see HANDOFF.md, "C store race: failing cases and workarounds".
+    tlx.amd_lds_write_drain(view)
     if C_TDM_ISSUER is not None:
         if C_TDM_ISSUER:
             # The local-store -> TDM dependence inserts the fill barrier.
@@ -2285,28 +2291,6 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                     row, col = (part // 2) * 64, (part % 2) * 64
                 view = c_buf[(QUADRANT * PARTS + part) % C_SLOTS]
                 tlx.local_store(view, chunk)
-                if C_TDM_ISSUER is None and QUADRANT * PARTS + part == 0:
-                    # gfx1250 hazard: the first chunk of an epilogue is written
-                    # right after the next tile's operand reads, with TDM loads
-                    # in flight. Its TDM store then occasionally read slot 0
-                    # before the last ds_store_b128s of the fill were visible,
-                    # even after s_wait_dscnt 0 and a workgroup barrier, and
-                    # wrote the slot's previous contents (an earlier tile's
-                    # chunk, or LDS left by the previous kernel) to C: about
-                    # one launch in 1,000-2,000 for FP16 four-stage 8192^2 x
-                    # 4096 and 8192^3. One more workgroup rendezvous before the
-                    # store removed it in 20,000 trials. The first call takes
-                    # the place of the fill barrier Membar would insert; the
-                    # second is the extra rendezvous. The FP32 three-stage
-                    # schedule has not shown the race but shares this path. On
-                    # one gfx1250 DPX partition it costs 0.3-0.5% (FP16
-                    # four-stage) and 0.1-0.4% (FP32 three-stage), and nothing
-                    # measurable with both partitions busy. The wave-
-                    # specialized handoff (C_TDM_ISSUER set) pairs one fill
-                    # barrier per role and is left unchanged. See HANDOFF.md,
-                    # "Chunk-0 C store race".
-                    tlx.workgroup_barrier()
-                    tlx.workgroup_barrier()
                 _mxgemm_c_tdm_store(desc, view, [row, col], C_TDM_ISSUER)
     else:
         offsets = tl.arange(0, BM)[:, None] * stride_cm + tl.arange(0, BN)[None, :]
@@ -2457,6 +2441,7 @@ def _mxgemm_store_register_panels(c_ptr, c00, c01, c10, c11, off_m, off_n, strid
         view = c_a if part % 2 == 0 else c_b
         tlx.async_amd_descriptor_wait(1)
         tlx.local_store(view, panel.to(tlx.dtype_of(c_ptr)))
+        tlx.amd_lds_write_drain(view)
         tlx.async_amd_descriptor_store(desc, view, [0, part * PANEL], clamp_bounds=False)
 
 
