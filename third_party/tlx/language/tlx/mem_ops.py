@@ -2170,6 +2170,25 @@ def amd_descriptor_prefetch_tensor(
 
 
 @tl.builtin
+def amd_lds_write_drain(buffer: tlx.buffered_tensor, _semantic=None) -> None:
+    """Make this wave's earlier writes to ``buffer`` visible to asynchronous copies (gfx1250).
+
+    On gfx1250, ``s_wait_dscnt 0`` and a workgroup barrier do not order DS
+    writes before a TDM store (or async store from LDS) that reads them; the
+    copy can read the previous contents. Call this in every wave after it
+    writes ``buffer`` and before the barrier that orders those writes with the
+    copy. Each lane ORs zero into one of the first (up to 32) dwords at
+    ``buffer``'s base address, then the wave waits for its LDS operations.
+    ``buffer`` must not be the destination of an asynchronous copy in flight.
+    Lowers to nothing on other AMD targets.
+    """
+    arch = _semantic.builder.options.arch
+    assert isinstance(arch, str) and arch.startswith("gfx"), (
+        f"amd_lds_write_drain is only available on AMD targets, got arch={arch}")
+    _semantic.builder.create_amd_lds_write_drain(buffer.handle)
+
+
+@tl.builtin
 def async_amd_descriptor_wait(
     pendings: tl.constexpr = 0,
     tokens: Optional[list[tlx.async_token]] = None,
