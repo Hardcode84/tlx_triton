@@ -1916,4 +1916,21 @@ def WorkgroupBarrierWaitOp : TT_AMDGPU_Op<"workgroup_barrier_wait"> {
   let assemblyFormat = "attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// LdsWriteDrainOp
+//===----------------------------------------------------------------------===//
+
+def LdsWriteDrainOp : TT_AMDGPU_Op<"lds_write_drain"> {
+  let summary = "Make this wave's earlier LDS writes visible to TDM stores";
+  let description = [{
+    On gfx1250, a TDM store may see stale LDS contents instead of the issuing
+    wave's earlier writes to `buffer`. This op makes those writes visible to
+    subsequent TDM stores that read `buffer`. Use it after writing a buffer
+    and before storing it with TDM.
+  }];
+  let arguments = (ins TTG_MemDescType:$buffer);
+  let assemblyFormat = "$buffer attr-dict `:` qualified(type($buffer))";
+  let hasVerifier = 1;
+}
+
 #endif

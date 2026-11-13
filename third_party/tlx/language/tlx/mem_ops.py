@@ -2131,6 +2131,21 @@ def amd_descriptor_prefetch_tensor(
 
 
 @tl.builtin
+def amd_lds_write_drain(buffer: tlx.buffered_tensor, _semantic=None) -> None:
+    """Make this wave's earlier LDS writes to ``buffer`` visible to TDM stores.
+
+    On gfx1250, a TDM store may see stale LDS contents instead of the issuing
+    wave's earlier writes to ``buffer``. This makes those writes visible to
+    subsequent TDM stores that read ``buffer``. Use it after writing a buffer
+    and before storing it with TDM.
+    """
+    arch = _semantic.builder.options.arch
+    assert isinstance(arch, str) and arch.startswith("gfx"), (
+        f"amd_lds_write_drain is only available on AMD targets, got arch={arch}")
+    _semantic.builder.create_amd_lds_write_drain(buffer.handle)
+
+
+@tl.builtin
 def async_amd_descriptor_wait(
     pendings: tl.constexpr = 0,
     tokens: Optional[list[tlx.async_token]] = None,

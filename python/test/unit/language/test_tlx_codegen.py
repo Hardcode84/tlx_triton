@@ -7292,6 +7292,32 @@ def test_tdm_copy_view_incompatible_gfx1250(view, mode, capfd):
     assert "is inconsistent with the shared memory allocation layout" in capfd.readouterr().err
 
 
+@triton.jit
+def _lds_write_drain_tdm_store_kernel(x_ptr, out_ptr):
+    buf = tlx.local_alloc((64, 128), tl.float16, 1)
+    view = tlx.local_view(buf, 0)
+    tlx.local_store(view, tl.load(x_ptr + tl.arange(0, 64)[:, None] * 128 + tl.arange(0, 128)[None, :]))
+    tlx.amd_lds_write_drain(view)
+    desc = tl.make_tensor_descriptor(out_ptr, [64, 128], [128, 1], [64, 128])
+    tlx.async_amd_descriptor_store(desc, view, [0, 0])
+    tlx.async_amd_descriptor_wait(pendings=0)
+
+
+def test_amd_lds_write_drain_before_tdm_store_gfx1250():
+    compiled = compile_for_gfx1250(_lds_write_drain_tdm_store_kernel, signature={"x_ptr": "*fp16", "out_ptr": "*fp16"},
+                                   constexprs={})
+    assert "amdg.lds_write_drain" in compiled.asm["ttgir"]
+    ops = [line.split()[0] for line in compiled.asm["amdgcn"].splitlines() if line.startswith("\t") and line.split()]
+    store = ops.index("tensor_store_from_lds")
+    drain = ops.index("ds_or_b32")
+    last_fill = max(i for i, op in enumerate(ops[:store]) if op.startswith("ds_store"))
+    # Fill, then the drain atomic and its wait, then the only fill barrier, then the TDM store.
+    assert ops.count("ds_or_b32") == 1 and ops[:store].count("s_barrier_signal") == 1
+    barrier = ops.index("s_barrier_signal")
+    assert last_fill < drain < barrier < store
+    assert "s_wait_dscnt" in ops[drain:barrier]
+
+
 def test_gfx1250_matmul_tdm_pipelined_compiles():
     """Compile-only check: runs everywhere, validates the kernel still
     lowers cleanly to TDM intrinsics + a propagated padded encoding."""
