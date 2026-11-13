@@ -7387,6 +7387,32 @@ def test_tdm_copy_view_incompatible_gfx1250(view, mode, capfd):
     assert "is inconsistent with the shared memory allocation layout" in capfd.readouterr().err
 
 
+@triton.jit
+def _lds_write_drain_tdm_store_kernel(x_ptr, out_ptr):
+    buf = tlx.local_alloc((64, 128), tl.float16, 1)
+    view = tlx.local_view(buf, 0)
+    tlx.local_store(view, tl.load(x_ptr + tl.arange(0, 64)[:, None] * 128 + tl.arange(0, 128)[None, :]))
+    tlx.amd_lds_write_drain(view)
+    desc = tl.make_tensor_descriptor(out_ptr, [64, 128], [128, 1], [64, 128])
+    tlx.async_amd_descriptor_store(desc, view, [0, 0])
+    tlx.async_amd_descriptor_wait(pendings=0)
+
+
+def test_amd_lds_write_drain_before_tdm_store_gfx1250():
+    compiled = compile_for_gfx1250(_lds_write_drain_tdm_store_kernel, signature={"x_ptr": "*fp16", "out_ptr": "*fp16"},
+                                   constexprs={})
+    assert "amdg.lds_write_drain" in compiled.asm["ttgir"]
+    ops = [line.split()[0] for line in compiled.asm["amdgcn"].splitlines() if line.startswith("\t") and line.split()]
+    store = ops.index("tensor_store_from_lds")
+    drain = ops.index("ds_or_b32")
+    last_fill = max(i for i, op in enumerate(ops[:store]) if op.startswith("ds_store"))
+    # Fill, then the drain atomic and its wait, then the only fill barrier, then the TDM store.
+    assert ops.count("ds_or_b32") == 1 and ops[:store].count("s_barrier_signal") == 1
+    barrier = ops.index("s_barrier_signal")
+    assert last_fill < drain < barrier < store
+    assert "s_wait_dscnt" in ops[drain:barrier]
+
+
 def test_gfx1250_matmul_tdm_pipelined_compiles():
     """Compile-only check: runs everywhere, validates the kernel still
     lowers cleanly to TDM intrinsics + a propagated padded encoding."""
@@ -7879,12 +7905,9 @@ def test_gfx1250_mxgemm_merged_handoff_barrier_drops_one_barrier(buffers):
 
 
 @pytest.mark.parametrize("schedule", ["fp16_four_stage", "fp32_three_stage"])
-def test_gfx1250_mxgemm_first_c_chunk_extra_barrier(schedule):
-    # Each epilogue's first C chunk gets one more workgroup rendezvous between
-    # its LDS fill and its TDM store (gfx1250 DS-write / TDM-read hazard, see
-    # _mxgemm_persistent_store); every later chunk keeps the single fill
-    # barrier. Count barrier waits between each TDM store and the C fill's
-    # LDS stores before it.
+def test_gfx1250_mxgemm_c_chunks_drain_before_tdm_store(schedule):
+    # Every C chunk drains its LDS fill before its TDM store (gfx1250
+    # DS-write / TDM-read hazard, see _mxgemm_c_tdm_store).
     cluster = dict(NUM_PROGRAMS=128, CLUSTER_SIZE=16, CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8,
                    XCD_REMAP_MODE=2)
     if schedule == "fp16_four_stage":
@@ -7894,19 +7917,20 @@ def test_gfx1250_mxgemm_first_c_chunk_extra_barrier(schedule):
     else:
         compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=8192, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3,
                                                       OVERLAP_PEEL=True, **cluster)
-    waits, count = [], None
-    for line in compiled.asm["amdgcn"].splitlines():
-        inst = line.strip()
-        if inst.startswith("ds_store"):
-            count = 0
-        elif count is not None and re.match(r"s_barrier_wait -1\b", inst):
-            count += 1
-        elif inst.startswith("tensor_store_from_lds"):
-            waits.append(count)
-            count = None
+    # Each TDM store's source was drained after its last LDS store, in TTGIR
+    # order (the drain's lane-0 atomic moves into its own block in the asm).
+    stores, drained = 0, set()
+    for line in compiled.asm["ttgir"].splitlines():
+        if m := re.search(r"amdg\.lds_write_drain (%[\w#]+)", line):
+            drained.add(m.group(1))
+        elif m := re.search(r"ttg\.local_store %[\w#]+, (%[\w#]+)", line):
+            drained.discard(m.group(1))
+        elif m := re.search(r"amdg\.async_tdm_copy_local_to_global %[\w#]+ from (%[\w#]+)", line):
+            assert m.group(1) in drained, line
+            stores += 1
     # Eight C chunks per tile, in the overlapped and the final-tile epilogue.
-    assert len(waits) == 16
-    assert waits == ([2] + [1] * 7) * 2
+    assert stores == 16
+    assert compiled.asm["amdgcn"].count("ds_or_b32") == 16
 
 
 @pytest.mark.parametrize("cluster_size", [1, 4])
