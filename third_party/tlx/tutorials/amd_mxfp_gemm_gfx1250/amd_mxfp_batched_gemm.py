@@ -234,6 +234,8 @@ def mxgemm_batched(a, b, a_scale, b_scale_packed, out=None, *, block_n=256, bloc
     if m % 16 or m > 128 or n % block_n or k % block_k or k // block_k < num_buffers - 1:
         raise ValueError("batched MXFP needs M % 16 == 0 (M <= 128), N % block_n == 0, K % block_k == 0, "
                          "and at least num_buffers - 1 K stages")
+    if k // SCALE_BLOCK % 16:
+        raise ValueError("batched MXFP needs K % 512 == 0 so A-scale TDM rows are 16-byte aligned")
     if tuple(b_scale_packed.shape) != (batch * n // 128, k // SCALE_BLOCK * 128):
         raise ValueError("b_scale_packed must be pack_b_scale(b_scale)")
     for t in (a, b, a_scale, b_scale_packed):
