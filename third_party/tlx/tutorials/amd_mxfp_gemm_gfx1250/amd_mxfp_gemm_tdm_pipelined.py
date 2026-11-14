@@ -2681,6 +2681,9 @@ def mxgemm_tdm_persistent_kernel(
     GROUPED_PREFETCH: tl.constexpr = DEFER_BOTTOM and (NUM_BUFFERS == 4 or tlx.num_warps() == 8) and DA == 1 and DB == 1 \
         and WITH_A_SCALE
     PREFETCH_B_AFTER_C10: tl.constexpr = GROUPED_PREFETCH or (DEFER_BOTTOM and tlx.num_warps() == 8)
+    # Eight-wave A8W8 K256 output reuse has no registers for the next B0
+    # while C10 still needs B10. Read B0 after C10 so it can reuse B10.
+    OUTPUT_REUSE_B_AFTER_C10: tl.constexpr = OUTPUT_REUSE and tlx.num_warps() == 8 and DB == 1
     # In the three-buffer dynamic-slot deferred-bottom loop, read each
     # operand's scale before its payload. The next quadrant's first WMMA then
     # waits only for its own operands instead of draining every outstanding
@@ -3329,7 +3332,7 @@ def mxgemm_tdm_persistent_kernel(
                     tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
                 a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, DA, NUM_BUFFERS,
                                                  WITH_A_SCALE, PREFETCH_SCALES=STEP_SCALES_FIRST)
-                if not PREFETCH_B_AFTER_C10:
+                if not PREFETCH_B_AFTER_C10 and not OUTPUT_REUSE_B_AFTER_C10:
                     b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS,
                                                      PREFETCH_SCALES=STEP_SCALES_FIRST)
                 if OUTPUT_REUSE:
@@ -3342,6 +3345,9 @@ def mxgemm_tdm_persistent_kernel(
                         tlx.amd_sched_barrier()
                     c10 = dot(a11, sa11, DTYPE_A, b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
+                    if OUTPUT_REUSE_B_AFTER_C10:
+                        b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB,
+                                                         NUM_BUFFERS, PREFETCH_SCALES=STEP_SCALES_FIRST)
                     c11 = dot(a11, sa11, DTYPE_A, b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
                     tlx.amd_sched_barrier()
                 if DEFER_BOTTOM:

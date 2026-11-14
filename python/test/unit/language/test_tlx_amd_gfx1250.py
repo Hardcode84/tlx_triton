@@ -887,7 +887,7 @@ def test_mxgemm_batched_split_n_across_devices():
     # Each device computes its N shard of every batch. With one device, both
     # shards run there.
     devices = [f"cuda:{index % torch.cuda.device_count()}" for index in range(2)]
-    batch, M, N, K = 2, 64, 1024, 768
+    batch, M, N, K = 2, 64, 1024, 1024
     a, b, a_scale, b_scale = _gfx1250_mxfp_batched._random_inputs(batch, M, N, K, "cpu", seed=7)
     ref = torch.stack(_gfx1250_mxfp_batched.reference(a, b, a_scale, b_scale))
     shards = _gfx1250_mxfp_batched.split_n_inputs(devices, b, b_scale)

@@ -7849,7 +7849,7 @@ def test_gfx1250_mxgemm_wave_specialized_handoff_separates_queues(k, cluster_siz
     # have no wait and the last two stores remain pending across tile entry.
     output = asm[asm.index("tensor_store_from_lds"):asm.rindex("tensor_store_from_lds")]
     assert not re.search(r"\bs_cbranch_", output)
-    assert re.findall(r"\bs_wait_tensorcnt\s+(\w+)", output) == ["1"] * 6
+    assert [int(count, 0) for count in re.findall(r"\bs_wait_tensorcnt\s+(\w+)", output)] == [1] * 6
     assert asm.count("tensor_store_from_lds") == 8
     # Descriptor setup must precede each fill-completion barrier. Stores can
     # issue immediately on its release, without another address/role sequence.
