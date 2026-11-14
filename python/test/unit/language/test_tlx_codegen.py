@@ -8188,7 +8188,11 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         # The two fused refills then need only their common K advances.
         assert sum("s_add_nc_u64" in inst for inst in body) <= 2
     wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
-    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    # Start at the stage wait. A8W4 waits before its split refill barrier, so
+    # the next operand reads can wrap to the top of the loop in assembly order.
+    body = body[wait:] + body[:wait]
+    wait = 0
+    load = next(i for i, inst in enumerate(body) if "ds_load_b128" in inst)
     # A periodic cluster barrier can put the refill block before the compute
     # block in assembly order. Do not count the next iteration's WMMAs as
     # overlap: independent matrix work must remain in the refill block itself.

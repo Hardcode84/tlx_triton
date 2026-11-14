@@ -3960,6 +3960,33 @@ stores from registers or LDS); draining every wave's TDM loads before the fill
 is available; WAR2 or WAR3 through a compiler lowering; the current two
 barriers, which only lower the probability.
 
+### A8W4 split refill barrier after the amd-llvm repin (2026-11-14): adopted
+
+Rebasing on main moved the AMD codegen LLVM from `ba034c2f` to `59389489`.
+Triton IR for the bench kernels is unchanged; only the LLVM pin matters. A8W4
+(MX8xMX4, four waves, BK256 output reuse) lost about 7% at 16384³ and 32768³;
+A8W8 stayed within 1-2%. The new scheduler put 2 instead of 7 and 5 WMMAs
+into the two refill barrier windows, and loaded the C01 B scale last.
+
+The A8W4 K loop now waits for the next stage before the refill, so a single
+split workgroup barrier (`named_barrier_arrive/wait(0, 128)`) releases the
+consumed slot and publishes the next one. C11 runs before the arrive and
+covers the LDS drain; C00 and C01 (32 register-only WMMAs) fill the barrier
+window; C10 and C11 overlap the next-slot operand reads. Membar cannot tell
+the refill slot from the next slot, so those reads are `relaxed`. Variants
+at FP32 16384³: C11 in the window -3.4%; C11 before and C00 in the window
+-6.2%, and loading the C01 B scale first on top of that, no change; C00 and
+C01 in the window -7.4% (adopted).
+
+Hardware (heliosr-1b114-d04-1, three interleaved rounds, medians):
+
+| A8W4 case | Before | Split barrier | Old LLVM |
+|---|---:|---:|---:|
+| 8192²×4096 FP32 / FP16 | 0.0807 / 0.0741 ms | 0.0766 / 0.0702 ms | - |
+| 8192³ FP32 / FP16 | 0.1396 / 0.1337 ms | 0.1296 / 0.1238 ms | - |
+| 16384³ FP32 / FP16 | 1.060 / 1.033 ms | 0.981 / 0.956 ms | 0.987 / 0.962 ms |
+| 32768³ FP32 / FP16 | 8.38 / 8.26 ms | 7.84 / 7.72 ms | 7.80 / 7.69 ms |
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
