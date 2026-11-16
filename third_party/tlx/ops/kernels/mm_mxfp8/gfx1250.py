@@ -948,6 +948,11 @@ def _mxgemm_c_slot_wait(PENDINGS: tl.constexpr):
 
 @triton.jit
 def _mxgemm_c_tdm_store(desc, view, offsets):
+    # gfx1250: a TDM store can read LDS before this wave's fill writes reach
+    # it, even after s_wait_dscnt 0 and the fill barrier, and write the slot's
+    # previous contents to C. Every wave drains its writes before the barrier
+    # that orders them with the store.
+    tlx.amd_lds_write_drain(view)
     tlx.async_amd_descriptor_store(desc, view, offsets, clamp_bounds=False)
 
 

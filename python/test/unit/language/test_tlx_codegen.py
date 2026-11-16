@@ -7590,6 +7590,35 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*f
     return compiled
 
 
+@pytest.mark.parametrize("schedule", ["fp16_four_stage", "fp32_three_stage"])
+def test_gfx1250_mxgemm_c_chunks_drain_before_tdm_store(schedule):
+    # Every C chunk drains its LDS fill before its TDM store (gfx1250
+    # DS-write / TDM-read hazard, see _mxgemm_c_tdm_store).
+    cluster = dict(NUM_PROGRAMS=128, CLUSTER_SIZE=16, CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8,
+                   XCD_REMAP_MODE=2)
+    if schedule == "fp16_four_stage":
+        compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 4, 128, c_type="*fp16", K=4096, STATIC_SLOT_UNROLL=True,
+                                                      OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True,
+                                                      STATIC_CLUSTER_STEPS=True, **cluster)
+    else:
+        compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=8192, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3,
+                                                      OVERLAP_PEEL=True, **cluster)
+    # Each TDM store's source was drained after its last LDS store, in TTGIR
+    # order (the drain's lane-0 atomic moves into its own block in the asm).
+    stores, drained = 0, set()
+    for line in compiled.asm["ttgir"].splitlines():
+        if m := re.search(r"amdg\.lds_write_drain (%[\w#]+)", line):
+            drained.add(m.group(1))
+        elif m := re.search(r"ttg\.local_store %[\w#]+, (%[\w#]+)", line):
+            drained.discard(m.group(1))
+        elif m := re.search(r"amdg\.async_tdm_copy_local_to_global %[\w#]+ from (%[\w#]+)", line):
+            assert m.group(1) in drained, line
+            stores += 1
+    # Eight C chunks per tile, in the overlapped and the final-tile epilogue.
+    assert stores == 16
+    assert compiled.asm["amdgcn"].count("ds_or_b32") == 16
+
+
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("k, output_c_slots", [(8192, None), (4096, None), (4096, 3), (16384, 3)])
 def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size, k, output_c_slots):

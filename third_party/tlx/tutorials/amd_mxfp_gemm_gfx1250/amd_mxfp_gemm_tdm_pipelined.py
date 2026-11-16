@@ -855,6 +855,7 @@ def mxgemm_tdm_pipelined_kernel(
         tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, 0], [SUBTILE_M, SUBTILE_N]), c10.to(tlx.dtype_of(c_ptr)))
         tlx.local_store(tlx.local_slice(c_view, [SUBTILE_M, SUBTILE_N], [SUBTILE_M, SUBTILE_N]),
                         c11.to(tlx.dtype_of(c_ptr)))
+        tlx.amd_lds_write_drain(c_view)
         tlx.async_amd_descriptor_store(c_desc, c_view, [c_off_m, c_off_n], clamp_bounds=True)
         tlx.async_amd_descriptor_wait(0)
     elif SCHEDULE == "sliceNK":
