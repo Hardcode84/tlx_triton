@@ -3987,6 +3987,49 @@ Hardware (heliosr-1b114-d04-1, three interleaved rounds, medians):
 | 16384³ FP32 / FP16 | 1.060 / 1.033 ms | 0.981 / 0.956 ms | 0.987 / 0.962 ms |
 | 32768³ FP32 / FP16 | 8.38 / 8.26 ms | 7.84 / 7.72 ms | 7.80 / 7.69 ms |
 
+### AMD codegen pin and static A8W4 slots (2026-11-17)
+
+Meta's #5053 (`b467b01534`) pinned `cmake/meta-amd-llvm-info.json` to
+`amd-llvm-59389489-1`, built from upstream `llvm-project@293a85c048f7`. That
+LLVM lacks the gfx1250 `CoExecScheduler` work in the previous pin (`ba034c2`)
+and in upstream Triton's still-active `cmake/amd-llvm-info.json` pin
+(`08b05a33` build 2): the co-execution scheduler, static simulator, and the
+`SIInsertWaitcnts` rule that treats a 32-bit-accumulator WMMA as a fence, so a
+DS load whose address a VALU computed during WMMAs waits for every in-flight
+WMMA (`s_wait_alu depctr_va_vdst(0)`). Upstream #12656 only requested a
+`293a85c048f7` build (`amd-llvm-build-info.json`); it did not pin it. In Meta
+mode the build ignores `amd-llvm-info.json`.
+
+Upstream's `amd-codegen-08b05a33-ubuntu-x64-2` package has this fork's codegen
+ABI (MIR entry points included). Installing it as
+`third_party/amd/backend/lib/libtriton_amd_codegen.so` restores the previous
+schedules: 453 MXFP codegen tests and 1,113 FFM runtime tests pass (`make`
+does not replace the library; `setup.py` builds do).
+
+Until origin fixes #5053, this branch takes `cmake/amd-llvm-info.json` from
+upstream (`08b05a33` build 2) and removes `cmake/meta-amd-llvm-info.json`.
+Meta builds then download upstream's `amd-codegen` package. The #5053 FA
+backward spill admissions are reverted because `08b05a33` meets the earlier
+spill-free expectations.
+
+heliosr-1b114-d04-1, three interleaved rounds, medians:
+
+| Case | ba034c2 | 08b05a33 | 08b05a33, static A8W4 | 59389489, static A8W4 |
+|---|---:|---:|---:|---:|
+| A8W8 8192²×4096 FP32 / FP16 | 0.0871 / 0.0797 | 0.0872 / 0.0784 | | 0.0982 / 0.0795 |
+| A8W8 8192³ FP32 / FP16 | 0.1579 / 0.1431 | 0.1579 / 0.1432 | | 0.1619 / 0.1443 |
+| A8W8 16384³ FP32 / FP16 | 1.258 / 1.196 | 1.259 / 1.185 | | 1.253 / 1.194 |
+| A8W4 8192²×4096 FP32 / FP16 | 0.0717 / 0.0649 | 0.0717 / 0.0649 | 0.0715 / 0.0646 | 0.0734 / 0.0671 |
+| A8W4 8192³ FP32 / FP16 | 0.1216 / 0.1152 | 0.1214 / 0.1151 | 0.1212 / 0.1146 | 0.1250 / 0.1183 |
+| A8W4 16384³ FP32 / FP16 | 0.926 / 0.899 | 0.927 / 0.900 | 0.922 / 0.893 | 0.943 / 0.916 |
+| A8W4 32768³ FP32 / FP16 | 7.29 / 7.18 | 7.29 / 7.18 | 7.23 / 7.12 | 7.51 / 7.41 |
+
+Adopted: the A8W4 BK256 steady loop (`_mxgemm_a8w4_k_step`) unrolls by the
+ring depth so each step's LDS slot is loop-invariant (rolled with
+`COMPACT_K_TAIL`): 0.1-0.9% faster with `08b05a33`, 3-4% with `59389489`.
+Rejected: MX8xMX8 static slots at K=4096 in `bench.py`; they help only with
+`59389489` (1.5%) and cost 8.6% with `08b05a33`.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

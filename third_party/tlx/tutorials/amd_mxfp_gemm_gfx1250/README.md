@@ -77,6 +77,8 @@ of the loop, removing most ALU dependency waits. Static code grows by about
 a third. On hardware with the pinned AMDGPU codegen it is 1.2% faster at
 8192 cubed but 1.8% slower at K=4096. `bench.py` therefore enables it for
 MX8xMX8 cases with K >= 8192; the kernel and `matmul` default remains off.
+The A8W4 BK256 loop always unrolls by its ring depth
+(`_mxgemm_a8w4_k_step`), except with `COMPACT_K_TAIL`.
 The unrolled schedule also peels each tile's first K step, so its WMMAs take
 the zero accumulator as an inline constant instead of zeroing 512 VGPRs.
 
