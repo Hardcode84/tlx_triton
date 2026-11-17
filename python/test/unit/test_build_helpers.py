@@ -213,6 +213,7 @@ class MetaLlvmInfoTest(unittest.TestCase):
     def test_amd_codegen_builds_against_core_meta_llvm(self) -> None:
         with tempfile.TemporaryDirectory() as base_dir:
             self._write(base_dir, self.META)
+            self._write_amd(base_dir, self.AMD_META)
             built = Path(base_dir) / "built" / "libtriton_amd_codegen.so"
             built.parent.mkdir()
             built.write_bytes(b"so")
@@ -228,3 +229,22 @@ class MetaLlvmInfoTest(unittest.TestCase):
             oai_package.assert_not_called()
             copied = Path(base_dir) / "third_party" / "amd" / "backend" / "lib" / built.name
             self.assertEqual(b"so", copied.read_bytes())
+
+    def test_amd_codegen_uses_oai_package_without_meta_amd_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as base_dir:
+            self._write(base_dir, self.META)
+            cached = Path(base_dir) / "amd" / "amd-codegen" / "lib" / "libtriton_amd_codegen.so"
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"oai")
+            (Path(base_dir) / "cmake" / "amd-llvm-info.json").write_text(
+                json.dumps({"llvm_hash": self.AMD_OAI_INFO_HASH, "build_number": 1}))
+            package = build_helpers.Package("amd", "amd-codegen", "", "", "", "", sha256sum="oai-sha")
+            helper_args = _helper_args(base_dir, llvm_system_suffix="ubuntu-x64")
+            with patch.object(build_helpers, "get_base_dir", return_value=base_dir), \
+                    patch.object(build_helpers, "amd_codegen_library_name", return_value=cached.name), \
+                    patch.object(build_helpers, "get_amd_codegen_package_info", return_value=package), \
+                    patch.object(meta_llvm, "copy_amd_codegen") as meta_copy:
+                build_helpers.download_and_copy_amd_codegen(helper_args)
+            meta_copy.assert_not_called()
+            copied = Path(base_dir) / "third_party" / "amd" / "backend" / "lib" / cached.name
+            self.assertEqual(b"oai", copied.read_bytes())

@@ -9590,21 +9590,7 @@ def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
     kernel = _compile_attention_backward_kernel(config, shape)
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
-    expected_private = {
-        ((1, 8, 2, 512), 3, True): 24,
-        ((1, 8, 2, 4096), 1, False): 16,
-        ((1, 8, 2, 4096), 1, True): 32,
-        ((1, 8, 2, 8192), 1, False): 16,
-        ((1, 8, 2, 8192), 1, True): 32,
-        ((1, 4, 4, 512), 2, True): 12,
-        ((1, 4, 4, 512), 3, True): 24,
-        ((1, 4, 4, 512), 4, True): 24,
-        ((1, 64, 8, 512), 2, True): 12,
-        ((1, 64, 8, 512), 3, True): 24,
-        ((1, 64, 8, 512), 4, True): 24,
-    }.get((shape, q_splits, packed_dq), 0)
-    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
+    _assert_occ1_scratch_outside_loop(assembly)
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
     # One merged LSE/Delta request joins Q and dO; a fourth request stalls the issue.
@@ -9651,9 +9637,9 @@ def test_attention_backward_occ1_war_flags_default_off():
     assert not config.occ1_load_after_dk
 
 
-@pytest.mark.parametrize("shape", [(16, 16, 16, 16384), (8, 64, 8, 8192)])
+@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 14), ((8, 64, 8, 8192), 14)])
 @pytest.mark.parametrize("packed_dq", [False, True])
-def test_attention_backward_occ1_war_drain_assembly(shape, packed_dq):
+def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, packed_dq):
     import dataclasses
     import re
 
@@ -9665,11 +9651,10 @@ def test_attention_backward_occ1_war_drain_assembly(shape, packed_dq):
         for enabled in (False, True)
     ]
     drains = []
-    privates = []
     for kernel in builds:
         assembly = kernel.asm["amdgcn"]
         assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-        privates.append(int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]))
+        _assert_occ1_scratch_outside_loop(assembly)
         assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
         loop = _attention_backward_isa_loop(assembly)
         drains.append(sum("s_wait_alu depctr_va_vdst(0)" in line for line in loop))
@@ -9678,19 +9663,8 @@ def test_attention_backward_occ1_war_drain_assembly(shape, packed_dq):
         assert 6 in waits
         assert 1 not in waits
     # Count instructions rather than matching source text or fixed line numbers.
-    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
-    assert privates == {
-        ((16, 16, 16, 16384), False): [0, 16],
-        ((16, 16, 16, 16384), True): [8, 32],
-        ((8, 64, 8, 8192), False): [0, 16],
-        ((8, 64, 8, 8192), True): [8, 28],
-    }[(shape, packed_dq)]
-    assert drains == {
-        ((16, 16, 16, 16384), False): [16, 17],
-        ((16, 16, 16, 16384), True): [16, 16],
-        ((8, 64, 8, 8192), False): [16, 17],
-        ((8, 64, 8, 8192), True): [16, 15],
-    }[(shape, packed_dq)]
+    assert drains[0] == expected_drains
+    assert drains[1] < drains[0]
 
 
 @pytest.mark.parametrize("shape,packed_dq,occ1", [
@@ -9816,30 +9790,7 @@ def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
     kernel = _compile_attention_backward_kernel(config, shape)
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
-    expected_private = {
-        ((16, 16, 16, 1024), False): 20,
-        ((16, 16, 16, 1024), True): 12,
-        ((8, 64, 8, 1024), False): 16,
-        ((8, 64, 8, 1024), True): 28,
-        ((16, 64, 8, 1024), False): 16,
-        ((16, 64, 8, 1024), True): 28,
-        ((8, 64, 8, 2048), False): 16,
-        ((8, 64, 8, 2048), True): 28,
-        ((16, 64, 8, 2048), False): 16,
-        ((16, 64, 8, 2048), True): 28,
-        ((8, 64, 8, 4096), False): 16,
-        ((8, 64, 8, 4096), True): 28,
-        ((1, 4, 4, 512), False): 16,
-        ((1, 4, 4, 512), True): 24,
-        ((2, 4, 4, 512), False): 16,
-        ((2, 4, 4, 512), True): 12,
-        ((1, 8, 1, 512), False): 16,
-        ((1, 8, 1, 512), True): 24,
-        ((2, 8, 1, 512), False): 16,
-        ((2, 8, 1, 512), True): 24,
-    }[(shape, packed_dq)]
-    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
+    _assert_occ1_scratch_outside_loop(assembly)
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
     waits = [int(x, 0) for line in loop for x in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]

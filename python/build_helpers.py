@@ -654,7 +654,7 @@ def download_and_copy_amd_codegen(helper_args: BuildHelperArgs):
         return
 
     library = amd_codegen_library_name()
-    if meta_llvm.enabled(get_base_dir()):
+    if meta_llvm.amd_codegen_enabled(get_base_dir()):
         return meta_llvm.copy_amd_codegen(helper_args, library)
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
