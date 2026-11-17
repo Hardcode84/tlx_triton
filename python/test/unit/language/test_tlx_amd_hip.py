@@ -669,15 +669,17 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     # stage earlier. This deliberately pays a RAW-to-refill wait/barrier; moving
     # the copy across the next existing barrier shortens DMA latency hiding and
     # regresses both measured benchmark shapes.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (66, 58, 65, 54)
+    # Upstream CodeGen 08b05a33 schedules 65 waits here.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (66, 58, 54, 65)
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 43
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     # Spill/private goldens admit post-CodeGen-switch values; see test_a4w4_inter_wave_256tile_codegen_gfx950.
     # The LLVM 18f9e623 roll in this diff spills further here (private 32,
     # 7 VGPR spills).
-    assert re.search(r"^\s*\.private_segment_fixed_size:\s*(0|160|32|148)\s*$", amdgcn, re.MULTILINE)
+    # Upstream CodeGen 08b05a33 spills here (private 24, 5 VGPR spills).
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)[1]) in (0, 160, 32, 148, 24)
     # Upstream #11365 retiled CDNA4 vec128 LDS traffic, shifting SGPR allocation 53 -> 55.
     assert ".sgpr_count:     53" in amdgcn or ".sgpr_count:     55" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert re.search(r"^\s*\.vgpr_spill_count:\s*(0|46|7|43)\s*$", amdgcn, re.MULTILINE)
+    assert int(re.search(r"\.vgpr_spill_count:\s*(\d+)", amdgcn)[1]) in (0, 46, 7, 43, 5)

@@ -29,6 +29,13 @@ def enabled(base_dir: str) -> bool:
     return os.path.exists(os.path.join(base_dir, "cmake", "meta-llvm-info.json"))
 
 
+def amd_codegen_enabled(base_dir: str) -> bool:
+    # TEMPORARY: without cmake/meta-amd-llvm-info.json, Meta builds use OAI's
+    # amd-codegen package from cmake/amd-llvm-info.json. The Meta AMD codegen
+    # pin from #5053 regresses gfx1250 scheduling; restore it once fixed.
+    return enabled(base_dir) and os.path.exists(os.path.join(base_dir, "cmake", "meta-amd-llvm-info.json"))
+
+
 def _load_info(base_dir: Optional[str], oai_name: str, meta_name: str) -> dict:
     # INVARIANT: compare against the OAI pin the Triton sources are written
     # against. The *-build-info.json files only request the next OAI build and
