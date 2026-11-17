@@ -1620,7 +1620,7 @@ def test_mxgemm_bench_cluster_and_output_options():
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
 
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
-    # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring with two C slots from K=16384.
+    # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring from K=16384.
     # Each variant runs with FP32 and then FP16 output.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
@@ -1632,15 +1632,18 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--cluster_size") + 1] == "16"
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
-            four_stage = variant == "mx8xmx8" and shape[2] >= 16384
-            # FP16 below K=16384 uses a four-stage static-slot ring with two C
+            # FP16 up to K=16384 uses a four-stage static-slot ring with two C
             # slots, the overlap peel, and one merged handoff barrier per step.
-            merged = variant == "mx8xmx8" and shape[2] < 16384 and args.out_dtype == "fp16"
+            merged = variant == "mx8xmx8" and shape[2] <= 16384 and args.out_dtype == "fp16"
+            # Other cases from K=16384 use the dynamic four-stage ring.
+            four_stage = variant == "mx8xmx8" and shape[2] >= 16384 and not merged
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage or merged else "3")
             assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
             if merged:
                 assert cmd[cmd.index("--output_c_slots") + 1] == "2"
-            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and (shape[2] == 8192 or merged))
+            # The three-stage ring unrolls its slots from K=8192.
+            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and not four_stage
+                                                       and (shape[2] >= 8192 or merged))
             assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
             assert ("--merged_handoff_barrier" in cmd) == merged
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
