@@ -4162,6 +4162,32 @@ out-of-bounds read faulted (GCVM protection fault, MES failed REMOVE_QUEUE)
 and, with `gpu_recovery=0`, wedged the GPU. Clone padded inputs into padded
 buffers. Logs and scripts: `s32_logs.tgz` in the archive above.
 
+### WMMA operand reuse (2026-11-18): no measurable effect
+
+gfx1250 WMMAs carry `matrix_a_reuse` / `matrix_b_reuse` hint bits (a one-slot
+operand cache per matrix: a later WMMA with the same opcode and the same A or
+B VGPR block may read it from the cache instead of the VGPR file). Triton sets
+both to 0 for `v_wmma_scale_f32_16x16x128_f8f6f4` (`generateScaledWMMAIntrinsic`)
+and LLVM never sets them, so no kernel here uses them. As emitted, every
+second WMMA could reuse B (8192³/16384³ FP16 mode 4: 414 of 832; 32768³
+dynamic ring: 160 of 320); no A reuse (a zigzag order would allow 7 of 8).
+
+Hardware (same host and boot, three interleaved rounds; ships reassembled
+from the compiled `.amdgcn` with `llvm-mc` + `ld.lld`, `.text` byte-identical
+without flags; B reuse set on back-to-back pairs only or on every eligible
+pair, `ds_load` / `s_set_vgpr_msb` in between allowed): all pass the device
+check, and time, clock and power are unchanged within noise (8192³ FP16
+0.1387-0.1407 ms, 16384³ 1.154-1.161 ms, padded 32768³ 9.498-9.525 ms and
+merged 9.441-9.446 ms, with and without flags, same clocks at 2,500 W).
+
+A register-only microbenchmark (eight scaled FP8 WMMAs per iteration, two A
+by four B, all 256 CUs at the 2,500 W cap) shows no difference either: 1 wave
+per SIMD 9.43-9.50 cycles per WMMA per wave and 2.17-2.19 J per launch, 2 waves
+per SIMD 17.37-17.41 cycles and 4.16 J, for no flags, B reuse on 1/2, and
+zigzag with reuse on 7/8 (results bit-identical). On this part the hint
+saves neither cycles nor measurable power, so it is not worth a compiler
+change. Archive: `/home/ibutygin/tlx/perf-data/wmma-reuse-20261118/`.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
