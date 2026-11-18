@@ -4030,6 +4030,138 @@ ring depth so each step's LDS slot is loop-invariant (rolled with
 Rejected: MX8xMX8 static slots at K=4096 in `bench.py`; they help only with
 `59389489` (1.5%) and cost 8.6% with `08b05a33`.
 
+### Large-shape A8W8 power and group-M 16 (2026-11-17): group-M 16 rejected at 32768³
+
+heliosr-1b114-d04-1, current bench ships (`08b05a33`), two rounds, flushed
+and back-to-back (`TIMING=noflush`) timing. Back-to-back medians:
+
+| Case | TFLOPS | Clock | TFLOPS per MHz |
+|---|---:|---:|---:|
+| FP16 8192³ (mode 4) | 7,614 | 1,578 MHz | 4.83 |
+| FP16 16384³ (mode 4 + lookahead) | 7,408 | 1,459 MHz | 5.08 |
+| FP16 32768³ (dynamic ring) | 6,954 | 1,511 MHz | 4.60 |
+| FP32 8192³ / 16384³ / 32768³ | 6,915 / 6,968 / 6,981 | 1,645 / 1,511 / 1,508 MHz | 4.20 / 4.61 / 4.63 |
+
+FP32 does not drop at large sizes. FP16 16384³ does more work per cycle than
+8192³ but loses on clock at the 2,500 W cap, i.e. more energy per FLOP. Flushed
+timing adds idle gaps that let 8192³ run another ~60 MHz higher; large
+sizes are unaffected. FP16 32768³ runs at the large-shape clock but at the
+dynamic ring's per-cycle rate. Mode 4 lost about 7% there on 2026-11-06,
+likely because its per-step rendezvous exposes every step to the slowest
+wave's TDM latency, and more loads miss L2 at that size.
+
+Group-M 8 with 256 programs in 4x4 clusters runs an 8x32 block of tiles: each
+K step reads 40 distinct operand blocks, and B is reread once per 8 M tiles.
+`--group-m 16` (grid layouts other than 2x2) runs 16x16: 32 blocks, B reread
+once per 16 M tiles, and each XCD still runs 8x4 tiles (same L2 footprint).
+A lockstep LRU model of the mapping (`l2model.py`, 12 MB L2 per XCD, MALL size
+unknown) gives HBM reads per launch:
+
+| Shape | MALL 128 / 256 / 512 MB, group-M 8 | group-M 16 |
+|---|---:|---:|
+| 16384³ | 2.58 / 2.32 / 0.52 GiB | 2.06 / 1.29 / 0.52 GiB |
+| 32768³ | 20.6 / 20.6 / 17.5 GiB | 16.5 / 16.5 / 9.3 GiB |
+
+L2 fill is unchanged (6.2 / 49.5 GiB), and 8192³ fits either way. The code
+is the same apart from tile-index constants (+3 SALU, same VGPRs). FFM covers
+tile coverage and 4x4 ring phases with the dynamic ring and mode 4 + split
+lookahead (`test_mxgemm_grid_cluster_group_m16_ring_phase`).
+
+Hardware disagrees with the model at 32768³ (same host after its reboot, all
+ships pass the device check; flushed timing, three interleaved rounds,
+median ms):
+
+| Case | Group-M 8 | Group-M 16 |
+|---|---:|---:|
+| FP16 32768³ dynamic ring (default) | **9.917** | 10.409 (+5.0%) |
+| FP16 32768³ mode 4 + split lookahead | 10.503 (+5.9%) | 11.042 (+11.3%) |
+| FP16 32768³ mode 4 | - | 11.215 (+13.1%) |
+| FP32 32768³ dynamic ring | **10.169** | 10.530 (+3.6%) |
+| FP16 16384³ default | 1.1872 | 1.1833 (-0.3%) |
+| FP32 16384³ default | 1.2594 | 1.2523 (-0.6%, every round) |
+
+Group-M 16 also runs at a lower clock at 32768³ (1,484 vs 1,498-1,509 MHz),
+so it draws more power per launch rather than less; the lockstep model
+misses something (likely the real XCD dispatch order or wave drift over 256 K
+steps). Mode 4 is still 6% behind the dynamic ring at 32768³. Defaults are
+unchanged; `--group-m 16` stays available. A PMC run (`rocprofv3`, GL2C/EA
+counters) was in progress when the host hung hard (journal ends 20:17 with
+no amdgpu error); avoid repeating it unchanged. Archive with the model,
+ships and scripts: `/home/ibutygin/tlx/perf-data/mxfp-large-shapes-20261117/`.
+
+### FP16 32768³ schedule sweep and data placement (2026-11-17)
+
+One-change sweep around the default dynamic four-stage ring (all pass the
+device check; flushed timing, 3-5 interleaved rounds, median ms; baseline
+9.909, run twice per round): wave256 scales **9.870** (fast in 9 of 10
+processes); cluster barrier every 12: 9.838 fast / 10.19 slow; static slots,
+overlap peel, no cross-tile prefetch, barrier every 4: 0 to +2%; merged
+barrier / + peel / + refill overlap 1, alone or with wave256: 9.81-9.83 fast,
+10.16-10.83 slow; refill overlap 3 +10-18%; group-M 4 and XCD chunk 1/4 +1.5
+to +4%; 4way fusion 10.1 or 13.4; 8x2 and 2x8 clusters about +48%.
+
+The fast/slow level is fixed per process and set by data placement: one
+process with one loaded kernel ran its original buffers at 9.81 ms (wave256 +
+merged + refill overlap 1) and 9.87 ms (baseline) before and after, and every
+fresh copy of the inputs and output at 10.16-10.77 / 10.0-10.07 ms. The row
+pitch is exactly 32 KiB, so a tile's 256 rows at one K step are a
+power-of-two stride apart; channel or MALL-set conflicts that depend on where
+A and B land fit this. With the pitch padded to 33,024 bytes (stride
+constexprs + 256; same tiles), the first placement ran at 9.706 ms
+(baseline) and 9.649 ms (wave256), about 2-2.5% under the unpadded fast level
+(one sample each).
+
+Follow-up (2026-11-18, after two reboots; this boot loaded amdgpu with
+`gpu_recovery=0 halt_if_hws_hang=1 mtype_local=0 noretry=1` and SMC messages
+`0x65,0x32` / `0x3D,0x1004B`, unlike the earlier `0x3D,0x10032`: the baseline
+runs at 1,568 MHz instead of ~1,500 at 2,500 W, with the same work per cycle).
+`run_place.py` times one loaded kernel on its original buffers and on five
+fresh copies placed after 0-513 MiB pads (copies keep their strides), one ship
+per `gpu-lock` session:
+
+| 32768³ FP16 ship | Eight placements, ms |
+|---|---:|
+| Default dynamic ring | 9.65-9.74 (earlier boot: 9.96-10.13) |
+| Default + `--k_rotate_step` 1 / 32 | 9.66-9.72 / 9.67-9.78 |
+| Merged + peel + refill overlap 1 (+ wave256, + rotate 32) | 9.49-9.56 orig, 9.84-10.55 copies |
+| Mode 4 + split lookahead | 10.01-10.29 |
+| Row pitch +256 B, default schedule | **9.46-9.51** (earlier boot: 9.73-9.76) |
+| Row pitch +256 B, wave256 + merged + peel + refill overlap 1 | **9.39-9.43** |
+
+The padded pitch is the only change that is fast on every placement, and it
+makes the merged schedule placement-independent: -3.2% against the default
+(about 7,480 TFLOPS). K rotation (cluster-uniform, per N cluster) is neutral
+on the default ring and does not fix the merged schedule's copies, so the
+conflict is not only between tiles at the same K column. Neither 80 GB of
+12 MiB VRAM holes nor a 300 GB ballast reproduced the default ring's slow
+level on this boot. A-B gap sweep (`AB_GAPS_MB`: copies with a held block between A and B,
+same process): the A-B distance alone does not decide it (A-B = 0x46800000
+ran 9.58 ms once and 12.05 ms in a later process). Copies at 100-114 MiB
+gaps ran 9.99-12.32 ms (merged + refill overlap 1) and 9.72-11.09 ms
+(default) against 9.55-9.61 ms on the original buffers; with the 256-byte
+pitch the same sweep ran 9.46-9.50 ms (default) and 9.39-9.43 ms (wave256 +
+merged + refill overlap 1) on every placement. Logs:
+`s32k_logs_20261118.tgz` in the archive.
+
+`--row-pad` (bench) / `--row_pad` (kernel CLI, `pad_rows`) widens the A and
+B row pitch; `--k-rotate-step` / `K_ROTATE_STEP` adds the rotation. Neither
+is a default: padding changes the caller's layout. Best measured 32768³ FP16
+command: `bench.py --variant mx8xmx8 --case 32768,32768,32768 --out-dtype
+fp16 --row-pad 256 --scale-layout wave256 --static-slot-unroll
+--merged-handoff-barrier --overlap-peel --refill-overlap 1 --output-c-slots 2
+--num-buffers 4`.
+
+Both hangs this session were in power management: the second boot's log
+shows `landscape-sysinfo` blocked in `amdgpu_dpm_read_sensor` from 00:06,
+with no GPU fault from these runs (the VM fault at 23:08 was another user's
+driver load).
+
+Caution: the placement harness (`run_place.py`) cloned padded views into
+contiguous tensors and launched the padded-pitch kernel on them; the
+out-of-bounds read faulted (GCVM protection fault, MES failed REMOVE_QUEUE)
+and, with `gpu_recovery=0`, wedged the GPU. Clone padded inputs into padded
+buffers. Logs and scripts: `s32_logs.tgz` in the archive above.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration

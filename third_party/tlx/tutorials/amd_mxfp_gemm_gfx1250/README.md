@@ -532,7 +532,13 @@ inputs across independent workgroups. The benchmark defaults to cluster size
 16 with `--cluster-layout 4x4`; use `--cluster-size 1` to disable clustering.
 Grid layouts `RxC` (`2x2`, `4x2`, `2x4`, `4x4`, `8x2`, `2x8`) place R M tiles by
 C N tiles in a cluster of R*C workgroups and require a group-M divisible by R
-and N tiles divisible by C. XCD remapping permutes whole clusters. Data and their
+and N tiles divisible by C. Grid layouts other than `2x2` also accept
+`--group-m 16`: 256 programs in 4x4 clusters then run a 16x16 block of tiles
+instead of 8x32, so each K step reads 32 distinct operand blocks instead of 40
+and B is reread once per 16 M tiles. Each XCD still runs an 8x4 block, so the
+L2 footprint is unchanged. On gfx1250 it is 4-5% slower at 32768³ and within
+1% at 16384³, so the benchmark keeps group-M 8. XCD remapping permutes whole
+clusters. Data and their
 E8M0 scales use the same recipient masks. Without remapping, a cluster shares
 B and its scales across consecutive M tiles, for either `--group-m 4` or
 `--group-m 8`. With chunked remapping, a two-workgroup cluster shares B and
@@ -540,6 +546,12 @@ its scales; a four-workgroup cluster with `--group-m 4` shares both A and B
 across a two-by-two output region, while `--group-m 8` shares B and its scales
 across four M tiles. `--no-cluster-multicast` keeps cluster synchronization
 with independent loads, for comparison.
+
+`--row-pad BYTES` widens the A and B row pitch (multiple of 16). With K=32768
+each row is exactly 32 KiB, and on gfx1250 the timing then depends on where A
+and B land in memory (up to 5% between placements of the same kernel); a
+256-byte pad removes that and makes 32768³ FP16 2-3% faster. The kernel takes
+any row pitch, so callers can allocate A and B this way.
 
 Cluster barriers are optional for AMD multicast. Only workgroups that have
 issued matching requests receive a combined load; late requests receive a
