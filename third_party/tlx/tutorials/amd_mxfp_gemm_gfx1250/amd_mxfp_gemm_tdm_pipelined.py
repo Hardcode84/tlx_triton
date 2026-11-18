@@ -2010,11 +2010,16 @@ def _mxgemm_defer_bottom_k_step(
         c01 = _mxgemm_native_dot(a00, sa00, DTYPE_A, b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
         tlx.amd_sched_barrier()
         tlx.named_barrier_wait(0, tlx.num_warps() * 32)
+        # The workgroup is synchronized here, so the multicast rendezvous
+        # needs only the cluster arrive and wait, not cluster_barrier's own
+        # workgroup barrier (8192^3 FP16: -0.26%).
+        if CLUSTER_STEP is None or CLUSTER_STEP:
+            _mxgemm_cluster_arrive(i + BUFFERS, CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL)
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                 i + BUFFERS, slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE,
                                 CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                                REGISTER_PIPELINE, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP, K_ROT=K_ROT)
+                                REGISTER_PIPELINE, CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=True,
+                                CLUSTER_STEP=CLUSTER_STEP, K_ROT=K_ROT)
         last_b00, last_sb00 = b00, sb00
         a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE,
                                          RELAXED=True, BOTH=W256)
