@@ -1004,16 +1004,15 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
         for k in ks
     ],
 )
-def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING,
-                                      NUM_WARPS, REGISTER_PIPELINE, SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE,
-                                      FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False, ASYNC_OUTPUT=False,
-                                      COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
-                                      HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear",
-                                      SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False, CLUSTER_BARRIER_INTERVAL=4,
-                                      WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
-                                      INTERLEAVE_C_FILL=0, STATIC_CLUSTER_STEPS=False, REFILL_OVERLAP=0, L2_LOOKAHEAD=0,
-                                      L2_LOOKAHEAD_SPLIT=False, SCALE_LAYOUT="block128"):
+def test_mxgemm_persistent_ring_phase(
+        K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING, NUM_WARPS, REGISTER_PIPELINE,
+        SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False,
+        ASYNC_OUTPUT=False, COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
+        HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
+        CLUSTER_BARRIER_INTERVAL=4, WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
+        OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False, INTERLEAVE_C_FILL=0,
+        STATIC_CLUSTER_STEPS=False, REFILL_OVERLAP=0, L2_LOOKAHEAD=0, L2_LOOKAHEAD_SPLIT=False, SCALE_LAYOUT="block128",
+        GROUP_SIZE_M=None, K_ROTATE_STEP=0, ROW_PAD=0):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -1022,7 +1021,12 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
     # Tail-reuse cases keep two prefetched stages live while A/B's third stage
     # holds output, including a full ring rotation and a zero-length steady loop.
     M, N = (2048, 1024) if CLUSTER_SIZE > 1 else (1280, 512)
+    if GROUP_SIZE_M == 16:
+        M = 4096  # one complete 16-tile M group
     programs = 16 if CLUSTER_SIZE > 1 else 3
+    group = {} if GROUP_SIZE_M is None else dict(GROUP_SIZE_M=GROUP_SIZE_M)
+    if K_ROTATE_STEP:
+        group["K_ROTATE_STEP"] = K_ROTATE_STEP
     K = K_ITERS * BLOCK_K
     torch.manual_seed(123)
     a = (torch.randn((M, K)) * 0.5).to(torch.float8_e4m3fn)
@@ -1032,8 +1036,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
     ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
     b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
     out = _gfx1250_mxfp.matmul(
-        a.cuda(),
-        b_data.T.contiguous().cuda(),
+        _gfx1250_mxfp.pad_rows(a.cuda(), ROW_PAD), _gfx1250_mxfp.pad_rows(b_data.T.contiguous().cuda(), ROW_PAD),
         _gfx1250_mxfp.pack_scale(a_scale, layout=SCALE_LAYOUT).cuda(),
         _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(), config=dict(
             BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
@@ -1049,7 +1052,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
             OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL, OUT_DTYPE=OUT_DTYPE,
             MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER, INTERLEAVE_C_FILL=INTERLEAVE_C_FILL,
             STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, REFILL_OVERLAP=REFILL_OVERLAP, L2_LOOKAHEAD=L2_LOOKAHEAD,
-            L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, SCALE_LAYOUT=SCALE_LAYOUT))
+            L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, SCALE_LAYOUT=SCALE_LAYOUT, **group))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -1412,6 +1415,48 @@ def test_mxgemm_grid_cluster_ring_phase(k_iters, layout, schedule):
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [5, 9])
+@pytest.mark.parametrize("schedule", ["dynamic", "mode4"])
+def test_mxgemm_grid_cluster_group_m16_ring_phase(k_iters, schedule):
+    # 4x4 clusters in 16-tile M groups: four clusters stack in M before the
+    # next N block, and each program runs four tiles. Cover the bench's
+    # four-stage dynamic ring and the FP16 mode 4 loop with the split L2
+    # lookahead and static cluster steps.
+    mode4 = schedule == "mode4"
+    test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, 16, False,
+                                      CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8, GROUP_SIZE_M=16,
+                                      STATIC_SLOT_UNROLL=mode4, OUTPUT_C_SLOTS=2 if mode4 else None, OVERLAP_PEEL=mode4,
+                                      OUT_DTYPE="fp16", MERGED_HANDOFF_BARRIER=mode4, REFILL_OVERLAP=4 if mode4 else 0,
+                                      L2_LOOKAHEAD=4 if mode4 else 0, L2_LOOKAHEAD_SPLIT=mode4,
+                                      STATIC_CLUSTER_STEPS=mode4)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [5, 9])
+@pytest.mark.parametrize("step", [0, 1, 3])
+@pytest.mark.parametrize("schedule", ["dynamic-4x4", "static-2x2", "linear"])
+def test_mxgemm_k_rotate_ring_phase(k_iters, step, schedule):
+    # Each N cluster starts its K loop step * (cluster column) steps along and
+    # wraps; cluster partners must keep the same K step for multicast. Cover the
+    # four-stage dynamic ring with 4x4 clusters, the merged static ring with
+    # 2x2 clusters (refill overlap mode 4, no lookahead), and single CTAs.
+    # Steps 0 and 3 also widen the A and B row pitch by 256 bytes.
+    pad = 256 if step != 1 else 0
+    if schedule == "dynamic-4x4":
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, 16, False,
+                                          CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8, OUT_DTYPE="fp16",
+                                          K_ROTATE_STEP=step, ROW_PAD=pad)
+    elif schedule == "static-2x2":
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, 4, False,
+                                          CLUSTER_LAYOUT="2x2", STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=2,
+                                          OVERLAP_PEEL=True, OUT_DTYPE="fp16", MERGED_HANDOFF_BARRIER=True,
+                                          REFILL_OVERLAP=4, STATIC_CLUSTER_STEPS=True, K_ROTATE_STEP=step, ROW_PAD=pad)
+    else:
+        test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, 1, False,
+                                          K_ROTATE_STEP=step, ROW_PAD=pad)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters,cluster_size", [(3, 1), (4, 1), (5, 1), (6, 1), (3, 4), (4, 4), (5, 4), (9, 4)])
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_mxgemm_compact_k_tail_ring_phase(k_iters, cluster_size, prefetch):
@@ -1569,15 +1614,18 @@ def test_mxgemm_cluster_2x2_tile_coverage(num_m, num_n, programs, group_m, remap
 @pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4", "8x2", "2x8"])
 @pytest.mark.parametrize("num_m,num_n,programs", [(16, 16, 32), (8, 16, 64), (16, 8, 128), (16, 16, 256)])
 @pytest.mark.parametrize("remap", [0, 2])
-def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap):
+@pytest.mark.parametrize("group_m", [8, 16])
+def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap, group_m):
     # Every tile is covered once, and rank r of each R x C cluster covers M
     # tile r % R and N tile r // R of one aligned block, matching the A
     # (equal r % R) and B (equal r // R) multicast masks. Chunked XCD remapping
     # permutes whole clusters (eight XCDs, chunk two).
     rows_per, cols_per = map(int, layout.split("x"))
+    if num_m % group_m:
+        pytest.skip("grid clusters need complete M groups")
     size = rows_per * cols_per
     output = torch.empty(num_m * num_n, dtype=torch.int32, device="cuda")
-    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, 8, remap, layout, num_warps=4,
+    _mxfp_cluster_tile_ids[(programs, )](output, num_m, num_n, programs, group_m, remap, layout, num_warps=4,
                                          ctas_per_cga=(size, 1, 1))
     ids = output.cpu().reshape(-1, size)
     torch.testing.assert_close(ids.flatten().sort().values, torch.arange(num_m * num_n, dtype=torch.int32))

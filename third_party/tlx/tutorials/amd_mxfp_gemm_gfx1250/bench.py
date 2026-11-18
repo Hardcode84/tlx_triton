@@ -428,6 +428,10 @@ def _command(args, case, dtype_b):
         command.append("--static_cluster_steps")
     if args.scale_layout != "block128":
         command.extend(["--scale_layout", args.scale_layout])
+    if args.row_pad:
+        command.extend(["--row_pad", str(args.row_pad)])
+    if args.k_rotate_step:
+        command.extend(["--k_rotate_step", str(args.k_rotate_step)])
     if args.out_dtype != "fp32":
         command.extend(["--out_dtype", args.out_dtype])
     if args.output_c_slots is not None:
@@ -487,7 +491,7 @@ def parse_benchmark_args(argv=None):
         "or 4/2 with --operand-pipeline at BK128/BK256)")
     parser.add_argument("--num-warps", type=int, choices=(4, 8), default=None,
                         help="waves per workgroup (default: 4, or 8 with --warp-pipeline)")
-    parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8), default=8)
+    parser.add_argument("--group-m", type=int, choices=(1, 2, 4, 8, 16), default=8)
     parser.add_argument("--variant", action="append", choices=tuple(VARIANT_DTYPES_B),
                         help="repeatable variant selection; default: sweep both variants")
     parser.add_argument("--dtype-a", choices=("float8_e4m3", "float8_e5m2"), default="float8_e4m3")
@@ -554,6 +558,12 @@ def parse_benchmark_args(argv=None):
         help="refill overlap mode 4: branch-free L2 prefetch of the input stage this many steps past the TDM "
         f"refill (default: {SPLIT_L2_LOOKAHEAD} where mode 4 is the default and K >= {SPLIT_L2_LOOKAHEAD_MIN_K}; "
         "0 disables)")
+    parser.add_argument(
+        "--row-pad", type=int, default=0,
+        help="widen the A and B row pitch by this many bytes (multiple of 16); a 32 KiB pitch (K=32768) makes "
+        "timings depend on where A and B land in memory (256 removes that on gfx1250)")
+    parser.add_argument("--k-rotate-step", type=int, default=0,
+                        help="start each N cluster's K loop this many steps further along (persistent kernel)")
     parser.add_argument(
         "--scale-layout", choices=("block128", "wave256"), default="block128",
         help="preshuffled scale format: wave256 reads both 128-row quadrants' scales with one ds_load_b128 "
@@ -706,8 +716,11 @@ def parse_benchmark_args(argv=None):
                 and (args.xcd_remap, args.num_xcds, args.xcd_chunk) != ("chunked", 8, 2)):
             parser.error("linear and 2x2 clusters require --xcd-remap none or chunked with --num-xcds 8 "
                          "--xcd-chunk 2")
-        if args.group_m not in (4, 8) or args.tdm_fusion == "none":
-            parser.error("clustering requires --group-m 4 or 8 and partial, 2way, or 4way TDM fusion")
+        grid = args.cluster_layout in GRID_CLUSTER_LAYOUTS and args.cluster_layout != "2x2"
+        group_ms = (4, 8, 16) if grid else (4, 8)
+        if args.group_m not in group_ms or args.tdm_fusion == "none":
+            parser.error("clustering requires --group-m 4 or 8 (or 16 with a grid --cluster-layout) and partial, "
+                         "2way, or 4way TDM fusion")
     if args.output_staging and not (args.warp_pipeline or args.operand_pipeline):
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--output-staging requires persistent 256x256 M/N tiles")
