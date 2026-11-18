@@ -4188,6 +4188,87 @@ zigzag with reuse on 7/8 (results bit-identical). On this part the hint
 saves neither cycles nor measurable power, so it is not worth a compiler
 change. Archive: `/home/ibutygin/tlx/perf-data/wmma-reuse-20261118/`.
 
+### FP16 8192³ profile (2026-11-18)
+
+Bench default (mode 4, four stages, two C slots; 0.1401 ms, 7,849 TFLOPS at
+1,684 MHz, 2,500 W), ATT of one steady dispatch, 16 SEs one wave each,
+with and without the benchmark's L2 flush (`do_bench` zero-fills 256 MiB
+before every launch):
+
+| Per wave | Flushed | No flush |
+|---|---:|---:|
+| Total | 236.8k cycles | 217.7k cycles |
+| Steady loop | 73.0% (759-772 cycles per K step) | 78.1% (759) |
+| Tile transitions | 20.7% (epilogue median 12.7k) | 14.8% (epilogue median 4.5k) |
+| Prologue / final epilogue | 2.1% / 4.2% | 2.3% / 4.8% |
+
+Flushed, every SE stalls at the same time for about 4 us in the second and
+third tile epilogues (65.4-69.9 us and 99.4-104.2 us of a 135 us kernel): one
+C-slot TDM wait, or the workgroup barrier behind it, takes 7-11k cycles while
+256 CTAs store their 32 MiB of C. Without the flush there are none, but
+that run also keeps A and B in MALL from the previous launch. A read-only
+flush (a sum over the same 256 MiB, no dirty lines) is not faster: 0.1408-
+0.1415 ms against 0.1391-0.1403 ms with the zero fill (four rounds), at
+about 2,370 W instead of the cap. So the stalls come from cold inputs plus
+the C burst, not from the zero fill; the benchmark is fair as a cold-cache
+measurement.
+
+Without the flush each wave issues 16,384 WMMAs at 13.3 cycles each (8 is
+the issue rate): the WMMA pipe is 60% busy, 67% in the steady loop (11.9
+cycles per WMMA). The 247 cycles per K step above the 512-cycle WMMA floor:
+about 82 at the `s_wait_dscnt 0x0` before each split-barrier signal (the
+release drain of this slot's 34 second-half reads, front-loaded into C00's
+16 WMMAs: about 68 KiB per CU in ~128 cycles, above the 512 B/cycle LDS
+peak), about 55 synchronization (cluster barrier 26 amortized, workgroup
+barrier wait 17, tensor wait 12), about 53 SALU/VALU (LDS address adds
+recomputed in the loop), and about 57 other issue cost (`ds_load` issue
+beyond the WMMA shadow, WMMA stalls behind operand loads). Transitions
+without the flush: 7 tail steps (5.5k, real work), C epilogue 4.8k (C-slot
+TDM waits 2.3k), next-tile start 0.4k. Of the SALU/VALU time, the loop has
+only 18 VALU address adds per four steps; the rest is 124 SALU and 278
+`s_set_vgpr_msb` per four steps (high-VGPR banks at 931 VGPRs).
+
+Moving the split barrier to give the release drain more cover loses (device
+check passes; four interleaved rounds, zero-fill flush, median ms):
+
+| Mode 4 step | Time | Change |
+|---|---:|---:|
+| Default: signal after C00, wait after C01 | 0.1396 | |
+| Signal and wait together after C01 | 0.1450 | +3.9% |
+| Signal after C01, wait after C10, refill and next-slot reads in C11 | 0.1433 | +2.6% |
+
+The split window around C01 is worth more than the drain it exposes, and
+squeezing the next-slot reads into C11 moves the stall to the next step.
+Starting the second-half reads in the previous step would need about 128
+more VGPRs (93 are free). Archive with traces, report, patches and scripts:
+`/home/ibutygin/tlx/perf-data/mxfp-f16-8k-profile-20261118/`.
+
+### Scalar work in the FP16 mode 4 K loop (2026-11-18)
+
+Per four K steps (256 WMMAs, ATT without flush): 59 SALU, 278
+`s_set_vgpr_msb`, 21 `s_wait_alu`, 20 `s_wait_dscnt`, 8 `s_wait_tensorcnt`, 6
+barrier signal/wait pairs, 18 VALU address adds. The SALU is TDM refill
+setup: per step two `tensor_load_to_lds`, each with a fresh four-SGPR group 0
+built by about five moves (some redundant: `s_mov_b64 s[86:87], s[2:3]` then
+`s_mov_b32 s86, s2` / `s87, s3`) and two 64-bit address adds. ATT charges
+them about one cycle each (a few 9-cycle dependency stalls, and the
+backend's `s_wait_tensorcnt 0xa` before each step's second TDM at about 8);
+`s_set_vgpr_msb` is free. With 64 WMMAs at 8 cycles per step there are
+enough issue slots, so this work is hidden.
+
+The scalar costs that stall are waits and barriers: the release drain
+(`s_wait_dscnt 0x0`, about 82 per step, see the profile above) and the
+cluster rendezvous every eight steps: the refill's `cluster_barrier()` added
+its own workgroup barrier (62 cycles) right after the step's split-barrier
+wait, then one wave's cluster signal and the cluster wait (210 cycles).
+Mode 4 now uses only the cluster arrive and wait there (the workgroup is
+already synchronized; FFM covers 2x2/4x4, intervals 4/8, K 9-17). Device,
+interleaved rounds, median: 8192³ FP16 0.13891 -> 0.13855 ms (-0.26%, four
+rounds) and 0.13949 -> 0.13895 ms (-0.39%, three rounds, faster in every
+round); 16384³ 1.1567 -> 1.1502 ms (-0.56%, 2 of 3 rounds); 8192²x4096
+0.08974 -> 0.08997 ms (+0.26%, within noise). Splitting the rendezvous (cluster arrive at the step's
+workgroup arrive, wait before the refill) did not help (0.13909 ms).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
