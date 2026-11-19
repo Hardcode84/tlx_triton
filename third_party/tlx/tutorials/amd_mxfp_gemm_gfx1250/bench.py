@@ -12,8 +12,9 @@ Both use 256 persistent programs, group-M 8, chunked XCD remapping of whole
 clusters (8 XCDs, chunk 2), and 16-workgroup
 multicast in a 4x4 tile layout (each A and B tile shared by four workgroups),
 with a cluster barrier every eight input K blocks. MX8xMX8 uses a four-stage
-input ring with two C slots for K >= 16384, and three stages otherwise (FP16
-up to K=16384 uses the static four-stage ring described below).
+input ring with two C slots for K >= 16384, and three stages otherwise (up to
+K=16384, FP16 and FP32 from K=8192 use the static four-stage ring described
+below).
 MX8xMX4 also enables split cluster barriers and early C stores. These two
 options are disabled by default for MX8xMX8 and output-tail reuse. Other
 operand schedules do not support these options. SCHED_MODE[2] is off.
@@ -53,14 +54,15 @@ for every variant except --async-output, which runs FP32 only by default.
 Repeat --out-dtype to choose output types (default: fp32 and fp16). MX8xMX8 uses six FP16 C
 slots for the three-buffer ring and two 64x128 slots for the four-buffer ring.
 For FP16 MX8xMX8 up to K=16384 it uses a four-stage static-slot ring with two C
-slots, the overlap peel, and one merged handoff barrier per K step
+slots (FP32 output too from K=8192: 8192^3 -4.0%, 16384^3 -2.1%; at K=4096
+only with --a-row-pairs --b-row-pairs), the overlap peel, and one merged handoff barrier per K step
 (--merged-handoff-barrier; 1.6-2.2% faster on gfx1250), split around the C01
 WMMAs with the refill and next-slot reads across C10/C11 (--refill-overlap 4;
 a further 1.3-2.2%). At K=16384 it also L2-prefetches the input stage four
 steps past the refill (--l2-lookahead 4; 1.3%). That loop tests the cluster
 rendezvous only in the one unrolled step of four that can hit it
-(--static-cluster-steps; 0.4-0.7%). FP16 at K=32768 keeps the dynamic
-four-stage ring.
+(--static-cluster-steps; 0.4-0.7%). K=32768 keeps the dynamic four-stage
+ring.
 --scale-layout wave256 packs MX8xMX8 scales one row per 256 M/N rows, ordered
 so each wave reads the scales of both 128-row quadrants with one ds_load_b128
 in the --refill-overlap 4 step (two scale reads per K step instead of four).
@@ -207,8 +209,11 @@ FOUR_BUFFER_MIN_K = 16384
 # (refill overlap mode 4: a further -2.2% / -1.25%). At 16384^3 this is 1%
 # faster than the dynamic four-stage ring. At 32768^3 the merged barrier
 # starves the TDM input (+6 to +8%, +4 to +6% even with the L2 lookahead),
-# so that case keeps the dynamic ring.
-MERGED_FP16_MAX_K = 16384
+# so that case keeps the dynamic ring. FP32 output (two 64x64 C slots) uses
+# the same loop from K=8192 (8192^3 -4.0%, 16384^3 -2.1% against its three-
+# and four-stage rings); at K=4096 it is 6% slower, but 2.2% faster with row-pair
+# A and B.
+MERGED_MAX_K = 16384
 # From this K, the merged FP16 ring also L2-prefetches the input stage this
 # many steps past the TDM refill, branch-free, every cluster CTA covering its
 # share (16384^3 -1.3%; 8192^3 +2%).
@@ -310,8 +315,10 @@ def _variant_args(args, dtype_b):
 def _case_args(args, case):
     if not args.auto_ring_depth:
         return args
-    if (args.out_dtype == "fp16" and args.static_slot_unroll is None and args.merged_handoff_barrier is not False
-            and case[2] // args.block_k > 4 and case[2] <= MERGED_FP16_MAX_K):
+    merged_min_k = (args.block_k * 5 if args.out_dtype == "fp16" or
+                    (args.a_row_pairs and args.b_row_pairs) else STATIC_SLOT_UNROLL_MIN_K)
+    if (args.static_slot_unroll is None and args.merged_handoff_barrier is not False
+            and merged_min_k <= case[2] <= MERGED_MAX_K):
         resolved = argparse.Namespace(**vars(args))
         resolved.num_buffers = 4
         resolved.output_c_slots = 2
@@ -550,7 +557,8 @@ def parse_benchmark_args(argv=None):
     parser.add_argument(
         "--merged-handoff-barrier", action=argparse.BooleanOptionalAction, default=None,
         help="one workgroup barrier per static-slot K step with relaxed operand loads "
-        f"(default: four-stage FP16 MX8xMX8 up to K={MERGED_FP16_MAX_K}; requires --static-slot-unroll)")
+        f"(default: four-stage MX8xMX8 up to K={MERGED_MAX_K}, FP32 output from K={STATIC_SLOT_UNROLL_MIN_K} "
+        "unless A and B are row pairs; requires --static-slot-unroll)")
     parser.add_argument(
         "--refill-overlap", type=int, choices=(0, 1, 3, 4), default=None,
         help="merged four-stage step schedule: 4 splits the handoff barrier around the C01 WMMAs and refills "
@@ -989,7 +997,7 @@ def main():
             f"\nConfiguration ({variant}, {run_args.out_dtype}): {kernel_name}, "
             f"tile={run_args.block_m}x{run_args.block_n}x{run_args.block_k}, "
             f"buffers={run_args.num_buffers}"
-            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K}; static/merged/split for FP16 up to K={MERGED_FP16_MAX_K})' if run_args.auto_ring_depth else ''}, "
+            f"{f' (4 with 2 C slots for K>={FOUR_BUFFER_MIN_K}; static/merged/split up to K={MERGED_MAX_K})' if run_args.auto_ring_depth else ''}, "
             f"warps={run_args.num_warps}, group_m={run_args.group_m}, fusion={run_args.tdm_fusion}, "
             f"scale_buffers={3 if run_args.warp_pipeline else run_args.num_buffers}, "
             f"split={run_args.tdm_split}, output_staging={run_args.output_staging}, "
