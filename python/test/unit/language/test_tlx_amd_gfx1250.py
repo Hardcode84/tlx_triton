@@ -1012,7 +1012,7 @@ def test_mxgemm_persistent_ring_phase(
         CLUSTER_BARRIER_INTERVAL=4, WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
         OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False, INTERLEAVE_C_FILL=0,
         STATIC_CLUSTER_STEPS=False, REFILL_OVERLAP=0, L2_LOOKAHEAD=0, L2_LOOKAHEAD_SPLIT=False, SCALE_LAYOUT="block128",
-        GROUP_SIZE_M=None, K_ROTATE_STEP=0, ROW_PAD=0):
+        GROUP_SIZE_M=None, K_ROTATE_STEP=0, ROW_PAD=0, A_ROW_PAIRS=False, B_ROW_PAIRS=False):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Register-pipeline cases cover odd two-slot phases.
@@ -1035,8 +1035,16 @@ def test_mxgemm_persistent_ring_phase(
     b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
     ref = _gfx1250_mxfp.torch_gemm_mxfp(a, b, a_scale, b_scale, 32, M, N, K)
     b_data = b.to_packed_tensor(dim=0) if DTYPE_B == "float4" else b
+    a_d = a
+    b_t = b_data.T.contiguous()
+    if A_ROW_PAIRS:
+        a_d = _gfx1250_mxfp.pack_row_pairs(a_d, BLOCK_K)
+        group["A_ROW_PAIRS"] = True
+    if B_ROW_PAIRS:
+        b_t = _gfx1250_mxfp.pack_row_pairs(b_t, BLOCK_K)
+        group["B_ROW_PAIRS"] = True
     out = _gfx1250_mxfp.matmul(
-        _gfx1250_mxfp.pad_rows(a.cuda(), ROW_PAD), _gfx1250_mxfp.pad_rows(b_data.T.contiguous().cuda(), ROW_PAD),
+        _gfx1250_mxfp.pad_rows(a_d.cuda(), ROW_PAD), _gfx1250_mxfp.pad_rows(b_t.cuda(), ROW_PAD),
         _gfx1250_mxfp.pack_scale(a_scale, layout=SCALE_LAYOUT).cuda(),
         _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(), config=dict(
             BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
@@ -1454,6 +1462,34 @@ def test_mxgemm_k_rotate_ring_phase(k_iters, step, schedule):
     else:
         test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, 1, False,
                                           K_ROTATE_STEP=step, ROW_PAD=pad)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [5, 9])
+@pytest.mark.parametrize("schedule", ["mode4-4x4", "mode4-2x2", "mode4-4x4-l2", "fp32-static", "dynamic-4x4"])
+@pytest.mark.parametrize("operands", ["a", "b", "ab"])
+def test_mxgemm_row_pairs_ring_phase(k_iters, schedule, operands):
+    # Row-pair operands (pack_row_pairs) load one 256-byte TDM piece per row
+    # pair into the unchanged LDS image: the partitioned static-slot slots of
+    # the FP16 mode 4 and FP32 three-stage loops, and the plain slots of the
+    # dynamic four-stage ring, with and without the split L2 lookahead.
+    pairs = dict(A_ROW_PAIRS="a" in operands, B_ROW_PAIRS="b" in operands)
+    if schedule.startswith("mode4"):
+        layout = schedule.split("-")[1]
+        l2 = 4 if schedule.endswith("-l2") else 0
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False,
+                                          16 if layout == "4x4" else 4, False, CLUSTER_LAYOUT=layout,
+                                          CLUSTER_BARRIER_INTERVAL=8, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=2,
+                                          OVERLAP_PEEL=True, OUT_DTYPE="fp16", MERGED_HANDOFF_BARRIER=True,
+                                          REFILL_OVERLAP=4, STATIC_CLUSTER_STEPS=True, L2_LOOKAHEAD=l2,
+                                          L2_LOOKAHEAD_SPLIT=bool(l2), **pairs)
+    elif schedule == "fp32-static":
+        test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, True, 4, False, False, 4, False,
+                                          CLUSTER_LAYOUT="2x2", STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=3,
+                                          OVERLAP_PEEL=True, **pairs)
+    else:
+        test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, 16, False,
+                                          CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=8, OUT_DTYPE="fp16", **pairs)
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")

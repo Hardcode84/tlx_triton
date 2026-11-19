@@ -321,7 +321,9 @@ def _case_args(args, case):
             resolved.refill_overlap = 4
         if resolved.overlap_peel is None:
             resolved.overlap_peel = True
-        if (resolved.l2_lookahead is None and resolved.refill_overlap == 4 and case[2] >= SPLIT_L2_LOOKAHEAD_MIN_K):
+        # Row-pair B reads whole L2 lines each step; the lookahead only slows it.
+        if (resolved.l2_lookahead is None and not resolved.b_row_pairs and not resolved.a_row_pairs
+                and resolved.refill_overlap == 4 and case[2] >= SPLIT_L2_LOOKAHEAD_MIN_K):
             resolved.l2_lookahead = SPLIT_L2_LOOKAHEAD
         if resolved.static_cluster_steps is None:
             resolved.static_cluster_steps = True
@@ -430,6 +432,10 @@ def _command(args, case, dtype_b):
         command.extend(["--scale_layout", args.scale_layout])
     if args.row_pad:
         command.extend(["--row_pad", str(args.row_pad)])
+    if args.a_row_pairs:
+        command.append("--a_row_pairs")
+    if args.b_row_pairs:
+        command.append("--b_row_pairs")
     if args.k_rotate_step:
         command.extend(["--k_rotate_step", str(args.k_rotate_step)])
     if args.out_dtype != "fp32":
@@ -556,12 +562,19 @@ def parse_benchmark_args(argv=None):
     parser.add_argument(
         "--l2-lookahead", type=int, default=None,
         help="refill overlap mode 4: branch-free L2 prefetch of the input stage this many steps past the TDM "
-        f"refill (default: {SPLIT_L2_LOOKAHEAD} where mode 4 is the default and K >= {SPLIT_L2_LOOKAHEAD_MIN_K}; "
+        f"refill (default: {SPLIT_L2_LOOKAHEAD} where mode 4 is the default and K >= {SPLIT_L2_LOOKAHEAD_MIN_K} "
+        "without --b-row-pairs; "
         "0 disables)")
     parser.add_argument(
         "--row-pad", type=int, default=0,
         help="widen the A and B row pitch by this many bytes (multiple of 16); a 32 KiB pitch (K=32768) makes "
         "timings depend on where A and B land in memory (256 removes that on gfx1250)")
+    parser.add_argument(
+        "--a-row-pairs", action="store_true",
+        help="MX8xMX8 persistent BK128: preshuffle A into row pairs so each TDM piece moves 256 contiguous bytes")
+    parser.add_argument(
+        "--b-row-pairs", action="store_true",
+        help="MX8xMX8 persistent BK128: preshuffle B into row pairs so each TDM piece moves 256 contiguous bytes")
     parser.add_argument("--k-rotate-step", type=int, default=0,
                         help="start each N cluster's K loop this many steps further along (persistent kernel)")
     parser.add_argument(
