@@ -4342,6 +4342,34 @@ caller's A and B layouts. The 32768³ config needs the 256-byte row pad,
 which pairs do not support yet (a pair pitch of 2K + pad).
 Logs: `/home/ibutygin/tlx/perf-data/mxfp-b-row-pairs-20261119/`.
 
+### FP32 output on the mode 4 loop (2026-11-19): new default from K=8192
+
+The pairs gain followed the K loop, not the output type: swapping the 8192³
+loops, A and B pairs cut the FP16 and FP32 three-stage static loop by 6.6% /
+7.0% and the mode 4 loop by 3.9% / 4.1%. The FP32 mode 4 loop (four stages,
+two 64x64 FP32 C slots, merged barrier, refill overlap 4, static cluster
+steps) was also faster than the FP32 default. Against the FP32 defaults
+(2222, same boot, three interleaved rounds; 32768³ two rounds, both sides
+with `--row_pad 256`; all checks pass):
+
+| Case | FP32 default | FP32 mode 4 |
+| --- | --- | --- |
+| 8192²x4096 | 0.0986 ms (three-stage dynamic) | 0.1047 (+6.1%) |
+| 8192²x4096, A and B pairs | 0.0837 | 0.0818 (-2.2%) |
+| 8192³ | 0.1577 (three-stage static) | 0.1514 (-4.0%) |
+| 16384³ | 1.2543 (four-stage dynamic) | 1.2397 (-1.2%); with split lookahead 1.2284 (-2.1%) |
+| 16384³, A and B pairs | 1.2052 | 1.1476 (-4.8%) |
+| 32768³, row pad 256 | 9.887 | 9.762 (-1.3%); with lookahead 9.746 (-1.4%) |
+
+bench now uses mode 4 for FP32 output from K=8192 up to K=16384 (with the
+lookahead at K=16384 unless an operand is paired), and at K=4096 when A and
+B are both row pairs. K=32768 keeps the dynamic ring for both output types:
+mode 4 was measured there only with the row pad, and FP16 mode 4 was slower
+at 32768³ without it. FFM: `test_mxgemm_refill_overlap_ring_phase` covers
+mode 4 with FP32 output (25 cases).
+Logs: `/home/ibutygin/tlx/perf-data/mxfp-b-row-pairs-20261119/` (`swap.log`,
+`f32m4.log`).
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
