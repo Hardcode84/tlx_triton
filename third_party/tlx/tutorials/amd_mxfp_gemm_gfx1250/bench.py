@@ -214,6 +214,13 @@ FOUR_BUFFER_MIN_K = 16384
 # and four-stage rings); at K=4096 it is 6% slower, but 2.2% faster with row-pair
 # A and B.
 MERGED_MAX_K = 16384
+# With A and B both row-paired, the 4x4 multicast requests of that loop stay
+# aligned with a rendezvous every 32 K steps instead of 8 (gfx1250: 8192^3
+# FP16 -2.5%, FP32 -2.3%; 16384^3 -3.1% / -2.8%), or every 16 when a tile
+# has fewer than 64 steps (8192^2x4096 -1.9%; 32: -1.1%). Without pairs,
+# longer intervals are slower (8192^3: 16 +0.9%, 32 +7.7%).
+PAIRED_CLUSTER_BARRIER_INTERVAL = 32
+PAIRED_SHORT_K_CLUSTER_BARRIER_INTERVAL = 16
 # From this K, the merged FP16 ring also L2-prefetches the input stage this
 # many steps past the TDM refill, branch-free, every cluster CTA covering its
 # share (16384^3 -1.3%; 8192^3 +2%).
@@ -334,6 +341,10 @@ def _case_args(args, case):
             resolved.l2_lookahead = SPLIT_L2_LOOKAHEAD
         if resolved.static_cluster_steps is None:
             resolved.static_cluster_steps = True
+        if (resolved.auto_cluster_barrier_interval and resolved.a_row_pairs and resolved.b_row_pairs
+                and resolved.cluster_layout == "4x4"):
+            resolved.cluster_barrier_interval = (PAIRED_CLUSTER_BARRIER_INTERVAL if case[2] //
+                                                 resolved.block_k >= 64 else PAIRED_SHORT_K_CLUSTER_BARRIER_INTERVAL)
         return resolved
     if case[2] >= FOUR_BUFFER_MIN_K:
         resolved = argparse.Namespace(**vars(args))
@@ -634,8 +645,8 @@ def parse_benchmark_args(argv=None):
                         help="share data and scales within a cluster; disable for a synchronization-only control")
     parser.add_argument(
         "--cluster-barrier-interval", type=int, default=None,
-        help="align cluster requests every N input K blocks (default: 8 for 4x4, otherwise 4); 0 disables all "
-        "cluster barriers")
+        help="align cluster requests every N input K blocks (default: 8 for 4x4, 32 (16 below 64 K blocks) for the "
+        "four-stage 4x4 loop with --a-row-pairs --b-row-pairs, otherwise 4); 0 disables all cluster barriers")
     parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
@@ -667,6 +678,7 @@ def parse_benchmark_args(argv=None):
     if args.cluster_layout is None:
         default_layouts = {4: "2x2", 16: "4x4"}
         args.cluster_layout = ("linear" if args.streamed_operands else default_layouts.get(args.cluster_size, "linear"))
+    args.auto_cluster_barrier_interval = args.cluster_barrier_interval is None
     if args.cluster_barrier_interval is None:
         args.cluster_barrier_interval = 8 if args.cluster_layout == "4x4" else 4
     if args.xcd_remap is None:
