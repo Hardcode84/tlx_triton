@@ -1497,6 +1497,20 @@ def test_mxgemm_row_pairs_ring_phase(k_iters, schedule, operands):
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [9, 37, 70])
+@pytest.mark.parametrize("out_dtype", ["fp16", "fp32"])
+def test_mxgemm_row_pairs_cluster_interval32_ring_phase(k_iters, out_dtype):
+    # Row-pair A and B in the mode 4 loop with a cluster rendezvous every 32
+    # steps (bench's paired default): no rendezvous inside the loop, one, and
+    # two, with static cluster steps.
+    test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, True, 4, False, False, 16, False,
+                                      CLUSTER_LAYOUT="4x4", CLUSTER_BARRIER_INTERVAL=32, STATIC_SLOT_UNROLL=True,
+                                      OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, OUT_DTYPE=out_dtype,
+                                      MERGED_HANDOFF_BARRIER=True, REFILL_OVERLAP=4, STATIC_CLUSTER_STEPS=True,
+                                      A_ROW_PAIRS=True, B_ROW_PAIRS=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters,cluster_size", [(3, 1), (4, 1), (5, 1), (6, 1), (3, 4), (4, 4), (5, 4), (9, 4)])
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_mxgemm_compact_k_tail_ring_phase(k_iters, cluster_size, prefetch):

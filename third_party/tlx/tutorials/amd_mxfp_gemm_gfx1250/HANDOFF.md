@@ -4291,6 +4291,48 @@ row-pair pre-shuffled B (256-byte TDM pieces, -5 to -6% on its own there),
 and a merged step barrier (their hot loop is about 680 cycles per K128 against
 759 here).
 
+ATT (8192³, 70th of 80 flushed launches, SE0 CU0, 28 four-step iterations;
+`att_new_pf4_8k.tar.gz` in the archive) shows why. Both builds compile to the
+same instruction as Gluon's `tdm.prefetch` (speculative `global_prefetch_b8`,
+SE scope, one 256-byte line per lane), so the mechanism is the same. The
+steady loop's TDM wait is only 72 cycles per iteration (1.2% of 5,918), so a
+prefetch can save at most that, and it saves nothing (74 with it). The
+iteration grows to 6,601 cycles (+11.5%): `ds_load` issue +292, LDS waits
++156 (the first step's release drain `s_wait_dscnt 0x0` 186 -> 358), WMMA
++89, VALU address work +82, cluster barrier +67, the prefetch itself 18. The
+prefetch and its `sched_barrier` at the top of the iteration delay the first
+step's front-loaded LDS reads. Their non-persistent kernel had larger,
+sporadic TDM waits (top 5% of waits = 65% of the total, their ATT), which
+gives the prefetch something to remove; why its GL2 miss count stays flat is
+not known.
+
+Placement and power (2026-11-19). Temporary copies (`v_c01.py`,
+`v_pf4c01.py` in the archive) put the split lookahead in the mode 4 C01
+window (between the split barrier's signal and wait: no LDS reads, no TDM),
+or issue one four-step prefetch (steps +8..+11, two 256-byte lines per lane,
+row pairs supported) per four unrolled steps in step 0's C01 window, as v16
+does. Device, 2-3 interleaved rounds, all checks pass; median time against no
+prefetch, package power, clock:
+
+| Case | Per step after the refill (current) | Per step in C01 | Four-step in C01 |
+| --- | --- | --- | --- |
+| 8192²x4096 FP16 (below the cap, 2357 W) | +2.0%, 2363 W | +0.6%, 2391 W | +1.5%, 2376 W |
+| 8192³ FP16 | +2.1%, 1651 vs 1640 MHz | +3.3%, 1661 MHz | +4.0%, 1670 MHz |
+| 16384³ FP16 | -1.2%, 1474 vs 1488 MHz | -0.1%, 1488 MHz | +2.1%, 1521 MHz |
+| 8192³, A and B pairs | +4.0% | +5.2% | +4.3% |
+| 16384³, A and B pairs | +3.0% | +3.6% | +2.9% |
+
+Spacing the prefetch from the TDM refill does not help, and the four-step
+form is slower everywhere. Below the cap it raises power; at the 2,500 W cap
+the prefetch builds run up to 2.2% higher clocks, but need more cycles, so
+energy per launch rises (16384³ four-step +2.1%). ATT of the 8192³ four-step
+build against the same-build baseline (`att_base_pf4c01_8k.tar.gz`): the
+four-step iteration 6,274 -> 6,555 cycles; LDS waits fall by 144, but the
+cluster barrier wait rises by 161, WMMA issue by 149, VALU by 42, and the
+demand TDM wait by 34 (72 -> 106): the extra requests slow the demand loads
+instead of shortening them, and the step that carries the prefetch skews
+the cluster rendezvous. The higher clocks match more idle barrier time.
+
 ### Row-pair A/B pre-shuffle from the Gluon v16 tutorial (2026-11-19): faster with both operands
 
 `A_ROW_PAIRS` / `B_ROW_PAIRS` (kernel CLI `--a_row_pairs` / `--b_row_pairs`,
@@ -4369,6 +4411,118 @@ at 32768³ without it. FFM: `test_mxgemm_refill_overlap_ring_phase` covers
 mode 4 with FP32 output (25 cases).
 Logs: `/home/ibutygin/tlx/perf-data/mxfp-b-row-pairs-20261119/` (`swap.log`,
 `f32m4.log`).
+
+### Same-session comparison with the Gluon tutorial and the aiter ASM kernel (2026-11-19)
+
+8192³, 2222, one boot, three interleaved rounds, run_place's flushed median
+timer for every kernel; all outputs pass an FP32-reference check. The
+tutorial kernels are their own compiler's cached builds (upstream Triton,
+BF16 output) loaded by `gl_run.py`; ASM is the shipped aiter code object
+`f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x4_ps` (A row pairs, B in 16x16
+tiles, grid 64x4, 4x4 clusters) through the tutorial's HIP launch shim.
+
+| Kernel | Time | Clock | Cycles |
+| --- | ---: | ---: | ---: |
+| ours, FP16 default | 141.8 us | 1630 MHz | 231k |
+| ours, A and B row pairs | 136.2 | 1647 | 224k |
+| tutorial v16 (non-persistent, B pairs) | 136.4 | 1623 | 221k |
+| tutorial v16 + separate four-step GL2 prefetch | 136.4 | 1617 | 221k |
+| tutorial v17 (persistent, A and B pairs) | 138.6 | 1651 | 229k |
+| tutorial v17 + K-only descriptors | 136.5 | 1634 | 223k |
+| aiter ASM | 118.1 (-13.3%) | 1529 | 181k (-19%) |
+
+With row pairs, ours matches the tutorial's best kernels within 0.2%; their
+GL2 prefetch gains nothing in this timer. ASM finishes in 19% fewer cycles at
+a lower clock (it is power capped too, with more work per cycle), so it is
+the reference to study. Logs and runner:
+`/home/ibutygin/tlx/perf-data/mxfp-gluon-asm-cmp-20261119/`.
+
+ASM anatomy (disassembly `asm_d26.s`; its TDM loads are encoded `0xd031...`,
+which our LLVM prints as `.long`; ATT `att_asm_8k.tar.gz`, 70th of 80 flushed
+launches, one SE0 CU0 wave, compared with our same-boot 8192³ FP16 trace):
+
+- Same work per four K steps as our mode 4 loop: 256 WMMAs, 256
+  `ds_load_b128`, 20 `s_wait_dscnt`, 4 workgroup barrier pairs. ASM has 4 TDM
+  loads (one per wave per step: A, B, A scales, B scales) to our 8, 40
+  `s_set_vgpr_msb` to our 278, and no VALU address work.
+- Layout: A row pairs, padded `[256:+16]` like ours (256-byte pieces). B in
+  16x16-byte tiles, unpadded, 2 KiB TDM pieces (16 per step). Scales
+  unpadded, 128-byte pieces.
+- Multicast with descriptor group 1 bit 21 (early timeout) on B and the
+  scales, and no cluster barrier in the K loop (2 cluster barriers in the
+  whole kernel). The tutorial's separate attempts at either one regressed
+  (+6% without the periodic sync, +53% with early timeout on its uneven TDM
+  issue).
+- LDS reads stay pipelined through the step: each quarter issues its 16 + 2
+  reads over its first 5 WMMAs, then waits only for the previous batch
+  (`s_wait_dscnt 0x12`, 18 in flight). The barrier window is 3 WMMAs and the
+  release drain finds almost nothing outstanding. Ours issues the step's 64
+  reads in one burst over about 48 WMMAs, then a 16-WMMA window without
+  reads.
+
+Steady loop per K step (ATT):
+
+| Class | ASM | Ours |
+| --- | ---: | ---: |
+| Total | 555 | 784 |
+| WMMA issue | 352 | 389 |
+| `ds_load` issue | 106 | 150 |
+| LDS waits | 28 | 103 |
+| Workgroup + cluster barrier | 42 + 0 | 35 + 33 |
+| SALU + VALU | 18 + 0 | 32 + 21 |
+| TDM issue + wait | ~5 | 17 |
+
+So the gap is LDS read cost (about 120 cycles per step: read schedule, and
+possibly B bank conflicts that the unpadded 16x16 tiles avoid), the periodic
+cluster rendezvous (33), and loop scalar/vector work (35).
+
+### ASM-derived experiments (2026-11-19): only the paired rendezvous interval wins
+
+Temporary variants of the FP16 mode 4 loop (sources, logs and traces in
+`/home/ibutygin/tlx/perf-data/mxfp-asm-steal-20261119/`); 2222, same boot,
+interleaved rounds against same-build baselines, every variant passes the
+FP32-reference check (and FFM first).
+
+Cluster rendezvous (`--cluster_barrier_interval`, plus an env-gated compiler
+hack setting TDM group 1 bit 21, early timeout, as ASM does; reverted):
+
+| Variant | 8192³ | 16384³ | 8192³ A+B pairs | 16384³ A+B pairs |
+| --- | ---: | ---: | ---: | ---: |
+| interval 0 (none) | +113% | +136% | +7% | +39% |
+| early timeout | +7% | +12% | +0.1% | +0.7% |
+| both | +129% | +123% | +15% | +42% |
+| interval 16 | +0.9% | +1.0% | -2.2% | -2.0% |
+| interval 32 | +7.7% | +13% | -2.5% | -3.1% |
+| interval 64 / 128 (once per tile) | +27% | +69% | -2.2% | -3.2% |
+
+Without pairs the cluster drifts within a few steps and late multicast
+requests stall; with A and B row pairs it stays aligned for at least a tile.
+Paired FP32 mode 4: 8192³ -2.3%, 16384³ -2.8% at interval 32; paired
+8192²x4096 (32 steps per tile): 16 -1.9%, 32 -1.1%. bench now uses 32 (16
+below 64 K steps) for the four-stage 4x4 loop when both pairs flags are set
+and no interval is given (`PAIRED_CLUSTER_BARRIER_INTERVAL`).
+`test_mxgemm_row_pairs_cluster_interval32_ring_phase` covers it in FFM.
+
+ASM-like read schedule (`v_rs.py`): read b01 during C00 and a10 during C01,
+each over the quadrant's first five WMMAs, then the TDM wait and the split
+barrier with no WMMA window (or C10 inside it), and the next slot's a00 / b00
+across C10 / C11. 8192³ +4.8% (C10 window +2.6%), 16384³ +3.7% (+4.5%);
+paired 8192³ +0.2%, paired 16384³ -0.5%; with interval 32 it gives back
+most of that gain (paired -0.2% / -0.9% against -2.5% / -3.1%). ATT
+(8192³): LDS waits fall from 95 to 72 cycles per step, but the workgroup
+barrier wait rises from 7 to 128: our waves arrive skewed, and the 16-WMMA C01
+window was hiding it. ASM's 3-WMMA window costs it 42.
+
+B as unpadded 16x16-byte tiles (`v_bt.py`, `--b_tiles`: host packing
+`[N/16, K/16, 16, 16]`, a `[16, 2048]` TDM view per slot through
+`local_reinterpret`, read through a `shared_linear_layout_encoding`; the same
+832 `ds_load_b128`, 8 KiB less LDS). It cannot sit beside partitioned A
+(331,768 bytes of LDS: an unpartitioned B must fit in one physical
+partition), so it is measured with `--lds_partitioned_ab 0` against the same
+unpartitioned baseline: 8192³ -0.8%, 16384³ (no lookahead) -5.1% (the B
+row-pair effect: larger TDM pieces); with A pairs against A+B pairs, +1.4% /
++0.7%. Against the partitioned default it does not win. Our B reads are not
+bank-conflict bound.
 
 ## Earlier shape-scaling evidence
 
