@@ -117,6 +117,23 @@ def _mxgemm_desc_group_rows(desc, _semantic=None):
 
 
 @tl.core.builtin
+def _mxgemm_desc_row_pairs(desc, block_k, _semantic=None):
+    # A row-pair operand descriptor ([rows // 2, 2 * K] or
+    # [rows // R, R // 2, 2 * K]) loads 2 * BLOCK_K contiguous bytes per row pair.
+    shape = [tl.core._unwrap_if_constexpr(d) for d in desc.block_shape]
+    return tl.constexpr(shape[-1] == 2 * tl.core._unwrap_if_constexpr(block_k))
+
+
+@tl.core.builtin
+def _mxgemm_row_pair_view(view, _semantic=None):
+    # View an operand slot [.., rows, K] as [.., rows // 2, 2 * K] for row-pair TDM
+    # loads: rows 2p and 2p + 1 become one row of the row-major reshape.
+    shape = [tl.core._unwrap_if_constexpr(d) for d in view.type.shape]
+    pairs = shape[:-2] + [shape[-2] // 2, 2 * shape[-1]]
+    return tlx.local_reshape(view, pairs, _semantic=_semantic)
+
+
+@tl.core.builtin
 def _mxgemm_flat_view(view, _semantic=None):
     # Read a group-major [G, R, K] operand slot as [G * R, K].
     shape = [tl.core._unwrap_if_constexpr(d) for d in view.type.shape]
@@ -138,6 +155,19 @@ def is_gfx1250_available():
         return target.arch == "gfx1250"
     except Exception:
         return False
+
+
+def pack_row_pairs(x: torch.Tensor, block_k: int = 128) -> torch.Tensor:
+    """Store an FP8 operand ([rows, K]: A or transposed B) as row pairs, [rows // 2, K // block_k, 2, block_k], in a
+    [rows, K] tensor.
+
+    For A_ROW_PAIRS / B_ROW_PAIRS: each row pair's K step is 2 * block_k contiguous bytes, so one TDM piece moves
+    both rows.
+    """
+    n, k = x.shape
+    if n % 2 or k % block_k:
+        raise ValueError("row pairs need an even number of rows and K a multiple of block_k")
+    return x.reshape(n // 2, 2, k // block_k, block_k).permute(0, 2, 1, 3).contiguous().view(n, k)
 
 
 def pack_scale(x: torch.Tensor, preshuffle_factor: int = 128, layout: str = "block128") -> torch.Tensor:
@@ -335,10 +365,24 @@ def _mxgemm_issue_loads(
     else:
         data_masks = None
         all_masks = None
-    if TRANSPOSE_B:
+    if _mxgemm_desc_row_pairs(a_desc, BLOCK_K_PACKED_A):
+        tl.static_assert(TDM_FUSION != "none", "row-pair A needs fused TDM loads")
+        a_offsets = [0, load_idx * 2 * BLOCK_K_PACKED_A]
+        a_view = _mxgemm_row_pair_view(tlx.local_view(a_buf, slot))
+    else:
+        a_offsets = [0, load_idx * BLOCK_K_PACKED_A]
+        a_view = tlx.local_view(a_buf, slot)
+    B_PAIRS: tl.constexpr = _mxgemm_desc_row_pairs(b_desc, BLOCK_K_PACKED_B)
+    if B_PAIRS:
+        tl.static_assert(TRANSPOSE_B and TDM_FUSION != "none", "row-pair B needs transposed B and fused TDM loads")
+        b_offsets = [0, load_idx * 2 * BLOCK_K_PACKED_B]
+        b_view = _mxgemm_row_pair_view(tlx.local_view(b_buf, slot))
+    elif TRANSPOSE_B:
         b_offsets = [0, load_idx * BLOCK_K_PACKED_B]
+        b_view = tlx.local_view(b_buf, slot)
     else:
         b_offsets = [load_idx * BLOCK_K_PACKED_B, 0]
+        b_view = tlx.local_view(b_buf, slot)
     if SCALE_PRESHUFFLE:
         scale_offsets = [0, load_idx * BLOCK_K_SCALE_PRESHUFFLED]
     else:
@@ -354,10 +398,8 @@ def _mxgemm_issue_loads(
     if TDM_FUSION == "4way":
         tl.static_assert(WITH_A_SCALE, "4-way TDM fusion requires WITH_A_SCALE")
         tlx.async_amd_descriptor_load_fused([
-            (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), 1 * WAVE_MASK_REPEAT),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
-                                                                                       slot), 2 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(a_desc, a_offsets, pred), a_view, 1 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), b_view, 2 * WAVE_MASK_REPEAT),
             (_mxgemm_position_load_descriptor(a_scale_desc, scale_offsets, pred), tlx.local_view(
                 a_scale_buf, slot), 4 * WAVE_MASK_REPEAT),
             (_mxgemm_position_load_descriptor(b_scale_desc, scale_offsets, pred), tlx.local_view(
@@ -365,10 +407,8 @@ def _mxgemm_issue_loads(
         ], multicast_masks=all_masks)
     elif TDM_FUSION == "2way":
         tlx.async_amd_descriptor_load_fused([
-            (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), 3 * WAVE_MASK_REPEAT),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf,
-                                                                                       slot), 12 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(a_desc, a_offsets, pred), a_view, 3 * WAVE_MASK_REPEAT),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), b_view, 12 * WAVE_MASK_REPEAT),
         ], multicast_masks=data_masks)
         if WITH_A_SCALE:
             tlx.async_amd_descriptor_load_fused([
@@ -392,9 +432,8 @@ def _mxgemm_issue_loads(
                                                                                                      slot), B_WAVES),
             ], multicast_masks=data_masks)
         tlx.async_amd_descriptor_load_fused([
-            (_mxgemm_position_load_descriptor(a_desc, [0, load_idx * BLOCK_K_PACKED_A],
-                                              pred), tlx.local_view(a_buf, slot), A_WAVES),
-            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), tlx.local_view(b_buf, slot), B_WAVES),
+            (_mxgemm_position_load_descriptor(a_desc, a_offsets, pred), a_view, A_WAVES),
+            (_mxgemm_position_load_descriptor(b_desc, b_offsets, pred), b_view, B_WAVES),
         ], multicast_masks=data_masks)
         if not SCALES_FIRST:
             tlx.async_amd_descriptor_load_fused([
@@ -1575,13 +1614,18 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
     # here and slot in the loader hides the invariant per-wave global base
     # from LLVM and repeats descriptor address work inside the K loop.
     if _mxgemm_desc_group_rows(a_desc) != 0:
-        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // _mxgemm_desc_group_rows(a_desc), 0, 0],
-                                          clamp_bounds=False)
-        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // _mxgemm_desc_group_rows(b_desc), 0, 0],
-                                          clamp_bounds=False)
+        # A row-pair group holds 2 * R // 2 operand rows.
+        A_GROUP_ROWS: tl.constexpr = _mxgemm_desc_group_rows(a_desc) * (2 if _mxgemm_desc_row_pairs(a_desc, BK //
+                                                                                                    DA) else 1)
+        B_GROUP_ROWS: tl.constexpr = _mxgemm_desc_group_rows(b_desc) * (2 if _mxgemm_desc_row_pairs(b_desc, BK //
+                                                                                                    DB) else 1)
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // A_GROUP_ROWS, 0, 0], clamp_bounds=False)
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // B_GROUP_ROWS, 0, 0], clamp_bounds=False)
     else:
-        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=False)
-        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
+        a_rows = off_m // 2 if _mxgemm_desc_row_pairs(a_desc, BK // DA) else off_m
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[a_rows, 0], clamp_bounds=False)
+        b_rows = off_n // 2 if _mxgemm_desc_row_pairs(b_desc, BK // DB) else off_n
+        bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[b_rows, 0], clamp_bounds=False)
     SROWS: tl.constexpr = 256 if _mxgemm_scale_cols(bs_desc) == BK // 32 * 256 else 128
     asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // SROWS, 0], clamp_bounds=False)
     bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // SROWS, 0], clamp_bounds=False)
@@ -1905,14 +1949,17 @@ def _mxgemm_lookahead_l2_prefetch(a_desc, b_desc, as_desc, bs_desc, off_m, off_n
 
 @triton.jit
 def _mxgemm_split_l2_prefetch(a_ptr, b_ptr, off_m, off_n, pk, K_ITERS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                              stride_am: tl.constexpr, stride_bn: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr):
+                              stride_am: tl.constexpr, stride_bn: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr,
+                              A_PAIRS: tl.constexpr = False, B_PAIRS: tl.constexpr = False):
     # Branch-free lookahead: every CTA prefetches its own slice of the
     # shared A and B tiles every step. A 256-byte L2 line holds two BK128
     # steps of an FP8 row, so the C CTAs sharing an A tile split its rows,
     # and each takes half of its rows per step (by step parity): each line
     # is requested once per pair. B likewise across the R CTAs sharing it.
     # Each lane addresses one line; the per-lane base is loop-invariant and
-    # each step only adds a uniform offset. Speculative, at SE scope.
+    # each step only adds a uniform offset. Speculative, at SE scope. For a
+    # row-pair operand a line is one pair's whole step, so it takes all of its
+    # pair lines (the same count) every step.
     R: tl.constexpr = _mxgemm_grid_rows(CLUSTER_LAYOUT)
     C: tl.constexpr = _mxgemm_grid_cols(CLUSTER_LAYOUT)
     LINES_A: tl.constexpr = BM // (2 * C)
@@ -1927,11 +1974,25 @@ def _mxgemm_split_l2_prefetch(a_ptr, b_ptr, off_m, off_n, pk, K_ITERS: tl.conste
     # Wave w covers lines [w * PER_WARP, (w + 1) * PER_WARP); duplicate lanes
     # of one wave request the same line.
     j = (e // 32) * PER_WARP + (e % 32) % PER_WARP
-    a_row = off_m + (rank // R) * (BM // C) + j
-    b_row = off_n + (rank % R) * (BN // R) + (j - LINES_A)
-    base = tl.where(j < LINES_A, a_ptr + a_row.to(tl.int64) * stride_am, b_ptr + b_row.to(tl.int64) * stride_bn)
+    if A_PAIRS:
+        a_line = a_ptr + ((off_m + (rank // R) * (BM // C)) // 2 + j).to(tl.int64) * (2 * stride_am)
+    else:
+        a_line = a_ptr + (off_m + (rank // R) * (BM // C) + j).to(tl.int64) * stride_am
+    if B_PAIRS:
+        b_line = b_ptr + ((off_n + (rank % R) * (BN // R)) // 2 + (j - LINES_A)).to(tl.int64) * (2 * stride_bn)
+    else:
+        b_line = b_ptr + (off_n + (rank % R) * (BN // R) + (j - LINES_A)).to(tl.int64) * stride_bn
+    base = tl.where(j < LINES_A, a_line, b_line)
     pk = tl.minimum(pk, K_ITERS - 1)
-    step = (pk % 2) * (LINES_A * stride_am) + (pk // 2) * 256
+    half_step = (pk % 2) * (LINES_A * stride_am) + (pk // 2) * 256
+    if A_PAIRS and B_PAIRS:
+        step = pk * 256
+    elif A_PAIRS:
+        step = tl.where(j < LINES_A, pk * 256, half_step)
+    elif B_PAIRS:
+        step = tl.where(j < LINES_A, half_step, pk * 256)
+    else:
+        step = half_step
     # The prefetch reads its address VGPRs after issue. LLVM inserts
     # depctr_vm_vsrc waits before overwriting a VMEM source only for
     # instructions it knows; inline asm is opaque, so wait here. Without it a
@@ -2038,8 +2099,10 @@ def _mxgemm_defer_bottom_k_step(
         if L2_LOOKAHEAD > 0:
             # Branch-free L2 lookahead, scheduled into the C11 WMMAs.
             tl.static_assert(L2_LOOKAHEAD_SPLIT, "refill overlap mode 4 supports only the split L2 lookahead")
-            _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM, BN,
-                                      L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT)
+            _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM,
+                                      BN, L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT,
+                                      _mxgemm_desc_row_pairs(a_desc,
+                                                             BK // DA), _mxgemm_desc_row_pairs(b_desc, BK // DB))
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True, BOTH=W256)
         c11 = _mxgemm_native_dot(a10, sa10, DTYPE_A, b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
         for _ in tl.static_range(6):
@@ -2131,8 +2194,10 @@ def _mxgemm_defer_bottom_k_step(
         if L2_LOOKAHEAD > 0 and L2_LOOKAHEAD_SPLIT:
             # Mid-step, away from the refill: the stage L2_LOOKAHEAD past it.
             # No branches, so let it schedule into the c11 WMMAs.
-            _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM, BN,
-                                      L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT)
+            _mxgemm_split_l2_prefetch(l2_a_ptr, l2_b_ptr, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD, K_ITERS, BM,
+                                      BN, L2_STRIDE_A, L2_STRIDE_B, CLUSTER_LAYOUT,
+                                      _mxgemm_desc_row_pairs(a_desc,
+                                                             BK // DA), _mxgemm_desc_row_pairs(b_desc, BK // DB))
         elif L2_LOOKAHEAD > 0:
             # Mid-step, away from the refill: the stage L2_LOOKAHEAD past it.
             _mxgemm_lookahead_l2_prefetch(a_desc, b_desc, as_desc, bs_desc, off_m, off_n, i + BUFFERS + L2_LOOKAHEAD,
@@ -2659,6 +2724,8 @@ def mxgemm_tdm_persistent_kernel(
     REFILL_OVERLAP: tl.constexpr = 0,
     SCALE_WAVE256: tl.constexpr = False,
     K_ROTATE_STEP: tl.constexpr = 0,
+    A_ROW_PAIRS: tl.constexpr = False,
+    B_ROW_PAIRS: tl.constexpr = False,
     probe_ptr=None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
@@ -2677,6 +2744,17 @@ def mxgemm_tdm_persistent_kernel(
         or (HANDOFF_SCHEDULE == "current" and not (FIRST_USE_PREFETCH or REGISTER_PIPELINE or WAVE_SPECIALIZED_HANDOFF)
             and L2_LOOKAHEAD == 0), "K_ROTATE_STEP requires the default operand schedule without the L2 lookahead")
     K_ROT: tl.constexpr = _mxgemm_k_rotation(K_ROTATE_STEP, K // BLOCK_K, BLOCK_N, CLUSTER_LAYOUT)
+    # A_ROW_PAIRS / B_ROW_PAIRS: the operand is stored as [rows // 2, K // BLOCK_K, 2, BLOCK_K]
+    # (pack_row_pairs), so each row pair's K step is 2 * BLOCK_K contiguous bytes and one TDM piece moves both
+    # rows. The LDS image is unchanged.
+    tl.static_assert(
+        not (A_ROW_PAIRS or B_ROW_PAIRS)
+        or ((not A_ROW_PAIRS or DTYPE_A != "e2m1") and (not B_ROW_PAIRS or DTYPE_B != "e2m1") and BLOCK_K == 128
+            and TDM_FUSION == "partial" and HANDOFF_SCHEDULE == "current"
+            and not (REGISTER_PIPELINE or FIRST_USE_PREFETCH or WAVE_SPECIALIZED_HANDOFF) and
+            (L2_LOOKAHEAD == 0 or L2_LOOKAHEAD_SPLIT)),
+        "A_ROW_PAIRS and B_ROW_PAIRS require an FP8 operand, BLOCK_K=128, partial TDM fusion, the default operand "
+        "schedule, and no L2 lookahead other than the split one")
     tl.static_assert(CLUSTER_LAYOUT == "linear"
                      or (_mxgemm_grid_rows(CLUSTER_LAYOUT) > 1
                          and _mxgemm_grid_rows(CLUSTER_LAYOUT) * _mxgemm_grid_cols(CLUSTER_LAYOUT) == CLUSTER_SIZE))
@@ -2827,19 +2905,39 @@ def mxgemm_tdm_persistent_kernel(
             "LDS_PARTITIONED_AB requires the default operand schedule")
         R: tl.constexpr = 2 * PIECE_ROWS
         tl.static_assert(M % R == 0 and N % R == 0 and BLOCK_M % R == 0 and BLOCK_N % R == 0)
-        a_desc = tl.make_tensor_descriptor(a_ptr, [M // R, R, K // DA],
-                                           [R * stride_am, stride_am, tl.constexpr(1)],
-                                           [BLOCK_M // R, R, BLOCK_K // DA])
-        b_desc = tl.make_tensor_descriptor(b_ptr, [N // R, R, K // DB],
-                                           [R * stride_bn, stride_bn, tl.constexpr(1)],
-                                           [BLOCK_N // R, R, BLOCK_K // DB])
+        if A_ROW_PAIRS:
+            a_desc = tl.make_tensor_descriptor(
+                a_ptr, [M // R, R // 2, 2 * K // DA],
+                [R * stride_am, 2 * stride_am, tl.constexpr(1)], [BLOCK_M // R, R // 2, 2 * BLOCK_K // DA])
+        else:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [M // R, R, K // DA],
+                                               [R * stride_am, stride_am, tl.constexpr(1)],
+                                               [BLOCK_M // R, R, BLOCK_K // DA])
+        if B_ROW_PAIRS:
+            b_desc = tl.make_tensor_descriptor(
+                b_ptr, [N // R, R // 2, 2 * K // DB],
+                [R * stride_bn, 2 * stride_bn, tl.constexpr(1)], [BLOCK_N // R, R // 2, 2 * BLOCK_K // DB])
+        else:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [N // R, R, K // DB],
+                                               [R * stride_bn, stride_bn, tl.constexpr(1)],
+                                               [BLOCK_N // R, R, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M // R, R, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                 layout=_partitioned_operand_shared_layout([BLOCK_M // R, R, BLOCK_K // DA]))
         b_buf = tlx.local_alloc((BLOCK_N // R, R, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
                                 layout=_partitioned_operand_shared_layout([BLOCK_N // R, R, BLOCK_K // DB]))
     else:
-        a_desc = tl.make_tensor_descriptor(a_ptr, [M, K // DA], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K // DA])
-        b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
+        if A_ROW_PAIRS:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [M // 2, 2 * K // DA],
+                                               [2 * stride_am, tl.constexpr(1)], [BLOCK_M // 2, 2 * BLOCK_K // DA])
+        else:
+            a_desc = tl.make_tensor_descriptor(a_ptr, [M, K // DA], [stride_am, tl.constexpr(1)],
+                                               [BLOCK_M, BLOCK_K // DA])
+        if B_ROW_PAIRS:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [N // 2, 2 * K // DB],
+                                               [2 * stride_bn, tl.constexpr(1)], [BLOCK_N // 2, 2 * BLOCK_K // DB])
+        else:
+            b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)],
+                                               [BLOCK_N, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K // DA), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                 layout=_operand_shared_layout([BLOCK_M, BLOCK_K // DA]))
         b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
@@ -4257,6 +4355,8 @@ def mxgemm_tdm_pipelined(
         STATIC_CLUSTER_STEPS: bool = False,
         REFILL_OVERLAP: int = 0,
         K_ROTATE_STEP: int = 0,
+        A_ROW_PAIRS: bool = False,
+        B_ROW_PAIRS: bool = False,
         SCALE_LAYOUT: str = "block128",
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
@@ -4710,6 +4810,16 @@ def mxgemm_tdm_pipelined(
         if not PERSISTENT or K_ROTATE_STEP < 0:
             raise ValueError("K_ROTATE_STEP must be a nonnegative step count for the persistent kernel")
         persistent_options["K_ROTATE_STEP"] = int(K_ROTATE_STEP)
+    if A_ROW_PAIRS:
+        if not (PERSISTENT and BLOCK_K == 128 and DTYPE_A != "e2m1"):
+            raise ValueError("A_ROW_PAIRS requires the persistent kernel with FP8 A and BLOCK_K=128 "
+                             "(pass A through pack_row_pairs)")
+        persistent_options["A_ROW_PAIRS"] = True
+    if B_ROW_PAIRS:
+        if not (PERSISTENT and TRANSPOSE_B and BLOCK_K == 128 and DTYPE_B != "e2m1"):
+            raise ValueError("B_ROW_PAIRS requires the persistent kernel with transposed FP8 B and BLOCK_K=128 "
+                             "(pass B through pack_row_pairs)")
+        persistent_options["B_ROW_PAIRS"] = True
     if CYCLE_PROBE:
         if not PERSISTENT:
             raise ValueError("CYCLE_PROBE requires the persistent kernel")
@@ -4993,8 +5103,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                             "CYCLE_PROBE",
                             False), STATIC_CLUSTER_STEPS=cfg.get("STATIC_CLUSTER_STEPS", False), REFILL_OVERLAP=cfg.get(
                                 "REFILL_OVERLAP",
-                                0), SCALE_LAYOUT=cfg.get("SCALE_LAYOUT",
-                                                         "block128"), K_ROTATE_STEP=cfg.get("K_ROTATE_STEP", 0))
+                                0), SCALE_LAYOUT=cfg.get("SCALE_LAYOUT", "block128"), K_ROTATE_STEP=cfg.get(
+                                    "K_ROTATE_STEP",
+                                    0), A_ROW_PAIRS=cfg.get("A_ROW_PAIRS",
+                                                            False), B_ROW_PAIRS=cfg.get("B_ROW_PAIRS", False))
 
     out_dtype = cfg.get("OUT_DTYPE", "fp32")
     if out_dtype not in _OUT_DTYPES:
@@ -5105,6 +5217,10 @@ if __name__ == "__main__":
         help="merged four-stage loop: 1 interleaves the refill with C10 WMMAs; 3 splits the step "
         "barrier around the C10 WMMAs and overlaps the refill with C11; 4 splits it around C01 and "
         "overlaps the refill and next-slot reads with C10 and C11")
+    parser.add_argument("--a_row_pairs", action="store_true",
+                        help="store FP8 A as row pairs (pack_row_pairs) so each TDM piece is 256 bytes")
+    parser.add_argument("--b_row_pairs", action="store_true",
+                        help="store transposed FP8 B as row pairs (pack_row_pairs) so each TDM piece is 256 bytes")
     parser.add_argument("--row_pad", type=int, default=0,
                         help="widen the A and transposed-B row pitch by this many bytes (multiple of 16)")
     parser.add_argument("--k_rotate_step", type=int, default=0,
@@ -5206,6 +5322,12 @@ if __name__ == "__main__":
         # Same values, row pitch widened by row_pad bytes: a power-of-two pitch
         # (K=32768) makes performance depend on where A and B land in memory.
         a_d, b_d = pad_rows(a_d, args.row_pad), pad_rows(b_d, args.row_pad)
+    if (args.a_row_pairs or args.b_row_pairs) and args.row_pad:
+        parser.error("--a_row_pairs and --b_row_pairs do not support --row_pad")
+    if args.a_row_pairs:
+        a_d = pack_row_pairs(a_d, args.BK)
+    if args.b_row_pairs:
+        b_d = pack_row_pairs(b_d, args.BK)
 
     benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
     if args.profile_workload:
@@ -5281,6 +5403,8 @@ if __name__ == "__main__":
         REFILL_OVERLAP=args.refill_overlap,
         SCALE_LAYOUT=args.scale_layout,
         K_ROTATE_STEP=args.k_rotate_step,
+        A_ROW_PAIRS=args.a_row_pairs,
+        B_ROW_PAIRS=args.b_row_pairs,
         OUT_DTYPE=args.out_dtype,
         BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
         BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,

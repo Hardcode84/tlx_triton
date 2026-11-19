@@ -4269,6 +4269,79 @@ round); 16384³ 1.1567 -> 1.1502 ms (-0.56%, 2 of 3 rounds); 8192²x4096
 0.08974 -> 0.08997 ms (+0.26%, within noise). Splitting the rendezvous (cluster arrive at the step's
 workgroup arrive, wait before the refill) did not help (0.13909 ms).
 
+### Four-step GL2 prefetch from the Gluon v16 tutorial (2026-11-19): slower
+
+`gfx12-gluon-tutorials` v16 (`41760b2`, `GL2_PREFETCH`) issues one
+speculative prefetch per four-step iteration, at its top behind a mask-0
+`sched_barrier`, for the next iteration's four K128 demand tiles (eight steps
+ahead; A 512 bytes per row, row-pair B 1 KiB; no scales). They report 131.8
+-> 128.8 us at 8192³ with GL2 misses unchanged and the cause not established.
+
+Port to the FP16 mode 4 loop (temporary copy; patch and logs in
+`/home/ibutygin/tlx/perf-data/mxfp-gl2-pf4-20261119/`): at the top of each
+four-step static iteration, each lane takes one of the CTA's 64 A and 64 B
+rows (the split-lookahead slices) and issues two `global_prefetch_b8` 256
+bytes apart for steps i+8..i+11, then one `depctr_vm_vsrc(0)`; 898 VGPRs, no
+spills; FFM 12 cluster cases pass. Device (after a reboot, ~2-3% slower than
+the previous boot; three interleaved rounds, all pass the check): 8192²x4096
+0.09482 -> 0.09582 ms (+1.1%), 8192³ 0.14253 -> 0.14842 ms (+4.1%), 16384³
+(replacing the per-step split lookahead) 1.1909 -> 1.2164 ms (+2.1%). Not
+adopted. Their kernel differs in ways that may matter: not persistent,
+row-pair pre-shuffled B (256-byte TDM pieces, -5 to -6% on its own there),
+and a merged step barrier (their hot loop is about 680 cycles per K128 against
+759 here).
+
+### Row-pair A/B pre-shuffle from the Gluon v16 tutorial (2026-11-19): faster with both operands
+
+`A_ROW_PAIRS` / `B_ROW_PAIRS` (kernel CLI `--a_row_pairs` / `--b_row_pairs`,
+bench `--a-row-pairs` / `--b-row-pairs`) take FP8 A or transposed FP8 B
+stored by `pack_row_pairs` as `[rows / 2, K / 128, 2, 128]` inside the
+`[rows, K]` tensor (v16 does this for B). The descriptor becomes
+`[rows / 2, 2K]` (or `[rows / R, R / 2, 2K]` for the partitioned group-major
+view), so each TDM piece moves one row pair's 256 contiguous bytes. The TDM
+destination is `local_reshape` of the unchanged slot to `[.., rows / 2, 256]`
+(the partitioned reshape keeps the partitions), so the LDS image and the
+WMMA reads are unchanged. With the split L2 lookahead, a paired operand's
+lane prefetches its pair line at `pk * 256`: each 256-byte line is one
+pair's whole step, so the operand needs the same number of lines per step
+without the parity split. Supported: persistent BK128 with partial fusion
+and the current handoff schedule (mode 4 FP16, FP32 static, dynamic ring).
+Not combinable with `--row_pad`. FFM: 30 ring-phase cases
+(`test_mxgemm_row_pairs_ring_phase`, A, B and both).
+
+Device (2222, same boot, interleaved rounds, spread under 0.5%; every pair
+ship passes the check). B-only with the row-pad control (3-5 rounds):
+
+| Case | Baseline | Row pad 256 | Row-pair B |
+| --- | --- | --- | --- |
+| 8192²x4096 FP16 | 0.0950 ms | 0.0770 (-19.0%) | 0.0761 (-19.9%) |
+| 8192³ FP16 | 0.1431 | 0.1439 (+0.5%) | 0.1436 (+0.3%) |
+| 8192³ FP32 | 0.1584 | 0.1603 (+1.2%) | 0.1538 (-2.9%) |
+| 16384³ FP16 (default, split lookahead) | 1.190 | 1.76 | 1.197 (+0.5%) |
+| 16384³ FP16, no lookahead | 1.203 | 1.88 | 1.149 (-3.4% vs default) |
+
+A, B and both (2-3 rounds; 16384³ without the lookahead, default 1.190):
+
+| Case | Baseline | B | A | A and B |
+| --- | --- | --- | --- | --- |
+| 8192²x4096 FP16 | 0.0950 ms | 0.0760 | 0.0766 | 0.0729 (-23.3%) |
+| 8192³ FP16 | 0.1423 | 0.1435 | 0.1425 | 0.1362 (-4.3%) |
+| 8192³ FP32 | 0.1578 | 0.1528 | 0.1524 | 0.1469 (-6.9%) |
+| 16384³ FP16 | 1.204 | 1.149 | 1.154 | 1.113 (-6.5% vs default) |
+
+The 8192²x4096 gain is mostly the 4 KiB row pitch: a 256-byte row pad gets
+all but 1.2% of the B-only gain. The other gains are specific to the pairs:
+the pad loses there. A likely reason: an unpaired row uses half of each
+256-byte L2 line per step and the other half on the next step, while a pair
+consumes whole lines. That matters when L2 is under pressure and makes the
+lookahead redundant, so bench turns the default lookahead off with either
+flag. Pairing one operand does nothing at 8192³ FP16 but pairing both gains
+4.3%: a step waits for both operands' TDM loads, so the unpaired one still
+sets the step time. Not a kernel default: like the row pad, it changes the
+caller's A and B layouts. The 32768³ config needs the 256-byte row pad,
+which pairs do not support yet (a pair pitch of 2K + pad).
+Logs: `/home/ibutygin/tlx/perf-data/mxfp-b-row-pairs-20261119/`.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
