@@ -4524,6 +4524,30 @@ row-pair effect: larger TDM pieces); with A pairs against A+B pairs, +1.4% /
 +0.7%. Against the partitioned default it does not win. Our B reads are not
 bank-conflict bound.
 
+### Loop-invariant LDS addresses, as in ASM (2026-11-20): no speedup
+
+ASM keeps 20 per-lane LDS base addresses (operand half x slot, plus scales)
+in VGPRs for the whole K loop and addresses every `ds_load` as base + an
+immediate up to 15,872 bytes, so its loop has no VALU. Ours spends 18 VALU
+adds per four steps (16 of 26 bases recomputed): Triton's LLVM IR hoists
+`@global_smem + C + laneOffset` into the loop preheader, but CodeGenPrepare
+sinks it back next to each access to fold it into the addressing mode, and
+C (slot bases up to 0x4e0b0) does not fit the 16-bit DS offset. The IR's 48
+lane offsets are 5 roots plus constants. CodeGenPrepare switches do not help
+(`disable-cgp` gives 127 adds and spills).
+
+`third_party/amd/lib/TritonAMDGPUToLLVM/AnchorLDSBases.cpp`, opt-in
+(`TRITON_HIP_ANCHOR_LDS_BASES=1`), runs after O3: one `freeze`d base per
+(root, 40 KB window), right after the root, and each access becomes base + a
+small constant. 8192³ FP16: 18 -> 4 adds per four steps (the rest are scale
+`ds_load_2addr` offsets), 931 -> 899 VGPRs, no spills; the same on the other
+configs (16384³ 23 -> 9). FFM ring-phase suite passes with it on (766).
+Device (2222, after a reboot, three interleaved rounds, all checks pass):
+8192²x4096 +2.2%, 8192³ +0.2%, 8192³ FP32 +0.2%, 16384³ -0.4%, paired 8192³
+-0.4%, paired 16384³ -0.3%. The adds were hidden behind the WMMAs, as the
+2026-11-18 profile suggested, so the pass stays off. Logs:
+`/home/ibutygin/tlx/perf-data/mxfp-anchor-lds-20261120/`.
+
 ## Earlier shape-scaling evidence
 
 These are user-reported measurements of the captured default configuration
