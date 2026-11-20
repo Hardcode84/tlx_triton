@@ -502,6 +502,10 @@ class HIPOptions:
     # so kernels near the register limit can turn them off. No effect on other
     # targets.
     va_vdst_anti_hints: bool = True
+    # Keep shared-memory base addresses whose constant offset does not fit the
+    # 16-bit ds_* offset loop-invariant (see the anchor-LDS-bases pass). The
+    # TRITON_HIP_ANCHOR_LDS_BASES knob enables it for every kernel.
+    anchor_lds_bases: bool = False
 
     # Cache-keyed, per-kernel schedule-group-barrier planning. Keep this name
     # distinct from the pre-existing TTGIR dot-decomposition scheduler.
@@ -535,6 +539,8 @@ class HIPOptions:
             raise ValueError("enable_wmma_queuing requires an AMD gfx1250 target")
         if type(self.va_vdst_anti_hints) is not bool:
             raise ValueError("va_vdst_anti_hints must be a bool")
+        if type(self.anchor_lds_bases) is not bool:
+            raise ValueError("anchor_lds_bases must be a bool")
 
         if self.ctas_per_cga is not None:
             dims = tuple(self.ctas_per_cga)
@@ -1176,11 +1182,11 @@ class HIPBackend(BaseBackend):
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-y")
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-z")
 
-        # Opt-in: after O3 hoisted them, keep large-offset LDS base addresses
+        # Opt-in (anchor_lds_bases option or knob): after O3 hoisted them, keep large-offset LDS base addresses
         # out of loops. CodeGenPrepare would otherwise sink each one back next to
         # its accesses as a VALU add, since the offset cannot fold into ds_*
         # (16 bits).
-        if knobs.amd.anchor_lds_bases:
+        if options.anchor_lds_bases or knobs.amd.anchor_lds_bases:
             amd.add_anchor_lds_bases_llvm_pass(kernel_fn)
 
         # Opt-in MFMA scheduler, see the schedule_hint option (validated in parse_options).

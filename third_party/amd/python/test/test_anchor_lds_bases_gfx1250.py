@@ -56,3 +56,10 @@ def test_anchor_lds_bases_freezes_large_offset_bases():
     assert "lds.anchor.fz = freeze" in on
     # Every remaining large-offset GEP is an anchor start; accesses use the frozen anchors.
     assert all(name.startswith("%lds.anchor") for name in large_offset_geps(on))
+
+
+def test_anchor_lds_bases_option():
+    src = ASTSource(fn=kernel, signature={"X": "*fp32", "Y": "*fp32", "n": "i32"},
+                    constexprs={"ROWS": ROWS, "COLS": COLS})
+    llir = triton_compile(src, target=TARGET, options={"num_warps": 4, "anchor_lds_bases": True}).asm["llir"]
+    assert "lds.anchor.fz = freeze" in llir
