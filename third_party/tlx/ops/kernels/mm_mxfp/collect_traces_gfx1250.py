@@ -504,9 +504,9 @@ def profile_workload(launch, spec_path):
 
 def make_cases(args):
     if __package__:
-        from . import bench
+        from . import bench_gfx1250 as bench
     else:
-        import bench
+        import bench_gfx1250 as bench
 
     forwarded = args.benchmark_args
     if forwarded[:1] == ["--"]:

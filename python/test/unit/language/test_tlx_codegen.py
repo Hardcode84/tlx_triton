@@ -11,7 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -5832,6 +5832,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7528,6 +7529,7 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7652,10 +7654,10 @@ def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, rema
 @pytest.mark.parametrize("block_k,num_buffers,prefetch", [(128, 4, -1), (256, 2, -1), (256, 2, 1), (256, 2, 2)])
 def test_gfx1250_mxgemm_operand_pipeline_preserves_native_work(block_k, num_buffers, prefetch):
     if block_k == 256:
-        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline_paired import (
+        from triton.tlx.ops.kernels.mm_mxfp.gfx1250_operand_pipeline_paired import (
             mxgemm_tdm_operand_pipeline_kernel as kernel, )
     else:
-        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_operand_pipeline import (
+        from triton.tlx.ops.kernels.mm_mxfp.gfx1250_operand_pipeline import (
             mxgemm_tdm_operand_pipeline_kernel as kernel, )
 
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*fp8e4nv", c_ptr="*fp32", a_scale="*u8", b_scale="*u8", M="i32", N="i32",
@@ -7766,7 +7768,7 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
                                        c_type="*fp32", **constants):
     kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
     if streamed_operands:
-        from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_streamed import (
+        from triton.tlx.ops.kernels.mm_mxfp.gfx1250_streamed import (
             mxgemm_tdm_streamed_kernel as kernel, )
     signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr=c_type, a_scale="*u8",
                      b_scale="*u8")
@@ -8582,6 +8584,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e4m3",

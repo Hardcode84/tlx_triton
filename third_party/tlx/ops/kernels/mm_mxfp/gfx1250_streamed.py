@@ -28,22 +28,13 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-if __package__:
-    from .amd_mxfp_gemm_tdm_pipelined import (
-        _mxgemm_persistent_load,
-        _mxgemm_remap_program_id,
-        _mxgemm_tile_offsets,
-        _operand_shared_layout,
-        _scale_shared_layout,
-    )
-else:
-    from amd_mxfp_gemm_tdm_pipelined import (
-        _mxgemm_persistent_load,
-        _mxgemm_remap_program_id,
-        _mxgemm_tile_offsets,
-        _operand_shared_layout,
-        _scale_shared_layout,
-    )
+from .gfx1250 import (
+    _mxgemm_persistent_load,
+    _mxgemm_remap_program_id,
+    _mxgemm_tile_offsets,
+    operand_shared_layout,
+    scale_shared_layout,
+)
 
 
 @triton.jit
@@ -261,10 +252,10 @@ def mxgemm_tdm_streamed_kernel(
     bd = tl.make_tensor_descriptor(b_ptr, [N, K], [stride_bn, 1], [256, 128])
     sad = tl.make_tensor_descriptor(a_scale, [M // 128, K * 4], [stride_as, 1], [2, 512])
     sbd = tl.make_tensor_descriptor(b_scale, [N // 128, K * 4], [stride_bs, 1], [2, 512])
-    ab = tlx.local_alloc((256, 128), tlx.dtype_of(a_ptr), NUM_BUFFERS, layout=_operand_shared_layout([256, 128]))
-    bb = tlx.local_alloc((256, 128), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=_operand_shared_layout([256, 128]))
-    sab = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
-    sbb = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=_scale_shared_layout([2, 512]))
+    ab = tlx.local_alloc((256, 128), tlx.dtype_of(a_ptr), NUM_BUFFERS, layout=operand_shared_layout([256, 128]))
+    bb = tlx.local_alloc((256, 128), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=operand_shared_layout([256, 128]))
+    sab = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=scale_shared_layout([2, 512]))
+    sbb = tlx.local_alloc((2, 512), tl.uint8, NUM_BUFFERS, layout=scale_shared_layout([2, 512]))
     C_COLS: tl.constexpr = 64 if NUM_BUFFERS == 4 and not OUTPUT_TAIL_REUSE else 128
     C_DTYPE: tl.constexpr = tlx.dtype_of(c_ptr)
     tl.static_assert(C_DTYPE == tl.float32 or C_DTYPE == tl.float16)

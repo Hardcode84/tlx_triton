@@ -21,10 +21,10 @@ and LLVM with gfx1250 support. The default assembler/linker are under
 `LLVM_SYSPATH`, falling back to `~/llvm/llvm-build`. Override with `--llvm PATH`.
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/gfx1250_research/hipblaslt_repro/bench.py \
   -M 8192 -N 8192 -K 8192
 
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/gfx1250_research/hipblaslt_repro/bench.py \
   -M 8192 -N 8192 -K 4096
 ```
 
@@ -34,7 +34,7 @@ assembly, object, HSACO, and build metadata are cached under
 The builder can also run separately without a GPU:
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/build.py
+python3 third_party/tlx/ops/kernels/mm_mxfp/gfx1250_research/hipblaslt_repro/build.py
 ```
 
 The benchmark validates against a CPU FP32 reference before timing. The default
@@ -85,7 +85,7 @@ lifetime waits.
 `--benchmark-mode none` performs one dispatch and correctness check:
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py \
+python3 third_party/tlx/ops/kernels/mm_mxfp/gfx1250_research/hipblaslt_repro/bench.py \
   -M 2048 -N 2048 -K 2048 --benchmark-mode none --output-dir /tmp/hipblaslt-f32
 ```
 
@@ -95,7 +95,7 @@ checks; both dimensions must remain multiples of four. For example, this checks
 64 output tiles across all four quadrants using full 8192-sized strides:
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/hipblaslt_repro/bench.py \
+python3 third_party/tlx/ops/kernels/mm_mxfp/gfx1250_research/hipblaslt_repro/bench.py \
   -M 8192 -N 8192 -K 8192 --grid-x 4 --grid-y 4 \
   --benchmark-mode none --output-dir /tmp/hipblaslt-f32-bounded
 ```

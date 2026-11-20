@@ -513,7 +513,7 @@ def mxfp_collector(monkeypatch):
     import sys
     from pathlib import Path
 
-    directory = Path(__file__).resolve().parents[4] / "third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250"
+    directory = Path(__file__).resolve().parents[4] / "third_party/tlx/ops/kernels/mm_mxfp"
 
     def load(name, filename):
         spec = importlib.util.spec_from_file_location(name, directory / filename)
@@ -521,8 +521,8 @@ def mxfp_collector(monkeypatch):
         spec.loader.exec_module(module)
         return module
 
-    monkeypatch.setitem(sys.modules, "bench", load("mxfp_bench", "bench.py"))
-    return load("mxfp_collector", "collect_traces.py")
+    monkeypatch.setitem(sys.modules, "bench_gfx1250", load("mxfp_bench", "bench_gfx1250.py"))
+    return load("mxfp_collector", "collect_traces_gfx1250.py")
 
 
 @pytest.fixture

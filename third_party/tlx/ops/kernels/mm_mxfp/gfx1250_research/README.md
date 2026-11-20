@@ -1,23 +1,28 @@
-# gfx1250 MXFP GEMM
+# gfx1250 MXFP GEMM research notes
 
-This directory contains the FP8/FP4 TDM-pipelined GEMM tutorial and a persistent
-MXFP8 x MXFP8 / MXFP8 x MXFP4 benchmark sweep.
+The gfx1250 MXFP kernels live one directory up, in `tlx.ops.kernels.mm_mxfp`:
+
+- `gfx1250.py`: the persistent kernel that backs `tlx.ops.mm_mxfp`, including
+  the opt-in research schedules, the TDM-pipelined kernel, the config-based
+  `matmul` API, and the `mxgemm_tdm_pipelined` API.
+- `bench_gfx1250.py`: multi-shape benchmark runner with separate processes and
+  CSV output; `bench_gfx1250.py --single` runs one shape with every launcher option.
+- `collect_traces_gfx1250.py`: real-device instruction traces, eager timings, and
+  timestamped power, clocks, temperatures, and power limits.
+- `gfx1250_operand_pipeline.py`: experimental four-wave A8W8 kernel
+  with operand prefetch across K steps and FP32 output.
+- `gfx1250_operand_pipeline_paired.py`: two K256 input stages feeding
+  native K128 computation, with partitioned input storage and cache prefetch.
+- `gfx1250_streamed.py`, `gfx1250_warp_pipeline.py`: alternative operand
+  schedules selected by `mxgemm_tdm_pipelined`.
+- `gfx1250_batched.py`: batched MXFP GEMM.
 
 See [WRITEUP.md](WRITEUP.md) for an overview of the kernel design,
 configuration, performance, and bottlenecks, and [HANDOFF.md](HANDOFF.md)
 for the performance investigation checkpoint, measured results, toolchain
 caveats, and next validation steps.
 
-- `amd_mxfp_gemm_tdm_pipelined.py`: kernels, config-based `matmul` API,
-  `mxgemm_tdm_pipelined` API, and single-shape benchmark CLI.
-- `bench.py`: multi-shape benchmark runner with separate processes and CSV output.
-- `collect_traces.py`: real-device instruction traces, eager timings, and
-  timestamped power, clocks, temperatures, and power limits.
-- `amd_mxfp_gemm_operand_pipeline.py`: experimental four-wave A8W8 kernel
-  with operand prefetch across K steps and FP32 output.
-- `amd_mxfp_gemm_operand_pipeline_paired.py`: two K256 input stages feeding
-  native K128 computation, with partitioned input storage and cache prefetch.
-- [`../../tools/perf_model/`](../../tools/perf_model/README.md): generic resource,
+- [`../../../../tools/perf_model/`](../../../../tools/perf_model/README.md): generic resource,
   dependency, and buffer-overlap model with an MXFP work-graph generator.
 - [`hipblaslt_repro/`](hipblaslt_repro/README.md): public hipBLASLt gfx1250 A8W8
   assembly reproduction with FP32 output and a standalone HIP benchmark.
@@ -168,10 +173,10 @@ defaults to two 64x128 slots. On hardware against FP32 output, MX8xMX8: 8192^3 -
 Run from the repository root in an environment configured for gfx1250:
 
 ```bash
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx4
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py -M 8192 -N 8192 -K 4096
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --csv mxfp.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --variant mx8xmx4
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py -M 8192 -N 8192 -K 4096
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --dry-run
 ```
 
 Two independent A8W4 options test startup and persistent tile handoff:
@@ -188,7 +193,7 @@ Two independent A8W4 options test startup and persistent tile handoff:
 Compare the baseline, each option separately, and their combination:
 
 ```bash
-mxfp_bench=third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py
+mxfp_bench=third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py
 gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --csv a8w4-baseline.csv
 gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --compact-k-tail --csv a8w4-compact.csv
 gpu-lock python3 "$mxfp_bench" --variant mx8xmx4 --cross-tile-prefetch --csv a8w4-handoff.csv
@@ -250,7 +255,7 @@ To collect hardware evidence for the persistent and streamed A8W8 schedules,
 run the collector on an idle gfx1250 device in the same Python environment:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --output /tmp/mxfp-hardware-01.tar.gz
 ```
 
@@ -336,7 +341,7 @@ and that can be absent from the core wheel.
 To check this setup without running the benchmarks:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --preflight-only --output /tmp/mxfp-profiler-check
 ```
 
@@ -351,12 +356,12 @@ Preview the cases without accessing a GPU, select one shape, or collect
 timing and power when a decoder is unavailable:
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py --dry-run
+python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py --dry-run
 
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --output /tmp/mxfp-k4096 -- --case 8192,8192,4096
 
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --no-att --output /tmp/mxfp-power --duration-seconds 10
 ```
 
@@ -371,7 +376,7 @@ If power validation fails, inspect the saved capture without rerunning the
 workload or accessing the device:
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --inspect /tmp/mxfp-hardware-01
 ```
 
@@ -383,7 +388,7 @@ Collection also saves `telemetry_diagnostics.json` and
 Use `--first-use-prefetch` to test the model-derived operand schedule:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --first-use-prefetch --csv mxfp-first-use.csv
 ```
 
@@ -412,7 +417,7 @@ Use `--output-tail-reuse` to test output staging in the retired third A/B
 input stage:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --output-tail-reuse --csv mxfp-output-reuse.csv
 ```
 
@@ -430,7 +435,7 @@ remain available without this flag.
 Use `--operand-pipeline` to test the four-wave operand pipeline:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --operand-pipeline --csv mxfp-operands.csv
 ```
 
@@ -449,7 +454,7 @@ the selected persistent configurations. To compare with the existing four-wave
 kernel at the same tile and input-ring depth:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --variant mx8xmx8 --no-persistent --cluster-size 1 --num-buffers 4 \
   --no-output-staging --csv mxfp-baseline.csv
 ```
@@ -461,11 +466,11 @@ and staged output. The summary and CSV identify the kernel as `operand_pipeline`
 Add `-BK 256` to transfer two native K128 steps in each batch:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --operand-pipeline -BK 256 --csv mxfp-paired.csv
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --operand-pipeline -BK 256 --l2-prefetch-distance -1 --csv mxfp-paired-no-prefetch.csv
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --operand-pipeline -BK 256 --l2-prefetch-distance 2 --csv mxfp-paired-prefetch-2.csv
 ```
 
@@ -488,7 +493,7 @@ The original operand path uses `BLOCK_K=128`, `NUM_BUFFERS=4`, and
 Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --variant mx8xmx8 --register-pipeline --sched-mode-2 --csv mxfp-register.csv
 ```
 
@@ -515,11 +520,11 @@ selects the default behavior. The summary and CSV record `sched_mode_2`.
 For example, compare the same sweep with the setting off and on:
 
 ```bash
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --no-sched-mode-2 --csv sched-off.csv
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --sched-mode-2 --csv sched-on.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --no-sched-mode-2 --csv sched-off.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --sched-mode-2 --csv sched-on.csv
 ```
 
-The standalone tutorial accepts `--persistent --sched_mode_2`; the Python
+`bench_gfx1250.py --single` accepts `--persistent --sched_mode_2`; the Python
 API and `matmul` configuration use `SCHED_MODE_2=True`.
 
 Persistent program ordering is selectable with `--xcd-remap none|balanced|chunked`,
@@ -557,19 +562,19 @@ Cluster barriers are optional for AMD multicast. Only workgroups that have
 issued matching requests receive a combined load; late requests receive a
 separate load after timeout. `--cluster-barrier-interval N` aligns requests
 every N input K blocks, restarting at K=0 of each output tile. The benchmark
-default is 4; the standalone tutorial and Python API default to 1.
+default is 4; `--single` and the Python API default to 1.
 Set it to 0 to remove **all** cluster barriers, including the exit
 barrier. Local workgroup synchronization and TDM completion waits still
 protect each workgroup's LDS. Positive intervals retain an exit barrier.
 
 ```bash
 # Multicast with no cluster synchronization.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
   --cluster-barrier-interval 0
 
 # Selected benchmark defaults: align requests every four input K blocks.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 \
   --cluster-barrier-interval 4
 ```
@@ -580,22 +585,22 @@ the same synchronization cadence.
 
 ```bash
 # Remapping alone, with the current per-variant tile defaults.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --cluster-size 1 --xcd-remap balanced
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --cluster-size 1 --xcd-remap balanced
 
 # Multicast with the original tile ordering.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256
 
 # Same ordering and cluster synchronization, without shared loads.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap none --cluster-size 4 --group-m 8 --num-programs 256 --no-cluster-multicast
 
 # Four-workgroup sharing of A/B and scales.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256
 
 # Same workgroup mapping and barriers, with multicast disabled.
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py \
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
   --xcd-remap chunked --cluster-size 4 --group-m 4 --num-programs 256 --no-cluster-multicast
 ```
 

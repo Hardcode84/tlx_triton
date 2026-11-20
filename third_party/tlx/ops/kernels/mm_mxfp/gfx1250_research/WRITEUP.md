@@ -159,9 +159,9 @@ process's first batch is inflated by slow first launches, so single-batch
 numbers are not comparable.
 
 ```bash
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --csv mxfp.csv
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --variant mx8xmx8 -M 8192 -N 8192 -K 8192
-python third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --csv mxfp.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --variant mx8xmx8 -M 8192 -N 8192 -K 8192
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --dry-run
 ```
 
 Build with the pinned AMDGPU code generator (`cmake/amd-llvm-info.json`,
