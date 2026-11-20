@@ -48,14 +48,22 @@ def test_mm_mxfp_gfx1250_catalog_entry():
 @pytest.mark.parametrize(
     "m,n,k,expected",
     [
-        # Benchmarked defaults: static merged loop up to K=16384, dynamic beyond.
-        (8192, 8192, 8192, dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True)),
-        (8192, 8192, 16384, dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True)),
-        (16384, 16384, 32768, dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=False, OVERLAP_PEEL=False)),
+        # Benchmarked defaults: static merged loop with refill overlap mode 4 up
+        # to K=16384 (with the split L2 lookahead at K=16384), dynamic beyond.
+        (8192, 8192, 8192,
+         dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True, REFILL_OVERLAP=4,
+              L2_LOOKAHEAD=0)),
+        (8192, 8192, 16384,
+         dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True, REFILL_OVERLAP=4,
+              L2_LOOKAHEAD=4)),
+        (16384, 16384, 32768,
+         dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=False, OVERLAP_PEEL=False, REFILL_OVERLAP=0)),
         # Clusters need whole 2048-row M groups and 1024-column N groups.
-        (512, 512, 768, dict(NUM_BUFFERS=4, CLUSTER_SIZE=1, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True)),
+        (512, 512, 768, dict(NUM_BUFFERS=4, CLUSTER_SIZE=1, STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True,
+                             REFILL_OVERLAP=4)),
         # Four or fewer K tiles cannot overlap the next tile's first step.
-        (8192, 8192, 512, dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=False, OVERLAP_PEEL=False)),
+        (8192, 8192, 512,
+         dict(NUM_BUFFERS=4, CLUSTER_SIZE=16, STATIC_SLOT_UNROLL=False, OVERLAP_PEEL=False, REFILL_OVERLAP=0)),
         (512, 512, 384, dict(NUM_BUFFERS=3, CLUSTER_SIZE=1, STATIC_SLOT_UNROLL=False)),
         (256, 256, 256, dict(NUM_BUFFERS=2, CLUSTER_SIZE=1, NUM_PROGRAMS=1)),
     ],

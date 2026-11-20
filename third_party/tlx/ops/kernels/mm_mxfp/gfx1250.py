@@ -17,9 +17,11 @@ slots and written with TDM stores. When the tile grid allows it, 4x4 clusters
 of 16 workgroups share A and B through TDM multicast.
 
 Up to K = 16384 the four-stage ring runs a statically unrolled loop with one
-split workgroup barrier per K step, and each next tile's first K step
-overlaps the current tile's C stores. Larger K uses the dynamic four-stage
-loop. Two or three K tiles use a matching shorter ring.
+split workgroup barrier per K step (refill overlap mode 4: each step reads the
+slot's second halves during its first quadrant and refills across the last
+two; K = 16384 also prefetches four steps ahead into L2), and each next tile's
+first K step overlaps the current tile's C stores. Larger K uses the dynamic
+four-stage loop. Two or three K tiles use a matching shorter ring.
 
 Scales use the cuBLAS 128x4 blocked byte order (``block128``): blocked inputs
 are consumed in place and natural ``[rows, K // 32]`` scales are packed on
@@ -5548,7 +5550,7 @@ def _schedule(m, n, k, num_cus):
     programs = min(num_cus, tiles)
     cfg = dict(NUM_BUFFERS=min(4, k_tiles), NUM_PROGRAMS=programs, CLUSTER_SIZE=1, CLUSTER_LAYOUT="linear",
                CLUSTER_BARRIER_INTERVAL=1, STATIC_SLOT_UNROLL=False, OVERLAP_PEEL=False, MERGED_HANDOFF_BARRIER=False,
-               STATIC_CLUSTER_STEPS=False, OUTPUT_C_SLOTS=None)
+               STATIC_CLUSTER_STEPS=False, OUTPUT_C_SLOTS=None, REFILL_OVERLAP=0, L2_LOOKAHEAD=0)
     # Every cluster member must run the same number of tiles; 4x4 clusters
     # also need whole M groups and N tile columns.
     if (m % (_GROUP_SIZE_M * _BLOCK_M) == 0 and n % (4 * _BLOCK_N) == 0 and programs % _CLUSTER_SIZE == 0
@@ -5556,8 +5558,12 @@ def _schedule(m, n, k, num_cus):
         cfg.update(CLUSTER_SIZE=_CLUSTER_SIZE, CLUSTER_LAYOUT=_CLUSTER_LAYOUT,
                    CLUSTER_BARRIER_INTERVAL=_CLUSTER_BARRIER_INTERVAL)
     if k_tiles > 4 and k <= _STATIC_MAX_K:
+        # Refill overlap mode 4 reads the slot's second halves during C00 and
+        # refills across C10/C11; from K=16384 4x4 clusters also prefetch the
+        # K step four ahead into L2, split across the cluster.
         cfg.update(STATIC_SLOT_UNROLL=True, OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True, OUTPUT_C_SLOTS=2,
-                   STATIC_CLUSTER_STEPS=cfg["CLUSTER_SIZE"] > 1)
+                   STATIC_CLUSTER_STEPS=cfg["CLUSTER_SIZE"] > 1, REFILL_OVERLAP=4,
+                   L2_LOOKAHEAD=4 if k >= 16384 and cfg["CLUSTER_LAYOUT"] == "4x4" else 0)
     return cfg
 
 
@@ -5595,5 +5601,7 @@ def mm_mxfp(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="heu
             CLUSTER_LAYOUT=cfg["CLUSTER_LAYOUT"], STATIC_SLOT_UNROLL=cfg["STATIC_SLOT_UNROLL"],
             OUTPUT_C_SLOTS=cfg["OUTPUT_C_SLOTS"], OVERLAP_PEEL=cfg["OVERLAP_PEEL"],
             MERGED_HANDOFF_BARRIER=cfg["MERGED_HANDOFF_BARRIER"], STATIC_CLUSTER_STEPS=cfg["STATIC_CLUSTER_STEPS"],
-            num_warps=4, waves_per_eu=1, ctas_per_cga=(cfg["CLUSTER_SIZE"], 1, 1))
+            REFILL_OVERLAP=cfg["REFILL_OVERLAP"], L2_LOOKAHEAD=cfg["L2_LOOKAHEAD"],
+            L2_LOOKAHEAD_SPLIT=cfg["L2_LOOKAHEAD"] > 0, num_warps=4, waves_per_eu=1, ctas_per_cga=(cfg["CLUSTER_SIZE"],
+                                                                                                   1, 1))
     return out
