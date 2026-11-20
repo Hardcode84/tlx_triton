@@ -4547,6 +4547,74 @@ Device (2222, after a reboot, three interleaved rounds, all checks pass):
 -0.4%, paired 16384³ -0.3%. The adds were hidden behind the WMMAs, as the
 2026-11-18 profile suggested, so the pass stays off. Logs:
 `/home/ibutygin/tlx/perf-data/mxfp-anchor-lds-20261120/`.
+Paired mode 4 now turns it on with front-loaded C00 reads and a narrow window
+for scale reads; see "LDS read bursts and register waits" below.
+
+### Where the rest of the ASM gap is (2026-11-20)
+
+ATT on 2222 (8192³ FP16, 70th of 80 flushed launches, SE0 CU0; one trace per
+SIMD, `--simd-select 0x1/0x2/0x4/0x8`; archive
+`/home/ibutygin/tlx/perf-data/mxfp-asm-waves-20261120/`).
+
+- Wave skew is not what sank the ASM read schedule. Across the four waves
+  the workgroup barrier wait rises from 5-8 to 22-40 cycles per step (the
+  earlier 128 came from one wave). The bigger costs are WMMA issue (389 ->
+  428) and the TDM wait of two waves (11-16 -> 47-49): the refill starts
+  later in the step.
+- Our WMMA time above ASM's (389 against 352 per step) is waits inside the
+  WMMA stream, not issue: plain WMMAs take 5.8 cycles each (346 per step);
+  the 2.25 per step followed by `s_wait_alu depctr_va_vdst` take 11.2 (25 per
+  step) and the 1.75 followed by a mid-stream `s_wait_dscnt` take 10.1 (18).
+  ASM's loop has no `s_wait_alu` at all; ours has 21 per four steps (16 with
+  the anchor-LDS-bases pass), register hazards between WMMAs and nearby
+  LDS loads that come from LLVM's register allocation.
+- Cluster rendezvous with A and B row pairs: interval 8 costs 29-30 cycles
+  per step at the loop head (728-756 cycles per step); interval 32 leaves
+  7-8 and also cuts LDS waits from 85 to 60 (682-683 per step); once per tile
+  (64) gives 688-690. Outside the loop: 7.3k, 2.6k and 4.8k cycles per wave.
+  ASM's rendezvous is once per tile, about 650 cycles per wave.
+- Paired interval 32 against ASM per K step: 683 vs 555. LDS issue + waits
+  210 vs 134, WMMA (with in-stream waits) 389 vs 352, SALU + VALU 55 vs 18,
+  barriers about 15 vs 42. Outside the loop ours spends about 33k cycles per
+  wave besides the 2,048 peeled-step WMMAs (TDM waits 10.8k, LDS 10.5k);
+  ASM 21k.
+
+### LDS read bursts and register waits (2026-11-20)
+
+Mode 4 with A and B row pairs now issues C00's 34 reads (B01 and A10) in
+the first three WMMAs (12, 12, 10) instead of four per WMMA over nine, and
+compiles with the `anchor_lds_bases` option. The anchor pass now uses a
+1 KiB window for accesses of 4 bytes or less, which LLVM turns into
+`ds_load_2addr_b32` with 8-bit dword offsets; with the old 40000-byte window
+those scale reads still added their address with VALU. Loop VALU drops from
+18 to 0 per four steps (ASM: 0); `s_wait_alu` stays at 20 (WAR 19).
+
+2222, flushed median, same session; paired cases at cluster interval 32
+(16 at 4096):
+
+| case | 12x3 | anchor only | anchor + 12x3 |
+| --- | --- | --- | --- |
+| FP16 4096 | -0.3% | | -1.6% |
+| FP16 8192³ | -1.0% to -1.3% | -1.3% | -2.6% |
+| FP16 16384³ | -1.2% to -1.4% | -1.6% | -2.4% to -2.6% |
+| FP32 4096 | -0.9% | | -0.8% |
+| FP32 8192³ | -1.0% | | -2.2% |
+| FP32 16384³ | -1.0% | | -2.3% |
+
+Unpaired mode 4 does not gain (FP16 4096 +1.8%, 16384³ +2.8%, 8192³ and
+FP32 flat), so it keeps the nine-group pattern and no anchors. Other C00
+patterns with anchors: 8x5 ties 12x3, 9x4 is 0.1-0.2% behind, 17x2 ties at
+16384³ but is 0.3% behind at 8192³, 6x6 gains only 1.1-1.5%. Spreading the
+reads further (3x12, 2x15) is 1-4.5% slower; C10/C11 patterns (2x9, 4x5)
+make no difference.
+
+Register waits are worth about 1% at most: with anchors and
+`amdgpu-va-vdst-war-hazard=false` (unsafe, measurement only) 8192³ is 0.8%
+and 16384³ 1.1% faster. LLVM's anti-hint knobs do not remove the WAR waits
+(lookback 64 no effect, 256 spills).
+
+Logs, runners and the pacing experiment kernel (`v_lds.py`, env
+`LDS_C00=NxG`): `/home/ibutygin/tlx/perf-data/mxfp-lds-bursts-20261120/`.
 
 ## Earlier shape-scaling evidence
 

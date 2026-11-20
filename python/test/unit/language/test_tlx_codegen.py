@@ -7797,7 +7797,9 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
         src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
             num_warps=num_warps, waves_per_eu=num_warps // 4, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1),
             enable_wmma_queuing=enable_wmma_queuing,
-            **_gfx1250_mxfp.persistent_compile_options(config.get("REGISTER_PIPELINE", False), streamed_operands)))
+            **_gfx1250_mxfp.persistent_compile_options(
+                config.get("REGISTER_PIPELINE", False), streamed_operands, config.get("REFILL_OVERLAP", 0),
+                config.get("A_ROW_PAIRS", False) and config.get("B_ROW_PAIRS", False))))
     compiled.asm["amdgcn"] = _strip_tdm_hazard_waits(compiled.asm["amdgcn"])
     return compiled
 
