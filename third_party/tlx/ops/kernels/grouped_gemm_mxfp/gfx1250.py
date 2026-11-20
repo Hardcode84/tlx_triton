@@ -201,8 +201,8 @@ def _stream_position(desc, offsets, pred, CLAMP: tl.constexpr = False):
 
 
 @triton.jit
-def _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N: tl.constexpr, MAX_M_TILES: tl.constexpr,
-                 BLOCK_M: tl.constexpr, UNIFORM_ROWS: tl.constexpr):
+def _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N: tl.constexpr, BLOCK_M: tl.constexpr,
+                 UNIFORM_ROWS: tl.constexpr):
     # (group, first row, valid rows, N tile) of an output tile. Tiles are
     # ordered M-tile-major, so the programs that run one M tile's N tiles at
     # the same time share its A rows through L2.
@@ -214,10 +214,10 @@ def _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N: tl.constexpr, M
         rows = BLOCK_M + 0 * m_tile
     else:
         # Steps past a program's last tile are predicated off but still
-        # position their descriptors: read the table in bounds and use tile
-        # (0, 0) past the map's m_tiles entries, which hold no tile.
+        # position their descriptors: read entry 0 and use tile (0, 0) past
+        # the map's m_tiles entries, which hold no tile.
         valid = m_tile < m_tiles
-        entry = tl.minimum(m_tile, MAX_M_TILES - 1)
+        entry = tl.where(valid, m_tile, 0)
         meta0 = tl.where(valid, tl.load(tile_meta0 + entry), 0)
         meta1 = tl.where(valid, tl.load(tile_meta1 + entry), 0)
         local = (meta1 >> 32).to(tl.int32)
@@ -231,16 +231,14 @@ def _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N: tl.constexpr, M
 def _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step, total, pid, tile_meta0,
                   tile_meta1, m_tiles, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                   BLOCK_K: tl.constexpr, DB: tl.constexpr, K_ITERS: tl.constexpr, TILES_N: tl.constexpr,
-                  MAX_M_TILES: tl.constexpr, UNIFORM_ROWS: tl.constexpr, NUM_BUFFERS: tl.constexpr,
-                  NUM_PROGRAMS: tl.constexpr):
+                  UNIFORM_ROWS: tl.constexpr, NUM_BUFFERS: tl.constexpr, NUM_PROGRAMS: tl.constexpr):
     # Load K step `step` of this program's flattened (tile, K step) sequence.
     # Past the end the loads are predicated off; they still count towards
     # TENSORcnt, so the ring's waits stay uniform.
     pred = step < total
     tile = pid + (step // K_ITERS) * NUM_PROGRAMS
     k = step % K_ITERS
-    group, row, _, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, MAX_M_TILES, BLOCK_M,
-                                         UNIFORM_ROWS)
+    group, row, _, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, BLOCK_M, UNIFORM_ROWS)
     row_b = group * N + n_tile * BLOCK_N
     slot = step % NUM_BUFFERS
     BKS: tl.constexpr = BLOCK_K // 32
@@ -250,14 +248,14 @@ def _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf
         (_stream_position(b_desc, [row_b, k * (BLOCK_K // DB)], pred), tlx.local_view(b_buf, slot), 3),
         (_stream_position(bs_desc, [row_b // 128, k * BKS * 128], pred), tlx.local_view(bs_buf, slot), 12),
     ], cache_modifier=".cv")
-    # The last group's last A tile can extend past row GM.
+    # The last group's last A tile can extend past A's last row.
     tlx.async_amd_descriptor_load_fused([
         (_stream_position(a_desc, [row, k * BLOCK_K], pred, True), tlx.local_view(a_buf, slot), 3),
         (_stream_position(as_desc, [row, k * BKS], pred, True), tlx.local_view(as_buf, slot), 12),
     ])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["gm"])
 def mxgemm_grouped_stream_kernel(
     a_ptr,
     b_ptr,
@@ -267,7 +265,7 @@ def mxgemm_grouped_stream_kernel(
     tile_meta0,
     tile_meta1,
     tile_count,
-    GM: tl.constexpr,
+    gm,
     N: tl.constexpr,
     K: tl.constexpr,
     GROUPS: tl.constexpr,
@@ -277,15 +275,14 @@ def mxgemm_grouped_stream_kernel(
     BLOCK_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
-    MAX_M_TILES: tl.constexpr,
     UNIFORM_ROWS: tl.constexpr,
 ):
     """Grouped A8W8 / A8W4 GEMM that streams the weights: out[rows of g] = x[rows of g] @ w[g].T.
 
-    A [GM, K] e4m3, B [GROUPS * N, K] e4m3 or [GROUPS * N, K // 2] packed e2m1,
-    A scales [GM, K // 32], B scales block128-ordered
+    A [gm, K] e4m3, B [GROUPS * N, K] e4m3 or [GROUPS * N, K // 2] packed e2m1,
+    A scales [gm, K // 32], B scales block128-ordered
     (preshuffle_grouped_weight_scale) [GROUPS * N // 128, K // 32 * 128];
-    C [GM, N]. Each weight byte feeds one output tile, so the kernel is bound by
+    C [gm, N]. Each weight byte feeds one output tile, so the kernel is bound by
     reading B: persistent programs run their flattened (tile, K step) sequence
     through a NUM_BUFFERS-deep TDM ring and the next tile's first stages load
     while the current one finishes. With UNIFORM_ROWS every group has that many
@@ -313,18 +310,20 @@ def mxgemm_grouped_stream_kernel(
 
     pid = tl.program_id(0)
     if UNIFORM_ROWS > 0:
-        m_tiles = MAX_M_TILES + 0 * pid
+        m_tiles = gm // BLOCK_M
     else:
         m_tiles = tl.load(tile_count).to(tl.int32)
     num_tiles = m_tiles * TILES_N
     my_tiles = tl.where(pid < num_tiles, (num_tiles - 1 - pid) // NUM_PROGRAMS + 1, 0)
     total = my_tiles * K_ITERS
+    if my_tiles == 0:
+        return
 
-    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[GM, K], strides=[K, tl.constexpr(1)],
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[gm, K], strides=[K, tl.constexpr(1)],
                                        block_shape=[BLOCK_M, BLOCK_K])
     b_desc = tl.make_tensor_descriptor(b_ptr, shape=[GROUPS * N, K // DB], strides=[K // DB, tl.constexpr(1)],
                                        block_shape=[BLOCK_N, BLOCK_K // DB])
-    as_desc = tl.make_tensor_descriptor(a_scale, shape=[GM, K // 32], strides=[K // 32, tl.constexpr(1)],
+    as_desc = tl.make_tensor_descriptor(a_scale, shape=[gm, K // 32], strides=[K // 32, tl.constexpr(1)],
                                         block_shape=[BLOCK_M, BKS_LOAD])
     BS_SHAPE: tl.constexpr = [BLOCK_N // 128, BKS * 128]
     bs_desc = tl.make_tensor_descriptor(b_scale, shape=[GROUPS * N // 128, K // 32 * 128],
@@ -341,21 +340,20 @@ def mxgemm_grouped_stream_kernel(
 
     for j in tl.static_range(NUM_BUFFERS - 1):
         _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, j, total, pid, tile_meta0,
-                      tile_meta1, m_tiles, N, BLOCK_M, BLOCK_N, BLOCK_K, DB, K_ITERS, TILES_N, MAX_M_TILES,
-                      UNIFORM_ROWS, NUM_BUFFERS, NUM_PROGRAMS)
+                      tile_meta1, m_tiles, N, BLOCK_M, BLOCK_N, BLOCK_K, DB, K_ITERS, TILES_N, UNIFORM_ROWS,
+                      NUM_BUFFERS, NUM_PROGRAMS)
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     for t in range(my_tiles):
         tile = pid + t * NUM_PROGRAMS
-        _, row, rows, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, MAX_M_TILES, BLOCK_M,
-                                            UNIFORM_ROWS)
+        _, row, rows, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, BLOCK_M, UNIFORM_ROWS)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in range(K_ITERS):
             step = t * K_ITERS + k
             _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step + NUM_BUFFERS - 1, total,
                           pid, tile_meta0, tile_meta1, m_tiles, N, BLOCK_M, BLOCK_N, BLOCK_K, DB, K_ITERS, TILES_N,
-                          MAX_M_TILES, UNIFORM_ROWS, NUM_BUFFERS, NUM_PROGRAMS)
+                          UNIFORM_ROWS, NUM_BUFFERS, NUM_PROGRAMS)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             slot = step % NUM_BUFFERS
             a = tlx.local_load(tlx.local_view(a_buf, slot))
@@ -520,19 +518,17 @@ def _grouped_stream(x, x_scale, w, w_scale, split_sizes, out, tile_map, w_dtype,
     groups, n = w.shape[0], w.shape[1]
     block_n, block_k, buffers = config
     if uniform_rows:
-        max_m_tiles = gm // block_m
         tile_meta0 = tile_meta1 = tile_count = split_sizes
     else:
         if tile_map is None:
             tile_map = _tile_map(split_sizes, gm, block_m)
         tile_meta0, tile_meta1, tile_count = tile_map[:3]
-        max_m_tiles = tile_meta0.numel()
+    # One program per CU whatever the row count, so a new token count does
+    # not recompile; programs without a tile return at once.
     programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
-    programs = min(programs, max_m_tiles * (n // block_n))
-    mxgemm_grouped_stream_kernel[(programs, )](x, w, out, x_scale, w_scale, tile_meta0, tile_meta1, tile_count, GM=gm,
-                                               N=n, K=k, GROUPS=groups, DTYPE_B=w_dtype, BLOCK_M=block_m,
-                                               BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=buffers,
-                                               NUM_PROGRAMS=programs, MAX_M_TILES=max_m_tiles,
+    mxgemm_grouped_stream_kernel[(programs, )](x, w, out, x_scale, w_scale, tile_meta0, tile_meta1, tile_count, gm, N=n,
+                                               K=k, GROUPS=groups, DTYPE_B=w_dtype, BLOCK_M=block_m, BLOCK_N=block_n,
+                                               BLOCK_K=block_k, NUM_BUFFERS=buffers, NUM_PROGRAMS=programs,
                                                UNIFORM_ROWS=uniform_rows, num_warps=4, waves_per_eu=1)
     return out
 
@@ -594,8 +590,8 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
                                                                           BLOCK_M=_PERSISTENT_BLOCK_M, COLS=64)
     k_tiles = k // _PERSISTENT_BLOCK_K
     static = 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
+    # One program per CU whatever the row count (see _grouped_stream).
     programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
-    programs = min(programs, entries * (n // _PERSISTENT_BLOCK_N))
     with torch.cuda.device(x.device):
         mxgemm_tdm_persistent_kernel[(programs, )](
             x, w.view(groups * n, k), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k, x.stride(0), k,
