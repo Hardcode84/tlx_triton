@@ -739,6 +739,11 @@ class amd_knobs(base_knobs):
     use_expert_scheduling: env_opt_bool = env_opt_bool("TRITON_HIP_USE_EXPERT_SCHEDULING")
     enable_ttgir_schedule: env_bool = env_bool("TRITON_AMD_TTGIR_SCHEDULE")
 
+    # Keep shared-memory base addresses whose constant exceeds the 16-bit DS
+    # offset loop-invariant (removes the in-loop VALU adds; no speedup measured
+    # on the gfx1250 MXFP GEMM, so off by default).
+    anchor_lds_bases: env_bool = env_bool("TRITON_HIP_ANCHOR_LDS_BASES")
+
     # Path to dump MIR files for debugging/analysis
     dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")
     # Path to externally-provided MIR files to use instead of generated ones

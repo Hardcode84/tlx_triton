@@ -635,6 +635,10 @@ void init_triton_amd(py::module_ &m) {
           return mlir::triton::AMD::runMFMASchedulePass(*fn, arch);
         });
 
+  m.def("add_anchor_lds_bases_llvm_pass", [](llvm::Function *fn) -> bool {
+    return mlir::triton::AMD::runAnchorLDSBasesPass(*fn);
+  });
+
   auto hipBlas = m.def_submodule("hipblas");
   py::class_<HipblasLtInstance>(hipBlas, "HipblasLt")
       .def(py::new_([](py::object workspace) {
