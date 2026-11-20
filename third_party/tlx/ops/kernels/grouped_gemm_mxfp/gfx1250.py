@@ -1,4 +1,4 @@
-"""gfx1250 grouped MX GEMM (A8W4 and W4A4) backend for ``tlx.ops``."""
+"""gfx1250 grouped MX GEMM (A8W8, A8W4 and W4A4) backend for ``tlx.ops``."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tlx.ops.kernels.mm_mxfp.gfx1250 import (
     PIPELINED_COMPILE_OPTIONS,
+    XCD_REMAP_MODES,
     mxgemm_load_a_operand,
     mxgemm_load_b_operand,
     mxgemm_position_load_descriptor,
     mxgemm_tdm_pipelined_kernel,
+    mxgemm_tdm_persistent_kernel,
     operand_shared_layout,
     scale_shared_layout,
 )
@@ -184,8 +186,211 @@ def mxgemm_w4_persistent_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, stride_am
     tlx.async_amd_descriptor_wait(0)
 
 
+@triton.constexpr_function
+def _stream_layout(block_shape, pad):
+    # Pad every 256-byte row piece so the WMMA operand reads avoid LDS bank
+    # conflicts (16 bytes for operands, 8 for scales).
+    return tlx.padded_shared_layout_encoding.with_identity_for([[256, pad]], block_shape, [1, 0])
+
+
+@triton.jit
+def _stream_position(desc, offsets, pred, CLAMP: tl.constexpr = False):
+    # CLAMP counts the descriptor's bounds from the new base, so a tile that
+    # extends past the tensor's last row reads zeros there.
+    return tlx.update_tensor_descriptor(desc, add_offsets=offsets, clamp_bounds=CLAMP, pred=pred)
+
+
+@triton.jit
+def _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N: tl.constexpr, MAX_M_TILES: tl.constexpr,
+                 BLOCK_M: tl.constexpr, UNIFORM_ROWS: tl.constexpr):
+    # (group, first row, valid rows, N tile) of an output tile. Tiles are
+    # ordered M-tile-major, so the programs that run one M tile's N tiles at
+    # the same time share its A rows through L2.
+    m_tile = tile // TILES_N
+    n_tile = tile % TILES_N
+    if UNIFORM_ROWS > 0:
+        group = m_tile // (UNIFORM_ROWS // BLOCK_M)
+        row = m_tile * BLOCK_M
+        rows = BLOCK_M + 0 * m_tile
+    else:
+        # Steps past a program's last tile are predicated off but still
+        # position their descriptors: read the table in bounds and use tile
+        # (0, 0) past the map's m_tiles entries, which hold no tile.
+        valid = m_tile < m_tiles
+        entry = tl.minimum(m_tile, MAX_M_TILES - 1)
+        meta0 = tl.where(valid, tl.load(tile_meta0 + entry), 0)
+        meta1 = tl.where(valid, tl.load(tile_meta1 + entry), 0)
+        local = (meta1 >> 32).to(tl.int32)
+        group = (meta1 & 0xFFFFFFFF).to(tl.int32)
+        row = (meta0 & 0xFFFFFFFF).to(tl.int32) + local * BLOCK_M
+        rows = tl.minimum((meta0 >> 32).to(tl.int32) - local * BLOCK_M, BLOCK_M)
+    return group, row, rows, n_tile
+
+
+@triton.jit
+def _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step, total, pid, tile_meta0,
+                  tile_meta1, m_tiles, N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                  BLOCK_K: tl.constexpr, DB: tl.constexpr, K_ITERS: tl.constexpr, TILES_N: tl.constexpr,
+                  MAX_M_TILES: tl.constexpr, UNIFORM_ROWS: tl.constexpr, NUM_BUFFERS: tl.constexpr,
+                  NUM_PROGRAMS: tl.constexpr):
+    # Load K step `step` of this program's flattened (tile, K step) sequence.
+    # Past the end the loads are predicated off; they still count towards
+    # TENSORcnt, so the ring's waits stay uniform.
+    pred = step < total
+    tile = pid + (step // K_ITERS) * NUM_PROGRAMS
+    k = step % K_ITERS
+    group, row, _, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, MAX_M_TILES, BLOCK_M,
+                                         UNIFORM_ROWS)
+    row_b = group * N + n_tile * BLOCK_N
+    slot = step % NUM_BUFFERS
+    BKS: tl.constexpr = BLOCK_K // 32
+    # B and its scales are read once and bypass the caches; A, which every N
+    # tile of its M tile reads, keeps the default policy.
+    tlx.async_amd_descriptor_load_fused([
+        (_stream_position(b_desc, [row_b, k * (BLOCK_K // DB)], pred), tlx.local_view(b_buf, slot), 3),
+        (_stream_position(bs_desc, [row_b // 128, k * BKS * 128], pred), tlx.local_view(bs_buf, slot), 12),
+    ], cache_modifier=".cv")
+    # The last group's last A tile can extend past row GM.
+    tlx.async_amd_descriptor_load_fused([
+        (_stream_position(a_desc, [row, k * BLOCK_K], pred, True), tlx.local_view(a_buf, slot), 3),
+        (_stream_position(as_desc, [row, k * BKS], pred, True), tlx.local_view(as_buf, slot), 12),
+    ])
+
+
+@triton.jit
+def mxgemm_grouped_stream_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale,
+    b_scale,
+    tile_meta0,
+    tile_meta1,
+    tile_count,
+    GM: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    GROUPS: tl.constexpr,
+    DTYPE_B: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    MAX_M_TILES: tl.constexpr,
+    UNIFORM_ROWS: tl.constexpr,
+):
+    """Grouped A8W8 / A8W4 GEMM that streams the weights: out[rows of g] = x[rows of g] @ w[g].T.
+
+    A [GM, K] e4m3, B [GROUPS * N, K] e4m3 or [GROUPS * N, K // 2] packed e2m1,
+    A scales [GM, K // 32], B scales block128-ordered
+    (preshuffle_grouped_weight_scale) [GROUPS * N // 128, K // 32 * 128];
+    C [GM, N]. Each weight byte feeds one output tile, so the kernel is bound by
+    reading B: persistent programs run their flattened (tile, K step) sequence
+    through a NUM_BUFFERS-deep TDM ring and the next tile's first stages load
+    while the current one finishes. With UNIFORM_ROWS every group has that many
+    rows; otherwise the tile map from prepare_grouped_gemm_mxfp gives each
+    BLOCK_M tile's group and rows, and tile_count[0] the number of M tiles.
+    """
+    tl.static_assert(DTYPE_B == "e4m3" or DTYPE_B == "e2m1")
+    tl.static_assert(BLOCK_M % 16 == 0 and BLOCK_M <= 128)
+    tl.static_assert(BLOCK_N % 128 == 0 and N % BLOCK_N == 0 and BLOCK_K % 128 == 0 and K % BLOCK_K == 0)
+    tl.static_assert(NUM_BUFFERS >= 2 and K // BLOCK_K >= NUM_BUFFERS - 1)
+    tl.static_assert(UNIFORM_ROWS == 0 or UNIFORM_ROWS % BLOCK_M == 0)
+    DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+    BKS: tl.constexpr = BLOCK_K // 32
+    # TDM rows are at least 16 bytes: read 16 scale columns per stage and use
+    # the stage's first BKS.
+    BKS_LOAD: tl.constexpr = 16 if BKS < 16 else BKS
+    K_ITERS: tl.constexpr = K // BLOCK_K
+    TILES_N: tl.constexpr = N // BLOCK_N
+    # Two fused TDM instructions per wave and K step.
+    LOADS: tl.constexpr = 2
+    # With BLOCK_N >= 4 * BLOCK_M the four waves sit side by side along N and
+    # each covers the tile's rows and a quarter of its columns; otherwise the
+    # compiler picks the wave layout and tiles.
+    TILES_PER_WARP: tl.constexpr = (BLOCK_M // 16, BLOCK_N // 64) if BLOCK_N >= 4 * BLOCK_M else None
+
+    pid = tl.program_id(0)
+    if UNIFORM_ROWS > 0:
+        m_tiles = MAX_M_TILES + 0 * pid
+    else:
+        m_tiles = tl.load(tile_count).to(tl.int32)
+    num_tiles = m_tiles * TILES_N
+    my_tiles = tl.where(pid < num_tiles, (num_tiles - 1 - pid) // NUM_PROGRAMS + 1, 0)
+    total = my_tiles * K_ITERS
+
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[GM, K], strides=[K, tl.constexpr(1)],
+                                       block_shape=[BLOCK_M, BLOCK_K])
+    b_desc = tl.make_tensor_descriptor(b_ptr, shape=[GROUPS * N, K // DB], strides=[K // DB, tl.constexpr(1)],
+                                       block_shape=[BLOCK_N, BLOCK_K // DB])
+    as_desc = tl.make_tensor_descriptor(a_scale, shape=[GM, K // 32], strides=[K // 32, tl.constexpr(1)],
+                                        block_shape=[BLOCK_M, BKS_LOAD])
+    BS_SHAPE: tl.constexpr = [BLOCK_N // 128, BKS * 128]
+    bs_desc = tl.make_tensor_descriptor(b_scale, shape=[GROUPS * N // 128, K // 32 * 128],
+                                        strides=[K // 32 * 128, tl.constexpr(1)], block_shape=BS_SHAPE)
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS,
+                            layout=_stream_layout([BLOCK_M, BLOCK_K], 16))
+    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
+                            layout=_stream_layout([BLOCK_N, BLOCK_K // DB], 16))
+    as_buf = tlx.local_alloc((BLOCK_M, BKS_LOAD), tlx.dtype_of(a_scale), NUM_BUFFERS,
+                             layout=_stream_layout([BLOCK_M, BKS_LOAD], 8))
+    bs_buf = tlx.local_alloc(BS_SHAPE, tlx.dtype_of(b_scale), NUM_BUFFERS, layout=_stream_layout(BS_SHAPE, 8))
+    # Restage C through LDS so each wave stores whole rows.
+    c_view = tlx.local_view(tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_ptr), 1), 0)
+
+    for j in tl.static_range(NUM_BUFFERS - 1):
+        _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, j, total, pid, tile_meta0,
+                      tile_meta1, m_tiles, N, BLOCK_M, BLOCK_N, BLOCK_K, DB, K_ITERS, TILES_N, MAX_M_TILES,
+                      UNIFORM_ROWS, NUM_BUFFERS, NUM_PROGRAMS)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    for t in range(my_tiles):
+        tile = pid + t * NUM_PROGRAMS
+        _, row, rows, n_tile = _stream_tile(tile_meta0, tile_meta1, tile, m_tiles, TILES_N, MAX_M_TILES, BLOCK_M,
+                                            UNIFORM_ROWS)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(K_ITERS):
+            step = t * K_ITERS + k
+            _stream_issue(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, step + NUM_BUFFERS - 1, total,
+                          pid, tile_meta0, tile_meta1, m_tiles, N, BLOCK_M, BLOCK_N, BLOCK_K, DB, K_ITERS, TILES_N,
+                          MAX_M_TILES, UNIFORM_ROWS, NUM_BUFFERS, NUM_PROGRAMS)
+            tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+            slot = step % NUM_BUFFERS
+            a = tlx.local_load(tlx.local_view(a_buf, slot))
+            b = tlx.local_load(tlx.local_trans(tlx.local_view(b_buf, slot)))
+            sa = tlx.local_load(tlx.local_slice(tlx.local_view(as_buf, slot), [0, 0], [BLOCK_M, BKS]))
+            sb_view = tlx.local_reshape(tlx.local_view(bs_buf, slot), [BLOCK_N // 128, BKS // 4, 32, 4, 4])
+            sb = tlx.local_load(tlx.local_reshape(tlx.local_trans(sb_view, (0, 3, 2, 1, 4)), [BLOCK_N, BKS]))
+            acc = tlx.dot_scaled(a, sa, "e4m3", b, sb, DTYPE_B, acc, tiles_per_warp=TILES_PER_WARP)
+        tlx.local_store(c_view, acc.to(tlx.dtype_of(c_ptr)))
+        c = tlx.local_load(c_view)
+        c_rows = c_ptr + (row + offs_m).to(tl.int64)[:, None] * N
+        tl.store(c_rows + (n_tile * BLOCK_N + offs_n)[None, :], c, mask=(offs_m < rows)[:, None])
+    tlx.async_amd_descriptor_wait(0)
+
+
 def _pick_block_m(gm):
     return 16 if gm <= 4 else (32 if gm <= 256 else (64 if gm <= 4096 else 128))
+
+
+def _streams(x_dtype, w_dtype):
+    # E4M3 activations (A8W8 and A8W4) stream the weights through mxgemm_grouped_stream_kernel.
+    return x_dtype == "e4m3" and (w_dtype == "e4m3" or _STREAM_A8W4)
+
+
+def _stream_block_m(gm, groups):
+    # One weight tile feeds BLOCK_M rows of one group: the smallest tile that
+    # holds an average group keeps the A reads and WMMAs of padding rows low.
+    rows = triton.cdiv(gm, max(groups, 1))
+    return next((block_m for block_m in (16, 32, 64) if rows <= block_m), 128)
+
+
+def _block_m(gm, groups, x_dtype, w_dtype):
+    if _persistent_rows(gm, groups, x_dtype, w_dtype):
+        return _PERSISTENT_BLOCK_M
+    return _stream_block_m(gm, groups) if _streams(x_dtype, w_dtype) else _pick_block_m(gm)
 
 
 class GroupedTileMap(NamedTuple):
@@ -198,14 +403,17 @@ class GroupedTileMap(NamedTuple):
     block_m: int
 
 
-def prepare_grouped_gemm_mxfp(split_sizes, gm):
+def prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype="e2m1", w_dtype="e2m1"):
     """Build a reusable tile map for ``gm`` total rows from device ``split_sizes``, with no host readback.
 
-    The map uses the BLOCK_M that ``grouped_gemm_mxfp`` picks for ``gm`` and records both, so the op can reject a
-    map built for a different row count.
+    The map uses the BLOCK_M that ``grouped_gemm_mxfp`` picks for ``gm`` rows in ``split_sizes.numel()`` groups of
+    ``x_dtype`` x ``w_dtype``, and records both, so the op can reject a map built for another problem.
     """
+    return _tile_map(split_sizes, gm, _block_m(gm, split_sizes.numel(), x_dtype, w_dtype))
+
+
+def _tile_map(split_sizes, gm, block_m):
     groups = split_sizes.numel()
-    block_m = _pick_block_m(gm)
     max_m_tiles = triton.cdiv(gm, block_m) + groups
     tile_meta0 = torch.empty(max_m_tiles, dtype=torch.int64, device=split_sizes.device)
     tile_meta1 = torch.empty_like(tile_meta0)
@@ -278,6 +486,129 @@ def preshuffle_grouped_weight(w, kstep_major=False):
     return packed.view_as(w)
 
 
+# LDS the streaming kernel may use per workgroup (one workgroup per CU, 320 KiB).
+_STREAM_LDS_BUDGET = 316 * 1024
+_STREAM_A8W4 = True
+
+
+def _stream_config(n, k, w_dtype, block_m):
+    """Pick (BLOCK_N, BLOCK_K, NUM_BUFFERS) for mxgemm_grouped_stream_kernel, or None if it does not apply.
+
+    Deeper K stages halve the per-step barrier and wait overhead, so prefer
+    BLOCK_K=256 with at least three stages, then fill the LDS with stages.
+    """
+    if n % 128 or k % 512:
+        return None
+    block_n = 256 if n % 256 == 0 else 128
+    db = 2 if w_dtype == "e2m1" else 1
+
+    def padded(rows, cols, pad):
+        return rows * (cols + pad * triton.cdiv(cols, 256))
+
+    for block_k in (256, 128):
+        stage = (padded(block_m, block_k, 16) + padded(block_n, block_k // db, 16) + padded(block_m, 16, 8) +
+                 padded(block_n // 128, block_k // 32 * 128, 8))
+        buffers = min(6, (_STREAM_LDS_BUDGET - block_m * block_n * 2) // stage, k // block_k + 1)
+        if buffers >= 3:
+            return block_n, block_k, buffers
+    return None
+
+
+def _grouped_stream(x, x_scale, w, w_scale, split_sizes, out, tile_map, w_dtype, uniform_rows, block_m, config,
+                    num_programs=None):
+    gm, k = x.shape
+    groups, n = w.shape[0], w.shape[1]
+    block_n, block_k, buffers = config
+    if uniform_rows:
+        max_m_tiles = gm // block_m
+        tile_meta0 = tile_meta1 = tile_count = split_sizes
+    else:
+        if tile_map is None:
+            tile_map = _tile_map(split_sizes, gm, block_m)
+        tile_meta0, tile_meta1, tile_count = tile_map[:3]
+        max_m_tiles = tile_meta0.numel()
+    programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
+    programs = min(programs, max_m_tiles * (n // block_n))
+    mxgemm_grouped_stream_kernel[(programs, )](x, w, out, x_scale, w_scale, tile_meta0, tile_meta1, tile_count, GM=gm,
+                                               N=n, K=k, GROUPS=groups, DTYPE_B=w_dtype, BLOCK_M=block_m,
+                                               BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=buffers,
+                                               NUM_PROGRAMS=programs, MAX_M_TILES=max_m_tiles,
+                                               UNIFORM_ROWS=uniform_rows, num_warps=4, waves_per_eu=1)
+    return out
+
+
+# A8W8 groups that average more than this many rows reuse each weight tile
+# across M tiles: the persistent mm_mxfp kernel runs them as 256x256 tiles.
+# On gfx1250 (N = K = 8192) it beats streaming from 192-row groups (-33%);
+# at 128-row groups streaming 128-row tiles is 20% faster.
+_STREAM_MAX_AVG_ROWS = 128
+_PERSISTENT_BLOCK_M = 256
+_PERSISTENT_BLOCK_N = 256
+_PERSISTENT_BLOCK_K = 128
+# Static slot unroll pays off up to this K; beyond it the dynamic four-stage
+# ring is faster (see mm_mxfp).
+_PERSISTENT_STATIC_MAX_K = 16384
+
+
+def _persistent_rows(gm, groups, x_dtype, w_dtype):
+    return x_dtype == w_dtype == "e4m3" and gm > _STREAM_MAX_AVG_ROWS * max(groups, 1)
+
+
+def _persistent_shape(n, k):
+    return n % _PERSISTENT_BLOCK_N == 0 and k % _PERSISTENT_BLOCK_K == 0 and k >= 2 * _PERSISTENT_BLOCK_K
+
+
+@triton.jit
+def _gather_tile_a_scale(x_scale, packed, tile_meta0, tile_meta1, tile_count, KS: tl.constexpr, BLOCK_M: tl.constexpr,
+                         COLS: tl.constexpr):
+    # Copy the natural [GM, KS] scales of each map entry's BLOCK_M rows into
+    # block128 order (pack_scale) at packed row entry * BLOCK_M // 128. Rows
+    # past the entry's group read as zero; the GEMM does not store them.
+    block = tl.program_id(0)
+    entry = block // (BLOCK_M // 128)
+    if entry < tl.load(tile_count):
+        meta0 = tl.load(tile_meta0 + entry)
+        local = (tl.load(tile_meta1 + entry) >> 32).to(tl.int32)
+        skip = local * BLOCK_M + block % (BLOCK_M // 128) * 128
+        rows = (meta0 >> 32).to(tl.int32) - skip
+        r = tl.arange(0, 128)
+        c = tl.program_id(1) * COLS + tl.arange(0, COLS)
+        src = x_scale + ((meta0 & 0xFFFFFFFF).to(tl.int32) + skip + r).to(tl.int64)[:, None] * KS + c[None, :]
+        values = tl.load(src, mask=(r < rows)[:, None] & (c < KS)[None, :], other=0)
+        # Row a * 32 + b, column q * 4 + d goes to ((q * 32 + b) * 4 + a) * 4 + d.
+        dst = ((c // 4)[None, :] * 32 + (r % 32)[:, None]) * 16 + (r // 32)[:, None] * 4 + (c % 4)[None, :]
+        tl.store(packed + block.to(tl.int64) * (KS * 128) + dst, values, mask=(c < KS)[None, :])
+
+
+def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None):
+    """A8W8 grouped GEMM on the persistent mm_mxfp kernel; ``w_scale`` is preshuffled, ``tile_map`` BLOCK_M=256."""
+    gm, k = x.shape
+    groups, n = w.shape[0], w.shape[1]
+    tile_meta0, tile_meta1, tile_count = tile_map[:3]
+    entries = tile_meta0.numel()
+    ks = k // 32
+    rows_per_entry = _PERSISTENT_BLOCK_M // 128
+    a_scale = torch.empty((entries * rows_per_entry, ks * 128), dtype=torch.uint8, device=x.device)
+    _gather_tile_a_scale[(entries * rows_per_entry, triton.cdiv(ks, 64))](x_scale, a_scale, tile_meta0, tile_meta1,
+                                                                          tile_count, KS=ks,
+                                                                          BLOCK_M=_PERSISTENT_BLOCK_M, COLS=64)
+    k_tiles = k // _PERSISTENT_BLOCK_K
+    static = 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
+    programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
+    programs = min(programs, entries * (n // _PERSISTENT_BLOCK_N))
+    with torch.cuda.device(x.device):
+        mxgemm_tdm_persistent_kernel[(programs, )](
+            x, w.view(groups * n, k), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k, x.stride(0), k,
+            out.stride(0), a_scale.stride(0), ks * 128, DTYPE_A="e4m3", DTYPE_B="e4m3", BLOCK_M=_PERSISTENT_BLOCK_M,
+            BLOCK_N=_PERSISTENT_BLOCK_N, BLOCK_K=_PERSISTENT_BLOCK_K, GROUP_SIZE_M=8, NUM_BUFFERS=min(4, k_tiles),
+            NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial", OUTPUT_STAGING=True,
+            CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8, XCD_CHUNK=2,
+            STATIC_SLOT_UNROLL=static, OUTPUT_C_SLOTS=2 if static else None, OVERLAP_PEEL=static,
+            MERGED_HANDOFF_BARRIER=static, REFILL_OVERLAP=4 if static else 0, LDS_PARTITIONED_AB=0, NUM_GROUPS=groups,
+            tile_meta0=tile_meta0, tile_meta1=tile_meta1, tile_count=tile_count, a_rows=gm, num_warps=4, waves_per_eu=1)
+    return out
+
+
 _SCALE_DTYPES = (torch.uint8, torch.float8_e8m0fnu)
 _X_STORAGE_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
 
@@ -299,12 +630,13 @@ def _check_inputs(x, x_scale, w, w_scale, split_sizes, out, w_scale_preshuffled,
     if (x.ndim, x_scale.ndim, w.ndim, w_scale.ndim, split_sizes.ndim) != (2, 2, 3, 3, 1):
         raise ValueError("grouped_gemm_mxfp expects x/x_scale/w/w_scale/split_sizes ranks 2/2/3/3/1; got "
                          f"{x.ndim}/{x_scale.ndim}/{w.ndim}/{w_scale.ndim}/{split_sizes.ndim}")
-    if x_dtype not in _X_STORAGE_DTYPES or w_dtype != "e2m1":
-        raise ValueError("grouped_gemm_mxfp supports x_dtype 'e4m3' or 'e2m1' and w_dtype 'e2m1'; "
-                         f"got x_dtype={x_dtype!r}, w_dtype={w_dtype!r}")
-    if x.dtype != _X_STORAGE_DTYPES[x_dtype] or w.dtype != torch.uint8:
+    if (x_dtype, w_dtype) not in (("e4m3", "e2m1"), ("e2m1", "e2m1"), ("e4m3", "e4m3")):
+        raise ValueError("grouped_gemm_mxfp supports (x_dtype, w_dtype) ('e4m3', 'e2m1'), ('e2m1', 'e2m1') and "
+                         f"('e4m3', 'e4m3'); got x_dtype={x_dtype!r}, w_dtype={w_dtype!r}")
+    w_storage = torch.float8_e4m3fn if w_dtype == "e4m3" else torch.uint8
+    if x.dtype != _X_STORAGE_DTYPES[x_dtype] or w.dtype != w_storage:
         raise ValueError(f"grouped_gemm_mxfp expects x_dtype={x_dtype!r} x stored as {_X_STORAGE_DTYPES[x_dtype]} "
-                         f"and packed-E2M1 uint8 w; got x.dtype={x.dtype}, w.dtype={w.dtype}")
+                         f"and w_dtype={w_dtype!r} w stored as {w_storage}; got x.dtype={x.dtype}, w.dtype={w.dtype}")
     if x_scale.dtype not in _SCALE_DTYPES or w_scale.dtype not in _SCALE_DTYPES:
         raise ValueError("grouped_gemm_mxfp expects E8M0 (or uint8) scales; "
                          f"got x_scale.dtype={x_scale.dtype}, w_scale.dtype={w_scale.dtype}")
@@ -318,7 +650,7 @@ def _check_inputs(x, x_scale, w, w_scale, split_sizes, out, w_scale_preshuffled,
     gm = x.shape[0]
     groups, n, packed_k = w.shape
     k = x.shape[1] if x_dtype == "e4m3" else 2 * x.shape[1]
-    if 2 * packed_k != k or k % 32:
+    if (packed_k if w_dtype == "e4m3" else 2 * packed_k) != k or k % 32:
         raise ValueError(f"grouped_gemm_mxfp reduction dimensions must match and be divisible by 32; got "
                          f"x.shape={tuple(x.shape)} ({x.dtype}), w.shape={tuple(w.shape)}")
     if split_sizes.numel() != groups:
@@ -354,15 +686,20 @@ def grouped_gemm_mxfp(
 ):
     """Grouped MX GEMM on gfx1250: ``out[rows of group g] = x[rows of group g] @ w[g].T``.
 
-    ``x_dtype`` and ``w_dtype`` name the MX formats: ``x`` is ``[GM, K]`` float8_e4m3fn for ``"e4m3"`` (A8W4) or
-    ``[GM, K // 2]`` packed uint8 for ``"e2m1"`` (W4A4); ``w`` is ``[G, N, K // 2]`` packed E2M1 (``"e2m1"``, the
-    only weight format). Scales are per-32 E8M0: ``x_scale [GM, K // 32]`` and ``w_scale [G, N, K // 32]``, or the
+    ``x_dtype`` and ``w_dtype`` name the MX formats: ``x`` is ``[GM, K]`` float8_e4m3fn for ``"e4m3"`` or
+    ``[GM, K // 2]`` packed uint8 for ``"e2m1"``; ``w`` is ``[G, N, K // 2]`` packed E2M1 for ``"e2m1"`` or
+    ``[G, N, K]`` float8_e4m3fn for ``"e4m3"`` (with ``x_dtype="e4m3"`` only). Scales are per-32 E8M0: ``x_scale [GM, K // 32]`` and ``w_scale [G, N, K // 32]``, or the
     ``preshuffle_grouped_weight_scale`` layout with ``w_scale_preshuffled=True``. Groups are contiguous along M;
     ``split_sizes`` is a device int32 ``[G]`` tensor and is not read on the host unless ``validate=True``, so the
     call is graph-capturable. Returns BF16 ``[GM, N]`` (``out`` if given).
 
-    A ``tile_map`` from ``prepare_grouped_gemm_mxfp`` is used whenever given; otherwise one is built for
-    256 < GM <= 4096. ``uniform_grouped`` and ``w_kstep_major`` are caller promises that every group has 64 rows;
+    A8W8 groups that average more than 128 rows run 256x256 tiles on the persistent ``mm_mxfp`` kernel when N
+    is divisible by 256 and K by 128 (K >= 256); the A scales of each tile are reordered on every call. Other
+    E4M3 activations (A8W8 and A8W4) stream the weights through ``mxgemm_grouped_stream_kernel`` when N is
+    divisible by 128 and K by 512, which A8W8 requires. Without ``w_scale_preshuffled`` the weight scales are
+    preshuffled on every call. A ``tile_map`` from ``prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype, w_dtype)``
+    is used whenever given; otherwise one is built (for W4A4 and preshuffled A8W4 weights only for
+    256 < GM <= 4096). ``uniform_grouped`` and ``w_kstep_major`` are caller promises that every group has 64 rows;
     ``validate=True`` checks ``split_sizes`` on the host at the cost of a device sync.
     """
     gm, groups, n, k = _check_inputs(x, x_scale, w, w_scale, split_sizes, out, w_scale_preshuffled, x_dtype, w_dtype)
@@ -372,6 +709,45 @@ def grouped_gemm_mxfp(
         return out
     x_scale_u8 = x_scale.view(torch.uint8)
     w_scale_u8 = w_scale.view(torch.uint8)
+    stream_config = stream_block_m = None
+    if _streams(x_dtype, w_dtype) and not w_preshuffled and not w_kstep_major:
+        uniform_rows = 64 if uniform_grouped and gm == groups * 64 else 0
+        if uniform_rows:
+            stream_block_m = uniform_rows
+        elif tile_map is not None:
+            # Any tile map works; one from prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype, w_dtype) has the
+            # tile height that suits this problem.
+            if tile_map.gm != gm:
+                raise ValueError(f"tile_map was built for {tile_map.gm} rows; x has {gm} rows. Rebuild it with "
+                                 f"prepare_grouped_gemm_mxfp(split_sizes, {gm}, {x_dtype!r}, {w_dtype!r})")
+            stream_block_m = tile_map.block_m
+        else:
+            stream_block_m = _block_m(gm, groups, x_dtype, w_dtype)
+            if stream_block_m == _PERSISTENT_BLOCK_M and not _persistent_shape(n, k):
+                stream_block_m = _stream_block_m(gm, groups)
+        if stream_block_m == _PERSISTENT_BLOCK_M and w_dtype == "e4m3" and _persistent_shape(n, k):
+            if validate:
+                _check_split_sizes(split_sizes, gm, 0)
+            if tile_map is None:
+                tile_map = _tile_map(split_sizes, gm, _PERSISTENT_BLOCK_M)
+            if not w_scale_preshuffled:
+                w_scale_u8 = preshuffle_grouped_weight_scale(w_scale_u8)
+            return _grouped_persistent(x, x_scale_u8, w, w_scale_u8, out, tile_map)
+        if stream_block_m <= 128:
+            stream_config = _stream_config(n, k, w_dtype, stream_block_m)
+    if stream_config is not None:
+        if validate:
+            _check_split_sizes(split_sizes, gm, uniform_rows)
+        if not w_scale_preshuffled:
+            # The kernel reads block128-ordered weight scales; preshuffle them
+            # offline (preshuffle_grouped_weight_scale) to skip this.
+            w_scale_u8 = preshuffle_grouped_weight_scale(w_scale_u8)
+        return _grouped_stream(x, x_scale_u8, w, w_scale_u8, split_sizes, out, tile_map, w_dtype, uniform_rows,
+                               stream_block_m, stream_config)
+    if w_dtype == "e4m3":
+        raise ValueError("grouped_gemm_mxfp A8W8 needs unshuffled weights and N divisible by 128 and K by 512 "
+                         f"(256 and 128 with 256-row tiles); got N={n}, K={k}, w_preshuffled={w_preshuffled}, "
+                         f"tile rows {stream_block_m}")
     block_m = _pick_block_m(gm)
     block_n = _BLOCK_N
     schedule = "baseline" if gm <= 4 else "sliceMNK"
