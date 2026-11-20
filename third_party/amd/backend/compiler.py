@@ -1174,6 +1174,13 @@ class HIPBackend(BaseBackend):
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-y")
             kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-z")
 
+        # Opt-in: after O3 hoisted them, keep large-offset LDS base addresses
+        # out of loops. CodeGenPrepare would otherwise sink each one back next to
+        # its accesses as a VALU add, since the offset cannot fold into ds_*
+        # (16 bits).
+        if knobs.amd.anchor_lds_bases:
+            amd.add_anchor_lds_bases_llvm_pass(kernel_fn)
+
         # Opt-in MFMA scheduler, see the schedule_hint option (validated in parse_options).
         if options.schedule_hint == "mfma-schedule" and options.arch in ("gfx942", "gfx950"):
             amd.add_mfma_schedule_pass(kernel_fn, options.arch)
