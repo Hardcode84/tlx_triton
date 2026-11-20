@@ -21,6 +21,9 @@ constexpr int64_t kDSOffsetLimit = 1 << 16;
 // Constants of one anchored base stay this close, leaving room for the small
 // offsets that later GEPs add before the access.
 constexpr int64_t kWindow = 40000;
+// Accesses of 4 bytes or less may become ds_*2addr_b32, whose two offsets are
+// 8-bit dword counts, so their anchors cover at most 1020 bytes.
+constexpr int64_t kNarrowWindow = 1024;
 constexpr unsigned kLDSAddrSpace = 3;
 
 struct Access {
@@ -53,7 +56,9 @@ Value *peelConstant(Value *v, int64_t &offset) {
 // CodeGenPrepare's address matching.
 bool anchorLDSBases(Function &F) {
   const DataLayout &dl = F.getDataLayout();
-  MapVector<std::pair<GlobalVariable *, Value *>, SmallVector<Access>> groups;
+  MapVector<std::tuple<GlobalVariable *, Value *, unsigned>,
+            SmallVector<Access>>
+      groups;
   for (Instruction &inst : instructions(F)) {
     auto *gep = dyn_cast<GetElementPtrInst>(&inst);
     if (!gep || gep->getAddressSpace() != kLDSAddrSpace ||
@@ -71,13 +76,22 @@ bool anchorLDSBases(Function &F) {
     Value *root = peelConstant(index, offset);
     if (offset < kDSOffsetLimit)
       continue;
-    groups[{gv, root}].push_back({gep, offset});
+    bool narrow = llvm::all_of(gep->users(), [&](User *user) {
+      Type *ty = nullptr;
+      if (auto *load = dyn_cast<LoadInst>(user))
+        ty = load->getType();
+      else if (auto *store = dyn_cast<StoreInst>(user))
+        ty = store->getValueOperand()->getType();
+      return ty && dl.getTypeStoreSize(ty) <= 4;
+    });
+    groups[{gv, root, narrow ? 1u : 0u}].push_back({gep, offset});
   }
 
   bool changed = false;
   Type *i8 = Type::getInt8Ty(F.getContext());
   for (auto &[key, accesses] : groups) {
-    auto [gv, root] = key;
+    auto [gv, root, narrow] = key;
+    int64_t window = narrow ? kNarrowWindow : kWindow;
     llvm::sort(accesses, [](const Access &a, const Access &b) {
       return a.offset < b.offset;
     });
@@ -87,7 +101,7 @@ bool anchorLDSBases(Function &F) {
     Instruction *base = nullptr;
     int64_t baseOffset = 0;
     for (Access &access : accesses) {
-      if (!base || access.offset - baseOffset >= kWindow) {
+      if (!base || access.offset - baseOffset >= window) {
         IRBuilder<> builder(F.getContext());
         if (base)
           builder.SetInsertPoint(base->getNextNode());
