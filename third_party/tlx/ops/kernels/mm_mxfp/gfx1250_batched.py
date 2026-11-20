@@ -25,7 +25,7 @@ the loads:
 two gfx1250 DPX partitions) by splitting N: every device holds its own N shard
 of B and its scales, a copy of A, and computes its N shard of C.
 
-Run ``python amd_mxfp_batched_gemm.py --check`` for the default 128x64x8192x8192
+Run ``python gfx1250_batched.py --check`` for the default 128x64x8192x8192
 problem on one device or ``--devices 0,1`` to split N across two.
 """
 import argparse

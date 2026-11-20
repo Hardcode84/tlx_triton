@@ -207,7 +207,7 @@ benchmark defaults, FP32 output. The run was one `collect_traces.py`
 invocation under `gpu-lock`:
 
 ```bash
-gpu-lock python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/collect_traces.py \
+gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/collect_traces_gfx1250.py \
   --kernels persistent --output /tmp/mxfp-a8w8-8k-profile-20261021 \
   -- --variant mx8xmx8 --case 8192,8192,8192
 ```
@@ -4706,7 +4706,7 @@ Lessons to retain when designing the next change:
    above for the open directions (lane-bit scale layout for swizzled waves,
    explicit partition placement). Rebuild the remote Triton with
    `639c951130` before running `bench.py` with the new 8192³ default.
-7. Update the [resource/dependency model](../../tools/perf_model/README.md)
+7. Update the [resource/dependency model](../../../../tools/perf_model/README.md)
    with the measured service times and exposed dependencies. Choose the next
    schedule change from a quantified gap; retain ordinary defaults until
    repeated hardware results justify replacing them.
@@ -4714,14 +4714,14 @@ Lessons to retain when designing the next change:
 Local command preparation (no GPU workload):
 
 ```bash
-python3 third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py --dry-run
+python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --dry-run
 ```
 
 After remote access is authorized, example baseline/candidate commands in
 the existing environment are:
 
 ```bash
-mxfp_bench=third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/bench.py
+mxfp_bench=third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py
 gpu-lock python3 "$mxfp_bench" --csv /tmp/mxfp-rebased-baseline.csv
 gpu-lock python3 "$mxfp_bench" --variant mx8xmx8 \
   --case 8192,8192,8192 --case 8192,8192,4096 \

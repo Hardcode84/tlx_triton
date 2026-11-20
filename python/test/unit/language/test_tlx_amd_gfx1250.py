@@ -5,9 +5,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _cdna5_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import (
-    amd_mxfp_batched_gemm as _gfx1250_mxfp_batched, )
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250_batched as _gfx1250_mxfp_batched
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
@@ -1875,7 +1874,7 @@ def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap
 
 
 def test_mxgemm_bench_devices_split_rows():
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
+    from triton.tlx.ops.kernels.mm_mxfp import bench_gfx1250 as bench
 
     # --devices passes through; the program count is per device and defaults
     # to each device's CU count, and cluster checks apply to each device's rows.
@@ -1893,7 +1892,7 @@ def test_mxgemm_bench_devices_split_rows():
 
 
 def test_mxgemm_bench_cluster_and_output_options():
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
+    from triton.tlx.ops.kernels.mm_mxfp import bench_gfx1250 as bench
 
     _, shapes, variants = bench.parse_benchmark_args(
         ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
@@ -1917,9 +1916,10 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--cluster_size") + 1] == "16"
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
-            # FP16 up to K=16384 uses a four-stage static-slot ring with two C
-            # slots, the overlap peel, and one merged handoff barrier per step.
-            merged = variant == "mx8xmx8" and shape[2] <= 16384 and args.out_dtype == "fp16"
+            # FP16 up to K=16384, and FP32 from K=8192 to K=16384, use a
+            # four-stage static-slot ring with two C slots, the overlap peel,
+            # and one merged handoff barrier per step.
+            merged = variant == "mx8xmx8" and shape[2] <= 16384 and (args.out_dtype == "fp16" or shape[2] >= 8192)
             # Other cases from K=16384 use the dynamic four-stage ring.
             four_stage = variant == "mx8xmx8" and shape[2] >= 16384 and not merged
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage or merged else "3")
