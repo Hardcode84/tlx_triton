@@ -2058,12 +2058,22 @@ def _mxgemm_defer_bottom_k_step(
             b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS, RELAXED=True)
             a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE, RELAXED=True)
         c00 = _mxgemm_native_dot(a00, sa00, DTYPE_A, b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
-        # Front-load the 34 reads so the release drain before the signal has
-        # several WMMAs of cover.
-        for _ in tl.static_range(9):
-            tlx.amd_sched_group_barrier(0x8, 1, 107)
-            tlx.amd_sched_group_barrier(0x100, 4, 107)
-        tlx.amd_sched_group_barrier(0x8, 7, 107)
+        if _mxgemm_desc_row_pairs(a_desc, BK // DA) and _mxgemm_desc_row_pairs(b_desc, BK // DB):
+            # Row-paired operands: issue the 34 reads in the first three WMMAs
+            # so the release drain before the signal has 13 WMMAs of cover.
+            # Anchored LDS bases (persistent_compile_options) keep these
+            # bursts free of address VALU.
+            for _ in tl.static_range(3):
+                tlx.amd_sched_group_barrier(0x8, 1, 107)
+                tlx.amd_sched_group_barrier(0x100, 12, 107)
+            tlx.amd_sched_group_barrier(0x8, 13, 107)
+        else:
+            # Front-load the 34 reads so the release drain before the signal has
+            # several WMMAs of cover.
+            for _ in tl.static_range(9):
+                tlx.amd_sched_group_barrier(0x8, 1, 107)
+                tlx.amd_sched_group_barrier(0x100, 4, 107)
+            tlx.amd_sched_group_barrier(0x8, 7, 107)
         tlx.amd_sched_barrier()
         tlx.async_amd_descriptor_wait((BUFFERS - 2) * LOADS)
         tlx.named_barrier_arrive(0, tlx.num_warps() * 32)
@@ -4277,16 +4287,22 @@ _OUT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
 PIPELINED_COMPILE_OPTIONS = {"va_vdst_anti_hints": False, "llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
 
 
-def persistent_compile_options(register_pipeline: bool = False, streamed_operands: bool = False) -> dict:
+def persistent_compile_options(register_pipeline: bool = False, streamed_operands: bool = False,
+                               refill_overlap: int = 0, row_pairs: bool = False) -> dict:
     """Compile options for a persistent launch.
 
     WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make the
     register-pipelined and streamed-operand kernels spill in the steady K loop.
     The default schedules keep the hints.
+
+    With A and B both row-paired, the refill-overlap-4 step anchors its LDS
+    bases: slots past 64 KiB would otherwise recompute each read address with
+    a VALU add, stalling its front-loaded read bursts.
     """
+    options = {"anchor_lds_bases": True} if refill_overlap == 4 and row_pairs else {}
     if register_pipeline or streamed_operands:
-        return {"llvm_cl_opts": (("amdgpu-anti-hints", "false"), )}
-    return {}
+        options["llvm_cl_opts"] = (("amdgpu-anti-hints", "false"), )
+    return options
 
 
 def mxgemm_tdm_pipelined(
@@ -4842,7 +4858,8 @@ def mxgemm_tdm_pipelined(
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
                 ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=SCHED_MODE_2, **persistent_options,
-                **persistent_compile_options(REGISTER_PIPELINE, STREAMED_OPERANDS))
+                **persistent_compile_options(REGISTER_PIPELINE, STREAMED_OPERANDS, REFILL_OVERLAP, A_ROW_PAIRS
+                                             and B_ROW_PAIRS))
         kernel = mxgemm_tdm_operand_pipeline_kernel if OPERAND_PIPELINE else mxgemm_tdm_pipelined_kernel
         return kernel[grid](
             a,
