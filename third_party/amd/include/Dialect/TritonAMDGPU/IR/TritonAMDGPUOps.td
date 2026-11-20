@@ -1944,21 +1944,12 @@ def WorkgroupBarrierWaitOp : TT_AMDGPU_Op<"workgroup_barrier_wait"> {
 //===----------------------------------------------------------------------===//
 
 def LdsWriteDrainOp : TT_AMDGPU_Op<"lds_write_drain"> {
-  let summary = "Drain this wave's pending LDS writes before an async read of LDS";
+  let summary = "Make this wave's earlier LDS writes visible to TDM stores";
   let description = [{
-    gfx1250 hardware workaround. `s_wait_dscnt 0` only guarantees that LDS
-    has accepted a wave's earlier DS writes; asynchronous copies that read
-    LDS (TDM stores and async stores from LDS) can still see the previous
-    contents. This op makes the issuing wave's earlier shared-memory writes
-    visible to such copies: each lane ORs zero into one of the first (up to
-    32) dwords at `buffer`'s base address, then the wave waits for its LDS
-    operations to complete.
-
-    Place it in every wave that wrote a buffer, after the writes and before
-    the barrier that orders them with the asynchronous copy. `buffer` must
-    not be the destination of an asynchronous copy in flight. The OR leaves
-    the data unchanged, so the op has no shared-memory effects for barrier
-    insertion. It lowers to nothing on other targets.
+    On gfx1250, a TDM store may see stale LDS contents instead of the issuing
+    wave's earlier writes to `buffer`. This op makes those writes visible to
+    subsequent TDM stores that read `buffer`. Use it after writing a buffer
+    and before storing it with TDM.
   }];
   let arguments = (ins TTG_MemDescType:$buffer);
   let assemblyFormat = "$buffer attr-dict `:` qualified(type($buffer))";
