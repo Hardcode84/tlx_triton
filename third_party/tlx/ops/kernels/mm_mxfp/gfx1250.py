@@ -35,8 +35,8 @@ and row sharding across devices through ``mxgemm_tdm_sharded``).
 ``mxgemm_tdm_pipelined`` selects, and ``gfx1250_research/`` records the
 measurements behind the defaults. ``tlx.ops.kernels.grouped_gemm_mxfp`` runs
 A8W8 grouped GEMMs whose groups average more than 128 rows on the persistent
-kernel (``NUM_GROUPS``, without clusters), and smaller groups on its streaming
-kernel.
+kernel (``NUM_GROUPS``, with 4x4 clusters from 1024-row groups), and smaller
+groups on its streaming kernel.
 """
 
 import inspect
@@ -776,14 +776,14 @@ def _mxgemm_rows_after(rows, skip: tl.constexpr):
 
 @triton.jit
 def _mxgemm_grouped_tile(tile, num_m, num_n, tile_meta0, tile_meta1, N: tl.constexpr, GROUP_M: tl.constexpr,
-                         BM: tl.constexpr, BN: tl.constexpr):
+                         BM: tl.constexpr, BN: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr = "linear"):
     # Grouped GEMM: M tile i is entry i of the tile map (group start row and
     # rows, group and BM tile within it). Returns the tile's first A/C row,
     # its B row (group * N + column), its row in the tile-ordered A scales,
     # its valid rows (may exceed BM), and its C column. Programs without a
     # tile still issue their prologue loads: use in-bounds zero coordinates.
     valid = tile < num_m * num_n
-    m, n = _mxgemm_tile_offsets(tl.where(valid, tile, 0), num_m, num_n, GROUP_M, BM, BN)
+    m, n = _mxgemm_tile_offsets(tl.where(valid, tile, 0), num_m, num_n, GROUP_M, BM, BN, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
     entry = tl.where(valid, m // BM, 0)
     meta0 = tl.load(tile_meta0 + entry, mask=valid, other=0)
     meta1 = tl.load(tile_meta1 + entry, mask=valid, other=0)
@@ -800,7 +800,7 @@ def _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, N: tl.constexpr, GR
     # (A/C row, B row, A-scale row, valid rows, C column) of a tile. Without
     # groups, the A-scale row and valid rows are None (whole tiles of A).
     if GROUPED:
-        return _mxgemm_grouped_tile(tile, num_m, num_n, tile_meta0, tile_meta1, N, GROUP_M, BM, BN)
+        return _mxgemm_grouped_tile(tile, num_m, num_n, tile_meta0, tile_meta1, N, GROUP_M, BM, BN, CLUSTER_LAYOUT)
     else:
         off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M, BM, BN, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
         return off_m, off_n, None, None, off_n
@@ -1912,7 +1912,7 @@ def _mxgemm_first_use_c00_prefetch(sync_id: tl.constexpr):
 
 
 # Grouped launches pass the row count at run time; one compile serves every count.
-@triton.jit(do_not_specialize=["a_rows"])
+@triton.jit(do_not_specialize=["a_rows", "a_scale_rows"])
 def mxgemm_tdm_persistent_kernel(
     a_ptr,
     b_ptr,
@@ -1977,14 +1977,17 @@ def mxgemm_tdm_persistent_kernel(
     tile_meta1=None,
     tile_count=None,
     a_rows=None,
+    a_scale_rows=None,
     probe_ptr=None,
 ):
     """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring.
 
     With NUM_GROUPS > 0 it computes a grouped GEMM: C[rows of g] = A[rows of g] @ B[g].T, with B
     [NUM_GROUPS * N, K] and its scales [NUM_GROUPS * N // 128, K // 32 * 128]. A has a_rows rows (pass M=0);
-    tile_meta0/tile_meta1/tile_count is a BLOCK_M tile map from prepare_grouped_gemm_mxfp, and A's scales
-    are tile-ordered: map entry i's BLOCK_M rows in block128 order at row i * BLOCK_M // 128.
+    tile_meta0/tile_meta1/tile_count is a BLOCK_M tile map from prepare_grouped_gemm_mxfp, and A's
+    a_scale_rows scale rows are tile-ordered: map entry i's BLOCK_M rows in block128 order at row
+    i * BLOCK_M // 128. With clusters, each group's map entries start at a multiple of the cluster rows
+    and fill whole cluster rows, and the map has whole GROUP_SIZE_M groups of entries.
     """
     if probe_ptr is not None:
         # Store right away so no probe value stays live across the kernel.
@@ -2038,19 +2041,20 @@ def mxgemm_tdm_persistent_kernel(
     if GROUPED_TILES:
         # Grouped tiles start at any row, end at their group's last row, and
         # read B from their group. The A8W8 staged-output schedules and the
-        # tile-ordered A scales support this.
+        # tile-ordered A scales support this. Grid clusters share B only
+        # within one group's cluster rows (see the docstring).
         tl.static_assert(M == 0, "grouped GEMM takes its rows from a_rows and the tile map; pass M=0")
         tl.static_assert(
             BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and DA == 1 and DB == 1 and WITH_A_SCALE
             and tlx.num_warps() == 4, "grouped GEMM requires A8W8 256x256x128 tiles")
         tl.static_assert(
-            OUTPUT_STAGING and CROSS_TILE_PREFETCH and TDM_FUSION == "partial" and CLUSTER_SIZE == 1
-            and HANDOFF_SCHEDULE == "current" and INTERLEAVE_C_FILL == 0 and L2_LOOKAHEAD == 0 and K_ROTATE_STEP == 0
-            and LDS_PARTITIONED_AB == 0 and not (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH
-                                                 or WAVE_SPECIALIZED_HANDOFF or EARLY_C_STORES or SPLIT_CLUSTER_BARRIER
-                                                 or COMPACT_K_TAIL or SCALE_WAVE256 or A_ROW_PAIRS or B_ROW_PAIRS),
-            "grouped GEMM supports the unclustered staged-output schedules "
-            "without LDS partitioning")
+            OUTPUT_STAGING and CROSS_TILE_PREFETCH and TDM_FUSION == "partial"
+            and (CLUSTER_SIZE == 1 or CLUSTER_LAYOUT != "linear") and HANDOFF_SCHEDULE == "current"
+            and INTERLEAVE_C_FILL == 0 and L2_LOOKAHEAD == 0 and K_ROTATE_STEP == 0 and LDS_PARTITIONED_AB == 0
+            and not (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH or WAVE_SPECIALIZED_HANDOFF
+                     or EARLY_C_STORES or SPLIT_CLUSTER_BARRIER or COMPACT_K_TAIL or SCALE_WAVE256 or A_ROW_PAIRS
+                     or B_ROW_PAIRS),
+            "grouped GEMM supports the staged-output schedules with grid clusters and without LDS partitioning")
     B_ROWS: tl.constexpr = NUM_GROUPS * N if GROUPED_TILES else N
     tl.static_assert(tlx.num_warps() == 4 or tlx.num_warps() == 8)
     if tlx.num_warps() == 8:
@@ -2158,8 +2162,7 @@ def mxgemm_tdm_persistent_kernel(
     SC_ROWS: tl.constexpr = 256 if SCALE_WAVE256 else 128
     if GROUPED_TILES:
         # One BLOCK_M block per tile-map entry.
-        as_desc = tl.make_tensor_descriptor(a_scale, [((a_rows + BLOCK_M - 1) // BLOCK_M + NUM_GROUPS) *
-                                                      (BLOCK_M // SC_ROWS), K // 32 * SC_ROWS],
+        as_desc = tl.make_tensor_descriptor(a_scale, [a_scale_rows, K // 32 * SC_ROWS],
                                             [stride_as, tl.constexpr(1)], [BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS])
     else:
         as_desc = tl.make_tensor_descriptor(a_scale, [M // SC_ROWS, K // 32 * SC_ROWS],

@@ -1449,6 +1449,34 @@ def test_gfx1250_grouped_mxfp_persistent(k, num_programs):
     _assert_close_grouped(out, ref)
 
 
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("num_programs", [16, 48, None])
+def test_gfx1250_grouped_mxfp_persistent_clusters(k, num_programs):
+    # 4x4 clusters on a map padded to whole cluster rows per group and whole
+    # M groups: padding tiles in partial groups and an empty group. 64 tiles
+    # over 16 or 48 programs, so clusters run different numbers of tiles; the
+    # op picks the padded map for groups averaging 1024 rows or more.
+    group_sizes, n = ((1500, 0, 2700) if num_programs is None else (300, 0, 700, 100, 257)), 1024
+    x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, "e4m3")
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    gm = sum(group_sizes)
+    if num_programs is None:
+        tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm, "e4m3", "e4m3")
+        assert (tile_map.block_m, tile_map.group_align, tile_map.tile_count[0].item()) == (256, 4, 24)
+        out = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x.cuda(), x_scale.cuda(), w.cuda(), w_scale.cuda(),
+                                                         split_sizes, x_dtype="e4m3", w_dtype="e4m3", tile_map=tile_map,
+                                                         validate=True)
+    else:
+        tile_map = _gfx1250_grouped_mxfp_op._tile_map(split_sizes, gm, 256, 4, 8)
+        assert tile_map.tile_count[0].item() == 16
+        out = torch.empty((gm, n), dtype=torch.bfloat16, device="cuda")
+        w_scale = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale.cuda())
+        _gfx1250_grouped_mxfp_op._grouped_persistent(x.cuda(), x_scale.cuda(), w.cuda(), w_scale, out, tile_map,
+                                                     num_programs=num_programs)
+    _assert_close_grouped(out, ref)
+
+
 def test_gfx1250_grouped_mxfp_a8w8_rejects_unsupported_shapes():
     x = torch.empty((64, 768), dtype=torch.float8_e4m3fn, device="cuda")
     w = torch.empty((1, 256, 768), dtype=torch.float8_e4m3fn, device="cuda")
