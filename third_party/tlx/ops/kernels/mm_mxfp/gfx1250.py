@@ -1911,7 +1911,8 @@ def _mxgemm_first_use_c00_prefetch(sync_id: tl.constexpr):
             tlx.amd_sched_group_barrier(0x100, 2, sync_id)
 
 
-@triton.jit
+# Grouped launches pass the row count at run time; one compile serves every count.
+@triton.jit(do_not_specialize=["a_rows"])
 def mxgemm_tdm_persistent_kernel(
     a_ptr,
     b_ptr,
@@ -2283,6 +2284,11 @@ def mxgemm_tdm_persistent_kernel(
     tl.assume(k_iters >= NUM_BUFFERS)
     tile = _mxgemm_cluster_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK,
                                       CLUSTER_LAYOUT)
+    if GROUPED_TILES:
+        # Grouped launches use one program per CU for any row count; those
+        # without a tile must not load or compute.
+        if tile >= total_tiles:
+            return
     phase = 0
     off_m, off_n, a_srow, c_rows, c_n = _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, N, GROUP_SIZE_M,
                                                      BLOCK_M, BLOCK_N, CLUSTER_LAYOUT, GROUPED_TILES)
