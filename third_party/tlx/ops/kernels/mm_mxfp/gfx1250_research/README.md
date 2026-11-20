@@ -16,7 +16,8 @@ The gfx1250 MXFP kernels live one directory up, in `tlx.ops.kernels.mm_mxfp`:
 - `gfx1250_streamed.py`, `gfx1250_warp_pipeline.py`: alternative operand
   schedules selected by `mxgemm_tdm_pipelined`.
 - Grouped and batched GEMMs run `grouped_gemm_mxfp/gfx1250.py`: A8W8 groups averaging more than
-  128 rows use the persistent kernel's grouped tiles, smaller groups its streaming kernel.
+  128 rows use the persistent kernel's grouped tiles (4x4 clusters from 1024-row groups), smaller groups
+  its streaming kernel.
 
 See [WRITEUP.md](WRITEUP.md) for an overview of the kernel design,
 configuration, performance, and bottlenecks, and [HANDOFF.md](HANDOFF.md)

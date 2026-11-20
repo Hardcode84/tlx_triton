@@ -35,16 +35,20 @@ def _build_grouped_tile_map(
     GROUP_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     MAX_TILES_PER_GROUP: tl.constexpr,
+    GROUP_ALIGN: tl.constexpr,
+    TOTAL_ALIGN: tl.constexpr,
 ):
+    # Each group's tiles are padded to a multiple of GROUP_ALIGN with tiles of
+    # no rows, and the map to a multiple of TOTAL_ALIGN with empty group-0 tiles.
     group = tl.program_id(0)
     offsets = tl.arange(0, GROUP_BLOCK)
     sizes = tl.load(split_sizes + offsets, mask=offsets < NUM_GROUPS, other=0)
-    tiles = tl.cdiv(sizes, BLOCK_M)
+    tiles = tl.cdiv(tl.cdiv(sizes, BLOCK_M), GROUP_ALIGN) * GROUP_ALIGN
     before = offsets < group
     row_base = tl.sum(tl.where(before, sizes, 0), axis=0).to(tl.int64)
     tile_base = tl.sum(tl.where(before, tiles, 0), axis=0).to(tl.int64)
     group_rows = tl.load(split_sizes + group).to(tl.int64)
-    group_tiles = tl.cdiv(group_rows, BLOCK_M)
+    group_tiles = tl.cdiv(tl.cdiv(group_rows, BLOCK_M), GROUP_ALIGN) * GROUP_ALIGN
 
     local_tile = tl.arange(0, MAX_TILES_PER_GROUP)
     mask = local_tile < group_tiles
@@ -53,7 +57,12 @@ def _build_grouped_tile_map(
     tl.store(tile_meta0 + tile_base + local_tile, meta0, mask=mask)
     tl.store(tile_meta1 + tile_base + local_tile, meta1, mask=mask)
     if group == NUM_GROUPS - 1:
-        tl.store(tile_count, tile_base + group_tiles)
+        end = tile_base + group_tiles
+        count = tl.cdiv(end, TOTAL_ALIGN) * TOTAL_ALIGN
+        pad = end + tl.arange(0, TOTAL_ALIGN)
+        tl.store(tile_meta0 + pad, tl.zeros_like(pad), mask=pad < count)
+        tl.store(tile_meta1 + pad, tl.zeros_like(pad), mask=pad < count)
+        tl.store(tile_count, count)
         tl.store(tile_count + 1, row_base + group_rows)
 
 
@@ -399,6 +408,9 @@ class GroupedTileMap(NamedTuple):
     tile_count: torch.Tensor
     gm: int
     block_m: int
+    # Tiles per group and in total are multiples of these (cluster rows and M groups).
+    group_align: int = 1
+    total_align: int = 1
 
 
 def prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype="e2m1", w_dtype="e2m1"):
@@ -407,12 +419,16 @@ def prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype="e2m1", w_dtype="e2m1"):
     The map uses the BLOCK_M that ``grouped_gemm_mxfp`` picks for ``gm`` rows in ``split_sizes.numel()`` groups of
     ``x_dtype`` x ``w_dtype``, and records both, so the op can reject a map built for another problem.
     """
-    return _tile_map(split_sizes, gm, _block_m(gm, split_sizes.numel(), x_dtype, w_dtype))
-
-
-def _tile_map(split_sizes, gm, block_m):
     groups = split_sizes.numel()
-    max_m_tiles = triton.cdiv(gm, block_m) + groups
+    block_m = _block_m(gm, groups, x_dtype, w_dtype)
+    if block_m == _PERSISTENT_BLOCK_M:
+        return _persistent_tile_map(split_sizes, gm)
+    return _tile_map(split_sizes, gm, block_m)
+
+
+def _tile_map(split_sizes, gm, block_m, group_align=1, total_align=1):
+    groups = split_sizes.numel()
+    max_m_tiles = _tile_map_entries(gm, groups, block_m, group_align, total_align)
     tile_meta0 = torch.empty(max_m_tiles, dtype=torch.int64, device=split_sizes.device)
     tile_meta1 = torch.empty_like(tile_meta0)
     tile_count = torch.zeros(2, dtype=torch.int64, device=split_sizes.device)
@@ -425,9 +441,16 @@ def _tile_map(split_sizes, gm, block_m):
             NUM_GROUPS=groups,
             GROUP_BLOCK=triton.next_power_of_2(groups),
             BLOCK_M=block_m,
-            MAX_TILES_PER_GROUP=triton.next_power_of_2(triton.cdiv(gm, block_m)),
+            MAX_TILES_PER_GROUP=triton.next_power_of_2(triton.cdiv(gm, block_m) + group_align - 1),
+            GROUP_ALIGN=group_align,
+            TOTAL_ALIGN=total_align,
         )
-    return GroupedTileMap(tile_meta0, tile_meta1, tile_count, gm, block_m)
+    return GroupedTileMap(tile_meta0, tile_meta1, tile_count, gm, block_m, group_align, total_align)
+
+
+def _tile_map_entries(gm, groups, block_m, group_align, total_align):
+    # Each group adds at most one partial tile and group_align - 1 padding tiles.
+    return triton.cdiv(gm, block_m) + groups * group_align + total_align - 1
 
 
 def preshuffle_grouped_weight_scale(w_scale, kstep_major=False):
@@ -544,6 +567,13 @@ _PERSISTENT_BLOCK_K = 128
 # Static slot unroll pays off up to this K; beyond it the dynamic four-stage
 # ring is faster (see mm_mxfp).
 _PERSISTENT_STATIC_MAX_K = 16384
+# 4x4 clusters share B across four M tiles of one group and A across four N
+# tiles. Padding each group to whole cluster rows costs up to three empty
+# tiles per group, so clusters are used from this average group size.
+_CLUSTER_MIN_AVG_ROWS = 1024
+_CLUSTER_ROWS = 4
+_CLUSTER_COLS = 4
+_CLUSTER_GROUP_M = 8
 
 
 def _persistent_rows(gm, groups, x_dtype, w_dtype):
@@ -552,6 +582,14 @@ def _persistent_rows(gm, groups, x_dtype, w_dtype):
 
 def _persistent_shape(n, k):
     return n % _PERSISTENT_BLOCK_N == 0 and k % _PERSISTENT_BLOCK_K == 0 and k >= 2 * _PERSISTENT_BLOCK_K
+
+
+def _persistent_tile_map(split_sizes, gm):
+    # Groups that average at least _CLUSTER_MIN_AVG_ROWS rows get a map padded for
+    # 4x4 clusters: whole cluster rows in each group and whole M groups.
+    if gm >= _CLUSTER_MIN_AVG_ROWS * split_sizes.numel():
+        return _tile_map(split_sizes, gm, _PERSISTENT_BLOCK_M, _CLUSTER_ROWS, _CLUSTER_GROUP_M)
+    return _tile_map(split_sizes, gm, _PERSISTENT_BLOCK_M)
 
 
 @triton.jit
@@ -592,16 +630,25 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
     static = 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
     # One program per CU whatever the row count (see _grouped_stream).
     programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
+    # A map padded for clusters keeps every cluster in one group and every
+    # cluster's members on the same number of tiles.
+    cluster = (tile_map.group_align % _CLUSTER_ROWS == 0 and tile_map.total_align % _CLUSTER_GROUP_M == 0
+               and n % (_CLUSTER_COLS * _PERSISTENT_BLOCK_N) == 0 and programs % (_CLUSTER_ROWS * _CLUSTER_COLS) == 0)
+    cluster_size = _CLUSTER_ROWS * _CLUSTER_COLS if cluster else 1
     with torch.cuda.device(x.device):
         mxgemm_tdm_persistent_kernel[(programs, )](
             x, w.view(groups * n, k), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k, x.stride(0), k,
             out.stride(0), a_scale.stride(0), ks * 128, DTYPE_A="e4m3", DTYPE_B="e4m3", BLOCK_M=_PERSISTENT_BLOCK_M,
-            BLOCK_N=_PERSISTENT_BLOCK_N, BLOCK_K=_PERSISTENT_BLOCK_K, GROUP_SIZE_M=8, NUM_BUFFERS=min(4, k_tiles),
-            NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial", OUTPUT_STAGING=True,
-            CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8, XCD_CHUNK=2,
+            BLOCK_N=_PERSISTENT_BLOCK_N, BLOCK_K=_PERSISTENT_BLOCK_K, GROUP_SIZE_M=_CLUSTER_GROUP_M,
+            NUM_BUFFERS=min(4, k_tiles), NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial",
+            OUTPUT_STAGING=True, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8,
+            XCD_CHUNK=2, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=True,
+            CLUSTER_BARRIER_INTERVAL=8 if cluster else 1, CLUSTER_LAYOUT="4x4" if cluster else "linear",
             STATIC_SLOT_UNROLL=static, OUTPUT_C_SLOTS=2 if static else None, OVERLAP_PEEL=static,
-            MERGED_HANDOFF_BARRIER=static, REFILL_OVERLAP=4 if static else 0, LDS_PARTITIONED_AB=0, NUM_GROUPS=groups,
-            tile_meta0=tile_meta0, tile_meta1=tile_meta1, tile_count=tile_count, a_rows=gm, num_warps=4, waves_per_eu=1)
+            MERGED_HANDOFF_BARRIER=static, STATIC_CLUSTER_STEPS=static and cluster, REFILL_OVERLAP=4 if static else 0,
+            LDS_PARTITIONED_AB=0, NUM_GROUPS=groups, tile_meta0=tile_meta0, tile_meta1=tile_meta1,
+            tile_count=tile_count, a_rows=gm, a_scale_rows=a_scale.shape[0], num_warps=4, waves_per_eu=1,
+            ctas_per_cga=(cluster_size, 1, 1))
     return out
 
 
@@ -690,7 +737,9 @@ def grouped_gemm_mxfp(
     call is graph-capturable. Returns BF16 ``[GM, N]`` (``out`` if given).
 
     A8W8 groups that average more than 128 rows run 256x256 tiles on the persistent ``mm_mxfp`` kernel when N
-    is divisible by 256 and K by 128 (K >= 256); the A scales of each tile are reordered on every call. Other
+    is divisible by 256 and K by 128 (K >= 256); the A scales of each tile are reordered on every call. Groups
+    averaging 1024 rows or more get a tile map padded for 4x4 clusters, which share A and B through multicast
+    when N is divisible by 1024. Other
     E4M3 activations (A8W8 and A8W4) stream the weights through ``mxgemm_grouped_stream_kernel`` when N is
     divisible by 128 and K by 512, which A8W8 requires. Without ``w_scale_preshuffled`` the weight scales are
     preshuffled on every call. A ``tile_map`` from ``prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype, w_dtype)``
@@ -725,7 +774,7 @@ def grouped_gemm_mxfp(
             if validate:
                 _check_split_sizes(split_sizes, gm, 0)
             if tile_map is None:
-                tile_map = _tile_map(split_sizes, gm, _PERSISTENT_BLOCK_M)
+                tile_map = _persistent_tile_map(split_sizes, gm)
             if not w_scale_preshuffled:
                 w_scale_u8 = preshuffle_grouped_weight_scale(w_scale_u8)
             return _grouped_persistent(x, x_scale_u8, w, w_scale_u8, out, tile_map)
