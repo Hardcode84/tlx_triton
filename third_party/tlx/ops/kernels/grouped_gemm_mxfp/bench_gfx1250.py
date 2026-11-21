@@ -10,8 +10,10 @@ released before the next run starts.
 By default the timed call takes preshuffled weight scales and a tile map built
 once by ``prepare_grouped_gemm_mxfp``, as a serving loop would reuse them;
 ``--natural-w-scale`` and ``--per-call-tile-map`` include that preparation in
-every call. Timing uses ``triton.testing.do_bench`` (L2 cleared before each
-call) and reports the median.
+every call. ``--benchmark-mode graph`` (default) times the call with
+``triton.testing.do_bench_cudagraph`` (no host launch overhead; L2 is not
+cleared between replays), ``eager`` with ``triton.testing.do_bench`` (L2
+cleared before each call); both report the median.
 """
 
 from __future__ import annotations
@@ -98,7 +100,7 @@ def _command(args: argparse.Namespace, case: BenchCase, variant: str) -> list[st
     command = [
         sys.executable,
         str(Path(__file__).resolve()), "--single", "--variant", variant, "--case", case.label, "--seed",
-        str(args.seed)
+        str(args.seed), "--benchmark-mode", args.benchmark_mode
     ]
     if args.natural_w_scale:
         command.append("--natural-w-scale")
@@ -127,9 +129,9 @@ def _run_case(args: argparse.Namespace, case: BenchCase, variant: str, index: in
     return BenchResult(case, variant, process.wait(), ms, tflops)
 
 
-def _print_summary(results: list[BenchResult]) -> None:
+def _print_summary(results: list[BenchResult], benchmark_mode: str) -> None:
     print()
-    print("Summary")
+    print(f"Summary ({benchmark_mode} timing)")
     print(f"{'variant':>7} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'ms':>12} {'TFLOPS':>12}  status")
     for result in results:
         case = result.case
@@ -231,7 +233,10 @@ def run_single(args: argparse.Namespace) -> int:
         print(f"check max_rel={err:.3g} {'OK' if err < 1e-2 else 'FAIL'}", flush=True)
         if err >= 1e-2:
             return 1
-    ms = triton.testing.do_bench(call, return_mode="median")
+    if args.benchmark_mode == "graph":
+        ms = triton.testing.do_bench_cudagraph(call, return_mode="median")
+    else:
+        ms = triton.testing.do_bench(call, return_mode="median")
     tflops = 2 * gm * case.n * case.k / (ms * 1e-3) / 1e12
     print(f"{variant} {case.label}: execution time: {ms:.4f} ms, {tflops:.2f} TFLOPS", flush=True)
     return 0
@@ -248,6 +253,10 @@ def main(argv=None) -> int:
     parser.add_argument("--per-call-tile-map", action="store_true", help="build the tile map in every call")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False,
                         help="compare sampled rows with a dequantized reference before timing")
+    parser.add_argument(
+        "--benchmark-mode", choices=("graph", "eager"), default="graph",
+        help="graph (default): CUDA graph replay without host launch overhead or L2 clearing; "
+        "eager: one call per repetition after clearing L2")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, default=None, help="optional summary CSV path")
     parser.add_argument("--dry-run", action="store_true")
@@ -268,7 +277,7 @@ def main(argv=None) -> int:
         results.append(result)
         if args.fail_fast and not args.dry_run and result.status != "ok":
             break
-    _print_summary(results)
+    _print_summary(results, args.benchmark_mode)
     if args.csv is not None:
         _write_csv(args.csv, results)
         print(f"\nWrote {args.csv}")

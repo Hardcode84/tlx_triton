@@ -155,9 +155,11 @@ Examples::
     python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py -M 8192 -N 8192 -K 4096
     python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --dry-run
 
-For a single dispatch per shape/variant, select
---benchmark-mode none and --output-dir to keep each run's artifacts in
-its own directory.
+Timing defaults to CUDA graph replay (--benchmark-mode graph), which has no
+host launch overhead and does not clear L2 between launches;
+--benchmark-mode eager clears L2 before each launch. For a single dispatch per
+shape/variant, select --benchmark-mode none and --output-dir to keep each
+run's artifacts in its own directory.
 
 --devices 0,1 splits each case's M evenly across devices (for example the two
 partitions of a gfx1250 in DPX mode): each device computes its own rows from
@@ -657,7 +659,10 @@ def parse_benchmark_args(argv=None):
         "--cluster-barrier-interval", type=int, default=None,
         help="align cluster requests every N input K blocks (default: 8 for 4x4, 32 (16 below 64 K blocks) for the "
         "four-stage 4x4 loop with --a-row-pairs --b-row-pairs, otherwise 4); 0 disables all cluster barriers")
-    parser.add_argument("--benchmark-mode", choices=("eager", "graph", "none"), default="eager")
+    parser.add_argument(
+        "--benchmark-mode", choices=("eager", "graph", "none"), default="graph",
+        help="graph (default): CUDA graph replay without host launch overhead or L2 clearing; "
+        "eager: one launch per repetition after clearing L2")
     parser.add_argument("--benchmark-ms", "--benchmark-num-iters", dest="benchmark_num_iters", type=int, default=256,
                         help="timing repetition budget in milliseconds (default: 256; not an iteration count)")
     parser.add_argument("--warmup-seconds", type=float, default=1.0,
@@ -1190,7 +1195,7 @@ def run_single(argv=None):
         help="prefetch next-tile inputs during the K tail, or overlap C retirement with BK256 A8W4 refills")
     parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
                         help="Prefetch distance in K iterations; -1 disables L2 prefetch")
-    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="graph")
     parser.add_argument("--benchmark_warmup_seconds", type=float, default=0.0,
                         help="repeat timing batches for this long before measuring")
     parser.add_argument("--benchmark_duration_seconds", type=float, default=0.0,

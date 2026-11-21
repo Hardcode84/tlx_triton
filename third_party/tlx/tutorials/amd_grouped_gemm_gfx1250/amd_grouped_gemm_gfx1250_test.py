@@ -1065,7 +1065,7 @@ if __name__ == "__main__":
                         help="workgroups per multicast cluster (default: 1)")
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
-    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="graph")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)

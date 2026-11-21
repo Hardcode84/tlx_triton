@@ -5422,6 +5422,49 @@ def _mxfp_concurrent_batch(devices, launches, rep_ms):
     return max(statistics.median(s.elapsed_time(e) for s, e in times) for times in events)
 
 
+def _mxfp_concurrent_graph_batch(devices, launches, rep_ms):
+    """One CUDA graph batch over several devices: return the slowest device's time per launch.
+
+    Each device captures about ``rep_ms`` of back-to-back launches into a
+    graph, as ``do_bench_cudagraph`` does, and the devices replay their graphs
+    concurrently. Like ``do_bench_cudagraph``, it does not clear L2.
+    """
+    entries = []
+    for device, launch in zip(devices, launches):
+        with torch.cuda.device(device):
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                launch()
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(5):
+                    launch()
+                end.record()
+                torch.cuda.synchronize()
+                reps = max(1, int(rep_ms / max(start.elapsed_time(end) / 5, 1e-3)))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    for _ in range(reps):
+                        launch()
+                torch.cuda.synchronize()
+            entries.append((device, stream, graph, reps))
+
+    def replay():
+        events = []
+        for device, stream, graph, reps in entries:
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                events.append((start, end, reps))
+        for device in devices:
+            torch.cuda.synchronize(device)
+        return max(start.elapsed_time(end) / reps for start, end, reps in events)
+
+    return statistics.median(replay() for _ in range(10))
+
+
 def mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, *args, **kwargs):
     """Split a persistent MXFP GEMM by rows of A across several devices.
 
@@ -5432,8 +5475,8 @@ def mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, *args, **kwargs):
     are independent: there is no reduction and no synchronization between
     devices. The remaining arguments are those of ``mxgemm_tdm_pipelined``;
     ``NUM_PROGRAMS`` applies to each device. Returns the C shards in row
-    order. ``BENCHMARK="eager"`` launches all shards concurrently and reports
-    the slowest device's time for the whole problem.
+    order. ``BENCHMARK="eager"`` or ``"graph"`` launches all shards
+    concurrently and reports the slowest device's time for the whole problem.
     """
     params = inspect.signature(mxgemm_tdm_pipelined).bind(a, b, a_scale, b_scale, *args, **kwargs)
     params.apply_defaults()
@@ -5445,8 +5488,8 @@ def mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, *args, **kwargs):
         raise ValueError("sharded MXFP requires the persistent kernel with transposed B and preshuffled A and B "
                          "scales")
     benchmark = params["BENCHMARK"]
-    if benchmark not in (None, "eager"):
-        raise ValueError("sharded MXFP supports BENCHMARK='eager' or None")
+    if benchmark not in (None, "eager", "graph"):
+        raise ValueError("sharded MXFP supports BENCHMARK='eager', 'graph' or None")
     M = a.shape[0] if params["M"] is None else params["M"]
     N = b.shape[0] if params["N"] is None else params["N"]
     K = params["K"] or a.shape[1] * (2 if params["DTYPE_A"] == "e2m1" else 1)
@@ -5464,8 +5507,9 @@ def mxgemm_tdm_sharded(devices, a, b, a_scale, b_scale, *args, **kwargs):
                      BENCHMARK=None if benchmark is None else launches.append)
         with torch.cuda.device(device):
             shards.append(mxgemm_tdm_pipelined(**shard))
-    if benchmark == "eager":
-        batch = lambda: _mxfp_concurrent_batch(devices, launches, params["BENCHMARK_NUM_ITERS"])  # noqa: E731
+    if benchmark is not None:
+        concurrent = _mxfp_concurrent_graph_batch if benchmark == "graph" else _mxfp_concurrent_batch
+        batch = lambda: concurrent(devices, launches, params["BENCHMARK_NUM_ITERS"])  # noqa: E731
         ms, batches = _mxfp_timed_batches(batch, params["BENCHMARK_WARMUP_SECONDS"],
                                           params["BENCHMARK_DURATION_SECONDS"])
         print(f"execution time: {ms} ms, {_mxfp_gemm_tflops(ms, M, N, K):.2f} TFLOPS over {len(devices)} devices "
