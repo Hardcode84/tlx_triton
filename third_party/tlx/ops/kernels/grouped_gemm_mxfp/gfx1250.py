@@ -604,11 +604,16 @@ _PERSISTENT_BLOCK_K = 128
 _PERSISTENT_STATIC_MAX_K = 16384
 # 4x4 clusters share B across four M tiles of one group and A across four N
 # tiles. Padding each group to whole cluster rows costs up to three empty
-# tiles per group, so clusters are used from this average group size.
-_CLUSTER_MIN_AVG_ROWS = 1024
+# tiles per group, so clusters are used from this average group size. On
+# gfx1250 (N = K = 8192) they win 7-14% for ragged groups averaging 591, 788
+# and 1040 rows and lose 7% at 500 rows and 25% for uniform 512-row groups.
+# 2x8 clusters pad less but share B over only two tiles: they win only for
+# uniform 512-row groups, which the op cannot tell from ragged ones.
+_CLUSTER_MIN_AVG_ROWS = 576
 _CLUSTER_ROWS = 4
 _CLUSTER_COLS = 4
 _CLUSTER_GROUP_M = 8
+_CLUSTER_L2_LOOKAHEAD = 4
 
 
 def _persistent_rows(gm, groups, x_dtype, w_dtype):
@@ -669,6 +674,9 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
     cluster = (tile_map.group_align % _CLUSTER_ROWS == 0 and tile_map.total_align % _CLUSTER_GROUP_M == 0
                and n % (_CLUSTER_COLS * _PERSISTENT_BLOCK_N) == 0 and programs % (_CLUSTER_ROWS * _CLUSTER_COLS) == 0)
     cluster_size = _CLUSTER_ROWS * _CLUSTER_COLS if cluster else 1
+    # As in mm_mxfp: from K=16384 the static ring's 4x4 clusters also prefetch
+    # the stage four steps ahead into L2, split across the cluster.
+    l2_lookahead = _CLUSTER_L2_LOOKAHEAD if static and cluster and k >= 16384 and _CLUSTER_ROWS == _CLUSTER_COLS == 4 else 0
     with torch.cuda.device(x.device):
         mxgemm_tdm_persistent_kernel[(programs, )](
             x, w.view(groups * n, k), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k, x.stride(0), k,
@@ -677,12 +685,13 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
             NUM_BUFFERS=min(4, k_tiles), NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial",
             OUTPUT_STAGING=True, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8,
             XCD_CHUNK=2, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=True,
-            CLUSTER_BARRIER_INTERVAL=8 if cluster else 1, CLUSTER_LAYOUT="4x4" if cluster else "linear",
-            STATIC_SLOT_UNROLL=static, OUTPUT_C_SLOTS=2 if static else None, OVERLAP_PEEL=static,
-            MERGED_HANDOFF_BARRIER=static, STATIC_CLUSTER_STEPS=static and cluster, REFILL_OVERLAP=4 if static else 0,
-            LDS_PARTITIONED_AB=0, NUM_GROUPS=groups, tile_meta0=tile_meta0, tile_meta1=tile_meta1,
-            tile_count=tile_count, a_rows=gm, a_scale_rows=a_scale.shape[0], num_warps=4, waves_per_eu=1,
-            ctas_per_cga=(cluster_size, 1, 1))
+            CLUSTER_BARRIER_INTERVAL=8 if cluster else 1,
+            CLUSTER_LAYOUT=f"{_CLUSTER_ROWS}x{_CLUSTER_COLS}" if cluster else "linear", L2_LOOKAHEAD=l2_lookahead,
+            L2_LOOKAHEAD_SPLIT=l2_lookahead > 0, STATIC_SLOT_UNROLL=static, OUTPUT_C_SLOTS=2 if static else None,
+            OVERLAP_PEEL=static, MERGED_HANDOFF_BARRIER=static, STATIC_CLUSTER_STEPS=static and cluster,
+            REFILL_OVERLAP=4 if static else 0, LDS_PARTITIONED_AB=0, NUM_GROUPS=groups, tile_meta0=tile_meta0,
+            tile_meta1=tile_meta1, tile_count=tile_count, a_rows=gm, a_scale_rows=a_scale.shape[0], num_warps=4,
+            waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1))
     return out
 
 
@@ -772,7 +781,7 @@ def grouped_gemm_mxfp(
 
     A8W8 groups that average more than 128 rows run 256x256 tiles on the persistent ``mm_mxfp`` kernel when N
     is divisible by 256 and K by 128 (K >= 256); the A scales of each tile are reordered on every call. Groups
-    averaging 1024 rows or more get a tile map padded for 4x4 clusters, which share A and B through multicast
+    averaging 576 rows or more get a tile map padded for 4x4 clusters, which share A and B through multicast
     when N is divisible by 1024. Other
     E4M3 activations (A8W8 and A8W4) stream the weights through ``mxgemm_grouped_stream_kernel`` when N is
     divisible by 128 and K by 512, which A8W8 requires. Without ``w_scale_preshuffled`` the weight scales are
