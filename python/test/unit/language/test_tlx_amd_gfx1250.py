@@ -1456,7 +1456,7 @@ def test_gfx1250_grouped_mxfp_persistent_clusters(k, num_programs):
     # 4x4 clusters on a map padded to whole cluster rows per group and whole
     # M groups: padding tiles in partial groups and an empty group. 64 tiles
     # over 16 or 48 programs, so clusters run different numbers of tiles; the
-    # op picks the padded map for groups averaging 1024 rows or more.
+    # op picks the padded map for groups averaging 576 rows or more.
     group_sizes, n = ((1500, 0, 2700) if num_programs is None else (300, 0, 700, 100, 257)), 1024
     x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, "e4m3")
     split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
