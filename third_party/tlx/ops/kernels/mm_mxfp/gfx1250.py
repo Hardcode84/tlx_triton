@@ -34,7 +34,7 @@ and row sharding across devices through ``mxgemm_tdm_sharded``).
 ``gfx1250_warp_pipeline.py`` hold alternative operand schedules that
 ``mxgemm_tdm_pipelined`` selects, and ``gfx1250_research/`` records the
 measurements behind the defaults. ``tlx.ops.kernels.grouped_gemm_mxfp`` runs
-A8W8 grouped GEMMs whose groups average more than 128 rows on the persistent
+A8W8 and A8W4 grouped GEMMs whose groups average more than 128 rows on the persistent
 kernel (``NUM_GROUPS``, with 4x4 clusters from 576-row groups), and smaller
 groups on its streaming kernel.
 """
@@ -1527,7 +1527,7 @@ def _mxgemm_a8w4_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc
                         GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr,
                         CLUSTER_BARRIER_INTERVAL: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr,
                         SPLIT_CLUSTER_BARRIER: tl.constexpr, CLUSTER_STEP: tl.constexpr = None,
-                        K_ROT: tl.constexpr = None):
+                        K_ROT: tl.constexpr = None, a_srow=None):
     # One A8W4 BK256 output-reuse K step with a single split refill barrier:
     # wait for the next stage, then one rendezvous releases the consumed slot
     # and publishes the next one. C11 covers the LDS drain before the arrive;
@@ -1552,7 +1552,7 @@ def _mxgemm_a8w4_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc
                             slot, BK, DA, DB, BUFFERS, WITH_A_SCALE, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
                             GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, False,
                             CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
-                            CLUSTER_STEP=CLUSTER_STEP, K_ROT=K_ROT)
+                            CLUSTER_STEP=CLUSTER_STEP, K_ROT=K_ROT, a_srow=a_srow)
     a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, WITH_A_SCALE, RELAXED=True)
     b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True)
     c10 = tlx.dot_scaled(a11, sa11, DTYPE_A, b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
@@ -2049,21 +2049,22 @@ def mxgemm_tdm_persistent_kernel(
     GROUPED_TILES: tl.constexpr = NUM_GROUPS > 0
     if GROUPED_TILES:
         # Grouped tiles start at any row, end at their group's last row, and
-        # read B from their group. The A8W8 staged-output schedules and the
-        # tile-ordered A scales support this. Grid clusters share B only
-        # within one group's cluster rows (see the docstring).
+        # read B from their group. The A8W8 BK128 and A8W4 BK256 staged-output
+        # schedules and the tile-ordered A scales support this. Grid clusters
+        # share B only within one group's cluster rows (see the docstring).
         tl.static_assert(M == 0, "grouped GEMM takes its rows from a_rows and the tile map; pass M=0")
         tl.static_assert(
-            BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and DA == 1 and DB == 1 and WITH_A_SCALE
-            and tlx.num_warps() == 4, "grouped GEMM requires A8W8 256x256x128 tiles")
+            BLOCK_M == 256 and BLOCK_N == 256 and DA == 1 and WITH_A_SCALE and tlx.num_warps() == 4
+            and ((BLOCK_K == 128 and DB == 1) or (BLOCK_K == 256 and DB == 2)),
+            "grouped GEMM requires A8W8 256x256x128 or A8W4 256x256x256 tiles")
         tl.static_assert(
-            OUTPUT_STAGING and CROSS_TILE_PREFETCH and TDM_FUSION == "partial"
+            OUTPUT_STAGING and (CROSS_TILE_PREFETCH or DB == 2) and TDM_FUSION == "partial"
             and (CLUSTER_SIZE == 1 or CLUSTER_LAYOUT != "linear") and HANDOFF_SCHEDULE == "current"
             and INTERLEAVE_C_FILL == 0 and (L2_LOOKAHEAD == 0 or L2_LOOKAHEAD_SPLIT) and not L2_LOOKAHEAD_SCALES
             and K_ROTATE_STEP == 0 and LDS_PARTITIONED_AB == 0
+            and (DB == 2 or not (EARLY_C_STORES or SPLIT_CLUSTER_BARRIER))
             and not (REGISTER_PIPELINE or OUTPUT_TAIL_REUSE or FIRST_USE_PREFETCH or WAVE_SPECIALIZED_HANDOFF
-                     or EARLY_C_STORES or SPLIT_CLUSTER_BARRIER or COMPACT_K_TAIL or SCALE_WAVE256 or A_ROW_PAIRS
-                     or B_ROW_PAIRS),
+                     or COMPACT_K_TAIL or SCALE_WAVE256 or A_ROW_PAIRS or B_ROW_PAIRS),
             "grouped GEMM supports the staged-output schedules with grid clusters and without LDS partitioning")
     B_ROWS: tl.constexpr = NUM_GROUPS * N if GROUPED_TILES else N
     tl.static_assert(tlx.num_warps() == 4 or tlx.num_warps() == 8)
@@ -2772,7 +2773,7 @@ def mxgemm_tdm_persistent_kernel(
                         as_buf, bs_buf, off_m, off_n, i, slot, next_slot, BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A,
                         DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, CLUSTER_SIZE, CLUSTER_MULTICAST,
                         GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER,
-                        K_ROT=K_ROT)
+                        K_ROT=K_ROT, a_srow=a_srow)
                     slot = next_slot
             elif A8W4_SPLIT_HANDOFF:
                 # The ring slot repeats every NUM_BUFFERS steps. Unrolling by
@@ -2793,14 +2794,15 @@ def mxgemm_tdm_persistent_kernel(
                             as_buf, bs_buf, off_m, off_n, i + j, a8w4_slots[j], a8w4_slots[(j + 1) % NUM_BUFFERS],
                             BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B, NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION,
                             LOADS, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                            CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, K_ROT=K_ROT)
+                            CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, K_ROT=K_ROT, a_srow=a_srow)
                 for j in tl.static_range(A8W4_STEADY % NUM_BUFFERS):
                     c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_a8w4_k_step(
                         c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf,
                         as_buf, bs_buf, off_m, off_n, A8W4_UNROLLED + j, a8w4_slots[j],
                         a8w4_slots[(j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, DA, DB, DTYPE_A, DTYPE_B,
                         NUM_BUFFERS, WITH_A_SCALE, TDM_FUSION, LOADS, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                        XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, K_ROT=K_ROT)
+                        XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, K_ROT=K_ROT,
+                        a_srow=a_srow)
                 slot = a8w4_slots[A8W4_STEADY % NUM_BUFFERS]
             # With STATIC_SLOT_UNROLL the steps above consume the whole range.
             for i in tl.range(
