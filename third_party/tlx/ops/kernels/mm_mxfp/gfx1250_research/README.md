@@ -644,8 +644,9 @@ persistent kernel on its rows with its own workgroups, so there is no
 reduction and no synchronization between devices. The remaining arguments are
 those of `mxgemm_tdm_pipelined`; `NUM_PROGRAMS` applies per device. With
 `BENCHMARK="eager"` every repetition clears each device's L2 and launches on
-all devices together, and the slowest device's median is reported for the
-whole problem.
+all devices together; with `BENCHMARK="graph"` each device replays its own
+CUDA graph of launches concurrently. The slowest device's time is reported for
+the whole problem.
 
 `bench.py --devices 0,1` runs every case this way; there `--num-programs` is
 per device and defaults to each device's CU count, and the cluster

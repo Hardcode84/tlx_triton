@@ -521,7 +521,10 @@ def make_cases(args):
         raise CollectionError("select the profiled schedule using --kernels before --")
     cases = []
     for kernel in args.kernels:
-        options = [*forwarded, *(["--streamed-operands"] if kernel == "streamed_operands" else [])]
+        # Traces and their timings use eager launches; an explicit graph mode is rejected below.
+        options = [
+            "--benchmark-mode", "eager", *forwarded, *(["--streamed-operands"] if kernel == "streamed_operands" else [])
+        ]
         parsed, shapes, variants = bench.parse_benchmark_args(options)
         if parsed.benchmark_mode != "eager" or parsed.csv or parsed.output_dir or parsed.dry_run:
             raise CollectionError("collection requires eager timing; use the collector's output and dry-run options")

@@ -619,7 +619,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_buffers", type=int, default=2, choices=[2, 3, 4])
     parser.add_argument("--transpose_b", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--l2_prefetch_distance", type=int, default=2)
-    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="graph")
     parser.add_argument("--benchmark_num_iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)

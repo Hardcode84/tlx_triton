@@ -1,7 +1,8 @@
 """Run the regular gfx1250 grouped GEMM benchmark shape sweep.
 
 Each shape is ``(G, M_per_group, N, K)``. Every group has the same M.
-Both packed and list kernels run for each shape by default. Each run uses a
+Both packed and list kernels run for each shape by default, timed with CUDA
+graph replay (``--benchmark-mode eager`` clears L2 before each launch). Each run uses a
 separate process so its large GPU allocations are released before the next
 run starts. Subprocesses use the current Python interpreter and inherit its
 environment.
@@ -242,7 +243,10 @@ def main() -> int:
                         help="workgroups per multicast cluster (default: 4); use 1 to disable clustering")
     parser.add_argument("--cluster-multicast", action=argparse.BooleanOptionalAction, default=True,
                         help="share inputs within a cluster; disable for a synchronization-only control")
-    parser.add_argument("--benchmark-mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument(
+        "--benchmark-mode", choices=("eager", "graph"), default="graph",
+        help="graph (default): CUDA graph replay without host launch overhead; eager: one launch "
+        "per repetition after clearing L2")
     parser.add_argument("--benchmark-num-iters", type=int, default=32)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)

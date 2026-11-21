@@ -148,8 +148,9 @@ python3 amd_grouped_gemm_gfx1250_test.py \
   --tdm_pipeline_depth 2 --cross_tile_prefetch --benchmark_mode none --check
 ```
 
-Use `--benchmark_mode eager` or `graph` and `--benchmark_num_iters 32` to time
-a single shape. Graph mode removes launch overhead. Timing excludes metadata
+Use `--benchmark_mode graph` (default) or `eager` and `--benchmark_num_iters 32`
+to time a single shape. Graph mode removes launch overhead; eager mode clears
+L2 before each launch. `bench.py` also defaults to graph timing. Timing excludes metadata
 and output allocation.
 
 The default sweep runs packed then list with identical settings for every
