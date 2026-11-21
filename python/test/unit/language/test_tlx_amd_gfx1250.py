@@ -1242,22 +1242,24 @@ def test_gfx1250_grouped_mxfp_stream_ring_phase(w_dtype, config, num_programs):
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-@pytest.mark.parametrize("k", [256, 384, 512, 1024])
+@pytest.mark.parametrize("w_dtype,k", [("e4m3", 256), ("e4m3", 384), ("e4m3", 512), ("e4m3", 1024), ("e2m1", 768),
+                                       ("e2m1", 1024)])
 @pytest.mark.parametrize("num_programs", [None, 3])
-def test_gfx1250_grouped_mxfp_persistent(k, num_programs):
-    # A8W8 groups averaging 256 or more rows run 256x256 tiles on the persistent
-    # mm_mxfp kernel: an empty group, groups ending in either half of a tile,
-    # A rows past the last group, programs without a tile or with several
-    # tiles across groups, and the dynamic two- to four-stage and static rings.
+def test_gfx1250_grouped_mxfp_persistent(w_dtype, k, num_programs):
+    # A8W8 and A8W4 groups averaging more than 128 rows run 256x256 tiles on the
+    # persistent mm_mxfp kernel: an empty group, groups ending in either half of
+    # a tile, A rows past the last group, programs without a tile or with
+    # several tiles across groups, the A8W8 dynamic two- to four-stage and
+    # static rings, and the A8W4 three-stage BK256 ring.
     group_sizes, n = (300, 0, 700, 100, 257), 512
-    x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, "e4m3")
+    x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, w_dtype)
     split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
     gm = sum(group_sizes)
     if num_programs is None:
         out = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x.cuda(), x_scale.cuda(), w.cuda(), w_scale.cuda(),
-                                                         split_sizes, x_dtype="e4m3", w_dtype="e4m3", validate=True)
+                                                         split_sizes, x_dtype="e4m3", w_dtype=w_dtype, validate=True)
     else:
-        tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm, "e4m3", "e4m3")
+        tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm, "e4m3", w_dtype)
         assert tile_map.block_m == 256
         out = torch.empty((gm, n), dtype=torch.bfloat16, device="cuda")
         w_scale = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale.cuda())
@@ -1267,23 +1269,23 @@ def test_gfx1250_grouped_mxfp_persistent(k, num_programs):
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("w_dtype,k", [("e4m3", 512), ("e4m3", 1024), ("e2m1", 1024)])
 @pytest.mark.parametrize("num_programs", [16, 48, None])
-def test_gfx1250_grouped_mxfp_persistent_clusters(k, num_programs):
+def test_gfx1250_grouped_mxfp_persistent_clusters(w_dtype, k, num_programs):
     # 4x4 clusters on a map padded to whole cluster rows per group and whole
     # M groups: padding tiles in partial groups and an empty group. 64 tiles
     # over 16 or 48 programs, so clusters run different numbers of tiles; the
     # op picks the padded map for groups averaging 576 rows or more.
     group_sizes, n = ((1500, 0, 2700) if num_programs is None else (300, 0, 700, 100, 257)), 1024
-    x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, "e4m3")
+    x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, w_dtype)
     split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
     gm = sum(group_sizes)
     if num_programs is None:
-        tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm, "e4m3", "e4m3")
+        tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm, "e4m3", w_dtype)
         assert (tile_map.block_m, tile_map.group_align, tile_map.tile_count[0].item()) == (256, 4, 24)
         out = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x.cuda(), x_scale.cuda(), w.cuda(), w_scale.cuda(),
-                                                         split_sizes, x_dtype="e4m3", w_dtype="e4m3", tile_map=tile_map,
-                                                         validate=True)
+                                                         split_sizes, x_dtype="e4m3", w_dtype=w_dtype,
+                                                         tile_map=tile_map, validate=True)
     else:
         tile_map = _gfx1250_grouped_mxfp_op._tile_map(split_sizes, gm, 256, 4, 8)
         assert tile_map.tile_count[0].item() == 16

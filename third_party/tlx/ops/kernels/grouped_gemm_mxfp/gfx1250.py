@@ -591,14 +591,16 @@ def _grouped_stream(x, x_scale, w, w_scale, split_sizes, out, tile_map, w_dtype,
     return out
 
 
-# A8W8 groups that average more than this many rows reuse each weight tile
-# across M tiles: the persistent mm_mxfp kernel runs them as 256x256 tiles.
-# On gfx1250 (N = K = 8192) it beats streaming from 192-row groups (-33%);
-# at 128-row groups streaming 128-row tiles is 20% faster.
+# A8W8 and A8W4 groups that average more than this many rows reuse each
+# weight tile across M tiles: the persistent mm_mxfp kernel runs them as
+# 256x256 tiles. For A8W8 on gfx1250 (N = K = 8192) it beats streaming from
+# 192-row groups (-33%); at 128-row groups streaming 128-row tiles is 20%
+# faster. A8W4 uses the same threshold.
 _STREAM_MAX_AVG_ROWS = 128
 _PERSISTENT_BLOCK_M = 256
 _PERSISTENT_BLOCK_N = 256
-_PERSISTENT_BLOCK_K = 128
+# BLOCK_K per weight dtype: A8W8 runs the BK128 schedules, A8W4 the BK256 one.
+_PERSISTENT_BLOCK_K = {"e4m3": 128, "e2m1": 256}
 # Static slot unroll pays off up to this K; beyond it the dynamic four-stage
 # ring is faster (see mm_mxfp).
 _PERSISTENT_STATIC_MAX_K = 16384
@@ -617,11 +619,13 @@ _CLUSTER_L2_LOOKAHEAD = 4
 
 
 def _persistent_rows(gm, groups, x_dtype, w_dtype):
-    return x_dtype == w_dtype == "e4m3" and gm > _STREAM_MAX_AVG_ROWS * max(groups, 1)
+    return x_dtype == "e4m3" and w_dtype in _PERSISTENT_BLOCK_K and gm > _STREAM_MAX_AVG_ROWS * max(groups, 1)
 
 
-def _persistent_shape(n, k):
-    return n % _PERSISTENT_BLOCK_N == 0 and k % _PERSISTENT_BLOCK_K == 0 and k >= 2 * _PERSISTENT_BLOCK_K
+def _persistent_shape(n, k, w_dtype):
+    # A8W8 needs two BK128 steps, A8W4 its three-stage BK256 ring.
+    block_k = _PERSISTENT_BLOCK_K[w_dtype]
+    return n % _PERSISTENT_BLOCK_N == 0 and k % block_k == 0 and k >= (2 if w_dtype == "e4m3" else 3) * block_k
 
 
 def _persistent_tile_map(split_sizes, gm):
@@ -650,7 +654,8 @@ def _gather_tile_a_scale(x_scale, packed, tile_meta0, tile_meta1, tile_count, QW
 
 
 def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None):
-    """A8W8 grouped GEMM on the persistent mm_mxfp kernel; ``w_scale`` is preshuffled, ``tile_map`` BLOCK_M=256."""
+    """A8W8 or A8W4 grouped GEMM on the persistent mm_mxfp kernel; ``w_scale`` is preshuffled, ``tile_map``
+    BLOCK_M=256."""
     gm, k = x.shape
     groups, n = w.shape[0], w.shape[1]
     tile_meta0, tile_meta1, tile_count = tile_map[:3]
@@ -665,8 +670,10 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
                                                                                    tile_meta0, tile_meta1, tile_count,
                                                                                    QW=qw, BLOCK_M=_PERSISTENT_BLOCK_M,
                                                                                    COLS=_scale_cols(qw))
-    k_tiles = k // _PERSISTENT_BLOCK_K
-    static = 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
+    w_dtype = "e4m3" if w.dtype == torch.float8_e4m3fn else "e2m1"
+    block_k = _PERSISTENT_BLOCK_K[w_dtype]
+    k_tiles = k // block_k
+    static = w_dtype == "e4m3" and 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
     # One program per CU whatever the row count (see _grouped_stream).
     programs = num_programs or torch.cuda.get_device_properties(x.device).multi_processor_count
     # A map padded for clusters keeps every cluster in one group and every
@@ -677,21 +684,26 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
     # As in mm_mxfp: from K=16384 the static ring's 4x4 clusters also prefetch
     # the stage four steps ahead into L2, split across the cluster.
     l2_lookahead = _CLUSTER_L2_LOOKAHEAD if static and cluster and k >= 16384 and _CLUSTER_ROWS == _CLUSTER_COLS == 4 else 0
+    if w_dtype == "e4m3":
+        schedule = dict(NUM_BUFFERS=min(4, k_tiles), CROSS_TILE_PREFETCH=True)
+    else:
+        # As mm_mxfp's A8W4 default: three BK256 stages, C staged in retired A
+        # stages, early C stores, split cluster barriers.
+        schedule = dict(NUM_BUFFERS=3, CROSS_TILE_PREFETCH=False, EARLY_C_STORES=True, SPLIT_CLUSTER_BARRIER=cluster)
     with torch.cuda.device(x.device):
         mxgemm_tdm_persistent_kernel[(programs, )](
-            x, w.view(groups * n, k), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k, x.stride(0), k,
-            out.stride(0), a_scale.stride(0), ks * 128, DTYPE_A="e4m3", DTYPE_B="e4m3", BLOCK_M=_PERSISTENT_BLOCK_M,
-            BLOCK_N=_PERSISTENT_BLOCK_N, BLOCK_K=_PERSISTENT_BLOCK_K, GROUP_SIZE_M=_CLUSTER_GROUP_M,
-            NUM_BUFFERS=min(4, k_tiles), NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial",
-            OUTPUT_STAGING=True, CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8,
-            XCD_CHUNK=2, CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=True,
-            CLUSTER_BARRIER_INTERVAL=8 if cluster else 1,
+            x, w.view(groups * n, w.shape[2]), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k,
+            x.stride(0), w.shape[2], out.stride(0), a_scale.stride(0), ks * 128, DTYPE_A="e4m3", DTYPE_B=w_dtype,
+            BLOCK_M=_PERSISTENT_BLOCK_M, BLOCK_N=_PERSISTENT_BLOCK_N, BLOCK_K=block_k, GROUP_SIZE_M=_CLUSTER_GROUP_M,
+            NUM_PROGRAMS=programs, WITH_A_SCALE=True, TDM_FUSION="partial", OUTPUT_STAGING=True,
+            XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=cluster_size,
+            CLUSTER_MULTICAST=True, CLUSTER_BARRIER_INTERVAL=8 if cluster else 1,
             CLUSTER_LAYOUT=f"{_CLUSTER_ROWS}x{_CLUSTER_COLS}" if cluster else "linear", L2_LOOKAHEAD=l2_lookahead,
             L2_LOOKAHEAD_SPLIT=l2_lookahead > 0, STATIC_SLOT_UNROLL=static, OUTPUT_C_SLOTS=2 if static else None,
             OVERLAP_PEEL=static, MERGED_HANDOFF_BARRIER=static, STATIC_CLUSTER_STEPS=static and cluster,
             REFILL_OVERLAP=4 if static else 0, LDS_PARTITIONED_AB=0, NUM_GROUPS=groups, tile_meta0=tile_meta0,
             tile_meta1=tile_meta1, tile_count=tile_count, a_rows=gm, a_scale_rows=a_scale.shape[0], num_warps=4,
-            waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1))
+            waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1), **schedule)
     return out
 
 
@@ -779,11 +791,11 @@ def grouped_gemm_mxfp(
     ``split_sizes`` is a device int32 ``[G]`` tensor and is not read on the host unless ``validate=True``, so the
     call is graph-capturable. Returns BF16 ``[GM, N]`` (``out`` if given).
 
-    A8W8 groups that average more than 128 rows run 256x256 tiles on the persistent ``mm_mxfp`` kernel when N
-    is divisible by 256 and K by 128 (K >= 256); the A scales of each tile are reordered on every call. Groups
-    averaging 576 rows or more get a tile map padded for 4x4 clusters, which share A and B through multicast
-    when N is divisible by 1024. Other
-    E4M3 activations (A8W8 and A8W4) stream the weights through ``mxgemm_grouped_stream_kernel`` when N is
+    A8W8 and A8W4 groups that average more than 128 rows run 256x256 tiles on the persistent ``mm_mxfp`` kernel
+    when N is divisible by 256 and K by 128 (K >= 256; A8W4: by 256, K >= 768); the A scales of each tile are
+    reordered on every call. Groups averaging 576 rows or more get a tile map padded for 4x4 clusters, which
+    share A and B through multicast when N is divisible by 1024. Other E4M3 activations (A8W8 and A8W4) stream
+    the weights through ``mxgemm_grouped_stream_kernel`` when N is
     divisible by 128 and K by 512, which A8W8 requires. Without ``w_scale_preshuffled`` the weight scales are
     preshuffled on every call. A ``tile_map`` from ``prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype, w_dtype)``
     is used whenever given; otherwise one is built (for W4A4 and preshuffled A8W4 weights only for
@@ -811,9 +823,9 @@ def grouped_gemm_mxfp(
             stream_block_m = tile_map.block_m
         else:
             stream_block_m = _block_m(gm, groups, x_dtype, w_dtype)
-            if stream_block_m == _PERSISTENT_BLOCK_M and not _persistent_shape(n, k):
+            if stream_block_m == _PERSISTENT_BLOCK_M and not _persistent_shape(n, k, w_dtype):
                 stream_block_m = _stream_block_m(gm, groups)
-        if stream_block_m == _PERSISTENT_BLOCK_M and w_dtype == "e4m3" and _persistent_shape(n, k):
+        if stream_block_m == _PERSISTENT_BLOCK_M and _persistent_shape(n, k, w_dtype):
             if validate:
                 _check_split_sizes(split_sizes, gm, 0)
             if tile_map is None:
