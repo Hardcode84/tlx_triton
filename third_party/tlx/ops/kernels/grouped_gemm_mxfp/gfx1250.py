@@ -453,11 +453,46 @@ def _tile_map_entries(gm, groups, block_m, group_align, total_align):
     return triton.cdiv(gm, block_m) + groups * group_align + total_align - 1
 
 
+@triton.jit
+def _block128_words(src, dst, first_row, rows, QW: tl.constexpr, COLS: tl.constexpr):
+    # Copy rows [first_row, first_row + rows) of [*, QW] int32 words of E8M0
+    # scales (zeros past `rows`, at most 128) into the block128 block at dst:
+    # word q of row a * 32 + b, four consecutive scales, goes to word
+    # (q * 32 + b) * 4 + a, as in pack_scale. Reading whole rows and writing
+    # whole 128-word runs makes the transpose go through LDS.
+    r = tl.arange(0, 128)
+    q = tl.program_id(1) * COLS + tl.arange(0, COLS)
+    values = tl.load(src + (first_row + r).to(tl.int64)[:, None] * QW + q[None, :],
+                     mask=(r < rows)[:, None] & (q < QW)[None, :], other=0)
+    values = tl.reshape(tl.permute(tl.reshape(values, (4, 32, COLS)), (2, 1, 0)), (COLS, 128))
+    tl.store(dst + q[:, None] * 128 + r[None, :], values, mask=(q < QW)[:, None])
+
+
+@triton.jit
+def _preshuffle_scale_kernel(src, dst, QW: tl.constexpr, COLS: tl.constexpr):
+    block = tl.program_id(0)
+    _block128_words(src, dst + block.to(tl.int64) * (128 * QW), block * 128, 128, QW, COLS)
+
+
+def _scale_cols(qw):
+    return min(32, triton.next_power_of_2(qw))
+
+
 def preshuffle_grouped_weight_scale(w_scale, kstep_major=False):
     """Preshuffle E8M0 weight scales; kstep_major must match the payload's."""
     groups, n, k_scale = w_scale.shape
     if n % 128 or k_scale % 4:
         raise ValueError("Weight-scale N must be divisible by 128 and K/32 by 4")
+    if w_scale.is_cuda and not kstep_major:
+        packed = torch.empty((groups, n // 128, k_scale * 128), dtype=w_scale.dtype, device=w_scale.device)
+        if packed.numel():
+            qw = k_scale // 4
+            with torch.cuda.device(w_scale.device):
+                _preshuffle_scale_kernel[(groups * n // 128,
+                                          triton.cdiv(qw, _scale_cols(qw)))](w_scale.contiguous().view(torch.int32),
+                                                                             packed.view(torch.int32), QW=qw,
+                                                                             COLS=_scale_cols(qw))
+        return packed
     packed = w_scale.view(groups, n // 128, 4, 32, k_scale // 4, 4)
     packed = packed.permute(0, 1, 4, 3, 2, 5).contiguous()
     if kstep_major:
@@ -593,25 +628,20 @@ def _persistent_tile_map(split_sizes, gm):
 
 
 @triton.jit
-def _gather_tile_a_scale(x_scale, packed, tile_meta0, tile_meta1, tile_count, KS: tl.constexpr, BLOCK_M: tl.constexpr,
+def _gather_tile_a_scale(x_scale, packed, tile_meta0, tile_meta1, tile_count, QW: tl.constexpr, BLOCK_M: tl.constexpr,
                          COLS: tl.constexpr):
-    # Copy the natural [GM, KS] scales of each map entry's BLOCK_M rows into
-    # block128 order (pack_scale) at packed row entry * BLOCK_M // 128. Rows
-    # past the entry's group read as zero; the GEMM does not store them.
+    # Copy the natural [GM, 4 * QW] scales (as int32 words) of each map
+    # entry's BLOCK_M rows into block128 order at packed row
+    # entry * BLOCK_M // 128. Rows past the entry's group read as zero; the
+    # GEMM does not store them.
     block = tl.program_id(0)
     entry = block // (BLOCK_M // 128)
     if entry < tl.load(tile_count):
         meta0 = tl.load(tile_meta0 + entry)
         local = (tl.load(tile_meta1 + entry) >> 32).to(tl.int32)
         skip = local * BLOCK_M + block % (BLOCK_M // 128) * 128
-        rows = (meta0 >> 32).to(tl.int32) - skip
-        r = tl.arange(0, 128)
-        c = tl.program_id(1) * COLS + tl.arange(0, COLS)
-        src = x_scale + ((meta0 & 0xFFFFFFFF).to(tl.int32) + skip + r).to(tl.int64)[:, None] * KS + c[None, :]
-        values = tl.load(src, mask=(r < rows)[:, None] & (c < KS)[None, :], other=0)
-        # Row a * 32 + b, column q * 4 + d goes to ((q * 32 + b) * 4 + a) * 4 + d.
-        dst = ((c // 4)[None, :] * 32 + (r % 32)[:, None]) * 16 + (r // 32)[:, None] * 4 + (c % 4)[None, :]
-        tl.store(packed + block.to(tl.int64) * (KS * 128) + dst, values, mask=(c < KS)[None, :])
+        _block128_words(x_scale, packed + block.to(tl.int64) * (128 * QW), (meta0 & 0xFFFFFFFF).to(tl.int32) + skip,
+                        (meta0 >> 32).to(tl.int32) - skip, QW, COLS)
 
 
 def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None):
@@ -623,9 +653,13 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
     ks = k // 32
     rows_per_entry = _PERSISTENT_BLOCK_M // 128
     a_scale = torch.empty((entries * rows_per_entry, ks * 128), dtype=torch.uint8, device=x.device)
-    _gather_tile_a_scale[(entries * rows_per_entry, triton.cdiv(ks, 64))](x_scale, a_scale, tile_meta0, tile_meta1,
-                                                                          tile_count, KS=ks,
-                                                                          BLOCK_M=_PERSISTENT_BLOCK_M, COLS=64)
+    qw = ks // 4
+    _gather_tile_a_scale[(entries * rows_per_entry, triton.cdiv(qw,
+                                                                _scale_cols(qw)))](x_scale.view(torch.int32),
+                                                                                   a_scale.view(torch.int32),
+                                                                                   tile_meta0, tile_meta1, tile_count,
+                                                                                   QW=qw, BLOCK_M=_PERSISTENT_BLOCK_M,
+                                                                                   COLS=_scale_cols(qw))
     k_tiles = k // _PERSISTENT_BLOCK_K
     static = 4 < k_tiles and k <= _PERSISTENT_STATIC_MAX_K
     # One program per CU whatever the row count (see _grouped_stream).

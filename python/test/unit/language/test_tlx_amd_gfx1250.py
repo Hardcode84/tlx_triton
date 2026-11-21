@@ -1477,6 +1477,16 @@ def test_gfx1250_grouped_mxfp_persistent_clusters(k, num_programs):
     _assert_close_grouped(out, ref)
 
 
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("k_scale", [36, 256])
+def test_gfx1250_grouped_mxfp_weight_scale_preshuffle(k_scale):
+    # The device preshuffle copies four-scale words into block128 order; the
+    # host path is the reference permutation.
+    w_scale = torch.randint(0, 256, (3, 384, k_scale), dtype=torch.uint8)
+    out = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale.cuda())
+    assert torch.equal(out.cpu(), _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale))
+
+
 def test_gfx1250_grouped_mxfp_a8w8_rejects_unsupported_shapes():
     x = torch.empty((64, 768), dtype=torch.float8_e4m3fn, device="cuda")
     w = torch.empty((1, 256, 768), dtype=torch.float8_e4m3fn, device="cuda")
