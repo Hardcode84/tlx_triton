@@ -1,10 +1,8 @@
 """Benchmark the gfx1250 grouped MXFP GEMM (``grouped_gemm_mxfp``) shape sweep.
 
 Each case is ``(G, M_per_group, N, K)`` with equal groups; the default sweep
-is the FP16 grouped GEMM benchmark's
-(``tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py``) plus a weight-bound
-case of 128 groups of 64 rows. Each run reports TFLOPS and the bandwidth of
-the bytes a call must move (X, W, their scales and the output). A8W8 and A8W4 run for
+matches the FP16 grouped GEMM benchmark
+(``tlx/tutorials/amd_grouped_gemm_gfx1250/bench.py``). A8W8 and A8W4 run for
 each shape by default (``--variant``; W4A4 on request). Each run uses a
 separate process (``bench_gfx1250.py --single``) so its large allocations are
 released before the next run starts.
@@ -12,10 +10,8 @@ released before the next run starts.
 By default the timed call takes preshuffled weight scales and a tile map built
 once by ``prepare_grouped_gemm_mxfp``, as a serving loop would reuse them;
 ``--natural-w-scale`` and ``--per-call-tile-map`` include that preparation in
-every call. ``--benchmark-mode graph`` (default) times the call with
-``triton.testing.do_bench_cudagraph`` (no host launch overhead; L2 is not
-cleared between replays), ``eager`` with ``triton.testing.do_bench`` (L2
-cleared before each call); both report the median.
+every call. Timing uses ``triton.testing.do_bench`` (L2 cleared before each
+call) and reports the median.
 """
 
 from __future__ import annotations
@@ -42,15 +38,13 @@ DEFAULT_CASES = (
     (1, 8192, 8192, 8192),
     (1, 16384, 16384, 16384),
     (16, 4096, 4096, 4096),
-    # Weight-bound: each weight byte feeds 64 rows.
-    (128, 64, 8192, 8192),
 )
 
 # (x_dtype, w_dtype) per variant.
 VARIANTS = {"a8w8": ("e4m3", "e4m3"), "a8w4": ("e4m3", "e2m1"), "w4a4": ("e2m1", "e2m1")}
 DEFAULT_VARIANTS = ("a8w8", "a8w4")
 
-RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS,\s*([0-9.eE+-]+)\s*TB/s")
+RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
 
 @dataclass(frozen=True)
@@ -64,15 +58,13 @@ class BenchCase:
     def label(self) -> str:
         return f"{self.groups}x{self.m}x{self.n}x{self.k}"
 
-    def tensor_bytes(self, variant: str) -> float:
-        # X, W, their scales, and the BF16 output: the bytes one call must move.
+    def tensor_gib(self, variant: str) -> float:
+        # X, W, their scales, and the BF16 output; excludes allocator overhead.
         x_bits, w_bits = (8 if dtype == "e4m3" else 4 for dtype in VARIANTS[variant])
         gm = self.groups * self.m
         size = gm * self.k * x_bits / 8 + self.groups * self.n * self.k * w_bits / 8
-        return size + (gm + self.groups * self.n) * self.k / 32 + gm * self.n * 2
-
-    def tensor_gib(self, variant: str) -> float:
-        return self.tensor_bytes(variant) / 1024**3
+        size += (gm + self.groups * self.n) * self.k / 32 + gm * self.n * 2
+        return size / 1024**3
 
 
 @dataclass
@@ -82,7 +74,6 @@ class BenchResult:
     returncode: int
     ms: float | None
     tflops: float | None
-    tbps: float | None
 
     @property
     def status(self) -> str:
@@ -107,7 +98,7 @@ def _command(args: argparse.Namespace, case: BenchCase, variant: str) -> list[st
     command = [
         sys.executable,
         str(Path(__file__).resolve()), "--single", "--variant", variant, "--case", case.label, "--seed",
-        str(args.seed), "--benchmark-mode", args.benchmark_mode
+        str(args.seed)
     ]
     if args.natural_w_scale:
         command.append("--natural-w-scale")
@@ -124,43 +115,42 @@ def _run_case(args: argparse.Namespace, case: BenchCase, variant: str, index: in
     print(f"[{index}/{total}] {variant} {case.label}  estimated tensors: {case.tensor_gib(variant):.1f} GiB")
     print(f"$ {shlex.join(command)}", flush=True)
     if args.dry_run:
-        return BenchResult(case, variant, 0, None, None, None)
+        return BenchResult(case, variant, 0, None, None)
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert process.stdout is not None
-    ms = tflops = tbps = None
+    ms = tflops = None
     for line in process.stdout:
         print(line, end="")
         match = RESULT_RE.search(line)
         if match:
-            ms, tflops, tbps = (float(match.group(i)) for i in (1, 2, 3))
-    return BenchResult(case, variant, process.wait(), ms, tflops, tbps)
+            ms, tflops = float(match.group(1)), float(match.group(2))
+    return BenchResult(case, variant, process.wait(), ms, tflops)
 
 
-def _print_summary(results: list[BenchResult], benchmark_mode: str) -> None:
+def _print_summary(results: list[BenchResult]) -> None:
     print()
-    print(f"Summary ({benchmark_mode} timing)")
-    print(f"{'variant':>7} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'ms':>12} {'TFLOPS':>10} {'TB/s':>8}  status")
+    print("Summary")
+    print(f"{'variant':>7} {'G':>4} {'M/group':>9} {'N':>7} {'K':>7} {'ms':>12} {'TFLOPS':>12}  status")
     for result in results:
         case = result.case
         ms = "-" if result.ms is None else f"{result.ms:.4f}"
         tflops = "-" if result.tflops is None else f"{result.tflops:.2f}"
-        tbps = "-" if result.tbps is None else f"{result.tbps:.2f}"
-        print(f"{result.variant:>7} {case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} {ms:>12} {tflops:>10} "
-              f"{tbps:>8}  {result.status}")
+        print(f"{result.variant:>7} {case.groups:4d} {case.m:9d} {case.n:7d} {case.k:7d} {ms:>12} {tflops:>12}  "
+              f"{result.status}")
 
 
 def _write_csv(path: Path, results: list[BenchResult]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as output:
-        writer = csv.DictWriter(
-            output, fieldnames=("variant", "groups", "m_per_group", "n", "k", "ms", "tflops", "tbps", "status"))
+        writer = csv.DictWriter(output,
+                                fieldnames=("variant", "groups", "m_per_group", "n", "k", "ms", "tflops", "status"))
         writer.writeheader()
         for result in results:
             case = result.case
             writer.writerow({
                 "variant": result.variant, "groups": case.groups, "m_per_group": case.m, "n": case.n, "k": case.k, "ms":
                 "" if result.ms is None else result.ms, "tflops": "" if result.tflops is None else result.tflops,
-                "tbps": "" if result.tbps is None else result.tbps, "status": result.status
+                "status": result.status
             })
 
 
@@ -241,13 +231,9 @@ def run_single(args: argparse.Namespace) -> int:
         print(f"check max_rel={err:.3g} {'OK' if err < 1e-2 else 'FAIL'}", flush=True)
         if err >= 1e-2:
             return 1
-    if args.benchmark_mode == "graph":
-        ms = triton.testing.do_bench_cudagraph(call, return_mode="median")
-    else:
-        ms = triton.testing.do_bench(call, return_mode="median")
+    ms = triton.testing.do_bench(call, return_mode="median")
     tflops = 2 * gm * case.n * case.k / (ms * 1e-3) / 1e12
-    tbps = case.tensor_bytes(variant) / (ms * 1e-3) / 1e12
-    print(f"{variant} {case.label}: execution time: {ms:.4f} ms, {tflops:.2f} TFLOPS, {tbps:.2f} TB/s", flush=True)
+    print(f"{variant} {case.label}: execution time: {ms:.4f} ms, {tflops:.2f} TFLOPS", flush=True)
     return 0
 
 
@@ -262,10 +248,6 @@ def main(argv=None) -> int:
     parser.add_argument("--per-call-tile-map", action="store_true", help="build the tile map in every call")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False,
                         help="compare sampled rows with a dequantized reference before timing")
-    parser.add_argument(
-        "--benchmark-mode", choices=("graph", "eager"), default="graph",
-        help="graph (default): CUDA graph replay without host launch overhead or L2 clearing; "
-        "eager: one call per repetition after clearing L2")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, default=None, help="optional summary CSV path")
     parser.add_argument("--dry-run", action="store_true")
@@ -286,7 +268,7 @@ def main(argv=None) -> int:
         results.append(result)
         if args.fail_fast and not args.dry_run and result.status != "ok":
             break
-    _print_summary(results, args.benchmark_mode)
+    _print_summary(results)
     if args.csv is not None:
         _write_csv(args.csv, results)
         print(f"\nWrote {args.csv}")
