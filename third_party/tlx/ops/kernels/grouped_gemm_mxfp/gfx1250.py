@@ -552,6 +552,11 @@ def _stream_config(n, k, w_dtype, block_m):
 
     Deeper K stages halve the per-step barrier and wait overhead, so prefer
     BLOCK_K=256 with at least three stages, then fill the LDS with stages.
+    With 256-column tiles, packed FP4 weights first try BLOCK_K=512 with at
+    least two stages, so each K step moves as many weight bytes as A8W8's: with BLOCK_K=256 the
+    per-step costs halve the weight bandwidth (gfx1250, 128 groups of 64
+    rows with N = K = 8192: 11.9 TB/s with five stages, 14.0 TB/s with two
+    BLOCK_K=512 stages; 12-18% faster for 8- to 64-row groups at K = 4096).
     """
     if n % 128 or k % 512:
         return None
@@ -561,11 +566,12 @@ def _stream_config(n, k, w_dtype, block_m):
     def padded(rows, cols, pad):
         return rows * (cols + pad * triton.cdiv(cols, 256))
 
-    for block_k in (256, 128):
+    candidates = ((512, 2), (256, 3), (128, 3)) if db == 2 and block_n == 256 else ((256, 3), (128, 3))
+    for block_k, min_buffers in candidates:
         stage = (padded(block_m, block_k, 16) + padded(block_n, block_k // db, 16) + padded(block_m, 16, 8) +
                  padded(block_n // 128, block_k // 32 * 128, 8))
         buffers = min(6, (_STREAM_LDS_BUDGET - block_m * block_n * 2) // stage, k // block_k + 1)
-        if buffers >= 3:
+        if buffers >= min_buffers:
             return block_n, block_k, buffers
     return None
 
