@@ -694,8 +694,11 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
         schedule = dict(NUM_BUFFERS=min(4, k_tiles), CROSS_TILE_PREFETCH=True)
     else:
         # As mm_mxfp's A8W4 default: three BK256 stages, C staged in retired A
-        # stages, early C stores, split cluster barriers.
-        schedule = dict(NUM_BUFFERS=3, CROSS_TILE_PREFETCH=False, EARLY_C_STORES=True, SPLIT_CLUSTER_BARRIER=cluster)
+        # stages, early C stores, split cluster barriers, and WMMA queuing
+        # (SCHED_MODE[2]; gfx1250, N = K = 8192: 2048-row groups -1.9%,
+        # ragged ~1040-row groups -2.6%).
+        schedule = dict(NUM_BUFFERS=3, CROSS_TILE_PREFETCH=False, EARLY_C_STORES=True, SPLIT_CLUSTER_BARRIER=cluster,
+                        enable_wmma_queuing=True)
     with torch.cuda.device(x.device):
         mxgemm_tdm_persistent_kernel[(programs, )](
             x, w.view(groups * n, w.shape[2]), out, a_scale, w_scale.view(groups * n // 128, ks * 128), 0, n, k,

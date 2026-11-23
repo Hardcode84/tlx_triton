@@ -19,9 +19,10 @@ with a cluster barrier every eight input K blocks. MX8xMX8 uses a four-stage
 input ring with two C slots for K >= 16384, and three stages otherwise (up to
 K=16384, FP16 and FP32 from K=8192 use the static four-stage ring described
 below).
-MX8xMX4 also enables split cluster barriers and early C stores. These two
-options are disabled by default for MX8xMX8 and output-tail reuse. Other
-operand schedules do not support these options. SCHED_MODE[2] is off.
+MX8xMX4 also enables split cluster barriers, early C stores, and WMMA queuing
+(SCHED_MODE[2], --sched-mode-2). These options are disabled by default for
+MX8xMX8 and output-tail reuse. Other operand schedules do not support the
+first two.
 Use --cluster-size 4 --cluster-layout 2x2 --cluster-barrier-interval 4 for the
 previous four-workgroup clusters, and --num-buffers 3 to keep three stages.
 Other cluster sizes and --streamed-operands use a linear layout by default.
@@ -320,6 +321,12 @@ def _variant_args(args, dtype_b):
                                           and resolved.cluster_barrier_interval > 0)
     if resolved.early_c_stores is None:
         resolved.early_c_stores = default_output_schedule
+    # WMMA queuing (SCHED_MODE[2]) lets the A8W4 split refill barrier's WMMAs
+    # queue behind its scalar and memory work (gfx1250 FP16: 8192^3 -2.0%,
+    # 8192^2x4096 -1.6%); MX8xMX8 is synchronization-bound and slows down
+    # (8192^2x4096 and 16384^3: +2.4%).
+    if resolved.sched_mode_2 is None:
+        resolved.sched_mode_2 = default_output_schedule
     # Choose the MX8xMX8 ring depth per case unless the ring, C slots, or the
     # three-stage static unroll were requested explicitly.
     resolved.auto_ring_depth = (args.num_buffers is None and args.output_c_slots is None
@@ -548,8 +555,10 @@ def parse_benchmark_args(argv=None):
         "--l2-prefetch-distance", type=int, default=None,
         help="cache lookahead in input K blocks (default: 1 for --operand-pipeline -BK 256; "
         "-1 disables it for other paths)")
-    parser.add_argument("--sched-mode-2", action=argparse.BooleanOptionalAction, default=False,
-                        help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: disabled)")
+    parser.add_argument(
+        "--sched-mode-2", action=argparse.BooleanOptionalAction, default=None,
+        help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: enabled for "
+        "the MX8xMX4 output schedule)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
                         help="stage persistent FP32 output for TDM stores; BK256 reuses input storage")
     parser.add_argument(

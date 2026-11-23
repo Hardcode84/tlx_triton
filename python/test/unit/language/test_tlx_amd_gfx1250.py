@@ -2062,7 +2062,12 @@ def test_mxgemm_bench_cluster_and_output_options():
                                                        and (shape[2] >= 8192 or merged))
             assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
             assert ("--merged_handoff_barrier" in cmd) == merged
+            # MX8xMX4 splits cluster barriers, starts C stores early, and queues WMMAs.
+            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores"
+                                                          in cmd) == ("--sched_mode_2" in cmd) == (variant == "mx8xmx4")
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
+    _, shapes, variants = bench.parse_benchmark_args(["--dry-run", "--no-sched-mode-2", "--variant", "mx8xmx4"])
+    assert all("--sched_mode_2" not in bench._command(args, shapes[0], dtype_b) for _, dtype_b, args in variants)
     _, _, variants = bench.parse_benchmark_args(["--dry-run", "--out-dtype", "fp16"])
     assert [args.out_dtype for _, _, args in variants] == ["fp16", "fp16"]
     # Opting out, and forcing it on for the four-stage ring.

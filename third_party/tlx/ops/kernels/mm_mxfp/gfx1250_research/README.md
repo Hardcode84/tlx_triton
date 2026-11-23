@@ -516,9 +516,12 @@ configuration use `REGISTER_PIPELINE=True`. Specify the required BK256 and
 two buffers when using those interfaces. The summary and CSV record
 `register_pipeline`.
 
-Use `--sched-mode-2` to enable the persistent kernel's hardware WMMA queuing
-setting (`SCHED_MODE[2]`). It is disabled by default; `--no-sched-mode-2`
-selects the default behavior. The summary and CSV record `sched_mode_2`.
+`--sched-mode-2` sets the persistent kernel's hardware WMMA queuing bit
+(`SCHED_MODE[2]`). It is enabled by default for the MX8xMX4 output schedule
+(gfx1250 FP16: 8192^3 -2.0%, 8192^2x4096 -1.6%) and disabled otherwise;
+MX8xMX8 slows down with it (8192^2x4096 and 16384^3: +2.4%, 8192^3 unchanged).
+`--no-sched-mode-2` and `--sched-mode-2` override the default. The summary and
+CSV record `sched_mode_2`.
 For example, compare the same sweep with the setting off and on:
 
 ```bash
