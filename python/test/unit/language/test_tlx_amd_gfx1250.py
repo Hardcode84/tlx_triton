@@ -2022,21 +2022,17 @@ def test_mxgemm_bench_devices_split_rows():
         bench.parse_benchmark_args(["--devices", "0,1", "--case", "3072x8192x8192", "--dry-run"])
 
 
-def test_mxgemm_bench_cluster_and_output_options():
+def test_mxgemm_bench_defaults_and_overrides():
     from triton.tlx.ops.kernels.mm_mxfp import bench_gfx1250 as bench
 
-    _, shapes, variants = bench.parse_benchmark_args(
-        ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
-    assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
-    for _, dtype_b, args in variants:
-        cmd = bench._command(args, shapes[0], dtype_b)
-        assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
-        assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
-        assert cmd[cmd.index("--xcd_remap") + 1] == "none"
-
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
-    # XCD remapping of whole clusters for both variants; MX8xMX8 uses a four-stage ring from K=16384.
-    # Each variant runs with FP32 and then FP16 output.
+    # XCD remapping of whole clusters for both variants, each with FP32 and
+    # then FP16 output. MX8xMX8 up to K=16384 (FP32 from K=8192) uses the
+    # four-stage static loop with the merged handoff barrier, static cluster
+    # steps, two C slots, and the overlap peel. FP32 at K=4096 keeps three
+    # stages with the overlap peel, and K=32768 uses a four-stage ring with two
+    # C slots. MX8xMX4 splits cluster barriers, starts C stores early, and
+    # queues WMMAs (SCHED_MODE[2]).
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
                                                                             ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
@@ -2047,30 +2043,56 @@ def test_mxgemm_bench_cluster_and_output_options():
             assert cmd[cmd.index("--cluster_size") + 1] == "16"
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
-            # FP16 up to K=16384, and FP32 from K=8192 to K=16384, use a
-            # four-stage static-slot ring with two C slots, the overlap peel,
-            # and one merged handoff barrier per step.
-            merged = variant == "mx8xmx8" and shape[2] <= 16384 and (args.out_dtype == "fp16" or shape[2] >= 8192)
-            # Other cases from K=16384 use the dynamic four-stage ring.
-            four_stage = variant == "mx8xmx8" and shape[2] >= 16384 and not merged
-            assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage or merged else "3")
-            assert ("--output_c_slots" in cmd) == (variant == "mx8xmx8" and not four_stage)
-            if merged:
-                assert cmd[cmd.index("--output_c_slots") + 1] == "2"
-            # The three-stage ring unrolls its slots from K=8192.
-            assert ("--static_slot_unroll" in cmd) == (variant == "mx8xmx8" and not four_stage
-                                                       and (shape[2] >= 8192 or merged))
-            assert ("--overlap_peel" in cmd) == (variant == "mx8xmx8" and not four_stage)
-            assert ("--merged_handoff_barrier" in cmd) == merged
-            # MX8xMX4 splits cluster barriers, starts C stores early, and queues WMMAs.
-            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores"
-                                                          in cmd) == ("--sched_mode_2" in cmd) == (variant == "mx8xmx4")
+            a8w8 = variant == "mx8xmx8"
+            merged = a8w8 and shape[2] <= 16384 and (args.out_dtype == "fp16" or shape[2] >= 8192)
+            four_stage = a8w8 and (shape[2] >= 16384 or merged)
+            assert cmd[cmd.index("-BK") + 1] == ("128" if a8w8 else "256")
+            assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
+            slots = "2" if merged else (None if not a8w8 or four_stage else "3")
+            assert (cmd[cmd.index("--output_c_slots") + 1] if "--output_c_slots" in cmd else None) == slots
+            assert ("--static_slot_unroll" in cmd) == (merged or (a8w8 and shape[2] == 8192))
+            assert ("--merged_handoff_barrier" in cmd) == ("--static_cluster_steps" in cmd) == merged
+            assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
+            assert "--scale_layout" not in cmd
+            assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
+            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == ("--sched_mode_2"
+                                                                                         in cmd) == (not a8w8)
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
-    _, shapes, variants = bench.parse_benchmark_args(["--dry-run", "--no-sched-mode-2", "--variant", "mx8xmx4"])
-    assert all("--sched_mode_2" not in bench._command(args, shapes[0], dtype_b) for _, dtype_b, args in variants)
-    _, _, variants = bench.parse_benchmark_args(["--dry-run", "--out-dtype", "fp16"])
+
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--cluster-size", "4", "--cluster-layout", "2x2", "--xcd-remap", "none", "--out-dtype", "fp16", "--dry-run"])
     assert [args.out_dtype for _, _, args in variants] == ["fp16", "fp16"]
-    # Opting out, and forcing it on for the four-stage ring.
+    for _, dtype_b, args in variants:
+        cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
+        assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
+        assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
+    # Explicit split cluster barriers and early C stores apply to both
+    # variants; --no-sched-mode-2 turns off MX8xMX4's WMMA queuing.
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
+    assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
+    for _, dtype_b, args in variants:
+        cmd = bench._command(args, shapes[0], dtype_b)
+        assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
+    _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx4", "--no-sched-mode-2", "--dry-run"])
+    for _, dtype_b, args in variants:
+        assert "--sched_mode_2" not in bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
+
+    # wave256 scales apply to MX8xMX8 only; opting out of the merged barrier
+    # restores the three-stage FP16 schedule with six C slots.
+    _, shapes, variants = bench.parse_benchmark_args(["--scale-layout", "wave256", "--out-dtype", "fp16", "--dry-run"])
+    for variant, dtype_b, args in variants:
+        cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
+        assert ("--scale_layout" in cmd) == (variant == "mx8xmx8")
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--variant", "mx8xmx8", "--out-dtype", "fp16", "--no-merged-handoff-barrier", "--dry-run"])
+    (_, dtype_b, args), = variants
+    cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
+    assert cmd[cmd.index("--num_buffers") + 1] == "3" and cmd[cmd.index("--output_c_slots") + 1] == "6"
+    assert "--merged_handoff_barrier" not in cmd and "--static_slot_unroll" in cmd
+
+    # Opting out of the overlap peel, and forcing it on for the four-stage ring.
     for flag, expected in (("--no-overlap-peel", (False, False)), ("--overlap-peel", (True, True))):
         _, shapes, variants = bench.parse_benchmark_args(
             ["--variant", "mx8xmx8", "--out-dtype", "fp32", flag, "--dry-run"])
