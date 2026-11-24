@@ -496,7 +496,7 @@ Use `--variant mx8xmx8 --register-pipeline` to test the register pipeline:
 
 ```bash
 gpu-lock python3 third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py \
-  --variant mx8xmx8 --register-pipeline --sched-mode-2 --csv mxfp-register.csv
+  --variant mx8xmx8 --register-pipeline --enable-wmma-queuing --csv mxfp-register.csv
 ```
 
 This selects 256x256x256 tiles, two input buffers, and four waves. Each K256
@@ -516,21 +516,21 @@ configuration use `REGISTER_PIPELINE=True`. Specify the required BK256 and
 two buffers when using those interfaces. The summary and CSV record
 `register_pipeline`.
 
-`--sched-mode-2` sets the persistent kernel's hardware WMMA queuing bit
+`--enable-wmma-queuing` sets the persistent kernel's hardware WMMA queuing bit
 (`SCHED_MODE[2]`). It is enabled by default for the MX8xMX4 output schedule
 (gfx1250 FP16: 8192^3 -2.0%, 8192^2x4096 -1.6%) and disabled otherwise;
 MX8xMX8 slows down with it (8192^2x4096 and 16384^3: +2.4%, 8192^3 unchanged).
-`--no-sched-mode-2` and `--sched-mode-2` override the default. The summary and
-CSV record `sched_mode_2`.
+`--no-enable-wmma-queuing` and `--enable-wmma-queuing` override the default. The summary and
+CSV record `enable_wmma_queuing`.
 For example, compare the same sweep with the setting off and on:
 
 ```bash
-python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --no-sched-mode-2 --csv sched-off.csv
-python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --sched-mode-2 --csv sched-on.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --no-enable-wmma-queuing --csv sched-off.csv
+python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py --enable-wmma-queuing --csv sched-on.csv
 ```
 
-`bench_gfx1250.py --single` accepts `--persistent --sched_mode_2`; the Python
-API and `matmul` configuration use `SCHED_MODE_2=True`.
+`bench_gfx1250.py --single` accepts `--persistent --enable_wmma_queuing`; the Python
+API and `matmul` configuration use `ENABLE_WMMA_QUEUING=True`.
 
 Persistent program ordering is selectable with `--xcd-remap none|balanced|chunked`,
 using `--num-xcds` (default 8) and `--xcd-chunk` (default 2). Remapping defaults

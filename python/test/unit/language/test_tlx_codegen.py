@@ -7792,8 +7792,8 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=
     for param in kernel.params:
         if param.is_constexpr and param.has_default and param.name not in config:
             config[param.name] = param.default
-    # SCHED_MODE_2 is a launch option (enable_wmma_queuing), not a kernel constexpr.
-    enable_wmma_queuing = config.pop("SCHED_MODE_2", False)
+    # ENABLE_WMMA_QUEUING is a launch option (enable_wmma_queuing), not a kernel constexpr.
+    enable_wmma_queuing = config.pop("ENABLE_WMMA_QUEUING", False)
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     compiled = triton_compile(
         src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
@@ -8146,15 +8146,15 @@ def test_gfx1250_mxgemm_async_output_requires_streamed_operands():
     ("e4m3", 2, 256, 8),
 ])
 @pytest.mark.parametrize("k", [4096, 8192])
-@pytest.mark.parametrize("sched_mode_2", [False, True])
+@pytest.mark.parametrize("enable_wmma_queuing", [False, True])
 @pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
-def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, sched_mode_2, cluster_size,
-                                                          barrier_interval, k, num_warps):
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, enable_wmma_queuing,
+                                                          cluster_size, barrier_interval, k, num_warps):
     compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, num_warps=num_warps, K=k,
-                                                  SCHED_MODE_2=sched_mode_2, CLUSTER_SIZE=cluster_size,
+                                                  ENABLE_WMMA_QUEUING=enable_wmma_queuing, CLUSTER_SIZE=cluster_size,
                                                   CLUSTER_BARRIER_INTERVAL=barrier_interval)
     asm = compiled.asm["amdgcn"]
-    assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == sched_mode_2
+    assert ("hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1" in asm) == enable_wmma_queuing
     assert "ds_load_b128" in asm and "ds_store_b128" in asm
     if num_warps == 4:
         assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
@@ -8435,11 +8435,11 @@ def test_gfx1250_mxgemm_a8w4_c_staging_preserves_overlap(k, cluster_size, uneven
 
 @pytest.mark.parametrize("k", [512, 768, 4096, 8192])
 @pytest.mark.parametrize("prefetch", [False, True])
-@pytest.mark.parametrize("sched_mode_2", [False, True])
-def test_gfx1250_mxgemm_register_pipeline_overlaps_refill(k, prefetch, sched_mode_2):
+@pytest.mark.parametrize("enable_wmma_queuing", [False, True])
+def test_gfx1250_mxgemm_register_pipeline_overlaps_refill(k, prefetch, enable_wmma_queuing):
     compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 2, 256, K=k, REGISTER_PIPELINE=True,
                                                   CROSS_TILE_PREFETCH=prefetch, CLUSTER_SIZE=4,
-                                                  CLUSTER_BARRIER_INTERVAL=4, SCHED_MODE_2=sched_mode_2)
+                                                  CLUSTER_BARRIER_INTERVAL=4, ENABLE_WMMA_QUEUING=enable_wmma_queuing)
     copies = re.findall(r"amdg\.async_tdm_fused_copy_global_to_local[^\n]*", compiled.asm["ttgir"])
     assert copies and len(copies) % 2 == 0
     # Preserve scale-first transfer order through lowering, including the

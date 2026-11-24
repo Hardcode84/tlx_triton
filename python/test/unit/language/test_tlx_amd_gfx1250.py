@@ -1157,7 +1157,7 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("CROSS_TILE_PREFETCH", [False, True])
 @pytest.mark.parametrize(
-    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,SCHED_MODE_2,CLUSTER_SIZE,"
+    "K_ITERS,NUM_BUFFERS,DTYPE_B,BLOCK_K,OUTPUT_STAGING,NUM_WARPS,REGISTER_PIPELINE,ENABLE_WMMA_QUEUING,CLUSTER_SIZE,"
     "OUTPUT_TAIL_REUSE",
     [(k, buffers, dtype, bk, staging, 4, False, False, 1, False)
      for k, buffers in [(2, 2), (3, 2), (3, 3), (4, 3), (5, 3)]
@@ -1187,7 +1187,7 @@ def test_mxgemm_operand_pipeline_ring_and_group_boundaries(M, N, K, BLOCK_K, NUM
 )
 def test_mxgemm_persistent_ring_phase(
         K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, OUTPUT_STAGING, NUM_WARPS, REGISTER_PIPELINE,
-        SCHED_MODE_2, CLUSTER_SIZE, OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False,
+        ENABLE_WMMA_QUEUING, CLUSTER_SIZE, OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=False, STREAMED_OPERANDS=False,
         ASYNC_OUTPUT=False, COMPACT_K_TAIL=False, TDM_FUSION="partial", HANDOFF_SCHEDULE="current",
         HANDOFF_TDM_FUSION="partial", CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
         CLUSTER_BARRIER_INTERVAL=4, WAVE_SPECIALIZED_HANDOFF=False, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
@@ -1231,7 +1231,7 @@ def test_mxgemm_persistent_ring_phase(
             BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
             DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
             TDM_FUSION=TDM_FUSION, PERSISTENT=True, NUM_PROGRAMS=programs, CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH,
-            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, SCHED_MODE_2=SCHED_MODE_2,
+            OUTPUT_STAGING=OUTPUT_STAGING, REGISTER_PIPELINE=REGISTER_PIPELINE, ENABLE_WMMA_QUEUING=ENABLE_WMMA_QUEUING,
             CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS,
             OUTPUT_TAIL_REUSE=OUTPUT_TAIL_REUSE, FIRST_USE_PREFETCH=FIRST_USE_PREFETCH,
             STREAMED_OPERANDS=STREAMED_OPERANDS, ASYNC_OUTPUT=ASYNC_OUTPUT, COMPACT_K_TAIL=COMPACT_K_TAIL,
@@ -1891,7 +1891,7 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
             assert "--scale_layout" not in cmd
             assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
-            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == ("--sched_mode_2"
+            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == ("--enable_wmma_queuing"
                                                                                          in cmd) == (not a8w8)
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
 
@@ -1904,16 +1904,16 @@ def test_mxgemm_bench_defaults_and_overrides():
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
 
     # Explicit split cluster barriers and early C stores apply to both
-    # variants; --no-sched-mode-2 turns off MX8xMX4's WMMA queuing.
+    # variants; --no-enable-wmma-queuing turns off MX8xMX4's WMMA queuing.
     _, shapes, variants = bench.parse_benchmark_args(
         ["--cluster-size", "4", "--cluster-layout", "2x2", "--split-cluster-barrier", "--early-c-stores", "--dry-run"])
     assert {variant for variant, _, _ in variants} == {"mx8xmx8", "mx8xmx4"}
     for _, dtype_b, args in variants:
         cmd = bench._command(args, shapes[0], dtype_b)
         assert "--split_cluster_barrier" in cmd and "--early_c_stores" in cmd
-    _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx4", "--no-sched-mode-2", "--dry-run"])
+    _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx4", "--no-enable-wmma-queuing", "--dry-run"])
     for _, dtype_b, args in variants:
-        assert "--sched_mode_2" not in bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
+        assert "--enable_wmma_queuing" not in bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
 
     # wave256 scales apply to MX8xMX8 only; opting out of the merged barrier
     # restores the three-stage FP16 schedule with six C slots.

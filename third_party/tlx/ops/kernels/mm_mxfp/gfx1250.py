@@ -4820,7 +4820,7 @@ def mxgemm_tdm_pipelined(
         NUM_PROGRAMS: int | None = None,
         CROSS_TILE_PREFETCH: bool = True,
         OUTPUT_STAGING: bool = False,
-        SCHED_MODE_2: bool = False,
+        ENABLE_WMMA_QUEUING: bool = False,
         XCD_REMAP: str = "none",
         NUM_XCDS: int = 8,
         XCD_CHUNK: int = 2,
@@ -4991,7 +4991,7 @@ def mxgemm_tdm_pipelined(
     register pipeline. It requires both scales, partial TDM fusion, and
     output staging. It retains one next-tile input stage and reuses the
     free A/B stage for four 256x64 FP32 output panels.
-    ``SCHED_MODE_2`` launches the persistent kernel with the HIP option
+    ``ENABLE_WMMA_QUEUING`` launches the persistent kernel with the HIP option
     ``enable_wmma_queuing=True``, which sets SCHED_MODE[2] at kernel entry to
     allow hardware WMMA queuing. It defaults to false (no register write).
     ``XCD_REMAP`` selects none, balanced, or chunked persistent program ordering.
@@ -5217,8 +5217,8 @@ def mxgemm_tdm_pipelined(
             raise ValueError("eight-wave MXFP requires persistent 256x256 M/N tiles and FP8 A")
         if OUTPUT_STAGING and NUM_BUFFERS == 4:
             raise ValueError("eight-wave output staging supports at most three input buffers")
-    if SCHED_MODE_2 and not PERSISTENT:
-        raise ValueError("SCHED_MODE_2 requires persistence")
+    if ENABLE_WMMA_QUEUING and not PERSISTENT:
+        raise ValueError("ENABLE_WMMA_QUEUING requires persistence")
     if OUTPUT_STAGING and not (WARP_PIPELINE or OPERAND_PIPELINE):
         if not PERSISTENT or BLOCK_M != 256 or BLOCK_N != 256 or DTYPE_A == "e2m1":
             raise ValueError("output staging requires persistent 256x256 M/N tiles and FP8 A")
@@ -5330,7 +5330,7 @@ def mxgemm_tdm_pipelined(
                 FIRST_USE_PREFETCH=FIRST_USE_PREFETCH, XCD_REMAP_MODE=XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4,
-                ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=SCHED_MODE_2, **persistent_options,
+                ctas_per_cga=(CLUSTER_SIZE, 1, 1), enable_wmma_queuing=ENABLE_WMMA_QUEUING, **persistent_options,
                 **persistent_compile_options(REGISTER_PIPELINE, STREAMED_OPERANDS, REFILL_OVERLAP, A_ROW_PAIRS
                                              and B_ROW_PAIRS))
         args = [
@@ -5544,7 +5544,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     ``a_scale`` / ``b_scale`` must already be pre-shuffled with :func:`pack_scale`, using the
     ``layout`` that matches ``config["SCALE_LAYOUT"]``.
     When ``config["TRANSPOSE_B"]`` is set, ``b`` is the ``[N, K]`` transposed layout.
-    ``PERSISTENT``, ``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``OUTPUT_STAGING``, and ``SCHED_MODE_2``
+    ``PERSISTENT``, ``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``OUTPUT_STAGING``, and ``ENABLE_WMMA_QUEUING``
     configure the persistent full-tile sliceMNK path; see :func:`mxgemm_tdm_pipelined`.
     ``XCD_REMAP``, ``NUM_XCDS``, ``XCD_CHUNK``, ``CLUSTER_SIZE``, and ``CLUSTER_MULTICAST``
     select persistent program remapping and input/scale sharing across workgroups.
@@ -5585,8 +5585,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     if cfg.get("OUTPUT_STAGING", False) and not (cfg.get("PERSISTENT", False) or cfg.get("WARP_PIPELINE", False)
                                                  or cfg.get("OPERAND_PIPELINE", False)):
         raise ValueError("output staging requires persistence")
-    if cfg.get("SCHED_MODE_2", False) and not cfg.get("PERSISTENT", False):
-        raise ValueError("SCHED_MODE_2 requires persistence")
+    if cfg.get("ENABLE_WMMA_QUEUING", False) and not cfg.get("PERSISTENT", False):
+        raise ValueError("ENABLE_WMMA_QUEUING requires persistence")
     if not cfg.get("PERSISTENT", False):
         _validate_mxfp_scheduling(M, N, cfg.get("NUM_PROGRAMS"), persistent=False, block_m=BLOCK_M, block_n=BLOCK_N,
                                   group_m=cfg["GROUP_SIZE_M"], with_a_scale=cfg.get("WITH_A_SCALE", True),
@@ -5613,17 +5613,16 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
                                                                  False), WARP_PIPELINE=cfg.get("WARP_PIPELINE", False),
             NUM_PROGRAMS=cfg.get("NUM_PROGRAMS"), CROSS_TILE_PREFETCH=cfg.get("CROSS_TILE_PREFETCH", True),
             COMPACT_K_TAIL=cfg.get("COMPACT_K_TAIL", False), HANDOFF_SCHEDULE=cfg.get("HANDOFF_SCHEDULE", "current"),
-            HANDOFF_TDM_FUSION=cfg.get("HANDOFF_TDM_FUSION",
-                                       "partial"), OUTPUT_STAGING=cfg.get("OUTPUT_STAGING", False),
-            CLUSTER_LAYOUT=cfg.get("CLUSTER_LAYOUT", "linear"), SPLIT_CLUSTER_BARRIER=cfg.get(
-                "SPLIT_CLUSTER_BARRIER", False), EARLY_C_STORES=cfg.get("EARLY_C_STORES", False), SCHED_MODE_2=cfg.get(
-                    "SCHED_MODE_2", False), XCD_REMAP=cfg.get("XCD_REMAP", "none"), WAVE_SPECIALIZED_HANDOFF=cfg.get(
-                        "WAVE_SPECIALIZED_HANDOFF",
-                        False), NUM_XCDS=cfg.get("NUM_XCDS",
-                                                 8), XCD_CHUNK=cfg.get("XCD_CHUNK",
-                                                                       2), CLUSTER_SIZE=cfg.get("CLUSTER_SIZE", 1),
-            CLUSTER_MULTICAST=cfg.get("CLUSTER_MULTICAST",
-                                      True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL", 1),
+            HANDOFF_TDM_FUSION=cfg.get("HANDOFF_TDM_FUSION", "partial"), OUTPUT_STAGING=cfg.get(
+                "OUTPUT_STAGING",
+                False), CLUSTER_LAYOUT=cfg.get("CLUSTER_LAYOUT",
+                                               "linear"), SPLIT_CLUSTER_BARRIER=cfg.get("SPLIT_CLUSTER_BARRIER", False),
+            EARLY_C_STORES=cfg.get("EARLY_C_STORES", False), ENABLE_WMMA_QUEUING=cfg.get("ENABLE_WMMA_QUEUING", False),
+            XCD_REMAP=cfg.get("XCD_REMAP",
+                              "none"), WAVE_SPECIALIZED_HANDOFF=cfg.get("WAVE_SPECIALIZED_HANDOFF",
+                                                                        False), NUM_XCDS=cfg.get("NUM_XCDS", 8),
+            XCD_CHUNK=cfg.get("XCD_CHUNK", 2), CLUSTER_SIZE=cfg.get("CLUSTER_SIZE", 1), CLUSTER_MULTICAST=cfg.get(
+                "CLUSTER_MULTICAST", True), CLUSTER_BARRIER_INTERVAL=cfg.get("CLUSTER_BARRIER_INTERVAL", 1),
             NUM_WARPS=cfg["num_warps"], REGISTER_PIPELINE=cfg.get("REGISTER_PIPELINE", False), OPERAND_PIPELINE=cfg.get(
                 "OPERAND_PIPELINE",
                 False), OUTPUT_TAIL_REUSE=cfg.get("OUTPUT_TAIL_REUSE", False), FIRST_USE_PREFETCH=cfg.get(

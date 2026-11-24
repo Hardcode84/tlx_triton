@@ -20,7 +20,7 @@ input ring with two C slots for K >= 16384, and three stages otherwise (up to
 K=16384, FP16 and FP32 from K=8192 use the static four-stage ring described
 below).
 MX8xMX4 also enables split cluster barriers, early C stores, and WMMA queuing
-(SCHED_MODE[2], --sched-mode-2). These options are disabled by default for
+(SCHED_MODE[2], --enable-wmma-queuing). These options are disabled by default for
 MX8xMX8 and output-tail reuse. Other operand schedules do not support the
 first two.
 Use --cluster-size 4 --cluster-layout 2x2 --cluster-barrier-interval 4 for the
@@ -325,8 +325,8 @@ def _variant_args(args, dtype_b):
     # queue behind its scalar and memory work (gfx1250 FP16: 8192^3 -2.0%,
     # 8192^2x4096 -1.6%); MX8xMX8 is synchronization-bound and slows down
     # (8192^2x4096 and 16384^3: +2.4%).
-    if resolved.sched_mode_2 is None:
-        resolved.sched_mode_2 = default_output_schedule
+    if resolved.enable_wmma_queuing is None:
+        resolved.enable_wmma_queuing = default_output_schedule
     # Choose the MX8xMX8 ring depth per case unless the ring, C slots, or the
     # three-stage static unroll were requested explicitly.
     resolved.auto_ring_depth = (args.num_buffers is None and args.output_c_slots is None
@@ -501,8 +501,8 @@ def _command(args, case, dtype_b):
         command.append("--warp_pipeline")
     if args.operand_pipeline:
         command.append("--operand_pipeline")
-    if args.sched_mode_2:
-        command.append("--sched_mode_2")
+    if args.enable_wmma_queuing:
+        command.append("--enable_wmma_queuing")
     if not args.cluster_multicast:
         command.append("--no-cluster_multicast")
     if args.tdm_split:
@@ -556,7 +556,7 @@ def parse_benchmark_args(argv=None):
         help="cache lookahead in input K blocks (default: 1 for --operand-pipeline -BK 256; "
         "-1 disables it for other paths)")
     parser.add_argument(
-        "--sched-mode-2", action=argparse.BooleanOptionalAction, default=None,
+        "--enable-wmma-queuing", action=argparse.BooleanOptionalAction, default=None,
         help="set SCHED_MODE[2] to allow WMMA queuing in the persistent kernel (default: enabled for "
         "the MX8xMX4 output schedule)")
     parser.add_argument("--output-staging", action=argparse.BooleanOptionalAction, default=True,
@@ -748,8 +748,8 @@ def parse_benchmark_args(argv=None):
         parser.error("--benchmark-num-iters must be positive")
     if args.tdm_split and args.persistent:
         parser.error("--tdm-split requires --no-persistent")
-    if args.sched_mode_2 and not args.persistent:
-        parser.error("--sched-mode-2 requires --persistent")
+    if args.enable_wmma_queuing and not args.persistent:
+        parser.error("--enable-wmma-queuing requires --persistent")
     if args.num_warps == 8 and not args.warp_pipeline:
         if not args.persistent or args.block_m != 256 or args.block_n != 256:
             parser.error("--num-warps 8 requires persistent 256x256 M/N tiles")
@@ -1004,15 +1004,16 @@ def main():
             output_staging=run_args.output_staging, register_pipeline=run_args.register_pipeline,
             output_tail_reuse=run_args.output_tail_reuse, first_use_prefetch=run_args.first_use_prefetch,
             wave_specialized_handoff=run_args.wave_specialized_handoff, static_slot_unroll=_static_slot_unroll(
-                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case, dtype_b),
-            output_c_slots=run_args.output_c_slots or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier),
-            refill_overlap=run_args.refill_overlap or 0, l2_lookahead=run_args.l2_lookahead or 0,
-            static_cluster_steps=bool(run_args.static_cluster_steps), scale_layout=run_args.scale_layout,
-            dynamic_scales_first=run_args.dynamic_scales_first, out_dtype=run_args.out_dtype,
-            handoff_schedule=run_args.handoff_schedule, compact_k_tail=run_args.compact_k_tail,
-            handoff_tdm_fusion=run_args.handoff_tdm_fusion, streamed_operands=run_args.streamed_operands,
-            async_output=run_args.async_output, sched_mode_2=run_args.sched_mode_2, xcd_remap=run_args.xcd_remap,
-            num_xcds=run_args.num_xcds, xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
+                run_args, case, dtype_b), overlap_peel=_overlap_peel(run_args, case,
+                                                                     dtype_b), output_c_slots=run_args.output_c_slots
+            or 2, merged_handoff_barrier=bool(run_args.merged_handoff_barrier), refill_overlap=run_args.refill_overlap
+            or 0, l2_lookahead=run_args.l2_lookahead or 0, static_cluster_steps=bool(run_args.static_cluster_steps),
+            scale_layout=run_args.scale_layout, dynamic_scales_first=run_args.dynamic_scales_first,
+            out_dtype=run_args.out_dtype, handoff_schedule=run_args.handoff_schedule,
+            compact_k_tail=run_args.compact_k_tail, handoff_tdm_fusion=run_args.handoff_tdm_fusion,
+            streamed_operands=run_args.streamed_operands, async_output=run_args.async_output,
+            enable_wmma_queuing=run_args.enable_wmma_queuing, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
+            xcd_chunk=run_args.xcd_chunk, cluster_size=run_args.cluster_size,
             cluster_multicast=run_args.cluster_multicast if run_args.cluster_size > 1 else False,
             cluster_barrier_interval=run_args.cluster_barrier_interval, cluster_layout=run_args.cluster_layout,
             split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
@@ -1056,7 +1057,7 @@ def main():
             f"streamed_operands={run_args.streamed_operands}, "
             f"async_output={run_args.async_output}, "
             f"l2_prefetch_distance={run_args.l2_prefetch_distance}, "
-            f"sched_mode_2={run_args.sched_mode_2}, "
+            f"enable_wmma_queuing={run_args.enable_wmma_queuing}, "
             f"xcd_remap={run_args.xcd_remap}, num_xcds={run_args.num_xcds}, xcd_chunk={run_args.xcd_chunk}, "
             f"cluster_size={run_args.cluster_size}, "
             f"cluster_multicast={run_args.cluster_multicast if run_args.cluster_size > 1 else False}, "
@@ -1115,7 +1116,7 @@ def run_single(argv=None):
                         help="use the nonpersistent E4M3 eight-wave pipeline with two payload and three scale slots")
     parser.add_argument("--operand_pipeline", action="store_true",
                         help="use the nonpersistent E4M3 four-wave pipeline with four K128 or two K256 buffers")
-    parser.add_argument("--sched_mode_2", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--enable_wmma_queuing", action=argparse.BooleanOptionalAction, default=False,
                         help="set SCHED_MODE[2] for persistent WMMA queuing (default: disabled)")
     parser.add_argument("--output_staging", action="store_true", help="stage persistent FP32 output for TDM stores")
     parser.add_argument(
@@ -1220,8 +1221,8 @@ def run_single(argv=None):
     parser.add_argument("--handoff_tdm_fusion", choices=("partial", "4way"), default="partial",
                         help="TDM fusion for ab-reuse handoff refills; ordinary K keeps partial fusion")
     args = parser.parse_args(argv)
-    if args.sched_mode_2 and not args.persistent:
-        parser.error("--sched_mode_2 requires --persistent")
+    if args.enable_wmma_queuing and not args.persistent:
+        parser.error("--enable_wmma_queuing requires --persistent")
 
     torch.manual_seed(args.seed)
     a = gfx1250._init_data(args.dtype_a, args.M, args.K)
@@ -1297,7 +1298,7 @@ def run_single(argv=None):
         NUM_PROGRAMS=args.num_programs,
         CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
         OUTPUT_STAGING=args.output_staging,
-        SCHED_MODE_2=args.sched_mode_2,
+        ENABLE_WMMA_QUEUING=args.enable_wmma_queuing,
         XCD_REMAP=args.xcd_remap,
         NUM_XCDS=args.num_xcds,
         XCD_CHUNK=args.xcd_chunk,
