@@ -7142,6 +7142,35 @@ def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
     assert "tdm_prefetch" in ttgir
 
 
+@triton.jit
+def _amd_global_prefetch_kernel(x_ptr, stride, SPECULATIVE: tl.constexpr):
+    # One line per lane; the per-lane base stays live across a uniform step.
+    rows = tl.arange(0, 128)
+    base = x_ptr + rows.to(tl.int64) * stride
+    for k in range(4):
+        tlx.amd_global_prefetch(base + k * 256, speculative=SPECULATIVE)
+
+
+@pytest.mark.parametrize("speculative", [True, False])
+def test_amd_global_prefetch_gfx1250(speculative):
+    """amd_global_prefetch emits one SE-scope global_prefetch_b8 per element, without inline asm."""
+    compiled = compile_for_gfx1250(
+        _amd_global_prefetch_kernel,
+        signature={"x_ptr": "*u8", "stride": "i32"},
+        constexprs={"SPECULATIVE": speculative},
+    )
+    assert compiled.asm["ttgir"].count("amdg.global_prefetch") == 1
+    asm = compiled.asm["amdgcn"]
+    assert "ASMSTART" not in asm
+    # The kernel prologue issues its own SGPR-addressed prefetch; ours address VGPR pairs.
+    prefetches = re.findall(r"global_prefetch_b8 v\[\d+:\d+\], off.*", asm)
+    assert len(prefetches) == 4, prefetches
+    assert prefetches and all("scope:SCOPE_SE" in line for line in prefetches)
+    # The non-speculative bit is the low cache-policy bit, which the
+    # disassembler prints as TH_LOAD_NT.
+    assert all(("TH_LOAD_NT" in line) == (not speculative) for line in prefetches), prefetches
+
+
 def test_async_descriptor_load_rejects_amd(device):
     """NV-only async_descriptor_load raises NotImplementedError on AMD."""
 

@@ -1093,13 +1093,7 @@ def _mxgemm_split_l2_prefetch(a_ptr, b_ptr, off_m, off_n, pk, K_ITERS: tl.conste
         step = tl.where(j < LINES_A, half_step, pk * 256)
     else:
         step = half_step
-    # The prefetch reads its address VGPRs after issue. LLVM inserts
-    # depctr_vm_vsrc waits before overwriting a VMEM source only for
-    # instructions it knows; inline asm is opaque, so wait here. Without it a
-    # later write to the address registers intermittently corrupts the
-    # address (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION).
-    tl.inline_asm_elementwise("global_prefetch_b8 $1, off scope:SCOPE_SE\n\ts_wait_alu depctr_vm_vsrc(0)", "=v,v",
-                              [base + step], dtype=tl.int32, is_pure=False, pack=1)
+    tlx.amd_global_prefetch(base + step, speculative=True)
 
 
 @triton.jit

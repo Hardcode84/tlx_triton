@@ -2170,6 +2170,36 @@ def amd_descriptor_prefetch_tensor(
 
 
 @tl.builtin
+def amd_global_prefetch(
+    pointer: tl.tensor,
+    speculative: tl.constexpr = False,
+    _semantic=None,
+) -> None:
+    """Prefetch the 256-byte global memory line at each pointer into L2.
+
+    ``pointer`` is a pointer or a block of pointers to global memory; each
+    thread issues one ``global_prefetch_b8`` per element it holds. Lowers to
+    ``amdgpu.global_prefetch``. Fire-and-forget: it loads no data into
+    registers and is not counted by :func:`async_amd_descriptor_wait`.
+
+    A speculative prefetch is dropped when the address translation is not
+    already cached, so its addresses may be out of bounds. A non-speculative
+    prefetch must stay in bounds.
+
+    Available only on AMD TDM-capable targets (gfx1250+).
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"amd_global_prefetch is only available on AMD TDM-capable targets, got arch={arch}")
+    pointer = _semantic.to_tensor(pointer)
+    assert pointer.dtype.is_ptr() and pointer.dtype.address_space == "global" and not pointer.dtype.const, (
+        f"amd_global_prefetch expects global memory pointers, got {pointer.type}")
+    speculative = tl._unwrap_if_constexpr(speculative)
+    assert isinstance(speculative, bool), "speculative must be a constexpr bool"
+    _semantic.builder.create_amd_global_prefetch(pointer.handle, speculative)
+
+
+@tl.builtin
 def amd_lds_write_drain(buffer: tlx.buffered_tensor, _semantic=None) -> None:
     """Make this wave's earlier LDS writes to ``buffer`` visible to TDM stores.
 

@@ -1150,6 +1150,10 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<amdgpu::ClusterBarrierArriveOp>();
              self.create<amdgpu::ClusterBarrierWaitOp>();
            })
+      .def("create_amd_global_prefetch",
+           [](TritonOpBuilder &self, Value ptr, bool speculative) -> void {
+             self.create<amdgpu::GlobalPrefetchOp>(ptr, speculative);
+           })
       .def("create_amd_lds_write_drain",
            [](TritonOpBuilder &self, Value buffer) -> void {
              self.create<amdgpu::LdsWriteDrainOp>(buffer);

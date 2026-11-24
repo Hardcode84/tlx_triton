@@ -2865,6 +2865,32 @@ private:
 };
 } // namespace
 
+namespace {
+struct GlobalPrefetchOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::GlobalPrefetchOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::GlobalPrefetchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    SmallVector<Value> ptrs =
+        isa<RankedTensorType>(op.getPtr().getType())
+            ? unpackLLElements(loc, adaptor.getPtr(), rewriter)
+            : SmallVector<Value>{adaptor.getPtr()};
+    // Same hint as TDM prefetches (emitTDMPrefetch): SE scope, plus the
+    // non-speculative bit.
+    constexpr int cacheScope = 8;
+    IntegerAttr hint = rewriter.getI32IntegerAttr(
+        cacheScope | static_cast<int>(!op.getSpeculative()));
+    for (Value ptr : ptrs)
+      ROCDL::GlobalPrefetchOp::create(rewriter, loc, ptr, hint, {}, {}, {});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+} // namespace
+
 namespace mlir::triton::AMD {
 void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        const TargetInfo &targetInfo,
@@ -2884,6 +2910,7 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
   patterns.add<TTGAsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<TDMPrefetchConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<GlobalPrefetchOpConversion>(typeConverter, benefit);
   patterns.add<AsyncTDMIntrinsicWaitConversion>(typeConverter, benefit);
   patterns.add<AsyncCommitGroupOpConversion>(typeConverter, targetInfo,
                                              benefit);

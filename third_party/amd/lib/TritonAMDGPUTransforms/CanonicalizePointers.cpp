@@ -2234,6 +2234,7 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       MaterializeFatPointer<triton::amdgpu::BufferStoreOp, 1>,
       MaterializeFatPointer<triton::amdgpu::BufferAtomicRMWOp>,
       MaterializeFatPointer<triton::amdgpu::BufferAtomicCASOp>,
+      MaterializeFatPointer<triton::amdgpu::GlobalPrefetchOp>,
       MaterializeFatPointer<tt::AtomicLoadOp>,
       MaterializeFatPointer<tt::AtomicCASOp>,
       MaterializeFatPointer<tt::AtomicPollOp>,
