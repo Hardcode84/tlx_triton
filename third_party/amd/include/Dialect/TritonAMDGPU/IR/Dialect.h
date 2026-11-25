@@ -58,6 +58,16 @@ inline int getTensorDescNumDwords(triton::TensorDescType type) {
 /// on every dimension but `axis`, where it must divide the output extent. The
 /// result is canonical: broadcast (zero) register bases are dropped so a thread
 /// keeps one register per distinct scale value.
+/// Distribution of a TDM prefetch's 256-byte chunks (`chunkShape`) over the
+/// registers, lanes, warps and CTAs. It is the default blocked layout, except
+/// that a single-CTA block with fewer chunks than threads gives the warps
+/// distinct chunks and broadcasts within each warp, so no two warps prefetch
+/// the same lines.
+triton::LinearLayout getTDMPrefetchLayout(MLIRContext *ctx,
+                                          ArrayRef<int64_t> chunkShape,
+                                          int numWarps, int threadsPerWarp,
+                                          int numCTAs);
+
 FailureOr<triton::LinearLayout> inferScaledUpcastFp4ScaleLayout(
     const triton::LinearLayout &outputLL, ArrayRef<int64_t> scaleShape,
     int64_t axis, function_ref<InFlightDiagnostic()> emitError = nullptr);

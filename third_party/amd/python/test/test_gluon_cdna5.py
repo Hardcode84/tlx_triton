@@ -2633,7 +2633,8 @@ def tdm_prefetch_store_back_offsets_kernel(inp_ptr, out_ptr, shape, inp_strides,
     ((2, 4, 64), (1, 1, 32)),
     ((2, 4, 64), (4, 8, 128)),
 ])
-def test_tdm_prefetch_offsets(shape, block_shape):
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_tdm_prefetch_offsets(shape, block_shape, num_warps):
     rank = len(shape)
     grid = tuple(triton.cdiv(shape[i], block_shape[i]) for i in range(rank))
 
@@ -2654,9 +2655,17 @@ def test_tdm_prefetch_offsets(shape, block_shape):
     constexpr_block_shape = tuple(ttgl.constexpr(v) for v in block_shape)
     constexpr_prefetch_block_shape = tuple(ttgl.constexpr(v) for v in prefetch_block_shape)
 
-    tdm_prefetch_store_back_offsets_kernel[grid](inp_handle, out_handle, inp.shape, inp.stride(), out_handle.stride(),
-                                                 constexpr_block_shape, constexpr_prefetch_block_shape,
-                                                 ttgl.constexpr(rank), num_warps=1, num_ctas=1)
+    compiled = tdm_prefetch_store_back_offsets_kernel[grid](inp_handle, out_handle, inp.shape, inp.stride(),
+                                                            out_handle.stride(),
+                                                            constexpr_block_shape, constexpr_prefetch_block_shape,
+                                                            ttgl.constexpr(rank), num_warps=num_warps, num_ctas=1)
+    if math.prod(prefetch_block_shape) >= num_warps * 32 or num_warps == 1:
+        assert "ttg.linear" not in compiled.asm["ttgir"]
+    elif math.prod(prefetch_block_shape) >= num_warps:
+        # Fewer chunks than threads: every warp prefetches different chunks and
+        # the lanes of a warp share them.
+        warp_bases = re.search(r"warp = (\[\[.*?\]\])", compiled.asm["ttgir"])[1]
+        assert not re.search(r"\[0(, 0)*\]", warp_bases), warp_bases
 
     # Compute reference values for prefetch offsets
     out_ref = torch.zeros(out_shape, dtype=torch.int64)

@@ -648,6 +648,44 @@ LogicalResult verifyScaledDowncastScaleShapeAndAxis(OpT op,
 
 } // namespace
 
+LinearLayout getTDMPrefetchLayout(MLIRContext *ctx,
+                                  ArrayRef<int64_t> chunkShape, int numWarps,
+                                  int threadsPerWarp, int numCTAs) {
+  auto enc = triton::gpu::getDefaultBlockedEncoding(ctx, chunkShape, numWarps,
+                                                    threadsPerWarp, numCTAs);
+  LinearLayout ll = triton::gpu::toLinearLayout(chunkShape, enc);
+  if (numCTAs != 1 || !llvm::all_of(chunkShape, llvm::isPowerOf2_64))
+    return ll;
+  // The default layout broadcasts a small block across the highest lane and
+  // warp bases, so whole warps repeat each other's prefetches. Keep the same
+  // distinct bases, but give the warps the most significant ones and leave the
+  // spare bases to the lanes.
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto bases = ll.getBases();
+  auto &lanes = bases[kLane];
+  auto &warps = bases[kWarp];
+  auto isZero = [](ArrayRef<int32_t> basis) {
+    return llvm::all_of(basis, [](int32_t v) { return v == 0; });
+  };
+  SmallVector<std::vector<int32_t>> distinct;
+  for (const auto &basis :
+       llvm::concat<const std::vector<int32_t>>(lanes, warps))
+    if (!isZero(basis))
+      distinct.push_back(basis);
+  if (distinct.size() == lanes.size() + warps.size())
+    return ll;
+  size_t numWarpBases = std::min(warps.size(), distinct.size());
+  size_t numLaneBases = distinct.size() - numWarpBases;
+  std::vector<int32_t> zero(ll.getNumOutDims(), 0);
+  for (auto [i, basis] : llvm::enumerate(lanes))
+    basis = i < numLaneBases ? distinct[i] : zero;
+  for (auto [i, basis] : llvm::enumerate(warps))
+    basis = i < numWarpBases ? distinct[numLaneBases + i] : zero;
+  return LinearLayout(std::move(bases), ll.getOutDims(),
+                      /*requireSurjective=*/true);
+}
+
 FailureOr<LinearLayout>
 inferScaledUpcastFp4ScaleLayout(const LinearLayout &outputLL,
                                 ArrayRef<int64_t> scaleShape, int64_t axis,
@@ -2728,9 +2766,13 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
   scaledBlockShape.back() =
       ceil<int64_t>(scaledBlockShape.back(), elemPerPrefetch);
 
-  // Use the default blocked encoding to unroll the TDM tile
-  auto enc = triton::gpu::getDefaultBlockedEncoding(
+  // The lowering unrolls the TDM tile with getTDMPrefetchLayout.
+  Attribute enc = triton::gpu::getDefaultBlockedEncoding(
       context, scaledBlockShape, numWarps, threadsPerWarp, numCTAs);
+  LinearLayout ll = getTDMPrefetchLayout(context, scaledBlockShape, numWarps,
+                                         threadsPerWarp, numCTAs);
+  if (ll != triton::gpu::toLinearLayout(scaledBlockShape, enc))
+    enc = triton::gpu::LinearEncodingAttr::get(context, std::move(ll));
   IntegerType i64Type = IntegerType::get(context, 64);
   auto tensorTy = RankedTensorType::get(scaledBlockShape, i64Type, enc);
 

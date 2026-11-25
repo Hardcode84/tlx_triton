@@ -1,4 +1,5 @@
 #include "TDMUtility.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1638,10 +1639,10 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
   scaledBlockShape.back() =
       ceil<int64_t>(scaledBlockShape.back(), elemPerPrefetch);
 
-  // Use the default blocked encoding to unroll the TDM tile
-  auto blockedEnc = triton::gpu::getDefaultBlockedEncoding(
+  // Unroll the TDM tile over registers, lanes, warps and CTAs; small tiles
+  // give each warp distinct lines.
+  auto ll = triton::amdgpu::getTDMPrefetchLayout(
       loc.getContext(), scaledBlockShape, numWarps, numLanes, numCTAs);
-  auto ll = triton::gpu::toLinearLayout(scaledBlockShape, blockedEnc);
 
   auto kRegister = rewriter.getStringAttr("register");
   auto kLane = rewriter.getStringAttr("lane");
