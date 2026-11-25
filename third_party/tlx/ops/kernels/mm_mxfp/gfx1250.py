@@ -2334,8 +2334,8 @@ def mxgemm_tdm_persistent_kernel(
             L2_LOOKAHEAD_SPLIT=L2_LOOKAHEAD_SPLIT, l2_a_ptr=a_ptr, l2_b_ptr=b_ptr, L2_STRIDE_A=stride_am,
             L2_STRIDE_B=stride_bn, K_ROT=K_ROT, a_srow=a_srow, l2_a_rows=a_rows)
         if W256_STEP_P:
-            sa00, _ = _mxgemm_scale_quads(sa00, False)
-            sb00, _ = _mxgemm_scale_quads(sb00, True)
+            sa00 = _mxgemm_scale_quads(sa00, False)[0]
+            sb00 = _mxgemm_scale_quads(sb00, True)[0]
 
     while tile < total_tiles:
         off_m, off_n, a_srow, c_rows, c_n = _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N,
@@ -2754,8 +2754,8 @@ def mxgemm_tdm_persistent_kernel(
                         l2_a_rows=a_rows)
                 slot = slots[STEADY_STEPS % NUM_BUFFERS]
                 if W256_STEP:
-                    sa00, _ = _mxgemm_scale_quads(sa00, False)
-                    sb00, _ = _mxgemm_scale_quads(sb00, True)
+                    sa00 = _mxgemm_scale_quads(sa00, False)[0]
+                    sb00 = _mxgemm_scale_quads(sb00, True)[0]
             if A8W4_SPLIT_HANDOFF and COMPACT_K_TAIL:
                 # Keep one rolled K-step body for the compact code footprint.
                 for i in tl.range(0, K // BLOCK_K - NUM_BUFFERS):
