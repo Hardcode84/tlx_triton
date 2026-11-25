@@ -665,6 +665,7 @@ _CLUSTER_MIN_AVG_ROWS = 576
 _CLUSTER_ROWS = 4
 _CLUSTER_COLS = 4
 _CLUSTER_GROUP_M = 8
+_CLUSTER_L2_LOOKAHEAD = 4
 
 
 def _persistent_rows(gm, groups, x_dtype, w_dtype):
@@ -730,6 +731,9 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
     cluster = (tile_map.group_align % _CLUSTER_ROWS == 0 and tile_map.total_align % _CLUSTER_GROUP_M == 0
                and n % (_CLUSTER_COLS * _PERSISTENT_BLOCK_N) == 0 and programs % (_CLUSTER_ROWS * _CLUSTER_COLS) == 0)
     cluster_size = _CLUSTER_ROWS * _CLUSTER_COLS if cluster else 1
+    # As in mm_mxfp: from K=16384 the static ring's 4x4 clusters also prefetch
+    # the stage four steps past each refill into L2, split across the cluster.
+    l2_lookahead = _CLUSTER_L2_LOOKAHEAD if static and cluster and k >= 16384 and _CLUSTER_ROWS == _CLUSTER_COLS == 4 else 0
     if w_dtype == "e4m3":
         schedule = dict(NUM_BUFFERS=min(4, k_tiles), CROSS_TILE_PREFETCH=True)
     else:
@@ -748,9 +752,9 @@ def _grouped_persistent(x, x_scale, w, w_scale, out, tile_map, num_programs=None
             CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=True, CLUSTER_BARRIER_INTERVAL=8 if cluster else 1,
             CLUSTER_LAYOUT=f"{_CLUSTER_ROWS}x{_CLUSTER_COLS}" if cluster else "linear", STATIC_SLOT_UNROLL=static,
             OUTPUT_C_SLOTS=2 if static else None, OVERLAP_PEEL=static, MERGED_HANDOFF_BARRIER=static,
-            STATIC_CLUSTER_STEPS=static and cluster, NUM_GROUPS=groups, tile_meta0=tile_meta0, tile_meta1=tile_meta1,
-            tile_count=tile_count, a_rows=gm, a_scale_rows=a_scale.shape[0], num_warps=4, waves_per_eu=1,
-            ctas_per_cga=(cluster_size, 1, 1), **schedule)
+            STATIC_CLUSTER_STEPS=static and cluster, L2_LOOKAHEAD=l2_lookahead, NUM_GROUPS=groups,
+            tile_meta0=tile_meta0, tile_meta1=tile_meta1, tile_count=tile_count, a_rows=gm,
+            a_scale_rows=a_scale.shape[0], num_warps=4, waves_per_eu=1, ctas_per_cga=(cluster_size, 1, 1), **schedule)
     return out
 
 

@@ -970,13 +970,14 @@ def test_gfx1250_grouped_mxfp_persistent(w_dtype, k, num_programs):
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-@pytest.mark.parametrize("w_dtype,k", [("e4m3", 512), ("e4m3", 1024), ("e2m1", 1024)])
+@pytest.mark.parametrize("w_dtype,k", [("e4m3", 512), ("e4m3", 1024), ("e2m1", 1024), ("e4m3", 16384)])
 @pytest.mark.parametrize("num_programs", [16, 48, None])
 def test_gfx1250_grouped_mxfp_persistent_clusters(w_dtype, k, num_programs):
     # 4x4 clusters on a map padded to whole cluster rows per group and whole
     # M groups: padding tiles in partial groups and an empty group. 64 tiles
     # over 16 or 48 programs, so clusters run different numbers of tiles; the
-    # op picks the padded map for groups averaging 576 rows or more.
+    # op picks the padded map for groups averaging 576 rows or more. At
+    # K=16384 the static ring also runs the split L2 lookahead.
     group_sizes, n = ((1500, 0, 2700) if num_programs is None else (300, 0, 700, 100, 257)), 1024
     x, x_scale, w, w_scale, ref = _grouped_a8_inputs(group_sizes, n, k, w_dtype)
     split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
@@ -1069,7 +1070,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                                       CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
                                       CLUSTER_BARRIER_INTERVAL=4, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
                                       OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
-                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128"):
+                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128", L2_LOOKAHEAD=0):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Cluster cases give each program two tiles; K5/K9 also
@@ -1098,7 +1099,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
                     STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
                     OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
-                    STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT))
+                    STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT, L2_LOOKAHEAD=L2_LOOKAHEAD))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -1134,6 +1135,18 @@ def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, cluster_size, overlap
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
                                       OUTPUT_C_SLOTS=2, OVERLAP_PEEL=overlap_peel, OUT_DTYPE=out_dtype,
                                       MERGED_HANDOFF_BARRIER=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("k_iters", [5, 6, 9, 13])
+@pytest.mark.parametrize("cluster_layout", ["2x2", "4x4"])
+def test_mxgemm_l2_lookahead_ring_phase(k_iters, cluster_layout):
+    # The merged steps' split L2 lookahead only adds prefetches: results must
+    # not change, including when the prefetched stage runs past the last one.
+    test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, 4 if cluster_layout == "2x2" else 16,
+                                      CLUSTER_LAYOUT=cluster_layout, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=2,
+                                      OVERLAP_PEEL=True, OUT_DTYPE="fp16", MERGED_HANDOFF_BARRIER=True,
+                                      STATIC_CLUSTER_STEPS=True, L2_LOOKAHEAD=4)
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
@@ -1414,6 +1427,8 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert (cmd[cmd.index("--output_c_slots") + 1] if "--output_c_slots" in cmd else None) == slots
             assert ("--static_slot_unroll" in cmd) == (merged or (a8w8 and shape[2] == 8192))
             assert ("--merged_handoff_barrier" in cmd) == ("--static_cluster_steps" in cmd) == merged
+            lookahead = cmd[cmd.index("--l2_lookahead") + 1] if "--l2_lookahead" in cmd else None
+            assert lookahead == ("4" if merged and shape[2] >= 16384 else None)
             assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
             assert "--scale_layout" not in cmd
             assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
@@ -1428,6 +1443,11 @@ def test_mxgemm_bench_defaults_and_overrides():
         cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
         assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
+    # --l2-lookahead 0 turns off the K=16384 L2 lookahead.
+    _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx8", "--l2-lookahead", "0", "--dry-run"])
+    for _, dtype_b, args in variants:
+        assert "--l2_lookahead" not in bench._command(bench._case_args(args, shapes[2]), shapes[2], dtype_b)
 
     # --no-enable-wmma-queuing turns off MX8xMX4's WMMA queuing.
     _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx4", "--no-enable-wmma-queuing", "--dry-run"])

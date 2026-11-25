@@ -1709,3 +1709,29 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
 // CHECK:           }
 // CHECK:           partition0(%[[VAL_7:.*]]: !tt.ptr<f32>, %[[VAL_9:.*]]: !tt.ptr<f32>, %[[VAL_10:.*]]: !tt.ptr<f32>)
 // CHECK:             %[[VAL_1:.*]] = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @global_prefetch(%arg0: !tt.ptr<i8>) {
+    %c1024_i32 = arith.constant 1024 : i32
+    %0 = tt.get_program_id x : i32
+    %1 = arith.muli %0, %c1024_i32 : i32
+    %2 = tt.splat %1 : i32 -> tensor<1024xi32>
+    %3 = tt.splat %arg0 : !tt.ptr<i8> -> tensor<1024x!tt.ptr<i8>>
+    %4 = tt.addptr %3, %2 : tensor<1024x!tt.ptr<i8>>, tensor<1024xi32>
+    amdg.global_prefetch %4, speculative = true : tensor<1024x!tt.ptr<i8>>
+    tt.return
+  }
+}
+
+// CHECK-LABEL:   tt.func @global_prefetch(
+// CHECK-SAME:                             %[[VAL_0:.*]]: !tt.ptr<i8>) {
+// CHECK:           %[[VAL_1:.*]] = arith.constant 1024 : i32
+// CHECK:           %[[VAL_2:.*]] = tt.get_program_id x : i32
+// CHECK:           %[[VAL_3:.*]] = arith.muli %[[VAL_2]], %[[VAL_1]] : i32
+// CHECK:           %[[VAL_4:.*]] = tt.addptr %[[VAL_0]], %[[VAL_3]] : !tt.ptr<i8>, i32
+// CHECK:           %[[VAL_5:.*]] = tt.splat %[[VAL_4]] : !tt.ptr<i8> -> tensor<1024x!tt.ptr<i8>>
+// CHECK:           amdg.global_prefetch %[[VAL_5]], speculative = true : tensor<1024x!tt.ptr<i8>>
+// CHECK:           tt.return
+// CHECK:         }

@@ -894,6 +894,8 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                                                                 context);
   patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
       typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::GlobalPrefetchOp>>(
+      typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
                                                                   context);
   target.addDynamicallyLegalOp<triton::amdgpu::PackedDot2Op>(

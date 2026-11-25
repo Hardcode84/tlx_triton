@@ -2773,4 +2773,12 @@ Type TDMPrefetchOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
 
+// -- GlobalPrefetchOp --
+LogicalResult GlobalPrefetchOp::verify() {
+  auto ptrTy = cast<triton::PointerType>(getElementTypeOrSelf(getPtr()));
+  if (ptrTy.getAddressSpace() != triton::PtrAddrSpace::Global)
+    return emitOpError("expects global memory pointers");
+  return success();
+}
+
 } // namespace mlir::triton::amdgpu

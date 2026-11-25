@@ -1669,6 +1669,32 @@ def TDMPrefetchOp
 }
 
 //===----------------------------------------------------------------------===//
+// GlobalPrefetchOp
+//===----------------------------------------------------------------------===//
+
+def GlobalPrefetchOp
+    : TT_AMDGPU_Op<"global_prefetch", [MemoryEffects<[MemWrite<L2Cache>]>]> {
+  let summary = "Prefetch the 256-byte lines at a block of global pointers into L2.";
+
+  let description = [{
+    Each thread prefetches the 256-byte line holding each of its elements of
+    `ptr` into L2, with one `global_prefetch_b8` per element. The prefetch
+    loads no data into registers and is not counted by any wait. A
+    speculative prefetch is dropped when the address translation is not
+    already cached, so its addresses may be out of bounds; a non-speculative
+    one must stay in bounds. Available on gfx1250.
+  }];
+
+  let arguments = (ins Arg<TT_PtrLike, "", [MemRead<GlobalMemory>]>:$ptr,
+                       BoolAttr:$speculative);
+
+  let assemblyFormat = [{
+    $ptr `,` `speculative` `=` $speculative attr-dict `:` type($ptr)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // UpdateTensorDescriptorOp
 //===----------------------------------------------------------------------===//
 

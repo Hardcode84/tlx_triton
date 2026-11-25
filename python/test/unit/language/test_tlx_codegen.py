@@ -7043,6 +7043,35 @@ def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
     assert "tdm_prefetch" in ttgir
 
 
+@triton.jit
+def _amd_global_prefetch_kernel(x_ptr, stride, SPECULATIVE: tl.constexpr):
+    # One line per lane; the per-lane base stays live across a uniform step.
+    rows = tl.arange(0, 128)
+    base = x_ptr + rows.to(tl.int64) * stride
+    for k in range(4):
+        tlx.amd_global_prefetch(base + k * 256, speculative=SPECULATIVE)
+
+
+@pytest.mark.parametrize("speculative", [True, False])
+def test_amd_global_prefetch_gfx1250(speculative):
+    """amd_global_prefetch emits one SE-scope global_prefetch_b8 per element, without inline asm."""
+    compiled = compile_for_gfx1250(
+        _amd_global_prefetch_kernel,
+        signature={"x_ptr": "*u8", "stride": "i32"},
+        constexprs={"SPECULATIVE": speculative},
+    )
+    assert compiled.asm["ttgir"].count("amdg.global_prefetch") == 1
+    asm = compiled.asm["amdgcn"]
+    assert "ASMSTART" not in asm
+    # The kernel prologue issues its own SGPR-addressed prefetch; ours address VGPR pairs.
+    prefetches = re.findall(r"global_prefetch_b8 v\[\d+:\d+\], off.*", asm)
+    assert len(prefetches) == 4, prefetches
+    assert prefetches and all("scope:SCOPE_SE" in line for line in prefetches)
+    # The non-speculative bit is the low cache-policy bit, which the
+    # disassembler prints as TH_LOAD_NT.
+    assert all(("TH_LOAD_NT" in line) == (not speculative) for line in prefetches), prefetches
+
+
 def test_async_descriptor_load_rejects_amd(device):
     """NV-only async_descriptor_load raises NotImplementedError on AMD."""
 
@@ -7606,6 +7635,35 @@ def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size,
     body = min(steady, key=len)
     assert body.count("tensor_load_to_lds") == 3 * 2
     assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+
+
+@pytest.mark.parametrize("l2_lookahead", [0, 4])
+def test_gfx1250_mxgemm_l2_lookahead_prefetches_in_steady_loop(l2_lookahead):
+    # The mm_mxfp K=16384 schedule: each merged step issues one per-lane
+    # global_prefetch_b8 for its cluster slice, at SE scope, without inline asm.
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 4, 128, c_type="*bf16", M=16384, N=16384, K=16384,
+                                                  CLUSTER_SIZE=16, CLUSTER_BARRIER_INTERVAL=8, CLUSTER_LAYOUT="4x4",
+                                                  XCD_REMAP_MODE=2, STATIC_SLOT_UNROLL=True, OUTPUT_C_SLOTS=2,
+                                                  OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True,
+                                                  STATIC_CLUSTER_STEPS=True, L2_LOOKAHEAD=l2_lookahead)
+    asm = compiled.asm["amdgcn"]
+    assert "ASMSTART" not in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    steady = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if sum("v_wmma_scale_f32_16x16x128_f8f6f4" in inst for inst in body) == 4 * 64:
+                steady.append(body)
+    assert steady
+    body = min(steady, key=len)
+    # VGPR-addressed prefetches; the disassembler may comment high VGPR numbers.
+    prefetches = [inst for inst in body if re.match(r"\s+global_prefetch_b8 v\[\d+:\d+\].*, off\b", inst)]
+    assert len(prefetches) == (4 if l2_lookahead else 0), prefetches
+    assert all("scope:SCOPE_SE" in inst and "TH_LOAD_NT" not in inst for inst in prefetches)
 
 
 @pytest.mark.parametrize("scale_wave256", [False, True])

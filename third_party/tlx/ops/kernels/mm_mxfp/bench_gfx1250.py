@@ -17,7 +17,9 @@ XCD remapping of whole clusters (eight XCDs, chunk two).
   input stages, two C slots, the static unrolled loop, the overlapped first K
   step, one split workgroup barrier per K step (--merged-handoff-barrier),
   and tests the cluster rendezvous only in the unrolled steps that can reach
-  it (--static-cluster-steps). FP32 output at K=4096 uses three input stages
+  it (--static-cluster-steps). From K=16384 that loop also prefetches the
+  stage four steps past each refill into L2, each CTA of the 4x4 cluster
+  taking its slice (--l2-lookahead). FP32 output at K=4096 uses three input stages
   and three dedicated C slots and overlaps each next tile's first K step with
   the C epilogue. At K=32768 it uses four stages and two C slots.
   --scale-layout wave256 packs its scales so each wave reads both 128-row
@@ -57,6 +59,10 @@ GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 
 STATIC_SLOT_UNROLL_MIN_K = 8192
 FOUR_BUFFER_MIN_K = 16384
 MERGED_MAX_K = 16384
+# The merged loop's 4x4 clusters prefetch the stage L2_LOOKAHEAD_STEPS past
+# each refill into L2 from L2_LOOKAHEAD_MIN_K.
+L2_LOOKAHEAD_MIN_K = 16384
+L2_LOOKAHEAD_STEPS = 4
 DEFAULT_OUTPUT_C_SLOTS = {"fp32": 3, "fp16": 6}
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
@@ -100,6 +106,7 @@ def _case_args(args, case):
     k = case[2]
     resolved.merged_handoff_barrier = bool(args.merged_handoff_barrier)
     resolved.static_cluster_steps = bool(args.static_cluster_steps)
+    resolved.l2_lookahead = args.l2_lookahead or 0
     if args.block_k == 256:
         resolved.num_buffers = args.num_buffers or 3
         resolved.static_slot_unroll = bool(args.static_slot_unroll)
@@ -114,6 +121,9 @@ def _case_args(args, case):
         resolved.output_c_slots = 2
         resolved.overlap_peel = args.overlap_peel is not False and args.cross_tile_prefetch
         resolved.static_cluster_steps = args.static_cluster_steps is not False
+        if (args.l2_lookahead is None and args.cluster_size > 1 and args.cluster_layout == "4x4"
+                and k >= L2_LOOKAHEAD_MIN_K):
+            resolved.l2_lookahead = L2_LOOKAHEAD_STEPS
         return resolved
     resolved.num_buffers = args.num_buffers or (4 if k >= FOUR_BUFFER_MIN_K else 3)
     three_stage = resolved.num_buffers == 3
@@ -192,6 +202,8 @@ def _command(args, case, dtype_b):
         command.append("--merged_handoff_barrier")
     if args.static_cluster_steps:
         command.append("--static_cluster_steps")
+    if args.l2_lookahead:
+        command.extend(["--l2_lookahead", str(args.l2_lookahead)])
     if args.scale_layout != "block128":
         command.extend(["--scale_layout", args.scale_layout])
     if args.output_c_slots is not None:
@@ -241,6 +253,10 @@ def parse_benchmark_args(argv=None):
         "--static-cluster-steps", action=argparse.BooleanOptionalAction, default=None,
         help="test the cluster rendezvous only in unrolled steps that can reach it (default: with the merged "
         "handoff barrier)")
+    parser.add_argument(
+        "--l2-lookahead", type=int, default=None,
+        help="merged loop: prefetch the stage this many steps past each refill into L2, split across a 2x2 or 4x4 "
+        f"cluster; 0 disables it (default: {L2_LOOKAHEAD_STEPS} with 4x4 clusters from K={L2_LOOKAHEAD_MIN_K})")
     parser.add_argument(
         "--scale-layout", choices=("block128", "wave256"), default="block128",
         help="MX8xMX8 preshuffled scale format: wave256 reads both 128-row quadrants' scales with one LDS load "
@@ -346,10 +362,11 @@ def main(argv=None):
                  N=case[1], K=case[2], block_k=run_args.block_k, num_buffers=run_args.num_buffers,
                  output_c_slots=run_args.output_c_slots, static_slot_unroll=run_args.static_slot_unroll,
                  overlap_peel=run_args.overlap_peel, merged_handoff_barrier=run_args.merged_handoff_barrier,
-                 static_cluster_steps=run_args.static_cluster_steps, scale_layout=run_args.scale_layout,
-                 cross_tile_prefetch=run_args.cross_tile_prefetch, split_cluster_barrier=run_args.split_cluster_barrier,
-                 early_c_stores=run_args.early_c_stores, enable_wmma_queuing=run_args.enable_wmma_queuing,
-                 group_m=run_args.group_m, cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
+                 static_cluster_steps=run_args.static_cluster_steps, l2_lookahead=run_args.l2_lookahead,
+                 scale_layout=run_args.scale_layout, cross_tile_prefetch=run_args.cross_tile_prefetch,
+                 split_cluster_barrier=run_args.split_cluster_barrier, early_c_stores=run_args.early_c_stores,
+                 enable_wmma_queuing=run_args.enable_wmma_queuing, group_m=run_args.group_m,
+                 cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
                  cluster_barrier_interval=run_args.cluster_barrier_interval,
                  cluster_multicast=run_args.cluster_multicast, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
                  xcd_chunk=run_args.xcd_chunk, num_programs=run_args.num_programs,
@@ -408,6 +425,8 @@ def run_single(argv=None):
                         help="four-buffer static loop: one workgroup barrier per K step, split around the C01 WMMAs")
     parser.add_argument("--static_cluster_steps", action="store_true",
                         help="static loop: test the cluster rendezvous only in unrolled steps that can hit it")
+    parser.add_argument("--l2_lookahead", type=int, default=0,
+                        help="merged loop: L2-prefetch the stage this many steps past each refill (0: off)")
     parser.add_argument(
         "--scale_layout", choices=("block128", "wave256"), default="block128",
         help="preshuffled scale format; wave256 reads both quadrants' scales with one ds_load_b128 per wave "
@@ -519,6 +538,7 @@ def run_single(argv=None):
         OVERLAP_PEEL=args.overlap_peel,
         MERGED_HANDOFF_BARRIER=args.merged_handoff_barrier,
         STATIC_CLUSTER_STEPS=args.static_cluster_steps,
+        L2_LOOKAHEAD=args.l2_lookahead,
         SCALE_LAYOUT=args.scale_layout,
         OUT_DTYPE=args.out_dtype,
         TILES_PER_WARP=tuple(args.tiles_per_warp),
